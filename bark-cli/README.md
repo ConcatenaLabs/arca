@@ -1262,6 +1262,37 @@ shows it `lapsing` or `lapsed`, and a held claim coin left unpaid is marked
     arca claims                                         # on a holder's wallet
     arca claim                                          # taken up
 
+### A watchtower for Bitcoin ark coins
+
+`arca btc-watchtower` runs a watchtower for coins of Bitcoin arks, in
+`<datadir>/btc-watchtower`, with a phrase of its own whose BTC pays the fees of
+the coins it brings on chain. A holder's wallet deposits each coin worth
+rescuing with it: the coin's data and a claim the holder signs, paying the
+coin to the holder's own address less a fixed rescue fee to the watchtower.
+A day (144 blocks) before the coin's expiry the watchtower broadcasts the
+coin's transactions level by level, each with a child it pays through the
+transaction's anchor, and once the coin's exit delta has passed it broadcasts
+the claim the same way. It acts at once instead when an earlier holder of a
+coin paid out of round brings that earlier coin on chain. It refuses a
+deposit whose coin does not validate against its anchor on chain, whose
+claim is not signed by the coin's key or pays it less than a rescue costs at
+its least rate, or whose ark it does not watch.
+
+    arca btc-watchtower create --network testnet4 --bitcoind http://127.0.0.1:48332 \
+        --bitcoind-user NAME [--ark SERVER_KEY …] [--min-rate 5]   # password from ARCA_BITCOIND_PASSWORD
+    arca btc-watchtower address               # fund it, in several coins
+    arca btc-watchtower serve --listen 127.0.0.1:3541 --interval 30
+    arca btc-watchtower deposits              # each deposit and its state
+    arca btc-watchtower info                  # what a wallet reads before depositing
+
+It answers `GET /v1/info`, `POST /v1/deposit` (`{"vtxo", "claim"}`) and
+`POST /v1/withdraw` (`{"claim_txid", "sig"}`, the coin's key signing
+`SHA256(T ‖ T ‖ network magic ‖ claim txid)`, `T = SHA256("Arca/btc-tower-withdraw")`),
+under any path prefix. A deposit for a coin it already holds replaces that
+one. A withdrawal arriving after the rescue started is answered
+`"withdrawn": false`. Wallets make their deposits and withdrawals with
+`tower_plan` (`bark-wasm`).
+
 ### Watchtowers: a coin kept safe while the wallet is away
 
 A coin the wallet does not refresh before its batch is released is brought on

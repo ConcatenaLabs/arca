@@ -121,9 +121,30 @@ fn handle(mut s: TcpStream, tx: mpsc::Sender<Request>) {
 
 /// Serves the watchtower on `listen` until the process is stopped.
 pub fn serve(w: &mut Wallet, listen: &str, interval: u64) -> Result<Value, Error> {
+	serve_with(listen, interval, "arca watchtower", |req| match req {
+		Some((call, body)) => match w.tower_call(call, body) {
+			Ok(v) => (200, v),
+			Err(e) => refusal(&e),
+		},
+		None => match w.tower_pass() {
+			Ok(v) => (200, v),
+			Err(e) => (503, json!({"error": e.to_string()})),
+		},
+	})
+}
+
+/// Serves calls on `listen` until the process is stopped: `service` answers
+/// `Some((call, body))` and runs a pass for `None`, every `interval` seconds.
+/// Requests wait while a pass runs.
+pub fn serve_with(
+	listen: &str,
+	interval: u64,
+	name: &str,
+	mut service: impl FnMut(Option<(&str, &Value)>) -> (u16, Value),
+) -> Result<Value, Error> {
 	let listener = TcpListener::bind(listen).map_err(|e| Error::Io(format!("{}: {}", listen, e)))?;
 	let at = listener.local_addr().map_err(|e| Error::Io(e.to_string()))?;
-	eprintln!("arca watchtower: listening on {}, a pass every {} s", at, interval);
+	eprintln!("{}: listening on {}, a pass every {} s", name, at, interval);
 	let (tx, rx) = mpsc::channel::<Request>();
 	std::thread::spawn(move || {
 		for s in listener.incoming().flatten() {
@@ -135,17 +156,14 @@ pub fn serve(w: &mut Wallet, listen: &str, interval: u64) -> Result<Value, Error
 	loop {
 		match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
 			Ok(r) => {
-				let a = match w.tower_call(&r.call, &r.body) {
-					Ok(v) => (200, v),
-					Err(e) => refusal(&e),
-				};
+				let a = service(Some((&r.call, &r.body)));
 				let _ = r.reply.send(a);
 			},
 			Err(mpsc::RecvTimeoutError::Timeout) => {
-				match w.tower_pass() {
-					Ok(v) if v["acted"].as_array().is_some_and(|a| !a.is_empty()) => eprintln!("arca watchtower: {}", v),
-					Ok(_) => {},
-					Err(e) => eprintln!("arca watchtower: the pass stopped: {}", e),
+				match service(None) {
+					(200, v) if v["acted"].as_array().is_some_and(|a| !a.is_empty()) => eprintln!("{}: {}", name, v),
+					(200, _) => {},
+					(_, e) => eprintln!("{}: the pass stopped: {}", name, e),
 				}
 				next = Instant::now() + Duration::from_secs(interval.max(1));
 			},

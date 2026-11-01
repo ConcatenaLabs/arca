@@ -84,6 +84,11 @@ pub async fn attach_funding(args: &mut OpenWalletArgs, network: Network, mnemoni
 	Ok(())
 }
 
+/// The phrase's BIP84 account [attach_funding] gave the open wallet.
+pub fn funding_of(wallet: &Wallet) -> anyhow::Result<Funding> {
+	funding(wallet)
+}
+
 fn funding(wallet: &Wallet) -> anyhow::Result<Funding> {
 	FUNDING.lock().unwrap().as_ref().and_then(|m| m.get(&wallet.fingerprint()).cloned())
 		.ok_or_else(|| anyhow!("this wallet was opened without its Bitcoin coins, so it cannot pay an exit"))
