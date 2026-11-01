@@ -151,6 +151,8 @@ pub enum CosignError {
 	#[error("leaf {0} is a claim leaf whose distribution's deadline {1} has passed: it lapses to its payer, and the operator co-signs no \
 		take-up of it")]
 	Lapsed(LeafId, u32),
+	#[error("leaf {0} vests at median time {1}: the operator co-signs no spend of it before then")]
+	Vesting(LeafId, u32),
 	#[error("leaf {0} is already spent: the server co-signs one spend of a leaf")]
 	DoubleSpend(LeafId),
 	#[error("leaf {0} rests on a board that is not credited: its transaction is not final")]
@@ -229,6 +231,7 @@ impl CosignError {
 			UnknownLeaf(_) => "unknown_leaf",
 			NotLive(..) => "not_live",
 			Lapsed(..) => "lapsed",
+			Vesting(..) => "vesting",
 			DoubleSpend(_) => "double_spend",
 			BoardNotFinal(_) => "board_not_final",
 			RoundNotFinal(_) => "round_not_final",
@@ -287,6 +290,7 @@ impl From<CoinError> for CosignError {
 			CoinError::Channel(id) => CosignError::Template(format!("coin {} is a channel-1 coin: it pays by its channel's states, and \
 				is given up only in a round", id)),
 			CoinError::Lapsed { leaf, deadline } => CosignError::Lapsed(leaf, deadline),
+			CoinError::Vesting { leaf, vest } => CosignError::Vesting(leaf, vest),
 			CoinError::Store(e) => e.into(),
 			CoinError::Internal(m) => CosignError::Internal(m),
 		}
@@ -816,7 +820,7 @@ impl Cosigner {
 				Some((_, a)) => self.signer.rebind_cosigned(&owner, &i.checkpoint_sig, &c.coin.leaf.salt,
 					c.coin.leaf.enclave.map(|e| e.enclave.holder), &a.over(&messages[k].0)?, c.coin.asset, c.coin.value,
 					std::slice::from_ref(&cp_out)).await,
-				None => self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
+				None => self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, crate::signer::After::of(&c.coin.leaf),
 					c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await,
 			};
 			let (cp, h) = match cp {
@@ -832,7 +836,7 @@ impl Cosigner {
 			let (re, h) = match &approval {
 				Some((_, a)) => self.signer.rebind_cosigned(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None,
 					&a.over(&messages[k].1)?, c.coin.asset, plan.inputs[k].1, &outputs).await,
-				None => self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
+				None => self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, crate::signer::After::NONE, c.coin.asset,
 					plan.inputs[k].1, &outputs, named).await,
 			}.map_err(|e| lost_spend(e, &c.coin.id))?;
 			latest(h);
@@ -1125,9 +1129,9 @@ impl Cosigner {
 				},
 				None => {
 					let cp = self.signer.check_rebind(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt,
-						c.coin.leaf.landing.map(|l| l.program), c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
+						crate::signer::After::of(&c.coin.leaf), c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
 					match cp {
-						Ok(()) => self.signer.check_rebind(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
+						Ok(()) => self.signer.check_rebind(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, crate::signer::After::NONE, c.coin.asset,
 							plan.inputs[k].1, outputs, named_for(plan, k, n)).await,
 						e => e,
 					}

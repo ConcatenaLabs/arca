@@ -359,11 +359,11 @@ async fn a_restricted_asset_moves_in_its_issuers_tree_under_its_policy() {
 	let out = [ExplicitOutput::new(rr, 700_000, node::op_true())];
 	let m = b_valid.leaf.message(rr, 700_000, &out).unwrap();
 	let owner_sig = sign_digest(&a2, &m.digest, &random32());
-	let e = client.rebind_recorded(&xonly(&a2), &owner_sig, &b_valid.leaf.salt, None, rr, 700_000, &out, None).await.unwrap_err();
+	let e = client.rebind_recorded(&xonly(&a2), &owner_sig, &b_valid.leaf.salt, server::signer::After::NONE, rr, 700_000, &out, None).await.unwrap_err();
 	println!("REFUSED by the signer, a message of R without the policy key's approval: {}", e);
 	assert!(e.to_string().contains("no valid approval by its policy key"), "{}", e);
 	let named = server::signer::WireNamed::new(0, &[b_valid.output()]);
-	let e = client.rebind_recorded(&xonly(&a2), &owner_sig, &b_valid.leaf.salt, None, rr, 700_000, &out, Some(named)).await.unwrap_err();
+	let e = client.rebind_recorded(&xonly(&a2), &owner_sig, &b_valid.leaf.salt, server::signer::After::NONE, rr, 700_000, &out, Some(named)).await.unwrap_err();
 	println!("REFUSED by the signer, a vtxo-2 message for a coin of R: {}", e);
 	assert!(e.to_string().contains("its coins are enclave-1, never vtxo-2"), "{}", e);
 	let other = sign_digest(&policy, &policy_cosign_digest(&[7; 32]), &random32());

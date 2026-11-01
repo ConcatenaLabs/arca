@@ -438,7 +438,7 @@ impl Forfeits {
 
 		// The operator's half of each forfeit, stored as it comes.
 		for ((leaf, c, f, owner_sig), stored) in built.iter().zip(forfeits.iter_mut()) {
-			let operator_sig = self.signer.rebind_forfeit(&c.leaf.owner, owner_sig, &c.leaf.salt, c.leaf.landing.map(|l| l.program), c.asset, c.value, &f.policy,
+			let operator_sig = self.signer.rebind_forfeit(&c.leaf.owner, owner_sig, &c.leaf.salt, crate::signer::After::of(&c.leaf), c.asset, c.value, &f.policy,
 				&f.output(), crate::cosign::alone(c)).await?;
 			f.verify(&Pair { operator: operator_sig, owner: *owner_sig })
 				.map_err(|_| ForfeitError::Internal("the signer signed another message than the server built".into()))?;
@@ -516,7 +516,7 @@ impl Forfeits {
 					continue;
 				},
 			};
-			match self.signer.rebind_forfeit(&c.leaf.owner, &owner_sig, &c.leaf.salt, c.leaf.landing.map(|l| l.program), c.asset, c.value,
+			match self.signer.rebind_forfeit(&c.leaf.owner, &owner_sig, &c.leaf.salt, crate::signer::After::of(&c.leaf), c.asset, c.value,
 				&forfeit.policy, &forfeit.output(), crate::cosign::alone(&c)).await {
 				Ok(operator_sig) => {
 					forfeit.verify(&Pair { operator: operator_sig, owner: owner_sig })

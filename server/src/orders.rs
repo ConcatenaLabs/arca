@@ -373,9 +373,9 @@ impl Orders {
 		let n = checked.len();
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = tplan.checkpoint_output(k);
-			self.signer.check_rebind(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
+			self.signer.check_rebind(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, crate::signer::After::of(&c.coin.leaf),
 				c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), cosign::alone(&c.coin)).await?;
-			self.signer.check_rebind(&tplan.checkpoint(k).owner, &i.reassignment_sig, &tplan.checkpoint(k).salt, None, c.coin.asset,
+			self.signer.check_rebind(&tplan.checkpoint(k).owner, &i.reassignment_sig, &tplan.checkpoint(k).salt, crate::signer::After::NONE, c.coin.asset,
 				i.checkpoint_value, outputs, fill_named(oc, tplan, k, n)).await?;
 		}
 		self.signer.check_order_fill(op, oc.coin.value, partial, outputs).await
@@ -915,13 +915,13 @@ impl Orders {
 		let mut sigs = Vec::with_capacity(n);
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = tplan.checkpoint_output(k);
-			let (cp, h) = self.signer.rebind_recorded(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, c.coin.leaf.landing.map(|l| l.program),
+			let (cp, h) = self.signer.rebind_recorded(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt, crate::signer::After::of(&c.coin.leaf),
 				c.coin.asset, c.coin.value,
 				std::slice::from_ref(&cp_out), cosign::alone(&c.coin)).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			let checkpoint = tplan.checkpoint(k);
 			let named = fill_named(&oc, &tplan, k, n);
-			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None, c.coin.asset,
+			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, crate::signer::After::NONE, c.coin.asset,
 				i.checkpoint_value, &outputs, named).await.map_err(|e| OrderError::Cosign(cosign::lost_spend(e, &c.coin.id)))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {

@@ -88,6 +88,17 @@ pub(crate) fn claim_bytes(l: &arca_covenant::Lapse) -> Vec<u8> {
 	b
 }
 
+/// A lapse's vest time as the store keeps it (`participation_output.vest`).
+pub(crate) fn vest_of(v: Option<i32>) -> Result<Option<arca_covenant::MedianTime>, StoreError> {
+	v.map(|t| arca_covenant::MedianTime::from_consensus(t as u32).map_err(|e| StoreError::Corrupt(format!("a vest time: {}", e))))
+		.transpose()
+}
+
+/// [`claim_of`] with its vest time, for `vest-1`.
+pub(crate) fn claim_with_vest(b: &[u8], vest: Option<i32>) -> Result<arca_covenant::Lapse, StoreError> {
+	Ok(arca_covenant::Lapse { vest: vest_of(vest)?, ..claim_of(b)? })
+}
+
 pub(crate) fn claim_of(b: &[u8]) -> Result<arca_covenant::Lapse, StoreError> {
 	if b.len() <= 12 {
 		return Err(StoreError::Corrupt(format!("a lapse of {} bytes", b.len())));
@@ -364,7 +375,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 	}
 	for r in c.query(
 		"SELECT kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, leaf_id,
-		        script, margin, reclaim_delay_units, htlc, order_terms, landing, channel, claim
+		        script, margin, reclaim_delay_units, htlc, order_terms, landing, channel, claim, vest
 		 FROM participation_output WHERE participation_id = $1 ORDER BY idx",
 		&[&&id[..]],
 	).await? {
@@ -394,7 +405,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 				},
 				landing: r.get::<_, Option<Vec<u8>>>(14).map(|b| landing_of(&b)).transpose()?,
 				channel: r.get::<_, Option<Vec<u8>>>(15).map(|b| channel_of(&b)).transpose()?,
-				claim: r.get::<_, Option<Vec<u8>>>(16).map(|b| claim_of(&b)).transpose()?,
+				claim: r.get::<_, Option<Vec<u8>>>(16).map(|b| claim_with_vest(&b, r.get(17))).transpose()?,
 			},
 			"offboard" => WantedKind::Offboard {
 				script: r.get(9),
@@ -1392,14 +1403,15 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 				});
 				let landing = landing.map(|l| landing_bytes(&l));
 				let channel = channel.map(|c| channel_bytes(&c));
+				let vest = claim.as_ref().and_then(|l| l.vest).map(|v| v.to_consensus_u32() as i32);
 				let claim = claim.as_ref().map(claim_bytes);
 				t.execute(
 					"INSERT INTO participation_output
 					 (participation_id, idx, kind, asset, value, template, owner_key, owner_nonce, exit_delay_units, operator_nonce, htlc,
-					  order_terms, landing, channel, claim)
-					 VALUES ($1, $2, 'leaf', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+					  order_terms, landing, channel, claim, vest)
+					 VALUES ($1, $2, 'leaf', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
 					&[&&p.id[..], &(k as i16), &&o.asset[..], &i64_of(o.value)?, template, &&owner_key[..], &&owner_nonce[..],
-						&(*exit_delay_units as i32), &&nonce[..], &htlc, &order_terms, &landing, &channel, &claim],
+						&(*exit_delay_units as i32), &&nonce[..], &htlc, &order_terms, &landing, &channel, &claim, &vest],
 				).await
 			},
 			WantedKind::Offboard { script, margin, reclaim_delay_units } => t.execute(

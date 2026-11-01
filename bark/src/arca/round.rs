@@ -501,10 +501,12 @@ pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option
 			asked_lapse.map_or("none".into(), |l| l.to_string())));
 	}
 	if asked_lapse.is_some() {
-		return if record.template() == Template::Claim1 && record.htlc().is_none() && record.order().is_none() {
+		// A lapse with a vest time is a vest-1 leaf's, any other a claim-1 leaf's.
+		let want = if record.lapse().is_some_and(|l| l.vest.is_some()) { Template::Vest1 } else { Template::Claim1 };
+		return if record.template() == want && record.htlc().is_none() && record.order().is_none() {
 			Ok(())
 		} else {
-			Err(format!("it is a leaf of template {}, and the wallet asked for a claim-1 leaf", record.template()))
+			Err(format!("it is a leaf of template {}, and the wallet asked for a {} leaf", record.template(), want))
 		};
 	}
 	let want = match (receive, asked_order, asked_landing, asked_channel) {

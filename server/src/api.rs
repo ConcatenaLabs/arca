@@ -40,7 +40,7 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"owed_withdrawn", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
-	"unknown_fill", "unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "wrong_chain", "wrong_operator", "wrong_round",
+	"unknown_fill", "unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "vesting", "wrong_chain", "wrong_operator", "wrong_round",
 ];
 
 /// `GET /v1/chain`: where the operator's finality service stands, so an
@@ -2445,6 +2445,10 @@ pub struct Distribute {
 	/// asset's atoms, decimal; below every claim.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lapse_allowance: Option<String>,
+	/// The vest time, a median time before the deadline: each claim leaf is
+	/// `vest-1`, and nothing moves it before then. Only with a deadline.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vest: Option<u32>,
 }
 
 /// One claim of a distribution: the named key (x-only, hex), the payer's
@@ -2489,6 +2493,9 @@ pub struct DistributionStatus {
 	pub lapse_deadline: Option<u32>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lapse_allowance: Option<String>,
+	/// The vest time of a distribution whose claims are `vest-1` leaves.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vest: Option<u32>,
 	pub claims: Vec<ClaimStatus>,
 	pub returns: Vec<ClaimReturn>,
 	/// What the returns pay together.
@@ -2586,6 +2593,10 @@ pub struct ClaimFound {
 	/// takes it up only before then.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub lapse_deadline: Option<u32>,
+	/// The vest time of a `vest-1` leaf: the operator co-signs no spend of
+	/// it before then.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub vest: Option<u32>,
 }
 
 /// `POST /v1/claim_leaf`: a holder's unroll authorisations for a claim leaf,

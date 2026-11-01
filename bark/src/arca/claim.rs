@@ -218,6 +218,23 @@ impl Wallet {
 	pub fn distribute_until(&mut self, asset: AssetId, claims: &[(XOnlyPublicKey, u64)], return_to: Option<Script>, shown: Option<u64>,
 		deadline: Option<u32>) -> Result<Value, Error>
 	{
+		self.distribute_with(asset, claims, return_to, shown, deadline, None)
+	}
+
+	/// [`Wallet::distribute`] of `vest-1` leaves, which nothing moves before
+	/// the median time `vest`: each holder takes its claim up from then until
+	/// the deadline, `days` days after `vest` ([`DEFAULT_CLAIM_DAYS`] by
+	/// default), and what is left then goes back to `return_to`.
+	pub fn distribute_vesting(&mut self, asset: AssetId, claims: &[(XOnlyPublicKey, u64)], return_to: Option<Script>, shown: Option<u64>,
+		vest: u32, days: Option<u32>) -> Result<Value, Error>
+	{
+		let deadline = vest.saturating_add(days.unwrap_or(DEFAULT_CLAIM_DAYS).saturating_mul(86_400));
+		self.distribute_with(asset, claims, return_to, shown, Some(deadline), Some(vest))
+	}
+
+	fn distribute_with(&mut self, asset: AssetId, claims: &[(XOnlyPublicKey, u64)], return_to: Option<Script>, shown: Option<u64>,
+		deadline: Option<u32>, vest: Option<u32>) -> Result<Value, Error>
+	{
 		self.witnessed_now()?;
 		let info = self.server_info()?;
 		let mut plan = self.distribution_plan(&info, asset, claims)?;
@@ -246,7 +263,11 @@ impl Wallet {
 		};
 		let deadline = MedianTime::from_consensus(deadline).map_err(|e| Error::Refused(format!("the deadline: {}", e)))?;
 		let allowance = arca_covenant::claim::lapse_allowance(self.chain.floor_per_kvb(asset)?, 4);
-		let lapse = arca_covenant::DistributionLapse { deadline, allowance, vest: None };
+		let vest = vest.map(|v| MedianTime::from_consensus(v).map_err(|e| Error::Refused(format!("the vest time: {}", e)))).transpose()?;
+		if vest.is_some_and(|v| v.to_consensus_u32() <= self.now().map_or(0, |n| n.to_consensus_u32())) {
+			return Err(Error::Refused("the vest time has passed: pay the claims without one".into()));
+		}
+		let lapse = arca_covenant::DistributionLapse { deadline, allowance, vest };
 		let fees: Vec<(AssetId, u64)> = if plan.fee > 0 { vec![(asset, plan.fee)] } else { vec![] };
 		let d = Distribution {
 			inputs: plan.coins.iter().map(|c| LeafId::from_str(&c.leaf_id).map_err(|e| Error::Store(e.to_string()))).collect::<Result<_, _>>()?,
@@ -271,6 +292,10 @@ impl Wallet {
 			"deadline": deadline.to_consensus_u32(),
 			"lapse_allowance": allowance.to_string(),
 		});
+		let mut body = body;
+		if let Some(v) = vest {
+			body["vest"] = json!(v.to_consensus_u32());
+		}
 		let lapse_json = d.claim_lapse().map(|l| arca_covenant::record_json::claim_json(&l));
 		// Each claim as the wallet's participation record keeps a leaf it
 		// wants: its asset, value and nonce, and the key it was named under.
@@ -294,6 +319,7 @@ impl Wallet {
 			"distribution": pid, "state": answer["state"], "asset": asset.to_string(), "total": plan.total.to_string(),
 			"fee": plan.fee.to_string(), "gives": given, "return_script": hex(return_script.as_bytes()),
 			"deadline": deadline.to_consensus_u32(), "lapse_allowance": allowance.to_string(),
+			"vest": vest.map(|v| v.to_consensus_u32()), "vests": vest.map(|v| date_words(v.to_consensus_u32())),
 			"claims": claims.iter().map(|c| json!({"key": hex(&c.named.serialize()), "value": c.value.to_string(),
 				"claim_key": c.owner().map(|k| hex(&k.serialize())).unwrap_or_default()})).collect::<Vec<_>>(),
 			"note": self.spelling.say("{sync} hands over the forfeits once the round is final; the claims open then"),
@@ -489,7 +515,7 @@ impl Wallet {
 			out.push(json!({
 				"distribution": c["distribution_id"], "index": c["index"], "key": c["key"], "address": address, "named_as": named_as,
 				"asset": c["asset"], "value": c["value"], "state": c["state"], "leaf_id": c["leaf_id"], "deadline": c["deadline"],
-				"expiry": c["expiry"], "held": held,
+				"expiry": c["expiry"], "held": held, "vest": c["vest"], "vests": c["vest"].as_u64().map(|v| date_words(v as u32)),
 				"note": claim_note(c),
 			}));
 		}
@@ -513,6 +539,10 @@ impl Wallet {
 			let name = format!("{}:{}", c["distribution_id"].as_str().unwrap_or(""), c["index"]);
 			let leaf = c["leaf_id"].as_str().unwrap_or("").to_string();
 			if !which.is_empty() && !which.iter().any(|w| *w == name || *w == leaf) {
+				continue;
+			}
+			if c["state"] == "vesting" {
+				out.push(json!({"claim": name, "state": "vesting", "vest": c["vest"], "note": claim_note(c)}));
 				continue;
 			}
 			if c["state"] != "open" {
@@ -622,6 +652,15 @@ impl Wallet {
 		if lapse.as_ref().map(|l| l.deadline.to_consensus_u32() as u64) != c["lapse_deadline"].as_u64() {
 			return Err(Error::Refused("the operator names another deadline for the claim than its leaf's record".into()));
 		}
+		// A vest-1 leaf vests at the time its record names, which the
+		// operator's answer repeats, and is taken only once it has.
+		let vest = lapse.as_ref().and_then(|l| l.vest);
+		if vest.map(|v| v.to_consensus_u32() as u64) != c["vest"].as_u64() {
+			return Err(Error::Refused("the operator names another vest time for the claim than its leaf's record".into()));
+		}
+		if let Some(v) = vest.filter(|v| now.to_consensus_u32() < v.to_consensus_u32()) {
+			return Err(Error::Refused(format!("the claim vests on {}: it is taken up then", date_words(v.to_consensus_u32()))));
+		}
 		if lapse.as_ref().is_some_and(|l| now.to_consensus_u32().saturating_add(TAKE_UP_MARGIN) >= l.deadline.to_consensus_u32()) {
 			return Err(Error::Refused("the claim's deadline has come: it goes back to its payer".into()));
 		}
@@ -670,12 +709,31 @@ impl Wallet {
 /// distribution's terms, which is no loss of the holder's.
 fn claim_note(c: &Value) -> Option<String> {
 	match c["state"].as_str() {
+		Some("vesting") => c["vest"].as_u64().map(|v| format!("vests on {}: nothing moves it before then, and the wallet takes it \
+			up from then on", date_words(v as u32))),
 		Some("lapsing") | Some("lapsed") => Some("not taken up by its deadline: it goes back to its payer, by the distribution's \
 			terms; nothing the wallet held is lost".into()),
 		Some("open") => c["lapse_deadline"].as_u64().map(|d| format!("open until median time {}: take it up before then, or it goes \
 			back to its payer", d)),
 		_ => None,
 	}
+}
+
+/// The UTC date of the median time `t`, in words: `1 March 2027`.
+pub fn date_words(t: u32) -> String {
+	// Days since 1970-01-01 to a civil date (H. Hinnant's algorithm).
+	let z = (t / 86_400) as i64 + 719_468;
+	let era = z.div_euclid(146_097);
+	let doe = z - era * 146_097;
+	let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+	let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	let mp = (5 * doy + 2) / 153;
+	let day = doy - (153 * mp + 2) / 5 + 1;
+	let month = if mp < 10 { mp + 3 } else { mp - 9 };
+	let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+	const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+		"November", "December"];
+	format!("{} {} {}", day, MONTHS[(month - 1) as usize], year)
 }
 
 /// What a distribution gives up and pays.
