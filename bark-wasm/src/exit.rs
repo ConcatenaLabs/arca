@@ -188,6 +188,24 @@ async fn funding_confirmed(f: &Funding) -> Amount {
 	f.read().await.inner.balance().confirmed
 }
 
+/// The holder's Bitcoin address holds too little confirmed BTC to pay an
+/// exit's fees as it goes.
+#[derive(Debug)]
+struct Unfunded {
+	needed: Amount,
+	available: Amount,
+}
+
+impl std::fmt::Display for Unfunded {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		write!(f, "refused: taking these coins out needs about {} sat of confirmed BTC at your Bitcoin address \
+			to pay the Bitcoin fees as it goes; it holds {} sat. Nothing was started.",
+			self.needed.to_sat(), self.available.to_sat())
+	}
+}
+
+impl std::error::Error for Unfunded {}
+
 /// Starts the exits of `ids`, all worth their exit, refused in words when the
 /// holder's Bitcoin address holds too little confirmed BTC to pay their fees.
 async fn start(wallet: &Wallet, f: &Funding, coins: &[bark::vtxo::WalletVtxo], ids: &[VtxoId]) -> anyhow::Result<Value> {
@@ -195,9 +213,7 @@ async fn start(wallet: &Wallet, f: &Funding, coins: &[bark::vtxo::WalletVtxo], i
 		.map_err(|e| anyhow!("refused: the exit cannot be priced: {}", e))?;
 	if !est.fundable {
 		let have = funding_confirmed(f).await;
-		bail!("refused: taking these coins out needs about {} sat of confirmed BTC at your Bitcoin address \
-			to pay the Bitcoin fees as it goes; it holds {} sat. Nothing was started.",
-			est.exit_broadcast_fee.to_sat(), have.to_sat());
+		return Err(Unfunded { needed: est.exit_broadcast_fee, available: have }.into());
 	}
 	let chosen = coins.iter().filter(|c| ids.contains(&c.vtxo.id())).map(|c| c.vtxo.clone()).collect::<Vec<_>>();
 	wallet.exit_mgr().start_exit_for_vtxos(&chosen).await?;
@@ -414,7 +430,15 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 			} else {
 				match start(wallet, &f, &coins, &ids).await {
 					Ok(s) => { out["action"] = json!("started"); out["started"] = s; },
-					Err(e) => { out["action"] = json!("cannot_start"); out["reason"] = json!(format!("{:#}", e)); },
+					Err(e) => {
+						out["action"] = json!("cannot_start");
+						out["reason"] = json!(format!("{:#}", e));
+						out["amount"] = json!(sat(priced.iter().filter(|p| p.worth()).map(|p| p.amount).sum()));
+						if let Some(u) = e.downcast_ref::<Unfunded>() {
+							out["needed"] = json!(sat(u.needed));
+							out["available"] = json!(sat(u.available));
+						}
+					},
 				}
 			}
 			if had_exits || out["action"] == "started" {
