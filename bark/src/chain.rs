@@ -335,12 +335,18 @@ impl ChainSource {
 				})
 			},
 			ChainSourceClient::Esplora(client) => {
-				// The API should return rates for targets 1-25, 144 and 1008
+				// The API should return rates for targets 1-25, 144 and 1008, but a server
+				// whose node lacks the data for a target leaves it out (testnet4's often
+				// answers 144 and above only). A missing target takes the rate of the
+				// nearest one above it that is there, else the nearest below.
 				let estimates = client.get_fee_estimates().await?;
-				let get_fee_rate = |target| {
-					let fee = estimates.get(&target).with_context(||
-						format!("No rate returned from get_fee_estimates for a {} confirmation target", target)
-					)?;
+				let get_fee_rate = |target: u16| {
+					let fee = estimates.get(&target)
+						.or_else(|| estimates.iter().filter(|(t, _)| **t > target).min_by_key(|(t, _)| **t).map(|(_, f)| f))
+						.or_else(|| estimates.iter().filter(|(t, _)| **t < target).max_by_key(|(t, _)| **t).map(|(_, f)| f))
+						.with_context(||
+							format!("No rate returned from get_fee_estimates for a {} confirmation target", target)
+						)?;
 					FeeRate::from_sat_per_vb_decimal_checked_ceil(*fee).with_context(||
 						format!("Invalid rate returned from get_fee_estimates {} for a {} confirmation target", fee, target)
 					)
@@ -787,8 +793,8 @@ impl ChainSource {
 			(Ok(fee_rates), _) => (fee_rates, false),
 			(Err(e), None) => return Err(e),
 			(Err(e), Some(fallback)) => {
-				warn!("Error getting fee rates, falling back to {} sat/kvB: {}",
-					fallback.to_btc_per_kvb(), e,
+				warn!("Error getting fee rates, falling back to {} sat/vB: {}",
+					fallback.to_sat_per_vb_ceil(), e,
 				);
 				(FeeRates { fast: fallback, regular: fallback, slow: fallback }, true)
 			}
