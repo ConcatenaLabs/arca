@@ -1294,7 +1294,10 @@ takes no sealed deposit (`passed_over` in `deposits`, with why): a sealed
 deposit cannot be checked when it is taken, so one sent to a watchtower of
 another operator would only be refused when it had to act.
 
-Back from an absence, the wallet finds such a coin on the chain: `coins`
+The operator brings a coin there too: at its batch's release, or, for a
+batch without a sweep, at the batch's service horizon, when it collects
+what is left of the batch on the chain. Back from an absence, the wallet
+finds such a coin on the chain: `coins`
 marks it `kept_safe`, with the sentence a program shows its user
 (`kept_safe_note`: "moved out of the Ark to keep it safe while you were
 away"), and `balance` counts it under `kept_safe` as well as `exiting`.
@@ -1825,6 +1828,22 @@ coin to the operator's sweep; a coin of an asset the node does not take for
 fees sped up by a child with a second input in an accepted one (the coin's
 own asset for the fee refused); and a coin received out of round refreshed
 in the next round, while the sender's change is left as it is.
+
+`tests/arca_no_sweep.rs` runs the same way, its operator building batches
+without a sweep (`[batches] no_sweep`): every wallet signs its refresh's
+forfeits against the served round before it is broadcast, a wallet that does
+not answer is left out and the others' round goes out, and a pays-on and a
+RECLAIM-D follow. A wallet that drops out of a round holds back nobody: the
+one that answered runs again at once, alone, before a newcomer; the one that
+dropped out, back again, sees in its `sync` why its refresh waits, then runs
+in a round of its own and goes out once it answers. With `ARCA_CLI_OLDER`
+naming an `arca` built before wallets said `forfeits_before_broadcast`, that
+wallet's refresh is refused as the operator's refusal, in words telling its
+holder to update, and its coin stays live. At a batch's service horizon, a
+wallet that kept syncing has refreshed by itself in time, while an absent
+wallet's coin is collected onto the chain: back again, it shows the coin kept
+safe ("moved out of the Ark to keep it safe while you were away"), takes it
+home and boards it back.
 
 `tests/arca_accumulator.rs` runs the same way, its operator building
 accumulator batches (`[batches] accumulator_exit_rate_ppm`): six wallets

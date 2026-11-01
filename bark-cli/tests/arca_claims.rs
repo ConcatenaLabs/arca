@@ -160,7 +160,7 @@ async fn a_payer_pays_twenty_holders_in_one_round_and_gets_back_what_nobody_took
 		assert_eq!(found[0]["state"], "open");
 		let taken = w.ok(&["claim"]);
 		assert!(taken[0]["taken_up"]["transfer_id"].is_string(), "{}", taken);
-		claimed.push(Arca { name: w.name.clone(), dir: w.dir.clone(), patience: w.patience.clone() });
+		claimed.push(Arca { name: w.name.clone(), dir: w.dir.clone(), patience: w.patience.clone(), bin: w.bin.clone() });
 	}
 	for (i, m) in mnemonics.iter().take(8).enumerate() {
 		let w = Arca::new(&format!("mnemonic {}", i));

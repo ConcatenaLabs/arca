@@ -67,6 +67,14 @@
 //! operator serves an asset I issuer-operated, its reissuance token in a
 //! mint limiter the signer mints through; `/state` names it `issuer`.
 //!
+//! With `ARCA_OPERATOR_NO_SWEEP` set to a number of seconds, the operator
+//! builds every batch without a sweep (`[batches] no_sweep`), each collected
+//! on the chain that long after its round (`collect_after_seconds`): every
+//! refresh round is held until its forfeits are in, so drive it with
+//! `/build`, the wallets' syncs, `/pass`, then `/produce` and `/bury`, and
+//! the collection with `/advance` and `/settle`. It applies without
+//! `ARCA_OPERATOR_LIGHTNING` and `ARCA_OPERATOR_ISSUER` only.
+//!
 //! With `ARCA_OPERATOR_CHANNELS` set to a capacity in atoms, the operator
 //! makes channel leaves (`channel-1`) of every plain asset it serves, with up
 //! to that much on its side of each.
@@ -742,7 +750,18 @@ async fn operator_for_browsers() {
 	let (mut r, _nodes) = match std::env::var_os("ARCA_OPERATOR_LIGHTNING") {
 		Some(_) => with_lightning().await,
 		None if std::env::var_os("ARCA_OPERATOR_ISSUER").is_some() => (Running::start_on(&["-evbparams=simplicity:-1:::"], |_, _, _| {}).await, vec![]),
-		None => (Running::start().await, vec![]),
+		// Batches without a sweep, collected at the horizon named (seconds).
+		None => match std::env::var("ARCA_OPERATOR_NO_SWEEP") {
+			Ok(h) => {
+				let h: u32 = h.trim().parse().expect("ARCA_OPERATOR_NO_SWEEP is a service horizon in seconds");
+				(Running::start_with(|c, _, _| {
+					c.batches.no_sweep = true;
+					c.batches.holder_batches = Some(0);
+					c.batches.collect_after_seconds = Some(h);
+				}).await, vec![])
+			},
+			Err(_) => (Running::start().await, vec![]),
+		},
 	};
 	let mut profiles = Profiles::default();
 	serve_profiles(&mut r, &mut profiles).await;

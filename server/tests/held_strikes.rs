@@ -275,7 +275,7 @@ async fn a_wallet_that_forfeits_after_broadcast_is_refused_in_words_and_loses_no
 	let ans = r.http.post("submit_participation", &body);
 	let (code, msg) = ans.refusal();
 	println!("an older wallet's refresh: {} {}: {}", ans.status, code, msg);
-	assert_eq!((ans.status, code.as_str()), (422, "forfeits_after_broadcast"));
+	assert_eq!((ans.status, code.as_str()), (422, "declined"));
 	assert!(msg.contains("update the wallet") && msg.contains("Nothing was taken"), "{}", msg);
 	assert_eq!(r.server.store.leaf(&a.id.0).await.unwrap().unwrap().state, server::store::LeafState::Live);
 	// The same wallet, flag and all, is taken by an operator with a sweep.

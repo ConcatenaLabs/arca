@@ -1208,7 +1208,9 @@ impl Wallet {
 				// operator's funds or cap is taken back, its coins free to pay.
 				"pending" => match self.withdraw_waited(&pid, &st) {
 					Ok(Some(v)) => out.push(v),
-					Ok(None) => out.push(json!({"participation": pid, "state": "pending", "note": "waiting for a round"})),
+					// Why the operator holds it back, in its words, when it says.
+					Ok(None) => out.push(json!({"participation": pid, "state": "pending",
+						"note": st["waiting"].as_str().map_or_else(|| "waiting for a round".to_string(), str::to_string)})),
 					Err(e) => out.push(json!({"participation": pid, "state": "pending", "error": e.to_string()})),
 				},
 				// A coin of it on its way home on the chain: its forfeits are

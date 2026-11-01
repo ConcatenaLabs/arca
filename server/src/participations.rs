@@ -476,7 +476,10 @@ impl ParticipationError {
 			ReturnScriptReused => "script_reused",
 			NotSynced => "not_synced",
 			Planned(_) => "planned",
-			ForfeitsAfterBroadcast => "forfeits_after_broadcast",
+			// A code every installed wallet takes as a refusal, so its coins
+			// are live again and it keeps the words; an unknown one it would
+			// take for a server it cannot reach, and retry.
+			ForfeitsAfterBroadcast => "declined",
 			SignedAlready(_) => "double_spend",
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
 			Signer(SignerError::Declined(_)) => "declined",

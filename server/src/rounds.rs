@@ -178,7 +178,8 @@
 //!   round with it goes out, the strike is cleared.
 //! - A wallet that hands over its forfeits only after a round is broadcast
 //!   would be voided from every such round: it is refused when it submits,
-//!   saying why (`forfeits_after_broadcast`), and never joins one. A wallet
+//!   saying why (`declined`, a code every installed wallet takes as a
+//!   refusal, so its coins are live again), and never joins one. A wallet
 //!   that hands them over before says so on the participation
 //!   (`forfeits_before_broadcast`).
 //!
