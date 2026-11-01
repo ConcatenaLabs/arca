@@ -47,7 +47,8 @@ const WORTH_MARGIN_SAT: u64 = 330;
 /// The commands of this module.
 pub const COMMANDS: &[&str] = &["exit_estimate", "exit_start", "exit_progress", "exit_claim", "exit_status", "exit_auto"];
 
-type Funding = Arc<tokio::sync::RwLock<OnchainWallet>>;
+/// The phrase's BIP84 account as Bark's onchain wallet.
+pub type Funding = Arc<tokio::sync::RwLock<OnchainWallet>>;
 
 /// The unused addresses past the last used one a sync of the funding wallet reads.
 const REVEAL_GAP: u32 = 20;
@@ -90,7 +91,7 @@ fn funding(wallet: &Wallet) -> anyhow::Result<Funding> {
 
 /// Brings the funding wallet up to the chain: the whole account the first time
 /// in this program, its known addresses after.
-async fn sync_funding(wallet: &Wallet) -> anyhow::Result<Funding> {
+pub async fn sync_funding(wallet: &Wallet) -> anyhow::Result<Funding> {
 	let f = funding(wallet)?;
 	let fp = wallet.fingerprint();
 	let first = SCANNED.lock().unwrap().get_or_insert_with(HashSet::new).insert(fp);

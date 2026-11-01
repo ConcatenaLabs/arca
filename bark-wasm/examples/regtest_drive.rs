@@ -1,6 +1,7 @@
 //! Runs one of the wallet's commands natively against a Bitcoin ark on
 //! regtest (`contrib/bitcoin-ark-regtest`), the chain read from its Bitcoin
-//! Core. Each run opens the wallet, runs the command, prints its answer and
+//! Core; or, with `NETWORK` (testnet4, signet, bitcoin) and `ESPLORA`, against
+//! any Bitcoin ark, the chain read from an Esplora server. Each run opens the wallet, runs the command, prints its answer and
 //! closes the wallet again, with no daemon: between two runs the wallet is
 //! closed, as a browser's is when its page is.
 //!
@@ -10,7 +11,8 @@
 //!
 //! `sync` is the wallet's own sync (what its daemon runs while it is open),
 //! `funding_address` the first address of the phrase's BIP84 account (whose
-//! coins pay an exit's fees); every other command is one of
+//! coins pay an exit's fees), `board_funding` `{"sats"}` a board paid from
+//! those coins; every other command is one of
 //! [arca_bark_wasm::command::COMMANDS].
 
 use std::path::PathBuf;
@@ -48,13 +50,18 @@ async fn main() -> anyhow::Result<()> {
 		None => serde_json::json!({}),
 	};
 
-	let net = bark::ark::bitcoin::Network::Regtest;
+	let net = arca_bark_wasm::command::network(&std::env::var("NETWORK").unwrap_or_else(|_| "regtest".into()))?;
 	let mnemonic = bark::bip39::Mnemonic::from_str(env("MNEMONIC")?.trim())?;
 	let seed = bark::WalletSeed::new_from_mnemonic(net, &mnemonic);
 	let mut config = bark::Config::network_default(net);
 	config.server_address = env("ARK")?;
-	config.bitcoind_address = Some(env("BITCOIND")?);
-	config.bitcoind_cookiefile = Some(PathBuf::from(env("COOKIE")?));
+	match std::env::var("ESPLORA") {
+		Ok(e) => config.esplora_address = Some(e),
+		Err(_) => {
+			config.bitcoind_address = Some(env("BITCOIND")?);
+			config.bitcoind_cookiefile = Some(PathBuf::from(env("COOKIE")?));
+		},
+	}
 	// A regtest node has no fee estimates: the rate the wallet takes instead
 	// (sat/vB, `FEERATE`, 5 by default, the regtest ark's own fallback).
 	let rate = std::env::var("FEERATE").ok().and_then(|r| r.parse().ok()).unwrap_or(5);
@@ -72,6 +79,13 @@ async fn main() -> anyhow::Result<()> {
 		// The phrase's first BIP84 address: the one a dual-chain wallet shows first.
 		let w = wallet.onchain().context("no funding wallet")?;
 		serde_json::json!({ "address": w.write().await.address().await?.to_string() })
+	} else if cmd == "board_funding" {
+		// Boards `sats` from the phrase's BIP84 coins, signed here: a holder with no
+		// other on-chain wallet to build the funding.
+		arca_bark_wasm::exit::sync_funding(&wallet).await?;
+		let b = wallet.board_amount(bark::ark::bitcoin::Amount::from_sat(
+			json["sats"].as_str().context("'sats' is missing")?.parse()?)).await?;
+		serde_json::json!({ "funding_txid": b.funding_tx.compute_txid().to_string(), "amount": b.amount.to_sat() })
 	} else {
 		arca_bark_wasm::run(&wallet, &cmd, &json).await?
 	};
