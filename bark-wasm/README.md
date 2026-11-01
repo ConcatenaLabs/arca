@@ -105,7 +105,7 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `exit_progress` | `address`? | `exits` (each `id`, `state`, `claimable_height`, `error`), `claimed` (`txid`, `address`, `amount`, `coins`, or null), `pending`, `claimable_at` |
 | `exit_claim` | `address`? | `txid`, `address`, `amount`, `coins` |
 | `exit_status` | | `exits`: every exit, live or finished, with its `state` |
-| `exit_auto` | `address`?, `ark_refused`?, `margin`? | `action` (`none`, `started`, `cannot_start` with `reason`), `ark` (`answering`, `refused`, `unreachable`), `not_worth` (coins due but not worth their exit), `started`, `progress` |
+| `exit_auto` | `address`?, `ark_refused`?, `margin`? | `action` (`none`, `started`, `cannot_start` with `reason`, the coins' `amount` and, when the address holds too little for the fees, `needed` and `available`), `ark` (`answering`, `refused`, `unreachable`), `not_worth` (coins due but not worth their exit), `started`, `progress` |
 
 An exit's states are `starting`, `on_its_way`, `waiting_out_its_delay`,
 `claimable`, `claiming`, `claimed`, `spent_elsewhere` and `canceled`.
