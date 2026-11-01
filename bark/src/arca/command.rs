@@ -138,7 +138,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 	let t0 = web_time::Instant::now();
 	let (n0, _) = w.chain.calls();
 	let g0 = super::chain::gaps();
-	let start = start(w, command);
+	let start = start(w, command, args["recheck"].as_str() == Some("coins"));
 	let (t1, (n1, _), g1) = (web_time::Instant::now(), w.chain.calls(), super::chain::gaps());
 	let result = command_of(w, command, args)?;
 	let (n2, _) = w.chain.calls();
@@ -161,8 +161,11 @@ fn reads_only(command: &str) -> bool {
 
 /// What `arca` runs before a command: the witness (unless the command stays
 /// on this machine and the node), then the re-check (unless the command is
-/// itself `recheck`, `sync` or `schedule`).
-fn start(w: &mut Wallet, command: &str) -> Value {
+/// itself `recheck`, `sync` or `schedule`). With `coins_only` (the argument
+/// `"recheck": "coins"`), the re-check is the part that concerns the coins
+/// ([`Wallet::recheck_coins`]): a program that answers others from the
+/// wallet asks for it on its answer path, and runs `sync` on a timer.
+fn start(w: &mut Wallet, command: &str, coins_only: bool) -> Value {
 	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "speed_up" | "schedule"
 		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards");
 	// A command that reads only, of the operator or an offer, skips the
@@ -188,7 +191,7 @@ fn start(w: &mut Wallet, command: &str) -> Value {
 			};
 			return out;
 		}
-		out["recheck"] = match w.recheck() {
+		out["recheck"] = match if coins_only { w.recheck_coins() } else { w.recheck() } {
 			Ok(v) => v,
 			Err(e) => json!({"error": {"kind": e.kind(), "message": format!("the re-check on start could not run: {}", e)}}),
 		};

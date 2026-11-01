@@ -2563,6 +2563,23 @@ impl Wallet {
 	/// (`read_again`), and whether the tip the wallet last saw has been
 	/// reorganised away.
 	pub fn recheck(&mut self) -> Result<Value, Error> {
+		self.recheck_scope(true)
+	}
+
+	/// The part of the re-check that concerns the coins the wallet holds:
+	/// each coin against the chain and the lineage watch, as
+	/// [`Self::recheck`] runs them, without following its participations'
+	/// rounds (a round that can never return, a re-run's round that stands),
+	/// which give coins back or move a participation on and guard no spend.
+	/// A program that answers others from the wallet (a maker's firm offer)
+	/// asks for it on its answer path and runs `sync` or `recheck` on a timer,
+	/// which do the rest. It is not recorded as a complete re-check: the next
+	/// command that asks for none runs the complete one.
+	pub(crate) fn recheck_coins(&mut self) -> Result<Value, Error> {
+		self.recheck_scope(false)
+	}
+
+	fn recheck_scope(&mut self, all: bool) -> Result<Value, Error> {
 		let tip = self.chain.tip()?;
 		let last_h: Option<u64> = self.store.meta("tip_height")?.and_then(|v| v.parse().ok());
 		let last_hash = self.store.meta("tip_hash")?;
@@ -2692,6 +2709,19 @@ impl Wallet {
 				let r = self.respend_to_self(vec![c.clone()]).unwrap_or_else(|e| json!({"error": e.to_string()}));
 				changes.push(json!({"leaf_id": c.leaf_id, "claim_paid_on": r}));
 			}
+		}
+		if !all {
+			for mut ch in self.watch_lineages()? {
+				let id = ch["leaf_id"].as_str().unwrap_or("").to_string();
+				changes.retain(|c| c["leaf_id"].as_str() != Some(id.as_str()));
+				ch["from"] = json!(before.get(&id));
+				changes.push(ch);
+			}
+			lap("lineages", &mut at);
+			return Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes, "ms": ms,
+				"coins_only": "the coins and their lineages; the participations' rounds are followed by the next sync or recheck",
+				"read_again": if grown { json!(coins.iter().filter(|c| matches!(c.state.as_str(), "pending" | "live")).count() - skip.len()) }
+					else { json!("all") }}));
 		}
 		// A round a participation was released in that can never return,
 		// whatever became of its new leaves (one paid on, say): the
