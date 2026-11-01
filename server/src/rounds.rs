@@ -167,15 +167,19 @@
 //! - After a drop, the participations that did hand their forfeits over run
 //!   again at once, in a round of their own: while any of them can run, the
 //!   next round of the asset takes them and no newcomer. So an answering
-//!   participation goes out at most one window late for each participant
-//!   that drops out beside it, whoever joins meanwhile.
-//! - The coins a voided participation gave up, and the batch leaves and
-//!   boards each rests on (so a coin paid on from one out of round is caught
-//!   too), are struck ([`Store::strike_coins`]). A participation giving one
-//!   up waits a back-off, the window at first and doubling with each strike
-//!   up to a day, and then runs only in a round of its own
-//!   ([`Rounds::run_solo_round_of`]), where it holds back nobody. Once a
-//!   round with it goes out, the strike is cleared.
+//!   participation goes out at most one window late for each participation
+//!   that drops out beside it, whoever joins meanwhile. That bound is per
+//!   participation, not per holder: the server cannot tell holders apart
+//!   (a fresh key per coin, and a mailbox binding that only the leaf's own
+//!   key signs), so one holder's several coins cost a window each.
+//! - The coins a voided participation gave up are struck
+//!   ([`Store::strike_coins`]), and a coin paid on from one out of round is
+//!   caught through its lineage ([`Store::coin_lineage`]); a coin beside
+//!   one, paid from the same parent (a payer's change), is not. A
+//!   participation giving one up waits a back-off, the window at first and
+//!   doubling with each strike up to a day, and then runs only in a round of
+//!   its own ([`Rounds::run_solo_round_of`]), where it holds back nobody.
+//!   Once a round with it goes out, the strike is cleared.
 //! - A wallet that hands over its forfeits only after a round is broadcast
 //!   would be voided from every such round: it is refused when it submits,
 //!   saying why (`declined`, a code every installed wallet takes as a
@@ -1523,27 +1527,20 @@ impl Rounds {
 		Ok(None)
 	}
 
-	/// The coins participation `row` gives up, and the batch leaves and
-	/// boards each rests on: what a strike names.
-	async fn struck_ids(&self, row: &ParticipationRow) -> Result<Vec<[u8; 32]>, RoundError> {
-		let mut ids = vec![];
-		for i in &row.inputs {
-			ids.push(i.leaf_id);
-			if let Some(l) = self.store.leaf(&i.leaf_id).await? {
-				if let Ok(rec) = CoinRecord::from_bytes(&l.record) {
-					crate::http::root_leaf_ids(&rec, &mut ids);
-				}
-			}
-		}
+	/// The coins participation `row` gives up: what a strike names. The
+	/// store reads a strike on any coin they were paid on from as well
+	/// ([`Store::coin_lineage`]), never one on a coin beside them.
+	fn given_up(row: &ParticipationRow) -> Vec<[u8; 32]> {
+		let mut ids: Vec<[u8; 32]> = row.inputs.iter().map(|i| i.leaf_id).collect();
 		ids.sort();
 		ids.dedup();
-		Ok(ids)
+		ids
 	}
 
 	/// How `row` stands toward a held round at `now`.
 	async fn standing(&self, row: &ParticipationRow, now: MedianTime) -> Result<Standing, RoundError> {
 		if !row.inputs.is_empty() {
-			if let Some((_, until)) = self.store.strike_of(&self.struck_ids(row).await?).await? {
+			if let Some((_, until)) = self.store.strike_of(&Self::given_up(row)).await? {
 				return Ok(if now.to_consensus_u32() < until { Standing::Waits(until) } else { Standing::Solo });
 			}
 		}
@@ -2610,7 +2607,7 @@ impl Rounds {
 			for id in &ids {
 				if let Some(p) = self.store.participation(id).await? {
 					if !p.inputs.is_empty() {
-						self.store.clear_strikes(&self.struck_ids(&p).await?).await?;
+						self.store.clear_strikes(&Self::given_up(&p)).await?;
 					}
 				}
 			}
@@ -2627,7 +2624,7 @@ impl Rounds {
 				batch without a sweep, goes out only once every participation in it has handed over its forfeits", window);
 			if let Some(p) = self.store.participation(&id).await? {
 				if !p.inputs.is_empty() {
-					let until = self.store.strike_coins(&self.struck_ids(&p).await?, now, window.max(1), STRIKE_CAP).await?;
+					let until = self.store.strike_coins(&Self::given_up(&p), now, window.max(1), STRIKE_CAP).await?;
 					why.push_str(&format!(". The coins it gave up run again only in a round of their own, from median time {}, so that \
 						nobody else waits on them", until));
 				}

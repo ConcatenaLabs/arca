@@ -3,12 +3,15 @@
 //!
 //! - After a drop, the participations that handed their forfeits over run
 //!   again at once, alone: a newcomer that arrived meanwhile waits for the
-//!   next round.
+//!   next round. The server cannot tell holders apart, so the bound is one
+//!   window per participation that drops: one holder's three coins cost an
+//!   honest refresh three windows, never more.
 //! - The coins of a participation voided for its missing forfeits are
 //!   struck: given up again, they wait (the window, doubling with each
 //!   strike) and then run only in a round of their own. A coin paid on out of
-//!   round from a struck coin is struck with it. A round that goes out with
-//!   them clears the strike.
+//!   round from a struck coin is struck with it; one beside it, such as the
+//!   payer's change, is not. A round that goes out with them clears the
+//!   strike.
 //! - A participation run again after a dropped held round is withdrawn by
 //!   its owner once that round is dead (its kill spend final), and not
 //!   before.
@@ -364,4 +367,202 @@ async fn a_participation_run_again_after_a_dropped_held_round_is_withdrawn_once_
 	assert_eq!(paid.status, 200, "{}", paid.json);
 	r.server.wallet.release(&hold).await.unwrap();
 	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "nothing of A's runs again");
+}
+
+/// `coin`, resting on the board transaction `board_tx`, paid out of round to
+/// one new leaf of `value` for each key of `to`: the new coins.
+fn pay(r: &Running, coin: &Held, board_tx: &elements::Transaction, checkpoint: u64, to: &[(&Keypair, u64)]) -> Vec<Held> {
+	let (x, s) = (r.x, xonly(&r.s));
+	let valid = coin.record.resolve(std::slice::from_ref(board_tx), &r.policy()).unwrap();
+	let leaves: Vec<_> = to.iter().map(|(k, _)| new_leaf(k)).collect();
+	let outs: Vec<_> = to.iter().zip(&leaves).map(|((_, v), (l, _))| (x, *v, l.clone())).collect();
+	let paid = r.http.post("cosign_transfer", &transfer_body(&[(coin, valid, checkpoint)], &outs, s, r.chain)).ok();
+	to.iter().zip(leaves).enumerate().map(|(i, ((k, _), (_, nonce)))| {
+		let record = arca_covenant::CoinRecord::from_bytes(&unhex(paid["outputs"][i]["record"].as_str().unwrap())).unwrap();
+		let id = record.validate(std::slice::from_ref(board_tx), &r.policy(), &xonly(k), &nonce).unwrap().id;
+		Held { key: (*k).clone(), nonce, id, record }
+	}).collect()
+}
+
+/// The median time a waiting participation's reason names as its end.
+fn waits_until(v: &Value) -> u32 {
+	reason(v, "waiting").split("median time ").nth(1).and_then(|s| s.split(':').next()).and_then(|s| s.parse().ok())
+		.unwrap_or_else(|| panic!("the wait names its end: {}", v))
+}
+
+/// H pays M out of round and keeps change. M asks a refresh and drops out of
+/// its held round. H's change, never in a dropped round, goes out in the next
+/// round, unstruck. M's struck coin waits and runs alone; so do the coins M
+/// then pays on from it (to D, and M's own change), with the wait doubled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_strike_falls_on_the_droppers_coins_and_never_on_its_payers_change() {
+	let mut r = start().await;
+	let x = r.x;
+	let kh = keypair("H board");
+	let (h, htx) = credited_board(&mut r, &kh, x).await;
+	let half = (VALUE - 4_000) / 2;
+	let (km, kc) = (keypair("M"), keypair("H change"));
+	let coins = pay(&r, &h, &htx, VALUE - 2_000, &[(&km, half), (&kc, half)]);
+	let (m, c) = (&coins[0], &coins[1]);
+
+	// M asks a refresh and drops out.
+	let idm = submit(&r, m, &keypair("M new"), half);
+	let built = r.server.rounds.run_round().await.unwrap().expect("M's round");
+	assert_eq!(members(&r, &built.tx.txid()).await, vec![idm]);
+	window_passes(&r).await;
+	assert_eq!(state_of(&r, &built.tx.txid()).await, RoundState::Lost);
+	let st = status(&r, &idm);
+	println!("M: {}: {}", st["state"], reason(&st, "void_reason"));
+	assert_eq!(st["state"], "void");
+	println!("strikes: M's coin {:?}, H's board {:?}, H's change {:?}", r.server.store.strike_of(&[m.id.0]).await.unwrap(),
+		r.server.store.strike_of(&[h.id.0]).await.unwrap(), r.server.store.strike_of(&[c.id.0]).await.unwrap());
+	assert!(r.server.store.strike_of(&[m.id.0]).await.unwrap().is_some(), "M's coin is struck");
+	assert_eq!(r.server.store.strike_of(&[h.id.0]).await.unwrap(), None, "H's board is not");
+	assert_eq!(r.server.store.strike_of(&[c.id.0]).await.unwrap(), None, "H's change is not");
+
+	// H's change goes out in the next round, beside a newcomer N.
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let idc = submit(&r, c, &keypair("H change new"), half);
+	let (n, _) = credited_board(&mut r, &keypair("N board"), x).await;
+	let idn = submit(&r, &n, &keypair("N new"), VALUE);
+	let next = r.server.rounds.run_round().await.unwrap().expect("a round for H's change");
+	let mut ids = members(&r, &next.tx.txid()).await;
+	ids.sort();
+	let mut want = vec![idc, idn];
+	want.sort();
+	println!("H's change: round {} with {} participation(s), H's change and N in it: {}", next.tx.txid(), ids.len(), ids == want);
+	assert_eq!(ids, want, "H's change shares a round, unstruck");
+	assert_eq!(reason(&status(&r, &idc), "waiting"), "", "H's change never waited");
+	answer(&r, &idc).await;
+	answer(&r, &idn).await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(state_of(&r, &next.tx.txid()).await, RoundState::Broadcast, "H's change goes out");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+
+	// M's struck coin, given up again, waits and runs alone; M drops again.
+	let idm2 = submit(&r, m, &keypair("M new 2"), half);
+	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "M's coin waits");
+	let st = status(&r, &idm2);
+	println!("M's struck coin: {} — {}", st["state"], reason(&st, "waiting"));
+	assert!(reason(&st, "waiting").contains("a round of their own"), "{}", st);
+	let until = waits_until(&st);
+	let now = mtp(&r).to_consensus_u32();
+	advance_mtp(&r, until.saturating_sub(now) + 1).await;
+	r.synced().await;
+	let solo = r.server.rounds.run_round().await.unwrap().expect("M's round of its own");
+	assert_eq!(members(&r, &solo.tx.txid()).await, vec![idm2], "M runs alone");
+	window_passes(&r).await;
+	assert_eq!(status(&r, &idm2)["state"], "void");
+	let (strikes, _) = r.server.store.strike_of(&[m.id.0]).await.unwrap().expect("struck");
+	assert_eq!(strikes, 2);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+
+	// M pays on from its struck coin, to D and to M's own change: both wait,
+	// longer, and then each runs alone.
+	let quarter = (half - 4_000) / 2;
+	let (kd, km2) = (keypair("D"), keypair("M change"));
+	let on = pay(&r, m, &htx, half - 2_000, &[(&kd, quarter), (&km2, quarter)]);
+	let idd = submit(&r, &on[0], &keypair("D new"), quarter);
+	let idm3 = submit(&r, &on[1], &keypair("M change new"), quarter);
+	let (n2, _) = credited_board(&mut r, &keypair("N2 board"), x).await;
+	let idn2 = submit(&r, &n2, &keypair("N2 new"), VALUE);
+	let fresh = r.server.rounds.run_round().await.unwrap().expect("N2's round");
+	assert_eq!(members(&r, &fresh.tx.txid()).await, vec![idn2], "the coins paid on from M's never share a round");
+	answer(&r, &idn2).await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(state_of(&r, &fresh.tx.txid()).await, RoundState::Broadcast);
+	let (std, stm) = (status(&r, &idd), status(&r, &idm3));
+	println!("D, paid on from M's struck coin: {} — {}", std["state"], reason(&std, "waiting"));
+	println!("M's change from it: {} — {}", stm["state"], reason(&stm, "waiting"));
+	assert!(reason(&std, "waiting").contains("a round of their own"), "{}", std);
+	assert!(reason(&stm, "waiting").contains("a round of their own"), "{}", stm);
+	let until = waits_until(&std).max(waits_until(&stm));
+	let now = mtp(&r).to_consensus_u32();
+	println!("they wait {} s from now (the strike counts from M's two)", until.saturating_sub(now));
+	assert!(until.saturating_sub(now) > 700, "the wait doubled from M's two strikes");
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.fund_wallet_in(x, 50_000_000).await;
+	advance_mtp(&r, until.saturating_sub(now) + 1).await;
+	r.bury().await;
+	r.synced().await;
+	let mut alone = vec![];
+	for _ in 0..2 {
+		let Some(solo) = r.server.rounds.run_round().await.unwrap() else {
+			panic!("no round of its own: D {}, M {}", status(&r, &idd), status(&r, &idm3));
+		};
+		let ids = members(&r, &solo.tx.txid()).await;
+		assert_eq!(ids.len(), 1, "alone");
+		alone.push((ids[0], solo.tx.txid()));
+	}
+	println!("{} rounds of one participation each", alone.len());
+	let d_round = alone.iter().find(|(id, _)| *id == idd).map(|(_, t)| *t).expect("D's round of its own");
+	assert!(alone.iter().any(|(id, _)| *id == idm3), "M's change runs alone too");
+	answer(&r, &idd).await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(state_of(&r, &d_round).await, RoundState::Broadcast, "D's refresh goes out");
+}
+
+/// One holder with three coins, B0..B2, each in its own participation beside
+/// an honest A, drops out one at a time: each answers every round until its
+/// turn, then does not. After each drop the answering participations run
+/// again alone, the hostile ones among them. The server cannot tell the
+/// three apart from three holders, so A goes out after one window per
+/// hostile coin, three, and never later: each drop leaves one coin fewer.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_holder_with_three_coins_holds_an_honest_refresh_back_one_window_per_coin() {
+	let mut r = start().await;
+	let x = r.x;
+	let (a, _) = credited_board(&mut r, &keypair("A board"), x).await;
+	let mut bs = vec![];
+	for i in 0..3 {
+		let (b, _) = credited_board(&mut r, &keypair(&format!("B{} board", i)), x).await;
+		bs.push(b);
+	}
+	let t0 = mtp(&r).to_consensus_u32();
+	let ida = submit(&r, &a, &keypair("A new"), VALUE);
+	let idb: Vec<[u8; 32]> = bs.iter().enumerate().map(|(i, b)| submit(&r, b, &keypair(&format!("B{} new", i)), VALUE)).collect();
+	let mut drops = 0;
+	let mut idn = None;
+	loop {
+		let built = r.server.rounds.run_round().await.unwrap().expect("a round");
+		let ids = members(&r, &built.tx.txid()).await;
+		let hostile: Vec<usize> = (0..3).filter(|i| ids.contains(&idb[*i])).collect();
+		println!("round {} ({}): {} participation(s): A {}, hostile {:?}, N {}", drops, built.tx.txid(), ids.len(), ids.contains(&ida),
+			hostile, idn.is_some_and(|n| ids.contains(&n)));
+		assert!(ids.contains(&ida));
+		assert_eq!(hostile.len(), 3 - drops, "each drop leaves one hostile coin fewer");
+		assert!(idn.is_none_or(|n| !ids.contains(&n)), "the newcomer waits for the re-runs");
+		answer(&r, &ida).await;
+		for i in hostile.iter().skip(1) {
+			answer(&r, &idb[*i]).await;
+		}
+		r.server.rounds.pass().await.unwrap();
+		if hostile.is_empty() {
+			assert_eq!(state_of(&r, &built.tx.txid()).await, RoundState::Broadcast, "A's refresh goes out");
+			break;
+		}
+		window_passes(&r).await;
+		assert_eq!(state_of(&r, &built.tx.txid()).await, RoundState::Lost);
+		assert_eq!(status(&r, &idb[hostile[0]])["state"], "void");
+		drops += 1;
+		if idn.is_none() {
+			let (n, _) = credited_board(&mut r, &keypair("N board"), x).await;
+			idn = Some(submit(&r, &n, &keypair("N new"), VALUE));
+		}
+	}
+	let waited = mtp(&r).to_consensus_u32() - t0;
+	println!("A went out after {} drops, {} s of median time from its submission", drops, waited);
+	assert_eq!(drops, 3, "one window per hostile coin, and no more");
+	// N runs next, and the struck coins never share a round with it.
+	let next = r.server.rounds.run_round().await.unwrap().expect("N's round");
+	assert_eq!(members(&r, &next.tx.txid()).await, vec![idn.unwrap()]);
+	answer(&r, &idn.unwrap()).await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(state_of(&r, &next.tx.txid()).await, RoundState::Broadcast, "N's refresh goes out");
 }
