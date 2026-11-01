@@ -60,13 +60,30 @@ async fn boarded(r: &mut Running, w: &Arca, server: &str, asset: AssetId, amount
 	board
 }
 
+// Whether each command [`library`] runs asks for the coins-only start
+// (`"recheck": "coins"`), as a maker's answer path does. Each test runs on
+// a thread of its own runtime, so the flag is the thread's.
+std::thread_local! {
+	static COINS_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// One command of the library on the open wallet `w`: its result, or its
 /// refusal, and the requests it made of the node.
 fn library(w: &mut Wallet, cmd: &str, args: Value) -> (Result<Value, String>, u64) {
+	let (r, n, _) = library_start(w, cmd, args);
+	(r, n)
+}
+
+/// [`library`], with what the command's start found.
+fn library_start(w: &mut Wallet, cmd: &str, mut args: Value) -> (Result<Value, String>, u64, Value) {
+	if COINS_ONLY.with(|c| c.get()) {
+		args["recheck"] = json!("coins");
+	}
 	tokio::task::block_in_place(|| {
 		let before = w.node_calls().0;
-		let r = command::run(w, cmd, &args).map(|v| v["result"].clone()).map_err(|e| e.to_string());
-		(r, w.node_calls().0 - before)
+		let r = command::run(w, cmd, &args).map_err(|e| e.to_string());
+		let start = r.as_ref().map(|v| v["start"].clone()).unwrap_or(Value::Null);
+		(r.map(|v| v["result"].clone()), w.node_calls().0 - before, start)
 	})
 }
 
@@ -96,14 +113,27 @@ fn sign_p2wpkh(tx: &mut Transaction, i: usize, prev: &elements::TxOut, key: &ele
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_open_wallet_answers_from_the_view_and_sees_every_change_before_it_signs() {
+	sees_every_change(false).await
+}
+
+/// The same changes, every command asking for the coins-only start
+/// (`"recheck": "coins"`, a maker's answer path): each is still seen before
+/// the next command signs, and the start leaves the participations' rounds
+/// to `sync`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_coins_only_start_sees_every_change_to_a_coin_before_it_signs() {
+	sees_every_change(true).await
+}
+
+async fn sees_every_change(coins_only: bool) {
 	let mut r = Running::start().await;
 	let x = r.x;
 	let xs = x.to_string();
 	let url = r.url();
 	// A reaches the operator through a proxy that can make it show another key.
 	let proxy = Proxy::start(&url);
-	let a = Arca::new("VA");
-	let b = Arca::new("VB");
+	let a = Arca::new(if coins_only { "VCA" } else { "VA" });
+	let b = Arca::new(if coins_only { "VCB" } else { "VB" });
 	boarded(&mut r, &a, &proxy.url, x, 2_000_000).await;
 	let b_board = boarded(&mut r, &b, &url, x, 3_000_000).await;
 	// A refreshes its board into a leaf of a round.
@@ -119,6 +149,25 @@ async fn an_open_wallet_answers_from_the_view_and_sees_every_change_before_it_si
 		.as_str().unwrap().to_string();
 
 	let mut w = tokio::task::block_in_place(|| Wallet::open(&a.dir)).expect("open A's wallet");
+	if coins_only {
+		// A new block, so the first command's start re-checks rather than
+		// watching lineages only: the coins-only start runs the coins and
+		// their lineages, and not the participations' rounds.
+		r.produce().await;
+		r.synced().await;
+		let (c, _, start) = library_start(&mut w, "coins", json!({"recheck": "coins"}));
+		c.unwrap();
+		println!("the coins-only start: {}", start["recheck"]);
+		assert!(start["recheck"]["coins_only"].is_string(), "{}", start);
+		let ms = start["recheck"]["ms"].as_object().unwrap();
+		assert!(ms.contains_key("coins") && ms.contains_key("lineages"), "{}", start);
+		assert!(!ms.contains_key("participations") && !ms.contains_key("rounds"), "{}", start);
+		// Not taken for a complete re-check: a command asking for none runs it.
+		let (_, _, full) = library_start(&mut w, "coins", json!({}));
+		println!("the next start, asking for none: {}", full["recheck"]["ms"]);
+		assert!(full["recheck"]["ms"].get("participations").is_some(), "{}", full);
+		COINS_ONLY.with(|c| c.set(true));
+	}
 
 	// --- Between tip changes ---
 	let (first, n_first) = library(&mut w, "coins", json!({}));

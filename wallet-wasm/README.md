@@ -221,7 +221,14 @@ spends nothing it does not have to on reading the chain again.
   on the chain at once), every round and board's finality, each coin's dates,
   and its lineage looked for on the chain and in the mempool. Then the witness
   of the operator's signer's record (`start.witness`), unless the command stays
-  on the machine and the node; a witness stands for ten seconds.
+  on the machine and the node; a witness stands for ten seconds. A command
+  given `"recheck": "coins"` among its arguments runs only the part of the
+  re-check that concerns the coins (each coin against the chain and its
+  lineage watch), leaving the following of its participations' rounds (a round
+  that can never return, a re-run whose round stands), which gives coins back
+  and guards no spend, to the next `sync` or `recheck`: a program that answers
+  others from the wallet, such as a maker's firm offer, asks for it on its
+  answer path and runs `sync` on a timer.
 - **In every command that reads the operator's terms** (each quote, payment,
   refresh, take, board and swap): the operator's `info`, its key, chain and
   keepers against those the wallet pinned when it was created. An operator
