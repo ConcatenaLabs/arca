@@ -2447,15 +2447,20 @@ impl Wallet {
 	/// chain that holds it (`bases`, as [`Self::assess`] finds them), and of
 	/// the batches without a sweep it rests on, each the operator's service
 	/// horizon (`info.batches.collect_after_seconds`, 28 days unless it said
-	/// otherwise) after its round's block: neither expires, but the operator
-	/// serves a coin on it only until then, and collects it on the chain
-	/// after. `None` when it rests on neither in a block.
+	/// otherwise) after its round's block, or, for a batch of claim leaves,
+	/// after their deadline where that is later (the operator serves such a
+	/// batch so long that a claim taken up by its deadline, a vesting one
+	/// included, is served as long as any coin after its round): neither
+	/// expires, but the operator serves a coin on it only until then, and
+	/// collects it on the chain after. `None` when it rests on neither in a
+	/// block.
 	pub(crate) fn board_expiry(&self, record: &CoinRecord, bases: &[(Transaction, Finality)]) -> Result<Option<u32>, Error> {
-		fn boards(r: &CoinRecord, out: &mut Vec<(TxOut, bool)>) {
+		fn boards(r: &CoinRecord, out: &mut Vec<(TxOut, bool, u32)>) {
 			match r {
-				CoinRecord::Board(b) => out.push((b.output().txout(), true)),
+				CoinRecord::Board(b) => out.push((b.output().txout(), true, 0)),
 				CoinRecord::Leaf { record, .. } if !record.schedule.expires() =>
-					out.extend(record.branch().ok().map(|b| (b.batch_output().txout(), false))),
+					out.extend(record.branch().ok().map(|b| (b.batch_output().txout(), false,
+						record.claim.as_ref().map_or(0, |c| c.deadline.to_consensus_u32())))),
 				CoinRecord::Leaf { .. } | CoinRecord::Accumulator { .. } => {},
 				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| boards(p, out)),
 			}
@@ -2465,10 +2470,10 @@ impl Wallet {
 		let horizon = self.store.meta(FILLS_TERMS)?.and_then(|v| serde_json::from_str::<Value>(&v).ok())
 			.and_then(|t| t["collect_after_seconds"].as_u64()).map_or(BOARD_LIFETIME, |h| h.min(u32::MAX as u64) as u32);
 		let mut earliest: Option<u32> = None;
-		for (o, board) in outs {
+		for (o, board, deadline) in outs {
 			let Some(h) = bases.iter().find(|(t, _)| t.output.contains(&o)).and_then(|(_, f)| f.height()) else { continue };
 			if let Some(m) = self.chain.median_time_at(h)? {
-				let e = m.saturating_add(if board { BOARD_LIFETIME } else { horizon });
+				let e = if board { m.saturating_add(BOARD_LIFETIME) } else { m.max(deadline).saturating_add(horizon) };
 				earliest = Some(earliest.map_or(e, |x| x.min(e)));
 			}
 		}

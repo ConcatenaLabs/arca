@@ -62,7 +62,10 @@
 //! for each vest time, and the server co-signs no spend of one before `V`
 //! (`vesting`, [`crate::coins::check`]), so no coin rests on a leaf that has
 //! not vested; a holder hands over its authorisations whenever it likes and
-//! takes its claim up between `V` and the deadline.
+//! takes its claim up between `V` and the deadline. Without a sweep, the
+//! claim leaves of each deadline rest in a batch of their own, served until
+//! the service horizon after that deadline ([`Params::collect_mtp`]), so a
+//! take-up works however far ahead `V` lies.
 //!
 //! The `vtxo-1` claim leaves of a distribution without a deadline, which no
 //! holder took up, are paid back to the payer's return script by the watcher

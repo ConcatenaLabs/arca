@@ -1755,6 +1755,18 @@ impl Server {
 		let wallet = Arc::new(Wallet::new(store.clone(), finality.clone(), operator,
 			WalletConfig { mnemonic, fee_multiple: config.fee_multiple, spend_from: SpendFrom::Final, pool_coins: config.pool_coins })
 			.map_err(err("the wallet"))?);
+		// A batch without a sweep that holds claim leaves is served until its
+		// claims' deadline and the service horizon after it
+		// (`Params::collect_mtp`); one stored with an earlier horizon is moved
+		// to it, so its holders can still take their claims up.
+		for (round_id, vout, at, deadline) in store.claim_batch_deadlines().await.map_err(err("the database"))? {
+			let due = params.collect_mtp(at.saturating_sub(params.collect_after_seconds), Some(deadline));
+			if due > at {
+				store.raise_collect_mtp(round_id, vout, due).await.map_err(err("the database"))?;
+				log::info!("the batch at output {} of round {} holds claims to median time {}: served until {} (was {})",
+					vout, round_id, deadline, due, at);
+			}
+		}
 		let nursery = Nursery::new(store.clone(), finality.clone(), Some(wallet.clone()), Duration::from_secs(30));
 		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone(),
 			Duration::from_secs(config.limits.board_unconfirmed_seconds));

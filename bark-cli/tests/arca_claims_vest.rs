@@ -6,6 +6,13 @@
 //! saying when it can; once the chain's median time has passed `T`, `arca
 //! claim` takes the claim up and the holder holds a live coin.
 //!
+//! A second test vests 40 days after the round, past the 28-day service
+//! horizon of an ordinary batch without a sweep: the claims' batch is served
+//! until their deadline and the horizon after it (an older server's shorter
+//! horizon is moved there at its start), nothing moves it while the claims
+//! vest, and after the vest time the holder takes its claim up through the
+//! operator and refreshes the coin into a round.
+//!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
 
@@ -13,6 +20,7 @@ mod common;
 
 use std::io::Write;
 
+use elements::hashes::Hash;
 use elements::Script;
 use serde_json::Value;
 
@@ -101,4 +109,111 @@ async fn vesting_claims_are_taken_up_once_they_vest() {
 	assert!(taken[0]["taken_up"]["transfer_id"].is_string(), "{}", taken);
 	let coins = holders[0].ok(&["coins"]);
 	assert!(coins.as_array().unwrap().iter().any(|c| c["asset"] == x.as_str()), "holder 0 holds its coin: {}", coins);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_vesting_past_the_service_horizon_is_taken_up_through_the_operator() {
+	const HORIZON: u32 = 28 * DAY;
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca"];
+	let payer = Arca::new("far vest payer");
+	payer.ok(&create);
+	r.pay_to(script(&payer.ok(&["address"])), r.x, 10_000_000);
+	r.produce().await;
+	payer.ok(&["board", &x, "3000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the payer's board to be credited", || payer.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	payer.ok(&["sync"]);
+	let holder = Arca::new("far vest holder");
+	holder.ok(&create);
+	let path = payer.dir.join("claims.txt");
+	std::fs::write(&path, format!("{} 1000000\n", holder.ok(&["address"])["key"].as_str().unwrap())).unwrap();
+	let file = path.to_string_lossy().to_string();
+	let fee = payer.ok(&["distribute", &file, "--asset", &x, "--quote"])["fee"].as_str().unwrap().to_string();
+	let vest = common::node::median_time(&r.rt) + 40 * DAY;
+	let deadline = vest + 8 * DAY;
+	let d = payer.ok(&["distribute", &file, "--asset", &x, "--shown", &fee, "--vest", &vest.to_string(), "--days", "8"]);
+	assert_eq!(d["deadline"].as_u64(), Some(deadline as u64));
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	payer.ok(&["sync"]);
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	payer.ok(&["sync"]);
+	assert_eq!(payer.ok(&["distributions"])[0]["state"], "released");
+
+	// The claims' batch is served until the deadline and the horizon after
+	// it, not the horizon after the round.
+	let round = r.server.store.round_by_txid(&built.tx.txid().to_byte_array()).await.unwrap().unwrap();
+	let batches = r.server.store.batches(round.round_id).await.unwrap();
+	println!("round {} at median time {}: batches {:?}", built.tx.txid(), common::node::median_time(&r.rt),
+		batches.iter().map(|b| (b.vout, b.kind.as_str(), b.collect_mtp)).collect::<Vec<_>>());
+	assert_eq!(batches.len(), 1, "the claims' batch alone");
+	let b = &batches[0];
+	assert_eq!(b.collect_mtp, Some(deadline + HORIZON), "served until the deadline and the horizon after it");
+
+	// A batch an older server stored with the horizon after its round is
+	// moved to the same at the next start.
+	let older = common::node::median_time(&r.rt) + HORIZON;
+	let (db, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move { let _ = conn.await; });
+	assert_eq!(db.execute("UPDATE batch SET collect_mtp = $3 WHERE round_id = $1 AND vout = $2",
+		&[&round.round_id, &(b.vout as i32), &(older as i64)]).await.unwrap(), 1);
+	r.restart_server().await;
+	let again = r.server.store.batches(round.round_id).await.unwrap();
+	println!("stored as an older server did: {}; after a start: {:?}", older, again[0].collect_mtp);
+	assert_eq!(again[0].collect_mtp, Some(deadline + HORIZON));
+
+	// Thirty days on, past the horizon after the round and before the vest
+	// time: nothing has moved the batch, and the claim is still vesting.
+	let now = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 30 * DAY));
+	r.synced().await;
+	r.server.watcher.pass().await.unwrap();
+	r.produce().await;
+	r.synced().await;
+	let out: Value = r.rt.client().call("gettxout", &[serde_json::json!(built.tx.txid().to_string()), serde_json::json!(b.vout)]).unwrap();
+	println!("day 30 (median time {}): the batch output {}", common::node::median_time(&r.rt),
+		if out.is_null() { "spent".to_string() } else { format!("unspent, {}", out["value"]) });
+	assert!(!out.is_null(), "nothing moves the claims' batch before they vest");
+	let early = holder.ok(&["claim"]);
+	assert_eq!(early[0]["state"], "vesting", "{}", early);
+	assert!(holder.ok(&["coins"]).as_array().unwrap().is_empty());
+
+	// After the vest time: taken up through the operator.
+	let now2 = common::node::median_time(&r.rt);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, vest - now2 + HOUR));
+	r.synced().await;
+	println!("after the vest time: median time {}, {} days after the round", common::node::median_time(&r.rt),
+		(common::node::median_time(&r.rt) - now) / DAY);
+	let taken = holder.ok(&["claim"]);
+	println!("the holder's claim: {}", taken);
+	assert!(taken[0]["taken_up"]["transfer_id"].is_string(), "{}", taken);
+	let coins = holder.ok(&["coins"]);
+	println!("the holder's coins: {}", coins);
+	let coin = coins.as_array().unwrap().iter().find(|c| c["asset"] == x.as_str()).expect("the taken-up coin").clone();
+	assert_eq!(coin["expiry"].as_u64(), Some((deadline + HORIZON) as u64), "the wallet finds the operator's horizon");
+
+	// And refreshed into a round, the coin out of the claims' batch.
+	let p = holder.ok(&["refresh"]);
+	println!("the holder's refresh: {}", p);
+	let next = r.server.rounds.run_round().await.unwrap().unwrap();
+	holder.ok(&["sync"]);
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&next.tx.txid(), RoundState::Final).await;
+	holder.ok(&["sync"]);
+	let after = holder.ok(&["coins"]);
+	println!("the holder's coins after the refresh in round {}: {}", next.tx.txid(), after);
+	assert!(after.as_array().unwrap().iter().any(|c| c["asset"] == x.as_str() && c["state"] == "live" && c["leaf_id"] != coin["leaf_id"]),
+		"a live coin from the refresh: {}", after);
 }

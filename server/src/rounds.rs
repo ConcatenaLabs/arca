@@ -880,6 +880,15 @@ impl Rounds {
 			WantedKind::Leaf { claim, .. } => claim.as_ref().and_then(|c| c.vest).map(|v| v.to_consensus_u32()),
 			_ => None,
 		};
+		// Without a sweep, claim leaves rest in batches of their own, one for
+		// each deadline: such a batch is served until its claims' deadline
+		// and the service horizon after it ([`Params::collect_mtp`]), so that
+		// a holder takes its claim up through the operator whenever it vests,
+		// and no other leaf's batch is served longer for it.
+		let deadline_of = |(k, j): (usize, usize)| match &rows[k].outputs[j].kind {
+			WantedKind::Leaf { claim: Some(c), .. } if self.config.no_sweep => Some(c.deadline.to_consensus_u32()),
+			_ => None,
+		};
 		// A shared batch's leaves wanted by participations whose wallets do
 		// not read the record of an accumulator batch rest in a tree of their
 		// own beside it, in the same round: such a wallet could not check its
@@ -893,11 +902,11 @@ impl Rounds {
 		let mut out = vec![];
 		for b in plan_batches(&leaves, room) {
 			let split = !b.own && self.may_accumulate(&b.asset);
-			let mut by: BTreeMap<(bool, Option<u32>), Vec<(usize, usize)>> = BTreeMap::new();
+			let mut by: BTreeMap<(bool, Option<u32>, Option<u32>), Vec<(usize, usize)>> = BTreeMap::new();
 			for l in b.leaves {
-				by.entry((split && !reads(l.0), vest_of(l))).or_default().push(l);
+				by.entry((split && !reads(l.0), vest_of(l), deadline_of(l))).or_default().push(l);
 			}
-			out.extend(by.into_iter().map(|((unread, _), leaves)| BatchPlan { asset: b.asset, leaves, own: b.own, tree: b.tree || unread }));
+			out.extend(by.into_iter().map(|((unread, _, _), leaves)| BatchPlan { asset: b.asset, leaves, own: b.own, tree: b.tree || unread }));
 		}
 		Ok(out)
 	}
@@ -2386,7 +2395,11 @@ impl Rounds {
 					min_leaf: tp.min_leaf,
 					kind: batch.kind(),
 					delegated_reclaim: tp.delegated_reclaim,
-					collect_mtp: no_sweep.then(|| now.to_consensus_u32().saturating_add(p.collect_after_seconds)),
+					// Claim leaves rest in a batch of their own for each
+					// deadline (`Self::batch_plan`), so one deadline holds for
+					// all of them.
+					collect_mtp: no_sweep.then(|| p.collect_mtp(now.to_consensus_u32(),
+						leaves.iter().filter_map(|l| l.spec.claim.as_ref().map(|c| c.deadline.to_consensus_u32())).max())),
 				},
 				leaves: new_leaves,
 				scripts,

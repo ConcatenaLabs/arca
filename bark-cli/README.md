@@ -1215,7 +1215,10 @@ leaf lapses at the distribution's deadline, 30 days ahead or `--days N`.
 With `--vest T` (a median time, Unix seconds) the claims vest: each leaf is
 `vest-1`, which nothing moves before `T`, as a sale locks what it sells, and
 the deadline counts `--days` from `T`. The operator takes such a distribution
-only where its batches have no sweep.
+only where its batches have no sweep. However far ahead `T` lies, a holder
+takes its claim up through the operator between `T` and the deadline: a batch
+of claim leaves is served until the operator's service horizon after their
+deadline, and the wallet counts the coin it takes up as served until then.
 
 The coins given up hold exactly the claims and the operator's fee (its
 refresh fee of each coin given up, its fixed part per claim leaf, and its
@@ -2107,6 +2110,15 @@ its payer, nothing of the wallet's lost, and the operator's watcher lapses
 the two unclaimed leaves to the payer's return address, which `arca
 distributions` shows `lapsed`, with no return from the operator's coins,
 while the holder that took its claim up keeps its coin.
+
+`tests/arca_claims_vest.rs` pays two holders with `arca distribute --vest T
+--days 8`: before `T` a holder's `arca claims` shows the date in words and
+`arca claim` takes nothing; after it the claim is taken up. A second test
+vests 40 days after the round, past an ordinary batch's 28-day horizon: the
+claims' batch is served until 28 days after the deadline (a horizon stored
+shorter is moved there at the server's start), nothing moves it on day 30,
+and after `T` the holder takes its claim up through the operator, its coin
+served until that horizon, and refreshes it into a round.
 
 `tests/arca_offline_refresh.rs` runs the same way: a holder pre-signs a plan
 of two steps with `arca plan` and its wallet stays closed across two expiries.

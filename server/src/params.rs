@@ -596,6 +596,20 @@ impl Params {
 	/// on it, or to answer an exit.
 	pub const BOARD_LIFETIME: u32 = 28 * 86_400;
 
+	/// The service horizon of a batch without a sweep built at median time
+	/// `built`, whose claim leaves (if any) lapse at `deadline`
+	/// ([`arca_covenant::claim::Lapse::deadline`]): [`Self::collect_after_seconds`]
+	/// after the later of the two. A holder takes a claim up until its
+	/// deadline, a `vest-1` claim only from its vest time on, and the coin it
+	/// takes up is served as long after that as any other coin is after its
+	/// round; so no take-up window, however far ahead, runs past the horizon,
+	/// and the collection never lands a claim before its holder could take it
+	/// up. A wallet finds the same horizon for its own coin from its claim
+	/// leaf's record.
+	pub fn collect_mtp(&self, built: u32, deadline: Option<u32>) -> u32 {
+		built.max(deadline.unwrap_or(0)).saturating_add(self.collect_after_seconds)
+	}
+
 	/// The service expiry of a board confirmed in a block of median time
 	/// `confirmed`.
 	pub fn board_expiry(confirmed: u32) -> u32 {

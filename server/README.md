@@ -311,7 +311,11 @@ delay plus a day. That gives the holder of every coin paid out of round
 before the notice the time to have it refreshed in a round, or to take it
 home on the chain, while the bond still stands; a coin resting on a batch
 without a sweep whose holder does neither is brought on the chain by the
-operator at the batch's horizon, so none outlives the notice off the chain. The server refuses to start with a
+operator at the batch's horizon, so none outlives the notice off the chain.
+The exception is a coin taken up from a claim batch whose deadline lies
+further ahead (Distributions: claim trees): such a batch is served until its
+deadline and the horizon after it, so a holder who takes a claim up and then
+stays away through a whole notice holds that coin off the chain past it. The server refuses to start with a
 shorter `D`, and with `W` equal to `S`.
 
 `[bond]` in the configuration holds its terms:
@@ -1051,6 +1055,18 @@ of their own (one for each vest time) whose lowest nodes' RECLAIM waits for
 `V` too, so nothing moves an allocation before it vests, owner and operator
 together included. It serves a sale whose allocations vest.
 
+With `[batches] no_sweep`, claim leaves that lapse (`claim-1` and `vest-1`)
+rest in a batch of their own for each deadline `D`, and that batch's service
+horizon is `collect_after_seconds` after the later of its round and `D`
+(`Params::collect_mtp`) rather than after its round alone. However far ahead
+`V` and `D` lie, a holder takes its claim up through the operator at any time
+before `D`, and the coin it takes up is served as long after that as any other
+coin is after its round. Nothing collects such a batch before its horizon, and
+its claims could not move before `V` anyway; at its horizon a claim nobody
+took up has lapsed to its payer, and a coin taken up lands as its holder's
+leaf. A batch stored with an earlier horizon is moved to this one when the
+server starts.
+
 The payer names each holder by a 32-byte x-only key `A` (an on-chain address
 key, a taproot address's program, or any key the holder hands over) and
 draws a fresh nonce `n` for it. The holder's leaf is owned by the claim key
@@ -1604,7 +1620,9 @@ too):
 
 A coin resting on such a batch never expires, but the operator serves it
 only up to the batch's service horizon, `[batches] collect_after_seconds`
-(28 days by default) after its round's median time: like a board's service
+(28 days by default) after its round's median time, or after its claims'
+deadline for a batch of claim leaves where that is later (see Distributions:
+claim trees): like a board's service
 expiry, it is taken in a transfer or a refresh only until three days before
 that, and its refresh fee counts from it. At the horizon the watcher collects
 the batch on the chain (see Collection, under The watcher). Offline-refresh
@@ -2519,7 +2537,8 @@ meanwhile.
   expiry, or, without a sweep, at its collection.
 - **Collection.** A batch without a sweep (see Rounds) never expires; at its
   service horizon, `[batches] collect_after_seconds` after its round's median
-  time, the watcher brings what is left of it on the chain, a step a coin
+  time (after its claims' deadline, for a batch of claim leaves whose
+  deadline is later), the watcher brings what is left of it on the chain, a step a coin
   each pass. A lowest node every owner of which has released it, or
   consented through a delegation, is left to its RECLAIM or RECLAIM-D above,
   and an accumulator slot whose owner released it to its release. A slot of
