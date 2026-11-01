@@ -55,7 +55,7 @@ sequentia-contracts (`accumulator_programs`).
 | `issuer` | No output of its own: an issuer-operated batch's burn (`burn`, a bare `OP_RETURN` of explicit asset and value) and the supply a transaction moves (`issued`, `burned`, `reissuing_inputs`) | None |
 | `bond` | The operator's equivocation bond (`BondPolicy`: the chain, `S`, the withdrawal key `W`, the notice delay `D`), and the notice output a withdrawal waits in | SLASH, in both outputs: the salt, two messages `S` signed under it (each a form, `Rebind` for a collaborative path's message `SHA256(K ‖ rest)` or `Fill` for an `order-2` fill's `SHA256(F ‖ salt ‖ rest)`, its rest in three chunks of at most 80 bytes, and `S`'s signature), the digests computed in the script and required to differ, and the output at the input's own index a bare `OP_RETURN` of its whole amount, so a slash pays no one; NOTICE, `W`'s signature, the bond whole to the notice output; WITHDRAW, on the notice output, `W`'s signature `D` after the notice confirmed. `slash_tx`, `notice_tx` and `withdraw_tx` build the three spends, a fee coin paying; `check` judges evidence as SLASH will; `rebind_signed_in` reads `S`'s signature and its message from a collaborative spend found on the chain, and `collab2_signed_in` from a `vtxo-2` spend given the outputs its named inputs spend; `cosigned_by` lists every message `S` signed that a coin's lineage rests on, each under its salt, which a holder hands a watcher |
 | `channel` | `channel-1`'s outputs: the channel output of each state (`ChannelPolicy`, `State`: the number, the owner's and the operator's balances, the credit already folded into the owner's), the leaf in the tree being the output of state 0, and the credit output the operator's balance settles into | The leaf's collaborative path under the salt's `K`, the same in every state, so a pair made for the coin spends it in any state; UPDATE(n), a state `m > n` signed by owner and operator over `SHA256(Q ‖ le8(m) ‖ P)` (`state_message`), `Q` the salt's state constant and `P` the program of the output at the input's own index, which keeps the input's asset and value; SETTLE(n), after the exit delay, exactly the owner's balance to `OP_1 <A>` and the operator's to the state's credit output, a zero balance's half left out. The credit output's CLAIM pays the owner, at the input's own index, what the operator's cumulative note (`note_message`, `SHA256(N ‖ le8(c))`) credits beyond what was paid, capped at the state's `s + F`, the rest returning to the same script; PROVIDER, `S`'s after the window. A `channel-1` leaf's `LeafPolicy` carries its terms (`ChannelTerms`: the value, the operator's opening balance, the credit window) and `channel_policy` gives its channel. `collab_tx` (the coin's pair at any state), `update_tx`, `settle_tx`, `claim_tx` and `provider_tx` build the spends, a fee coin paying; `claim_amounts` computes a claim as the script does. `read_spend` reads how a spend found on the chain left a state's output (`ChannelSpend`: an update and the number it moved to, a settle, or the collaborative path) by the leaf script it ran, through `witness::without_annex`: nothing a channel signs covers an annex, so whoever relays or mines an update, a settle or a claim can add one, the same spend with the same outputs; a witness that is no spend of that output's leaves is refused |
-| `claim` | The claim key a holder's leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair); the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up, with a deadline and a fee allowance when its claims lapse, `DistributionLapse`); and `claim-1`, the claim leaf that lapses ([Claim leaves that lapse](#claim-leaves-that-lapse)) | A distribution without a deadline pays `vtxo-1` leaves under claim keys. `claim-1`: `[collab, [exit, lapse]]`, `vtxo-1`'s collaborative path and exit under the claim key, and LAPSE, which once the median time has passed the deadline `D` (`OP_CHECKLOCKTIMEVERIFY`) and the leaf has waited its exit delay (`OP_CHECKSEQUENCEVERIFY`) pays the output at its own input's index to the distribution's return script (`script_pin`: `SHA256(program ‖ version + 2)`), explicitly in the leaf's asset, holding at least the value less the allowance, with no signature (`LapseTerms`; 105 bytes with a 36-hour delay; `lapse_tx` builds it, the allowance or a fee coin paying) |
+| `claim` | The claim key a holder's leaf in a claim tree is owned by, `A' = lift_x(A) + t·G` with `t = SHA256(T ‖ T ‖ A ‖ n)` and `T = SHA256("Arca/claim-key")`, for the key `A` a payer names and the nonce `n` it draws (`claim_key`; `claim_keypair` signs for it from the named key's pair); the distribution a payer submits (`Distribution`, its id the attestation of every coin it gives up, with a deadline and a fee allowance when its claims lapse, `DistributionLapse`); and `claim-1`, the claim leaf that lapses ([Claim leaves that lapse](#claim-leaves-that-lapse)) | A distribution without a deadline pays `vtxo-1` leaves under claim keys. `claim-1`: `[collab, [exit, lapse]]`, `vtxo-1`'s collaborative path and exit under the claim key, and LAPSE, which once the median time has passed the deadline `D` (`OP_CHECKLOCKTIMEVERIFY`) and the leaf has waited its exit delay (`OP_CHECKSEQUENCEVERIFY`) pays the output at its own input's index to the distribution's return script (`script_pin`: `SHA256(program ‖ version + 2)`), explicitly in the leaf's asset, holding at least the value less the allowance, with no signature (`LapseTerms`; 105 bytes with a 36-hour delay; `lapse_tx` builds it, the allowance or a fee coin paying). `vest-1`, a vesting distribution's claim leaf: `claim-1` with `<V> OP_CHECKLOCKTIMEVERIFY OP_DROP` in front of the collaborative path and the exit, its collaborative constant `K ‖ V` ([Claim leaves that vest](#claim-leaves-that-vest)) |
 
 `batch` holds a batch of either kind (`Batch`: a tree or an accumulator
 batch, built from the same parameters and leaves) and the operator's rule for
@@ -111,7 +111,7 @@ holder's key, the asset's policy key and its clawback key, though no batch holds
 an `enclave-1` leaf: it rests on a board or comes from a reassignment; or
 `channel-1` with the operator's opening balance and the credit window;
 `claim-1` with its distribution's deadline, the lapse's fee allowance and the
-return script; or
+return script; `vest-1` with the same and its vest time; or
 `vtxo-2`, a `vtxo-1` leaf whose collaborative path is `arca/collab-2`), the owner's key, the two
 nonces the salt is built from, the exit delay, the asset and value, the entry in
 front of the leaf (its unlock hash and reserve), the batch's chain, token and
@@ -439,6 +439,55 @@ takes it in `LeafSpec::claim`.
 let lapse = distribution.claim_lapse().unwrap();     // what every claim leaf's record keeps
 let tx = valid.branch.leaf.lapse_tx(at, value, &lapse.return_script, &FeeSource::Split { fee, change })?.tx;
 ```
+
+### Claim leaves that vest
+
+A distribution whose lapse names a vest time `V` before `D`
+(`DistributionLapse::vest`, the last field of its id) pays `vest-1` leaves,
+for allocations that their holders may not move before `V`, as a token sale
+locks what it sells:
+
+```text
+collab:  <V> OP_CHECKLOCKTIMEVERIFY OP_DROP   vtxo-1's collaborative path over K ‖ V
+exit:    <V> OP_CHECKLOCKTIMEVERIFY OP_DROP <delay> OP_CHECKSEQUENCEVERIFY OP_DROP <A'> OP_CHECKSIG
+lapse:   claim-1's, after D
+```
+
+as `[collab, [exit, lapse]]`, in a batch without a sweep that holds only
+`vest-1` leaves of one `V` (`TreeError::VestBatch` otherwise), whose lowest
+nodes carry `[UNROLL, RECLAIM]` with RECLAIM (and RECLAIM-D) behind the same
+`<V> OP_CHECKLOCKTIMEVERIFY OP_DROP` (`NodePolicy::with_reclaim_lock`).
+
+- **Nothing moves the value before `V`.** The batch output and the inner
+  nodes only unroll into their pinned children, the entry only opens into its
+  leaf, and the leaf's collaborative path, its exit and its lowest node's
+  RECLAIM all check `V`. Owner and operator together cannot move it either:
+  a refresh, an out-of-round transfer and a reclaim each take a transaction
+  that is not final before `V`. What no script can stop is a holder signing
+  away, before `V`, a spend that confirms only after it, as with any time
+  lock; so an operator co-signs no spend of a `vest-1` leaf before `V`, and
+  no off-chain coin rests on one before it vests.
+- **A pair names `V`.** The collaborative message starts with `K ‖ V` (`V`
+  as u32), so a pair made for a vesting leaf spends no other leaf, and a pair
+  over `vtxo-1`'s `K` spends no vesting leaf.
+- **Without a sweep, and why.** A sweep would take an unvested leaf back at
+  the batch's expiry, and a leaf repaid after a sweep is a new coin that has
+  not vested anything. The builder and the record refuse `vest-1` in a batch
+  with a sweep.
+- **The lapse.** What a holder has not taken up by `D` goes back to the
+  payer as with `claim-1`. A holder takes its claim up between `V` and `D`;
+  `D` comes after `V` (`LapseError::Vest`, `ClaimError::VestAfterDeadline`).
+- **Spends carry `V`.** `LeafPolicy::lock_time` is `V`; `collab_tx` (and so
+  every forfeit and checkpoint of the leaf) and `exit_tx` set it with a
+  non-final input, as `NodePolicy::reclaim_tx` does for a locked RECLAIM.
+
+The record is template `vest-1` (id 9, version 1, format 3 only): `claim-1`'s
+fields and then `V`; its JSON form adds `"vest"` to `claim`. The policy
+encoding is type 16, and a node's reclaim flag 2 carries `V`.
+Measured on a regtest node (`tests/vest.rs`): the exit 229 vB, the
+collaborative spend 283 vB, the lapse 215 vB, a reclaim of a lowest node of
+three with one connector 451 vB; the round paying one hundred holders 264 vB,
+one batch output; a hundred leaves are four levels deep at radix 4.
 
 ## Off-chain transactions
 
@@ -1283,6 +1332,20 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   the chain after the deadline is refused its lapse at once
   (`non-BIP68-final`), and lapses with a fee coin once its exit delay has
   run, the whole value to the return script.
+- `tests/vest.rs`: on an anchored regtest chain, a batch without a sweep of
+  six `vest-1` leaves under claim keys. The builder refuses `vest-1` beside
+  `claim-1` or `vtxo-1`, two vest times, a batch with a sweep and a vest time
+  at the deadline; each record is format 3, template id 9, reads back from
+  both forms and validates, and a record naming another vest time does not
+  match the round. Before `V`, with the leaf on the chain past its exit
+  delay, the exit, the collaborative spend signed by owner and operator, and
+  the RECLAIM of the other lowest node with every owner's release are each
+  refused `non-final` (in a block `bad-txns-nonfinal`) and, with lock time 0,
+  `Locktime requirement not satisfied`. After `V` a pair over `vtxo-1`'s
+  message is refused (`Invalid Schnorr signature`); the exit, a collaborative
+  spend and the RECLAIM confirm; an unclaimed leaf's lapse is refused until
+  `D` and then confirms. A second test pays a hundred holders from one batch
+  output and takes one leaf out alone after `V`.
 - `tests/regtest.rs`: on an anchored regtest chain, the checkpoint and
   reassignment chain, the forfeit and the entry it releases, `htlc-1`, the swap of
   two leaves in two assets, the entry's sweep behind the token and the notice, and

@@ -302,14 +302,14 @@ async fn claims_nobody_takes_up_lapse_to_the_payer_after_the_deadline() {
 	let ret = Script::from([vec![0x00, 0x14], vec![9u8; 20]].concat());
 	let deadline = MedianTime::from_consensus(mtp(&r).to_consensus_u32() + 8 * DAY).unwrap();
 	let allowance = 20_000;
-	let lapse = DistributionLapse { deadline, allowance };
+	let lapse = DistributionLapse { deadline, allowance, vest: None };
 	// Refused: a deadline sooner than a week, an allowance as large as a
 	// claim, a deadline without an allowance.
-	let soon = DistributionLapse { deadline: MedianTime::from_consensus(mtp(&r).to_consensus_u32() + 2 * DAY).unwrap(), allowance };
+	let soon = DistributionLapse { deadline: MedianTime::from_consensus(mtp(&r).to_consensus_u32() + 2 * DAY).unwrap(), allowance, vest: None };
 	let (body, _) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(), Some(soon));
 	refused(r.http.post("distribute", &body), "out_of_bounds", "a deadline two days ahead");
 	let (body, _) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(),
-		Some(DistributionLapse { deadline, allowance: value }));
+		Some(DistributionLapse { deadline, allowance: value, vest: None }));
 	refused(r.http.post("distribute", &body), "malformed", "an allowance as large as a claim");
 	let (mut body, _) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(), Some(lapse));
 	body.as_object_mut().unwrap().remove("lapse_allowance");
@@ -331,7 +331,7 @@ async fn claims_nobody_takes_up_lapse_to_the_payer_after_the_deadline() {
 	let idx0 = st["outputs"][0]["leaf_index"].as_u64().unwrap() as usize;
 	let rec = tree.record(idx0);
 	assert_eq!(rec.template, Template::Claim1, "a lapsing distribution's claim leaves are claim-1");
-	assert_eq!(rec.claim, Some(arca_covenant::Lapse { deadline, allowance, return_script: ret.clone() }));
+	assert_eq!(rec.claim, Some(arca_covenant::Lapse { deadline, allowance, return_script: ret.clone(), vest: None }));
 	let new0 = rec.validate(&round, &accept_policy(&r), &claims[0].owner().unwrap(), &claims[0].nonce).unwrap();
 	let old = b1.record.resolve(std::slice::from_ref(&tx1), &r.policy()).unwrap();
 	let f = forfeit_for(&old, &new0, &round, &st);

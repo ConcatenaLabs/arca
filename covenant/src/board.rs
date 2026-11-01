@@ -201,6 +201,10 @@ impl BoardPolicy {
 /// The board output's collaborative path is the leaf's: one pair spends the
 /// coin as a board or as the leaf it converts into.
 impl Rebindable for BoardPolicy {
+	fn lock_time(&self) -> elements::LockTime {
+		self.leaf.lock_time()
+	}
+
 	fn owner(&self) -> XOnlyPublicKey {
 		self.leaf.owner
 	}

@@ -286,6 +286,12 @@ pub trait Rebindable {
 		self.tap().witness(&self.collab(), two_party_items(&pair.operator, &pair.owner, m))
 	}
 
+	/// The lock time a collaborative spend carries: 0, or `V` for a
+	/// `vest-1` leaf, whose path checks it.
+	fn lock_time(&self) -> LockTime {
+		LockTime::ZERO
+	}
+
 	/// Whether the pair also signs the coin's index and the inputs it names
 	/// (a `vtxo-2` leaf or checkpoint, [`crate::collab`]).
 	fn names_inputs(&self) -> bool {
@@ -323,6 +329,10 @@ pub trait Rebindable {
 }
 
 impl Rebindable for LeafPolicy {
+	fn lock_time(&self) -> LockTime {
+		LeafPolicy::lock_time(self)
+	}
+
 	fn owner(&self) -> XOnlyPublicKey {
 		self.owner
 	}
@@ -433,7 +443,9 @@ pub fn collab_tx<P: Rebindable>(
 		return Err(Error::OutputCount(outputs.len()).into());
 	}
 	let spent = explicit_txout(asset, value, policy.tap().script_pubkey());
-	let mut u = assemble(LockTime::ZERO, vec![(coin, spent, FINAL)], outputs, fee, FINAL)?;
+	let lock = policy.lock_time();
+	let sequence = if lock == LockTime::ZERO { FINAL } else { Sequence::ENABLE_LOCKTIME_NO_RBF };
+	let mut u = assemble(lock, vec![(coin, spent, sequence)], outputs, fee, FINAL)?;
 	u.tx.input[0].witness.script_witness = policy.witness(pair, outputs.len() as u8);
 	Ok(u)
 }
@@ -523,7 +535,8 @@ impl LeafPolicy {
 			e.check_output(first).map_err(SpendError::Enclave)?;
 		}
 		let spent = explicit_txout(asset, value, self.script_pubkey());
-		KeySpend::build(self.taproot(), self.exit_script(), vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))], outputs, fee)
+		KeySpend::build_at(self.lock_time(), self.taproot(), self.exit_script(), vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))],
+			outputs, fee)
 	}
 
 	/// The landing of `coin`, this `landing-1` leaf on-chain holding `value`

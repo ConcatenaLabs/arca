@@ -64,10 +64,19 @@ fn policies() -> Vec<Policy> {
 		Policy::Leaf(LeafPolicy {
 			claim: Some(arca_covenant::LapseTerms {
 				deadline: MedianTime::from_consensus(1_800_000_000).unwrap(), pin: label32("return pin"), asset: asset("X"),
-				min_value: 98_500,
+				min_value: 98_500, vest: None,
 			}),
 			..leaf
 		}),
+		Policy::Leaf(LeafPolicy {
+			claim: Some(arca_covenant::LapseTerms {
+				deadline: MedianTime::from_consensus(1_800_000_000).unwrap(), pin: label32("return pin"), asset: asset("X"),
+				min_value: 98_500, vest: Some(MedianTime::from_consensus(1_790_000_000).unwrap()),
+			}),
+			..leaf
+		}),
+		Policy::Node(NodePolicy::new(children.clone(), s, owners.clone(), None, Some(chain())).unwrap()
+			.with_reclaim_lock(MedianTime::from_consensus(1_790_000_000).unwrap()).unwrap()),
 		Policy::Checkpoint(CheckpointPolicy { owner: a, operator: s, salt: label32("cp2"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: true }),
 		Policy::Offboard(OffboardPolicy {
 			unlock_hash: label32("h"), destination: ExplicitOutput::new(asset("X"), 1_000, Script::from(vec![0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])),
@@ -109,8 +118,8 @@ fn malformed_encodings_are_refused() {
 	b[0] = 2;
 	assert_eq!(Policy::decode(&b), Err(DecodeError::Version(2)));
 	let mut b = leaf.clone();
-	b[1] = 16;
-	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(16)));
+	b[1] = 17;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(17)));
 	// a key that is not on the curve: x = 0xff..ff is above the field size
 	let mut b = leaf.clone();
 	b[2..34].copy_from_slice(&[0xff; 32]);
@@ -154,11 +163,14 @@ fn malformed_encodings_are_refused() {
 	let mut b = node.clone();
 	b.splice(owners_at..owners_at + 1, [0xfd, 0x05, 0x00]);
 	assert_eq!(Policy::decode(&b), Err(DecodeError::NonCanonical));
-	// a reclaim flag that is not 0 or 1, and sweep flags out of range
+	// a reclaim flag that is not 0, 1 or 2, and sweep flags out of range;
+	// flag 2 needs the genesis hash and the vest time after it
 	let mut b = node.clone();
 	let n = b.len();
+	b[n - 1] = 3;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::Flag(3)));
 	b[n - 1] = 2;
-	assert_eq!(Policy::decode(&b), Err(DecodeError::Flag(2)));
+	assert_eq!(Policy::decode(&b), Err(DecodeError::UnexpectedEnd));
 	let sweep_flags = owners_at + 1 + 5 * 32 + 96;
 	let mut b = node.clone();
 	b[sweep_flags] = 4;

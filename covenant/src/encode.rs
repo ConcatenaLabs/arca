@@ -12,10 +12,10 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 an `enclave-1` leaf, 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 an `enclave-1` leaf, 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf, 16 a `vest-1` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
-//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `enclave-1` then `H`, `Kp` (32 each), a clawback flag (u8) and `Ki` (32) when it is set, the asset (32) and the value the exit pays (u64); for `claim-1` then the deadline (u32), the return script's pin (32), the asset (32) and the least the lapse pays (u64) |
-//! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8) and, when set, the genesis hash |
+//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `enclave-1` then `H`, `Kp` (32 each), a clawback flag (u8) and `Ki` (32) when it is set, the asset (32) and the value the exit pays (u64); for `claim-1` then the deadline (u32), the return script's pin (32), the asset (32) and the least the lapse pays (u64); for `vest-1` the same, then the vest time (u32) |
+//! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8: 0 none, 1 RECLAIM, 2 RECLAIM behind a vest time) and, when set, the genesis hash, then for 2 the vest time (u32) |
 //! | [`EntryPolicy`] | unlock hash, asset (32 each), value (u64), leaf program (32), sweep |
 //! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16), the leaf id given up (32), the connector asset (32) |
 //! | [`CheckpointPolicy`] | `A`, `S`, salt, genesis hash (32 each), sweep |
@@ -328,6 +328,9 @@ impl Encoding for LeafPolicy {
 			w.extend(c.pin);
 			w.extend(asset_bytes(c.asset));
 			w.extend(c.min_value.to_le_bytes());
+			if let Some(v) = c.vest {
+				w.extend(v.to_consensus_u32().to_le_bytes());
+			}
 		}
 	}
 
@@ -382,9 +385,10 @@ impl Encoding for NodePolicy {
 			w.extend(o.serialize());
 		}
 		encode_sweep_path(w, self.sweep());
-		match self.reclaim_chain() {
-			None => w.push(0),
-			Some(c) => { w.push(1); w.extend(c.genesis_bytes()); },
+		match (self.reclaim_chain(), self.reclaim_lock()) {
+			(None, _) => w.push(0),
+			(Some(c), None) => { w.push(1); w.extend(c.genesis_bytes()); },
+			(Some(c), Some(v)) => { w.push(2); w.extend(c.genesis_bytes()); w.extend(v.to_consensus_u32().to_le_bytes()); },
 		}
 	}
 
@@ -409,8 +413,17 @@ impl Encoding for NodePolicy {
 			owners.push(r.key()?);
 		}
 		let sweep = decode_sweep_path(r)?;
-		let reclaim = if r.flag()? { Some(r.chain()?) } else { None };
-		Ok(NodePolicy::new(children, operator, owners, sweep, reclaim)?)
+		let (reclaim, lock) = match r.u8()? {
+			0 => (None, None),
+			1 => (Some(r.chain()?), None),
+			2 => (Some(r.chain()?), Some(r.median_time()?)),
+			f => return Err(DecodeError::Flag(f)),
+		};
+		let p = NodePolicy::new(children, operator, owners, sweep, reclaim)?;
+		Ok(match lock {
+			Some(v) => p.with_reclaim_lock(v)?,
+			None => p,
+		})
 	}
 }
 
@@ -548,6 +561,7 @@ impl Encoding for Policy {
 					crate::Template::Htlc1 => 6,
 					crate::Template::Vtxo2 => 12,
 					crate::Template::Claim1 => 15,
+					crate::Template::Vest1 => 16,
 					crate::Template::Vtxo1 | crate::Template::Board1 => 1,
 				});
 				p.encode_to(w)
@@ -565,7 +579,8 @@ impl Encoding for Policy {
 		if v != VERSION {
 			return Err(DecodeError::Version(v));
 		}
-		Ok(match r.u8()? {
+		let ty = r.u8()?;
+		Ok(match ty {
 			1 => Policy::Leaf(LeafPolicy::decode_from(r)?),
 			2 => Policy::Node(NodePolicy::decode_from(r)?),
 			3 => Policy::Entry(EntryPolicy::decode_from(r)?),
@@ -622,7 +637,7 @@ impl Encoding for Policy {
 			},
 			12 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
 			14 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
-			15 => {
+			15 | 16 => {
 				let mut p = LeafPolicy::decode_from(r)?;
 				let deadline = r.median_time()?;
 				let pin = r.array32()?;
@@ -631,7 +646,11 @@ impl Encoding for Policy {
 				if min_value == 0 {
 					return Err(DecodeError::Count(0));
 				}
-				p.claim = Some(crate::claim::LapseTerms { deadline, pin, asset, min_value });
+				let vest = if ty == 16 { Some(r.median_time()?) } else { None };
+				if crate::claim::check_vest(vest, deadline).is_err() {
+					return Err(DecodeError::Count(vest.map_or(0, |v| v.to_consensus_u32() as u64)));
+				}
+				p.claim = Some(crate::claim::LapseTerms { deadline, pin, asset, min_value, vest });
 				Policy::Leaf(p)
 			},
 			t => return Err(DecodeError::PolicyType(t)),

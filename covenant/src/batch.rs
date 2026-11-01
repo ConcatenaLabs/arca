@@ -52,8 +52,8 @@ impl BatchKind {
 	pub fn choose(leaves: &[LeafSpec], radix: usize, exit_rate_ppm: Option<u32>, burn: bool) -> BatchKind {
 		let Some(ppm) = exit_rate_ppm else { return BatchKind::Tree };
 		let n = leaves.len();
-		if burn || n > SLOTS || leaves.iter().any(|l| matches!(l.template, Template::Order2 | Template::Order3 | Template::Channel1 | Template::Claim1)
-			|| l.channel.is_some() || l.claim.is_some()) {
+		if burn || n > SLOTS || leaves.iter().any(|l| matches!(l.template, Template::Order2 | Template::Order3 | Template::Channel1 | Template::Claim1
+			| Template::Vest1) || l.channel.is_some() || l.claim.is_some()) {
 			return BatchKind::Tree;
 		}
 		let exits = n as f64 * ppm as f64 / 1_000_000.0;

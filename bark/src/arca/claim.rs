@@ -246,7 +246,7 @@ impl Wallet {
 		};
 		let deadline = MedianTime::from_consensus(deadline).map_err(|e| Error::Refused(format!("the deadline: {}", e)))?;
 		let allowance = arca_covenant::claim::lapse_allowance(self.chain.floor_per_kvb(asset)?, 4);
-		let lapse = arca_covenant::DistributionLapse { deadline, allowance };
+		let lapse = arca_covenant::DistributionLapse { deadline, allowance, vest: None };
 		let fees: Vec<(AssetId, u64)> = if plan.fee > 0 { vec![(asset, plan.fee)] } else { vec![] };
 		let d = Distribution {
 			inputs: plan.coins.iter().map(|c| LeafId::from_str(&c.leaf_id).map_err(|e| Error::Store(e.to_string()))).collect::<Result<_, _>>()?,

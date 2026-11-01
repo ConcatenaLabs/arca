@@ -17,7 +17,7 @@
 //!                    for order-3 "version": 3 (absent for order-2)
 //! landing            landing-1 only: {"program": hex, 20 bytes, "allowance": decimal string}
 //! channel            channel-1 only: {"capacity": decimal string, "window_units": 512-second units}
-//! claim              claim-1 only: {"deadline": median time, "allowance": decimal string,
+//! claim              claim-1 and vest-1 only: {"deadline": median time, "allowance": decimal string,
 //!                    "return_script": hex}
 //! asset              hex, display order
 //! value              decimal string
@@ -206,7 +206,7 @@ impl LeafRecord {
 		if named == Some(Template::Channel1) {
 			fields.push("channel");
 		}
-		if named == Some(Template::Claim1) {
+		if matches!(named, Some(Template::Claim1 | Template::Vest1)) {
 			fields.push("claim");
 		}
 		let m = object(v, "record", &fields)?;
@@ -310,18 +310,27 @@ impl LeafRecord {
 
 /// `claim-1`'s lapse as the record's JSON form and the server's interface
 /// write it: `{"deadline": median time, "allowance": decimal string,
-/// "return_script": hex}`.
+/// "return_script": hex}`, and for `vest-1` `"vest": median time`.
 pub fn claim_json(l: &Lapse) -> Value {
 	let mut m = Map::new();
 	m.insert("deadline".into(), l.deadline.to_consensus_u32().into());
 	m.insert("allowance".into(), Value::String(l.allowance.to_string()));
 	m.insert("return_script".into(), Value::String(hex(l.return_script.as_bytes())));
+	if let Some(v) = l.vest {
+		m.insert("vest".into(), v.to_consensus_u32().into());
+	}
 	Value::Object(m)
 }
 
 /// Reads [`claim_json`].
 pub fn claim_from_json(v: &Value) -> Result<Lapse, RecordError> {
-	let o = object(v, "claim", &["deadline", "allowance", "return_script"])?;
+	let vesting = v.as_object().is_some_and(|o| o.contains_key("vest"));
+	let fields: &[&str] = if vesting { &["deadline", "allowance", "return_script", "vest"] } else { &["deadline", "allowance", "return_script"] };
+	let o = object(v, "claim", fields)?;
+	let vest = match vesting {
+		true => Some(MedianTime::from_consensus(int(o, "vest", u32::MAX as u64)? as u32).map_err(crate::encode::DecodeError::from)?),
+		false => None,
+	};
 	let t = int(o, "deadline", u32::MAX as u64)?;
 	let deadline = MedianTime::from_consensus(t as u32).map_err(crate::encode::DecodeError::from)?;
 	let allowance = match &o["allowance"] {
@@ -330,7 +339,7 @@ pub fn claim_from_json(v: &Value) -> Result<Lapse, RecordError> {
 	};
 	let script = string(o, "return_script").map_err(|_| RecordError::Type("claim.return_script".into()))?;
 	let bytes = crate::record::hex_lower(script).ok_or_else(|| RecordError::Hex("claim.return_script".into()))?;
-	Ok(Lapse { deadline, allowance, return_script: elements::Script::from(bytes) })
+	Ok(Lapse { deadline, allowance, return_script: elements::Script::from(bytes), vest })
 }
 
 /// `landing-1`'s landing as the record's JSON form and the server's interface
