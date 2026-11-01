@@ -115,6 +115,7 @@ impl Wallet {
 	/// a fee above the wallet's bound (`max_fee_ppm` millionths of the price,
 	/// 10,000 unless raised), and a leaf below the operator's smallest.
 	pub fn take_quote(&self, text: &str, amount: Option<u64>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let _quote = self.quoting();
 		let o = self.read_order(text)?;
 		let info = self.server_info()?;
 		self.quote_of(&o, &info, amount, max_fee_ppm).map(|(q, _)| q)

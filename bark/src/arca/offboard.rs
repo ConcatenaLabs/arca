@@ -85,6 +85,7 @@ impl Wallet {
 	/// holds for its unlock) and the change. Refuses what [`Self::offboard`]
 	/// refuses for the same reason.
 	pub fn offboard_quote(&mut self, asset: AssetId, amount: u64, script: &Script, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let _quote = self.quoting();
 		let info = self.server_info()?;
 		self.offboard_plan(&info, asset, amount, script, max_fee_ppm).map(|(q, _)| q)
 	}
@@ -106,6 +107,9 @@ impl Wallet {
 		// The coins, furthest from their exit date first and the largest
 		// first among one date, until they hold the amount and the fee, with
 		// no change or change of at least the operator's smallest leaf.
+		// A coin given up in a refresh that waits is taken back first when
+		// the live coins fall short.
+		self.free_when_short(asset, amount.saturating_add(offboard))?;
 		let mut chosen: Vec<In> = vec![];
 		let (mut total, mut refresh) = (0u64, 0u64);
 		let mut done = None;

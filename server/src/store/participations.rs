@@ -267,6 +267,21 @@ pub struct Restored {
 	pub revived: u64,
 }
 
+/// What [`Store::withdraw_participation`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Withdrawal {
+	/// Void now, its coins live again.
+	Withdrawn,
+	/// Void already, by an earlier withdrawal or for another reason.
+	AlreadyVoid,
+	/// In a round, or past one: its state.
+	InRound(ParticipationState),
+	/// Pending, but of a kind no owner withdraws, and why.
+	Refused(String),
+	/// No such participation.
+	Unknown,
+}
+
 /// A participation as the database holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParticipationRow {
@@ -994,6 +1009,59 @@ impl Store {
 		free_keys(&t, id).await?;
 		t.commit().await?;
 		Ok(true)
+	}
+
+	/// Withdraws participation `id` at its owner's request, whole or not at
+	/// all: its row locked first, it must be pending, at its first attempt
+	/// (never in a round, so no lost round can come back with it), and a
+	/// plain refresh or offboard (no take, no distribution, no plan's step),
+	/// with no forfeit recorded. It becomes void with `why`, its coins live
+	/// again and the keys it wanted free, as [`Store::void_participation`]
+	/// leaves them. A participation already void is answered as it stands.
+	pub async fn withdraw_participation(&self, id: &[u8; 32], why: &str) -> Result<Withdrawal, StoreError> {
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		let Some(row) = t.query_opt(
+			"SELECT state::text, attempt,
+			        EXISTS (SELECT 1 FROM participation_fill f WHERE f.participation_id = p.participation_id),
+			        EXISTS (SELECT 1 FROM distribution d WHERE d.participation_id = p.participation_id),
+			        EXISTS (SELECT 1 FROM plan_step s WHERE s.participation_id = p.participation_id),
+			        EXISTS (SELECT 1 FROM forfeit f WHERE f.participation_id = p.participation_id)
+			 FROM participation p WHERE participation_id = $1 FOR UPDATE",
+			&[&&id[..]],
+		).await? else {
+			return Ok(Withdrawal::Unknown);
+		};
+		let state = ParticipationState::parse(row.get::<_, String>(0).as_str())?;
+		let attempt: i32 = row.get(1);
+		let (take, distribution, step, forfeit): (bool, bool, bool, bool) = (row.get(2), row.get(3), row.get(4), row.get(5));
+		let refused = |s: &str| Ok(Withdrawal::Refused(s.to_string()));
+		match state {
+			ParticipationState::Void => return Ok(Withdrawal::AlreadyVoid),
+			ParticipationState::Pending => {},
+			s => return Ok(Withdrawal::InRound(s)),
+		}
+		if take {
+			return refused("it is a take of an on-chain order, whose round fills the order: it runs or is voided with its order");
+		}
+		if distribution {
+			return refused("it is a distribution, whose claims its holders are told of: it runs as it stands");
+		}
+		if step {
+			return refused("it is a step of an offline-refresh plan: cancel the plan instead");
+		}
+		if attempt > 0 || forfeit {
+			return refused("it was in a round that went out of the chain and may still return with it: it runs again, or its coins \
+				are given back once that round is gone");
+		}
+		t.execute(
+			"UPDATE participation SET state = 'void', void_reason = $2, updated_at = now() WHERE participation_id = $1 AND state = 'pending'",
+			&[&&id[..], &why],
+		).await?;
+		give_back(&t, id).await?;
+		free_keys(&t, id).await?;
+		t.commit().await?;
+		Ok(Withdrawal::Withdrawn)
 	}
 
 	/// Expires every participation issued in a round found final at or

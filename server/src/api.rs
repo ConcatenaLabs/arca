@@ -31,11 +31,11 @@ pub struct ErrorDetail {
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
-	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "internal", "invalid_coin",
+	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "internal", "invalid_coin",
 	"invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "lapsed", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
-	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "not_synced", "on_chain", "open_reassignment",
+	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "not_synced", "not_withdrawable", "on_chain", "open_reassignment",
 	"operator_key", "order", "order_expiring", "order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed",
 	"owed_withdrawn", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
@@ -391,6 +391,11 @@ pub struct ParticipationsInfo {
 	/// the coins it gave up; otherwise it expires, its coins are the owner's
 	/// again and its new leaves never are.
 	pub forfeit_deadline_seconds: u32,
+	/// The operator takes back a pending participation for the owners of
+	/// its coins (`withdraw_participation`), so a wallet can give a coin up
+	/// in a refresh that may wait and still pay with it.
+	#[serde(default)]
+	pub withdraw: bool,
 }
 
 /// The dates a board, and every coin resting on it, carries: those of a batch
@@ -1986,6 +1991,16 @@ pub struct TransferOutputStatus {
 	pub owner: String,
 	pub asset: String,
 	pub value: String,
+}
+
+/// `POST /v1/withdraw_participation`: for each coin the participation gives
+/// up, in its order, its owner key's BIP340 signature over the withdrawal
+/// digest ([`crate::participations::withdraw_digest`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WithdrawParticipation {
+	pub participation_id: String,
+	pub signatures: Vec<String>,
 }
 
 /// `POST /v1/participation_status`.

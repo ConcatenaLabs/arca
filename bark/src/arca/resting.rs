@@ -128,6 +128,7 @@ impl Wallet {
 	/// coin's refresh fee), the change and the order's full price. Refuses
 	/// what [`Self::order_rest`] refuses for the same reason.
 	pub fn order_rest_quote(&mut self, ask: &RestAsk, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let _quote = self.quoting();
 		let info = self.server_info()?;
 		self.rest_plan(&info, ask, max_fee_ppm).map(|(q, _)| q)
 	}
@@ -160,6 +161,9 @@ impl Wallet {
 		// The coins, furthest from their exit date first, until they hold the
 		// amount and the refresh fees, with no change or change of at least
 		// the operator's smallest leaf.
+		// A coin given up in a refresh that waits is taken back first when
+		// the live coins fall short.
+		self.free_when_short(a, ask.amount)?;
 		let mut chosen: Vec<In> = vec![];
 		let (mut total, mut fee) = (0u64, 0u64);
 		let mut done = None;
@@ -478,6 +482,7 @@ impl Wallet {
 	/// the coins given up and the change. Refuses what
 	/// [`Self::order_fill_resting`] refuses for the same reason.
 	pub fn order_fill_resting_quote(&mut self, order: &str, amount: Option<u64>) -> Result<Value, Error> {
+		let _quote = self.quoting();
 		self.witnessed_now()?;
 		let info = self.server_info()?;
 		let o = self.served_order(order)?;
@@ -538,6 +543,9 @@ impl Wallet {
 		// board by the board's service expiry, when that comes first), until
 		// they hold the price, every margin and change of none or at least the
 		// smallest leaf.
+		// A coin given up in a refresh that waits is taken back first when
+		// the live coins fall short.
+		self.free_when_short(asset_b, price)?;
 		let mut chosen: Vec<In> = vec![];
 		let mut kept = 0u64;
 		let mut done = None;

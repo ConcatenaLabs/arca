@@ -51,6 +51,44 @@ use super::keys::{p2wpkh, CHANGE, RECEIVE};
 use super::wallet::{owner_of, Wallet};
 use super::Error;
 
+/// Seconds a refresh of received coins may wait at the operator, for funds
+/// or for its in-flight cap, before the wallet takes it back.
+pub const WITHDRAW_AFTER: u64 = 120;
+/// Seconds after taking a coin back from a refresh that waited before the
+/// wallet gives it up in a refresh again.
+pub const RETRY_AFTER: u64 = 600;
+
+/// The wall-clock time, in seconds.
+fn wall_now() -> u64 {
+	web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// The store's key for the time a refresh of received coins was given up.
+fn received_key(pid: &str) -> String {
+	format!("refresh-received:{}", pid)
+}
+
+/// The store's key for the time a received coin was taken back from a
+/// refresh that waited.
+fn withdrawn_key(leaf_id: &str) -> String {
+	format!("refresh-withdrawn:{}", leaf_id)
+}
+
+/// What the operator can fund now of the asset named `asset` for refreshes,
+/// by its `info`: what a round can pay of it (`fundable`), within what its
+/// in-flight cap leaves (`in_flight_cap` less `in_flight`), when it sets
+/// one. `None` when the operator does not say what it can fund, or does not
+/// serve the asset.
+fn fundable_room(info: &Value, asset: &str) -> Option<u64> {
+	let a = info["assets"].as_array()?.iter().find(|a| a["asset"].as_str() == Some(asset))?;
+	let n = |k: &str| a[k].as_str().and_then(|v| v.parse::<u64>().ok());
+	let fundable = n("fundable")?;
+	Some(match n("in_flight_cap") {
+		Some(cap) => fundable.min(cap.saturating_sub(n("in_flight").unwrap_or(0))),
+		None => fundable,
+	})
+}
+
 /// Blocks a transaction an exit needs waits in the mempool before the wallet
 /// speeds it up, and again between two raises.
 pub(crate) const STUCK_BLOCKS: u64 = 2;
@@ -418,13 +456,23 @@ impl Wallet {
 		Ok(false)
 	}
 
-	/// Gives up in the operator's next round every coin the wallet received
+	/// Gives up in the operator's next round the coins the wallet received
 	/// out of round and has not refreshed, for a leaf of its own, at the
 	/// operator's refresh fee within `max_fee_ppm` (by default the wallet's
 	/// bound): a coin held live and final, from a sender other than the
-	/// wallet. Answers what it gave up (`participations`) and every coin it
-	/// left as it is, with why (`left`).
+	/// wallet. Only with an operator that takes back a refresh that waits
+	/// (`participations.withdraw` in its `info`), and in each asset only as
+	/// much as the operator can fund now: what `fundable` says a round can
+	/// pay of it, within what its in-flight cap leaves, if it sets one. A
+	/// coin the wallet took back from a refresh that waited
+	/// ([`Self::withdraw_waited`]) is left for [`RETRY_AFTER`] seconds.
+	/// Answers what it gave up (`participations`), one per asset, and every
+	/// coin it left as it is, with why (`left`).
 	pub fn refresh_received(&mut self, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let info = self.server_info()?;
+		let withdraws = Self::operator_withdraws(&info);
+		let wall = wall_now();
+		let mut room: std::collections::BTreeMap<String, Option<u64>> = Default::default();
 		let mut take = vec![];
 		let mut left = vec![];
 		for c in self.store.coins_in("live")? {
@@ -435,11 +483,32 @@ impl Wallet {
 			if !self.received_from_another(&record)? {
 				continue;
 			}
+			if !withdraws {
+				left.push(json!({"leaf_id": c.leaf_id, "why": "the operator cannot take back a refresh that waits, so the wallet gives up \
+					no received coin in one: it stays live, to pay with"}));
+				continue;
+			}
+			if let Some(t) = self.store.meta(&withdrawn_key(&c.leaf_id))?.and_then(|t| t.parse::<u64>().ok()) {
+				if wall < t.saturating_add(RETRY_AFTER) {
+					left.push(json!({"leaf_id": c.leaf_id, "why": format!("taken back from a refresh that waited for the operator; \
+						tried again {} s after", RETRY_AFTER)}));
+					continue;
+				}
+			}
 			// Each coin quoted alone first, so one the operator's schedule or
 			// the wallet's bound refuses holds back no other.
-			match self.refresh_quote(std::slice::from_ref(&c.leaf_id), max_fee_ppm) {
-				Ok(_) => take.push(c.leaf_id.clone()),
-				Err(e) => left.push(json!({"leaf_id": c.leaf_id, "why": e.to_string()})),
+			if let Err(e) = self.refresh_quote(std::slice::from_ref(&c.leaf_id), max_fee_ppm) {
+				left.push(json!({"leaf_id": c.leaf_id, "why": e.to_string()}));
+				continue;
+			}
+			let r = room.entry(c.asset.clone()).or_insert_with(|| fundable_room(&info, &c.asset));
+			match r {
+				Some(v) if *v >= c.value => {
+					*v -= c.value;
+					take.push(c.leaf_id.clone());
+				},
+				_ => left.push(json!({"leaf_id": c.leaf_id, "why": "the operator cannot fund its refresh now: it stays live, and is \
+					given up once the operator can"})),
 			}
 		}
 		if take.is_empty() {
@@ -447,8 +516,39 @@ impl Wallet {
 		}
 		let quote = self.refresh_quote(&take, max_fee_ppm)?;
 		let mut out = self.participate(quote, None)?;
+		for p in out["participations"].as_array().into_iter().flatten() {
+			if let Some(pid) = p["participation"].as_str().filter(|_| p.get("error").is_none()) {
+				self.store.set_meta(&received_key(pid), &wall.to_string())?;
+			}
+		}
 		out["left"] = json!(left);
 		out["refreshed"] = json!(take);
 		Ok(out)
+	}
+
+	/// Takes back participation `pid`, a refresh of received coins
+	/// ([`Self::refresh_received`]), once it has waited [`WITHDRAW_AFTER`]
+	/// seconds and the operator's status `st` says it waits for funds or for
+	/// the in-flight cap: its coins are live again, to pay with, and each is
+	/// given up again no sooner than [`RETRY_AFTER`] seconds later. `None`
+	/// for any other participation, or one that has not waited so long.
+	pub(crate) fn withdraw_waited(&self, pid: &str, st: &Value) -> Result<Option<Value>, Error> {
+		let Some(since) = self.store.meta(&received_key(pid))?.and_then(|t| t.parse::<u64>().ok()) else { return Ok(None) };
+		let wall = wall_now();
+		if st["waiting"].as_str().is_none() || wall < since.saturating_add(WITHDRAW_AFTER) {
+			return Ok(None);
+		}
+		let mut v = self.withdraw_participation(pid)?;
+		if v["state"] == "void" {
+			for l in v["live_again"].as_array().cloned().unwrap_or_default() {
+				if let Some(l) = l.as_str() {
+					self.store.set_meta(&withdrawn_key(l), &wall.to_string())?;
+				}
+			}
+			v["note"] = json!(format!("the refresh waited {} s for the operator ({}): taken back, its coins live again; given up again \
+				no sooner than {} s from now", wall - since, st["waiting"].as_str().unwrap_or(""), RETRY_AFTER));
+		}
+		self.store.delete_meta(&received_key(pid))?;
+		Ok(Some(v))
 	}
 }

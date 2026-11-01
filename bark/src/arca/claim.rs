@@ -181,6 +181,7 @@ impl Wallet {
 	/// asking nothing of the operator but its `info`: what
 	/// [`Wallet::distribute`] takes as `shown`.
 	pub fn distribute_quote(&mut self, asset: AssetId, claims: &[(XOnlyPublicKey, u64)]) -> Result<Value, Error> {
+		let _quote = self.quoting();
 		let info = self.server_info()?;
 		let plan = self.distribution_plan(&info, asset, claims)?;
 		Ok(json!({

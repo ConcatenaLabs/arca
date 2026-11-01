@@ -40,7 +40,7 @@ use arca_covenant::{connector_asset, AccumulatorRecord, Batch, BatchKind, Chain,
 
 use super::chain::{hex, unhex, unhex32};
 use super::store::ForfeitRow;
-use super::client::{key_proof_digest, participation_id, Wanted};
+use super::client::{key_proof_digest, participation_id, withdraw_digest, Wanted};
 use super::pay::MARGIN_MULTIPLE;
 use super::wallet::{amount, sign, Wallet};
 use super::Error;
@@ -73,6 +73,18 @@ pub fn schedule_of(info: &Value, asset: AssetId) -> Value {
 		}
 	}
 	s
+}
+
+/// A quote under way ([`Wallet::quoting`]), until dropped.
+pub(crate) struct Quoting {
+	flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	was: bool,
+}
+
+impl Drop for Quoting {
+	fn drop(&mut self) {
+		self.flag.store(self.was, std::sync::atomic::Ordering::Relaxed);
+	}
 }
 
 /// The most a refresh may cost, in millionths of a coin's value, unless the
@@ -988,6 +1000,116 @@ impl Wallet {
 		Ok(Value::Array(out))
 	}
 
+	/// Whether the operator takes back a pending participation for the owners
+	/// of its coins (`info` `participations.withdraw`).
+	pub(crate) fn operator_withdraws(info: &Value) -> bool {
+		info["participations"]["withdraw"].as_bool() == Some(true)
+	}
+
+	/// Takes back the wallet's participation `pid` while the operator has not
+	/// put it in a round: each coin it gives up signs the withdrawal digest
+	/// under its own key ([`withdraw_digest`]), and the operator voids it
+	/// under the lock its round builder holds, so a round either took it
+	/// first or never takes it. Each coin the operator gives back is live
+	/// again. One a round took is answered `in_round`, its coins still given
+	/// up there, and is completed as any other.
+	pub fn withdraw_participation(&self, pid: &str) -> Result<Value, Error> {
+		let Some((_, body, _, _, state, _, _)) = self.store.participations()?.into_iter().find(|p| p.0 == pid) else {
+			return Err(Error::Refused(format!("the wallet made no participation {}", pid)));
+		};
+		if state != "pending" {
+			return Err(Error::Refused(format!("participation {} is {}: only one the operator holds pending is withdrawn", pid, state)));
+		}
+		let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+		let id = unhex32(pid).map_err(|e| Error::Store(e.to_string()))?;
+		let digest = withdraw_digest(&self.genesis, &self.operator, &id);
+		let mut sigs = vec![];
+		let mut leaves = vec![];
+		for i in body["inputs"].as_array().into_iter().flatten() {
+			let l = i["leaf_id"].as_str().ok_or_else(|| Error::Store(format!("participation {} names a coin without its id", pid)))?;
+			let row = self.store.coin(l)?.ok_or_else(|| Error::Store(format!("no coin {}", l)))?;
+			sigs.push(hex(sign(&self.coin_key(&row.owner_nonce)?, &digest).as_ref()));
+			leaves.push(l.to_string());
+		}
+		let st = match self.server.post("withdraw_participation", &json!({"participation_id": pid, "signatures": sigs})) {
+			Ok(st) => st,
+			Err(Error::Server { code, message, .. }) if code == "in_round" => {
+				return Ok(json!({"participation": pid, "state": "in_round", "note": message}));
+			},
+			Err(e) => return Err(e),
+		};
+		if st["state"] != "void" {
+			return Err(Error::Refused(format!("the operator answers participation {} as {}, not void", pid, st["state"])));
+		}
+		let mut back = vec![];
+		for l in &leaves {
+			let returned = st["inputs"].as_array().and_then(|a| a.iter().find(|i| i["leaf_id"].as_str() == Some(l.as_str())))
+				.and_then(|i| i["returned"].as_bool()).unwrap_or(true);
+			if returned && self.store.coin(l)?.is_some_and(|c| c.state == "given") {
+				back.push(l.clone());
+			}
+		}
+		for l in &back {
+			self.store.set_coin_state(l, "live", "")?;
+		}
+		self.store.set_participation(pid, "void", None, None)?;
+		Ok(json!({"participation": pid, "state": "void", "live_again": back, "void_reason": st["void_reason"]}))
+	}
+
+	/// Takes back every refresh of the wallet's in `asset` that the operator
+	/// still holds pending (not a take, a distribution or an offboard), so a
+	/// payment or a trade the live coins of `asset` cannot cover can use the
+	/// coins it gave up. Answers what it took back; nothing when the operator
+	/// takes no withdrawal.
+	pub(crate) fn withdraw_refreshes(&self, asset: AssetId) -> Result<Vec<Value>, Error> {
+		if self.quoting.load(std::sync::atomic::Ordering::Relaxed) || !Self::operator_withdraws(&self.server_info()?) {
+			return Ok(vec![]);
+		}
+		let mut out = vec![];
+		for (pid, body, given, _, state, _, _) in self.store.participations()? {
+			if state != "pending" {
+				continue;
+			}
+			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+			let refresh = !Self::is_take(&body) && body.get("claims").is_none()
+				&& body["outputs"].as_array().is_some_and(|o| !o.is_empty() && o.iter().all(|o| o.get("leaf").is_some()));
+			if !refresh {
+				continue;
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			let mut of_asset = false;
+			for l in &given {
+				of_asset |= self.store.coin(l)?.is_some_and(|c| c.asset == asset.to_string());
+			}
+			if !of_asset {
+				continue;
+			}
+			match self.withdraw_participation(&pid) {
+				Ok(v) => out.push(v),
+				Err(e @ Error::Unreachable(_)) => return Err(e),
+				Err(e) => out.push(json!({"participation": pid, "error": e.to_string()})),
+			}
+		}
+		Ok(out)
+	}
+
+	/// Marks a quote under way until the guard is dropped: a quote takes back
+	/// no refresh ([`Self::withdraw_refreshes`]), and says what the live coins
+	/// can pay.
+	pub(crate) fn quoting(&self) -> Quoting {
+		Quoting { flag: self.quoting.clone(), was: self.quoting.swap(true, std::sync::atomic::Ordering::Relaxed) }
+	}
+
+	/// [`Self::withdraw_refreshes`] when the live coins of `asset` the wallet
+	/// can pay with hold less than `need`: whether it took any back.
+	pub(crate) fn free_when_short(&self, asset: AssetId, need: u64) -> Result<bool, Error> {
+		let have: u64 = self.spendable_coins(asset)?.iter().map(|i| i.coin.value).sum();
+		if have >= need {
+			return Ok(false);
+		}
+		Ok(self.withdraw_refreshes(asset)?.iter().any(|v| v["state"] == "void"))
+	}
+
 	/// Posts the participation `pid` of `body`, a take's to `take_order`.
 	pub(crate) fn submit_participation_body(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
 		self.submit(pid, body, given)
@@ -1066,7 +1188,13 @@ impl Wallet {
 				s @ ("void" | "expired") => out.push(self.give_back(&pid, &given, s, &st)?),
 				_ if state == "withdrawn" => out.push(json!({"participation": pid, "state": "withdrawn",
 					"note": "the wallet is taking a coin of it on-chain, and signs nothing for it"})),
-				"pending" => out.push(json!({"participation": pid, "state": "pending", "note": "waiting for a round"})),
+				// A refresh of received coins that has waited too long for the
+				// operator's funds or cap is taken back, its coins free to pay.
+				"pending" => match self.withdraw_waited(&pid, &st) {
+					Ok(Some(v)) => out.push(v),
+					Ok(None) => out.push(json!({"participation": pid, "state": "pending", "note": "waiting for a round"})),
+					Err(e) => out.push(json!({"participation": pid, "state": "pending", "error": e.to_string()})),
+				},
 				// A coin of it on its way home on the chain: its forfeits are
 				// not handed over again (the server would refuse them, the coin
 				// being on the chain). Once the operator releases the

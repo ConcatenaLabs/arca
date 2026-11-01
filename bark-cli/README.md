@@ -666,7 +666,32 @@ of its lineage, until it is refreshed in a round. `arca refresh-received
 than the wallet signed into since its last round or board; the change of its
 own payment from a coin of a round is not one) in the next round for a leaf
 of its own, at the operator's refresh fee within the wallet's bound, and says
-which coins it left as they are, and why. The browser wallets run it by
+which coins it left as they are, and why. It gives up a coin only with an
+operator that takes back a refresh that waits (`info`
+`participations.withdraw`), and in each asset only as much as the operator
+can fund now: what its `info` says a round can pay of the asset
+(`fundable`), within what its in-flight cap leaves, when it sets one. The
+coins of each asset go in one participation of their own, so an asset the
+operator cannot fund holds back no other's.
+
+A refresh can still wait at the operator, for its funds or its cap. Its
+coins stay the wallet's to pay with:
+
+- `sync` takes a refresh of received coins back once it has waited two
+  minutes and the operator's status says it waits (`withdraw_participation`):
+  its coins are live again, and are given up again no sooner than ten
+  minutes later;
+- a payment, a swap, a Lightning payment, a take, an offboard or an order
+  that the live coins of its asset cannot cover first takes back every
+  refresh of that asset the operator still holds pending, and pays with
+  their coins as well (a quote takes nothing back, and answers what the live
+  coins can pay);
+- `arca withdraw-participation ID` takes back any pending participation of
+  the wallet's by hand.
+
+Each coin given up signs the withdrawal under its own key, and the operator
+takes it only before a round has: once a round has taken the refresh, it is
+completed as any other. The browser wallets run `refresh-received` by
 themselves in their default mode.
 
 ### Paying and receiving over Lightning
@@ -1692,6 +1717,7 @@ registry for both commands.
 | `lightning receives` | Every payment the wallet asked to receive, by payment hash: the invoice, asset, amount, fee, the leaf's value and participation, and its state (`waiting`, `issuing`, `claiming`, `received` or `failed` with the reason); never the preimage |
 | `quote [--leaf L]… [--max-fee-ppm N]` | The refresh fee of each coin a participation would give up (every live coin when none is named), coin by coin with the schedule it was priced by (`coins`), within the wallet's bound, before anything is signed |
 | `participate [--leaf L]… [--not-before T] [--max-fee-ppm N] [--shown FEES]` (`refresh`) | Gives up the coins named (every live coin when none is) for a new leaf in each of their assets, in one participation per asset, since a round carries one asset, or one per 16 coins of an asset that has more, the most a participation gives up: each asset's coins are refreshed in that asset's next round. Every other command that gives coins up in a participation (`order_rest`, `order_place`, `offboard`, a take) chooses at most 16, the largest first when the wallet holds more, and is refused naming a refresh, which merges them, when 16 do not hold what it needs. Each new leaf is under a fresh key whose own signature proves the wallet holds it; each participation pays the operator's refresh fee in its own asset, within the wallet's bound (`--max-fee-ppm` raises it for this command); each coin's fee is printed before anything is signed. It answers each participation (`participations`), one the server refused or did not take now with its `error` and a `note`: a refused one gives its coins back; one not taken now (no answer, or the operator taking no new work in its asset while its rate is stale, `rate_stale`) stands, its coins given, and `sync` posts it again, while every other asset's goes on. It is refused only when none was taken. With `--shown` (`quote`'s `coins`, as JSON), the participation goes ahead only on the very fees a program showed its user, and is refused before anything is signed when they changed |
+| `withdraw-participation ID` | Takes back a participation of the wallet's that the operator holds pending, before a round takes it: its coins are live again (see Refreshing what it receives) |
 | `participations` | Every participation the wallet made, from its own store, asking nothing of the operator: where each stands, the round it ran in, whether it was released, the coins it gave up and the new leaves it wanted, with the state of each. `sync` reports a release once; this answers again whenever it is asked |
 | `sync` | Re-checks every coin, posts again the board registrations and transfer requests the server never answered, reads the mailbox, binds to the mailbox key every coin kept before the wallet named it (`bound`), claims back every coin the operator's sweep took and takes up a claim made before a restore (`owed`; see Swept coins), moves every participation on (a take's forfeits as soon as its round is built, against the round as its status serves it, and a refresh's the same way when the operator holds its rounds for their forfeits, as one building batches without a sweep does (`info.batches.no_sweep`), its `schedule` then waking the wallet within half the forfeit window until the round is built; once its round is final, validates the new leaves, signs the forfeits, takes the preimage and releases the old batch leaves' lowest nodes, each release naming the new round's connector asset, and for a coin a reassignment made each lowest node with RECLAIM-D it rests on, as its current holder (never for an order resting again after a fill, whose key is the order's and has delegated); one the server released on forfeits the wallet handed over before is completed with the preimage the server publishes with the round's tree, nothing signed again and none of the checks made before signing made again; the releases, signed with the forfeits, go to the server once the participation is completed however it completes, and again at each `sync` until the server takes them), asks for the refresh of every live coin in its free window (but the current coin of an open offline-refresh plan, which its step refreshes), takes up each step of a plan whose round is final, holds again the coin a step gave up whose round can never return, and cancels a plan the operator stopped while its coin can be refreshed or once it is home (`plans`), follows on the chain every forfeit whose preimage it does not hold, follows
 every payment over Lightning the operator has not decided (a paid one closed
