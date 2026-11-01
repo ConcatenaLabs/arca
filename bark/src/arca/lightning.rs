@@ -1081,9 +1081,22 @@ impl Wallet {
 		match row.state.as_str() {
 			"receiving" => {},
 			"spent" => {
+				// Claimed by a request whose answer never came (a timeout, a
+				// 5xx): the coin the claim made reached the wallet through
+				// its mailbox, or the request was answered when `sync` posted
+				// it again. That coin is named here as an answered claim
+				// names it, so whoever follows the payment finds it.
 				rec["state"] = json!("received");
+				if rec["leaf"].is_null() {
+					if let Some(made) = row.spent_by.as_deref().and_then(|b| b.strip_prefix("transfer creating ")) {
+						rec["leaf"] = json!(made);
+					} else if let Some((transfer, leaf)) = self.claimed_leaf(hash)? {
+						rec["received_by"] = transfer;
+						rec["leaf"] = leaf;
+					}
+				}
 				self.set_receive(hash, rec.clone())?;
-				return Ok(json!({"payment_hash": hash, "state": "received"}));
+				return Ok(json!({"payment_hash": hash, "state": "received", "leaf": rec["leaf"]}));
 			},
 			"exited" => {
 				rec["state"] = json!("received");
@@ -1190,6 +1203,23 @@ impl Wallet {
 		rec["leaf"] = answer["outputs"][0].clone();
 		self.set_receive(hash, rec)?;
 		Ok(json!({"payment_hash": hash, "state": "received", "transfer": answer}))
+	}
+
+	/// The transfer that claimed the leaf received under `hash`, and the leaf
+	/// of the wallet's own it made, from the claim request the wallet kept
+	/// with the operator's answer; `None` when no answered claim is kept.
+	fn claimed_leaf(&self, hash: &str) -> Result<Option<(Value, Value)>, Error> {
+		for (_, body, answer) in self.store.transfer_answers_in("done")? {
+			let Ok(b) = serde_json::from_str::<Value>(&body) else { continue };
+			if b["payment_hash"].as_str() != Some(hash) || b.get("preimage").is_none() {
+				continue;
+			}
+			let Ok(a) = serde_json::from_str::<Value>(&answer) else { continue };
+			if let Some(leaf) = a["outputs"][0]["leaf_id"].as_str() {
+				return Ok(Some((a["transfer_id"].clone(), json!(leaf))));
+			}
+		}
+		Ok(None)
 	}
 
 	/// When the received leaf `coin`, resting on `bases` (its round, as

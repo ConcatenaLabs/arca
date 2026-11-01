@@ -971,6 +971,15 @@ impl Store {
 		Ok(rows)
 	}
 
+	/// Each transfer request in `state`, newest first, with its body and the
+	/// answer kept for it (empty when none was).
+	pub fn transfer_answers_in(&self, state: &str) -> Result<Vec<(i64, String, String)>, Error> {
+		let mut st = self.conn.prepare("SELECT id, body, COALESCE(answer, '') FROM transfer WHERE state = ?1 ORDER BY id DESC").map_err(db)?;
+		let rows = st.query_map(params![state], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db)?
+			.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
 	pub fn set_transfer(&self, id: i64, state: &str, answer: &str) -> Result<(), Error> {
 		self.conn.execute("UPDATE transfer SET state = ?2, answer = ?3 WHERE id = ?1", params![id, state, answer]).map_err(db)?;
 		Ok(())

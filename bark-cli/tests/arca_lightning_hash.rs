@@ -27,6 +27,7 @@ use server::server::LegSection;
 
 use common::cli::Arca;
 use common::lightning::{lightningd, node};
+use common::proxy::Proxy;
 use common::running::Running;
 use server::store::RoundState;
 
@@ -358,6 +359,132 @@ async fn a_receive_under_a_given_hash_waits_for_its_preimage_and_is_claimed_with
 	assert_eq!(row_total(&q2, &x), row_before, "nothing of it was ever counted");
 	drop(ox);
 	for w in [&p, &q, &q2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A claim the operator co-signs whose answer never reaches the wallet (a
+/// timeout, a 5xx from a loaded machine): the coin the claim made comes
+/// through the wallet's mailbox, or in the answer when `sync` posts the
+/// request again. Either way the receive then names that coin, as an
+/// answered claim does, so a program following the payment finds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_answered_only_when_posted_again_names_its_leaf() {
+	let Some(lnd) = lightningd("a_claim_answered_only_when_posted_again_names_its_leaf") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
+	}).await;
+	let x = r.x;
+	let xs = x.to_string();
+	let ox = tokio::task::block_in_place(|| {
+		let ox = node(&r.rt, &mut r.purse, &lnd, "lro", true, x, 2_000_000_000);
+		let px = node(&r.rt, &mut r.purse, &lnd, "lrp", true, x, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
+		drop(px);
+		ox
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if a.asset == xs {
+			a.lightning = Some(LegSection { rpc: ox.rpc_path() });
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("X's leg up", || g.leg(&x, true).is_ok()).await;
+	let url = r.url();
+	let proxy = Proxy::start(&url);
+
+	// The payer, P, with a board in X; the receiver, Q, through the proxy.
+	let p = wallet_at("LRP", &url, &r, None);
+	let s = script(&p.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	p.ok(&["board", &xs, "3000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || p.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	p.ok(&["sync"]);
+	let q = wallet_at("LRQ", &proxy.url, &r, None);
+
+	// The claim's answer lost, whatever the answer: the first claim posted
+	// while `lose` is set, and every mailbox read while `deaf` is.
+	let lose = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let deaf = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let (l, d) = (lose.clone(), deaf.clone());
+	proxy.rewrite(Some(std::sync::Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		use std::sync::atomic::Ordering::SeqCst;
+		let claim = path.ends_with("/lightning_receive_claim") && status == 200 && l.swap(false, SeqCst);
+		if claim || (path.ends_with("/mailbox_read") && d.load(SeqCst)) {
+			*v = serde_json::json!({"error": {"code": "unavailable", "message": "lost on the way"}});
+			return Some(503);
+		}
+		None
+	})));
+	let claims = || proxy.calls().iter().filter(|(path, ..)| path.ends_with("/lightning_receive_claim")).count();
+	let mut held = 0u64;
+	for (k, through) in ["posted again", "the mailbox"].into_iter().enumerate() {
+		let (pre, h) = preimage(through);
+		let t = mtp(&r) + 8 * 3600 + 1800;
+		paid_inside(&r, &q, &p, &h, 100_000 + k as u64 * 10_000, t).await;
+		q.ok(&["sync"]);
+		leaf_round(&r).await;
+		q.ok(&["sync"]);
+		let htlc = received_leaf(&q, &h);
+		q.ok(&["lightning", "preimage", &h, &hex(&pre)]);
+		let before = claims();
+		lose.store(true, std::sync::atomic::Ordering::SeqCst);
+		deaf.store(k == 0, std::sync::atomic::Ordering::SeqCst);
+		let first = q.ok(&["sync"]);
+		deaf.store(false, std::sync::atomic::Ordering::SeqCst);
+		let rec = q.ok(&["lightning", "receives"])[&h].clone();
+		println!("LR {}: the claim's answer lost: sync lightning {} | mailbox {} | receive state {} leaf {} | the received leaf {}", through,
+			first["lightning"], first["mailbox"], rec["state"], rec["leaf"], coin_of(&q, &htlc));
+		assert!(!lose.load(std::sync::atomic::Ordering::SeqCst), "the operator answered the claim, and the answer was lost");
+		assert_eq!(claims(), before + 1);
+		if k == 0 {
+			// Nothing came: the request stands, posted again by the next sync.
+			assert_eq!(rec["state"], "claiming", "{}", rec);
+			assert_eq!(coin_of(&q, &htlc)["state"], "sending", "the claim request stands");
+			let second = q.ok(&["sync"]);
+			println!("LR {}: transfers {} | lightning {}", through, second["transfers"], second["lightning"]);
+			assert_eq!(claims(), before + 2, "the claim was posted again");
+		}
+		let rec = q.ok(&["lightning", "receives"])[&h].clone();
+		println!("LR {}: the receive {}", through, rec);
+		assert_eq!(rec["state"], "received", "{}", rec);
+		let leaf = rec["leaf"].as_str().unwrap_or_else(|| panic!("the receive names no leaf: {}", rec)).to_string();
+		let c = coin_of(&q, &leaf);
+		let spent = coin_of(&q, &htlc);
+		println!("LR {}: the coin it names {} | the received leaf {} spent by {}", through, c, spent["state"], spent["spent_by"]);
+		assert_eq!((c["state"].as_str(), c["asset"].as_str()), (Some("live"), Some(xs.as_str())), "{}", c);
+		let v: u64 = c["value"].as_str().unwrap().parse().unwrap();
+		assert!(v > 0 && v < 100_000 + k as u64 * 10_000, "the amount less the fee and the claim's margins: {}", v);
+		assert_eq!(spent["state"], "spent", "the received leaf is spent by the claim");
+		held += v;
+		p.ok(&["sync"]);
+		assert_eq!(p.ok(&["lightning", "payments"])[&h]["state"], "paid");
+	}
+	// Each coin once: a request posted again makes no second coin.
+	let live: u64 = q.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "live" && c["asset"] == xs.as_str())
+		.map(|c| c["value"].as_str().unwrap().parse::<u64>().unwrap()).sum();
+	println!("LR the receiver holds {} of X live, the two claimed coins {}", live, held);
+	assert_eq!(live, held);
+
+	drop(ox);
+	for w in [&p, &q] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
