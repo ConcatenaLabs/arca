@@ -25,7 +25,7 @@ pub const COMMANDS: &[&str] = &[
 	"info", "balance", "address", "board_address", "board_psbt", "send", "send_fee",
 	"pay", "pay_status", "pay_fee", "invoice", "receive_status", "receive_fee",
 	"offboard", "offboard_fee", "refresh", "schedule_refreshes", "sync", "catch_up", "history",
-	"coins",
+	"coins", "exit_estimate", "exit_start", "exit_progress", "exit_claim", "exit_status", "exit_auto",
 ];
 
 /// The Bitcoin network a name stands for. Testnet4 is the network the
@@ -286,14 +286,18 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 				return Ok(json!({ "refreshed": 0 }));
 			}
 			let n = due.len();
-			wallet.refresh_vtxos(due).await?;
+			let r = wallet.refresh_vtxos(due).await;
+			crate::exit::note_server(wallet, r.is_err());
+			r?;
 			Ok(json!({ "refreshed": n }))
 		},
 		// Schedules with the server the refresh of every coin that has none yet, so the
 		// server renews it with the wallet closed; the wallet takes the new coin in at its
 		// next sync.
 		"schedule_refreshes" => {
-			let s = wallet.schedule_refreshes().await?;
+			let s = wallet.schedule_refreshes().await;
+			crate::exit::note_server(wallet, s.is_err());
+			let s = s?;
 			Ok(json!({
 				"scheduled": s.iter().map(|r| json!({
 					"height": r.height,
@@ -332,6 +336,7 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 			})).collect::<Vec<_>>();
 			Ok(json!({ "tip": tip, "coins": coins }))
 		},
+		c if crate::exit::COMMANDS.contains(&c) => crate::exit::run(wallet, c, args).await,
 		other => bail!("unknown command '{}'", other),
 	}
 }
