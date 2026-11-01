@@ -26,8 +26,8 @@
 //!   for the owner, and the owner's release under another batch's `ROOT`;
 //! - a release for the round that was rolled back, with its connector's atom
 //!   (which no longer exists) and with the replacement's;
-//! - a slot twice in one release, slots out of order, and a slot whose bit is
-//!   already set;
+//! - a slot twice in one release, slots out of order, a slot whose bit is
+//!   already set, and 15 slots, one more than the program has places;
 //! - the rest under another `ROOT`, another `OPERATOR`, or one atom short so
 //!   the operator takes more than the slots weighed; the operator's
 //!   signature missing, or over another payout;
@@ -388,6 +388,15 @@ fn accumulator_release_on_regtest() {
 	let mut n = r2.clone();
 	n.slots.swap(0, 1);
 	refuse(&mut a.net, "neg release of 14 slots, two out of order", &n, INSIDE_JET);
+	// Fifteen slots: the program has 14 places, so the fifteenth is bits its
+	// witness type does not hold.
+	let fifteen: Vec<Released> = (12..27).map(|i| released[i].clone()).collect();
+	assert_eq!(state2.check_release_slots(&chain, &fifteen), Err(AccumulatorError::Places(15)), "the judge refuses 15 slots");
+	let tx = fifteen_tx(&a.net, &r2, &released[12], &s);
+	let r = a.net.rt.client().test_mempool_accept(&[&tx]).unwrap().remove(0);
+	println!("  neg release of 15 slots: the mempool says {:?}", r.reject_reason);
+	let why = r.reject_reason.clone().unwrap_or_default();
+	a.net.refuse("neg release of 15 slots by the program of 14", &tx, &why);
 	let tx2 = r2.tx(&a.net);
 	r2.judge(&a.net, &tx2).unwrap();
 	let id3 = a.net.pass("release 2: 14 slots after the exit, owners of rounds B2 and C", &tx2);
@@ -447,6 +456,40 @@ fn accumulator_release_on_regtest() {
 
 	a.net.print();
 	println!("\n{} confirmed, {} refused in a block", a.net.confirmed, a.net.refused);
+}
+
+/// `r`, a release of 14 slots, with `extra` as a fifteenth place before the
+/// operator's signature: the witness `release_witness` cannot build, the
+/// rest and payout as for 15 slots.
+fn fifteen_tx(net: &Net, r: &RawRelease, extra: &Released, s: &Keypair) -> Transaction {
+	let mut raw = r.clone();
+	let w_extra = extra.exit.record.weight().unwrap();
+	raw.rest = raw.rest.map(|(v, spk)| (v - w_extra, spk));
+	raw.pay += w_extra;
+	let mut tx = raw.tx(net);
+	let w = &tx.input[0].witness.script_witness[0];
+	let bits: Vec<bool> = w.iter().flat_map(|x| (0..8).rev().map(move |i| x >> i & 1 == 1)).collect();
+	// The state, the tag, 14 places; then the operator's signature and padding.
+	let places_end = 192 * 8 + 1 + 14 * (1 + 8 * arca_covenant::accumulator::RELEASED_SLOT_BYTES);
+	let mut place = vec![true];
+	let mut b = extra.exit.slot.to_be_bytes().to_vec();
+	b.extend(extra.exit.record.owner.serialize());
+	b.extend(extra.exit.record.script_hash);
+	b.extend(extra.exit.record.value.to_be_bytes());
+	b.extend(extra.exit.record.reserve.to_be_bytes());
+	for (h, wt) in &extra.exit.path {
+		b.extend(h);
+		b.extend(wt.to_be_bytes());
+	}
+	b.extend(1u32.to_be_bytes());
+	b.extend(extra.signature.as_ref());
+	place.extend(b.iter().flat_map(|x| (0..8).rev().map(move |i| x >> i & 1 == 1)));
+	let op_sig = sig(s, &payout_digest(&net.chain, &r.state, 0, &tx));
+	let mut out: Vec<bool> = bits[..places_end].to_vec();
+	out.extend(place);
+	out.extend(op_sig.as_ref().iter().flat_map(|x| (0..8).rev().map(move |i| x >> i & 1 == 1)));
+	tx.input[0].witness.script_witness[0] = out.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |a, (i, &x)| a | ((x as u8) << (7 - i)))).collect();
+	tx
 }
 
 /// Where a release paid the connector atom of `m` back: the operator reuses it.

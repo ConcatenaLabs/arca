@@ -1284,7 +1284,8 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   a release signed by a stranger, by another slot's owner and by the operator
   for the owner, an owner's release under another batch's root, a release for
   the rolled-back round with its atom and with the replacement's, a slot twice
-  and slots out of order, a slot already released, the rest under another
+  and slots out of order, a slot already released, 15 slots (the program has
+  14 places: `Trailing bytes after final byte of witness`), the rest under another
   root, another operator key or with the slot's bit clear, the operator taking
   one atom more, the operator's signature missing or over another payout, an
   annex, and the removed sweep leaf with a real token at `R` beside it (by its
