@@ -775,6 +775,9 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 		let before = if s.idx == 1 { plan.value } else { plan.steps[s.idx as usize - 2].step.value };
 		let pid = step_participation_id(&id, s.idx);
 		let np = NewParticipation {
+			// The holder's wallet named no format here: it is taken to read
+			// those every wallet reads.
+			record_formats: vec![],
 			id: pid,
 			unlock_hash: s.unlock_hash,
 			preimage: s.preimage,

@@ -143,7 +143,7 @@ pub struct ClaimRequest {
 /// The repayment participation's id for a claim wanting `leaf`.
 pub fn repayment_id(chain: &Chain, operator: &XOnlyPublicKey, leaf: &OutputRequest) -> [u8; 32] {
 	ParticipationRequest { inputs: vec![], outputs: vec![leaf.clone()], key_proofs: vec![], fees: vec![], not_before: None,
-		forfeits_before_broadcast: true }
+		forfeits_before_broadcast: true, record_formats: vec![] }
 		.id(chain, operator)
 }
 
@@ -195,6 +195,9 @@ pub async fn claim(store: &Store, params: &Params, req: &ClaimRequest) -> Result
 	let mut preimage = [0u8; 32];
 	rand::rngs::OsRng.fill_bytes(&mut preimage);
 	let p = NewParticipation {
+		// The holder's wallet named no format here: it is taken to read
+		// those every wallet reads.
+		record_formats: vec![],
 		id,
 		unlock_hash: arca_covenant::script::sha256(&preimage),
 		preimage,

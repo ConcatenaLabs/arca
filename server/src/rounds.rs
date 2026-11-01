@@ -21,7 +21,10 @@
 //! [`RoundConfig::accumulator_exit_rate_ppm`] set, a batch whose expected
 //! exits cost less from one output is built as an accumulator batch instead
 //! ([`BatchKind::choose`]): the same entries under one output, from which each
-//! leaf leaves in one transaction. Each batch has
+//! leaf leaves in one transaction. Only a participation whose wallet reads
+//! that batch's record format gets a slot in it ([`Rounds::reads_accumulator`],
+//! by the formats it names); the others' leaves rest in a tree beside it, in
+//! the same round. Each batch has
 //! a sweep token of its own, issued as one explicit atom with no reissuance
 //! token by one of the operator's coins, and a clock schedule of three steps
 //! (28, 56 and 84 days after the round) with a notice of 36 hours; with
@@ -612,13 +615,17 @@ pub struct Rounds {
 }
 
 /// A batch a round builds: its asset, its leaves (each a participation's
-/// index among the round's and an output's index in it), and whether it is
-/// a holder's own, built as a tree whatever the batch kind rule says.
+/// index among the round's and an output's index in it), whether it is a
+/// holder's own, and whether it is built as a tree whatever the batch kind
+/// rule says: a holder's own batch, and the leaves of participations whose
+/// wallets do not read the record of the accumulator batch the round would
+/// build ([`Rounds::reads_accumulator`]).
 #[derive(Debug, Clone)]
 pub struct BatchPlan {
 	pub asset: AssetId,
 	pub leaves: Vec<(usize, usize)>,
 	pub own: bool,
+	pub tree: bool,
 }
 
 /// The batches of a round, in order: per asset in asset order, a batch of
@@ -653,7 +660,7 @@ pub fn plan_batches(leaves: &[(AssetId, Option<[u8; 32]>, u64, usize, usize)], o
 			}
 		}
 		for h in &seen {
-			out.push(BatchPlan { asset, own: true,
+			out.push(BatchPlan { asset, own: true, tree: true,
 				leaves: of_asset.iter().filter(|l| l.1 == Some(*h)).map(|l| (l.3, l.4)).collect() });
 		}
 		// The rest, a holder's leaves side by side in the order its first
@@ -671,7 +678,7 @@ pub fn plan_batches(leaves: &[(AssetId, Option<[u8; 32]>, u64, usize, usize)], o
 			shared.extend(rest.iter().filter(|l| l.1.or(Some(participation_key(l.3))) == key).map(|l| (l.3, l.4)));
 		}
 		if !shared.is_empty() {
-			out.push(BatchPlan { asset, leaves: shared, own: false });
+			out.push(BatchPlan { asset, leaves: shared, own: false, tree: false });
 		}
 	}
 	out
@@ -873,25 +880,41 @@ impl Rounds {
 			WantedKind::Leaf { claim, .. } => claim.as_ref().and_then(|c| c.vest).map(|v| v.to_consensus_u32()),
 			_ => None,
 		};
+		// A shared batch's leaves wanted by participations whose wallets do
+		// not read the record of an accumulator batch rest in a tree of their
+		// own beside it, in the same round: such a wallet could not check its
+		// slot, and so would never hand over its forfeits, and the round,
+		// held for them, would be lost for everyone in it.
+		let reads = |k: usize| self.reads_accumulator(rows[k]);
 		let mut out = vec![];
 		for b in plan_batches(&leaves, room) {
-			let mut by: BTreeMap<Option<u32>, Vec<(usize, usize)>> = BTreeMap::new();
+			let mut by: BTreeMap<(bool, Option<u32>), Vec<(usize, usize)>> = BTreeMap::new();
 			for l in b.leaves {
-				by.entry(vest_of(l)).or_default().push(l);
+				by.entry((!b.own && !reads(l.0), vest_of(l))).or_default().push(l);
 			}
-			out.extend(by.into_values().map(|leaves| BatchPlan { asset: b.asset, leaves, own: b.own }));
+			out.extend(by.into_iter().map(|((unread, _), leaves)| BatchPlan { asset: b.asset, leaves, own: b.own, tree: b.tree || unread }));
 		}
 		Ok(out)
 	}
 
-	/// A batch's kind: a holder's own batch (`own`) is a tree, so that its
-	/// holder's next refresh takes the whole of it back by one reclaim;
-	/// every other batch is what [`Self::kind_of`] chooses. A batch without a
-	/// sweep may be an accumulator batch (`arca/accumulator-2`): the watcher
-	/// releases each slot its owner released, and collects the rest at the
-	/// service horizon.
-	fn kind_for(&self, own: bool, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
-		if own { BatchKind::Tree } else { self.kind_of(asset, specs) }
+	/// Whether the wallet of `row` reads the record of a leaf of the
+	/// accumulator batches this operator builds: `accumulator-4` without a
+	/// sweep, `accumulator-1` with one, by the formats it named
+	/// ([`arca_covenant::reads_format`]). A participation that named none
+	/// reads `accumulator-1` alone.
+	pub fn reads_accumulator(&self, row: &ParticipationRow) -> bool {
+		arca_covenant::reads_format(&row.record_formats, BatchKind::Accumulator.record_format(self.config.no_sweep))
+	}
+
+	/// A batch's kind: a tree when its plan says so (`tree`): a holder's own
+	/// batch, so that its holder's next refresh takes the whole of it back by
+	/// one reclaim, and the leaves of wallets that do not read an accumulator
+	/// record; every other batch is what [`Self::kind_of`] chooses. A batch
+	/// without a sweep may be an accumulator batch (`arca/accumulator-2`):
+	/// the watcher releases each slot its owner released, and collects the
+	/// rest at the service horizon.
+	fn kind_for(&self, tree: bool, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
+		if tree { BatchKind::Tree } else { self.kind_of(asset, specs) }
 	}
 
 	/// A batch's schedule: [`ClockSchedule::never`] without a sweep, else the
@@ -1800,7 +1823,7 @@ impl Rounds {
 				asset, chain: self.params.chain, schedule, burn: false, delegated_reclaim: self.config.delegated_reclaim, radix: self.config.radix, reserve,
 				min_leaf: Self::tree_min_leaf(&self.params, &asset, &specs),
 			};
-			let kind = self.kind_for(plan.own, &asset, &specs);
+			let kind = self.kind_for(plan.tree, &asset, &specs);
 			let batch = Batch::build(kind, params, &specs)
 				.map_err(|e| RoundError::Internal(format!("the batch of asset {}: {}", asset, e)))?;
 			*pays.entry(asset).or_default() += batch.batch_output().value;
@@ -2157,7 +2180,7 @@ impl Rounds {
 		// accumulator batch.
 		// A holder's own batch is a tree, so that it can be reclaimed.
 		let kinds: Vec<BatchKind> = groups.iter().zip(&plan)
-			.map(|((a, leaves), b)| self.kind_for(b.own, a, &leaves.iter().map(|l| l.spec.clone()).collect::<Vec<_>>()))
+			.map(|((a, leaves), b)| self.kind_for(b.tree, a, &leaves.iter().map(|l| l.spec.clone()).collect::<Vec<_>>()))
 			.collect();
 		// A batch without a sweep issues no token: its output alone, where a
 		// batch with one is followed by its token's atom.
@@ -3573,6 +3596,7 @@ mod tests {
 
 	fn take(n: u8, at: OutPoint, terms: &FillOrder, locked: u64, filled: u64, shared: bool) -> ParticipationRow {
 		ParticipationRow {
+			record_formats: vec![],
 			id: [n; 32], unlock_hash: [0; 32], preimage: [0; 32], attempt: 0, round_id: None, state: ParticipationState::Pending,
 			not_before: None, refund_delay_units: 1, inputs: vec![], outputs: vec![], fees: vec![], waiting: None, void_reason: None,
 			fill: Some(FillRow {

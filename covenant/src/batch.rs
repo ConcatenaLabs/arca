@@ -61,6 +61,39 @@ impl BatchKind {
 		let exits = n as f64 * ppm as f64 / 1_000_000.0;
 		if prefer_accumulator(n, radix, exits, no_sweep) { BatchKind::Accumulator } else { BatchKind::Tree }
 	}
+
+	/// The record format of a leaf of a batch of this kind, with a sweep or
+	/// without one (`no_sweep`), by the names of [`RECORD_FORMATS`].
+	pub fn record_format(self, no_sweep: bool) -> &'static str {
+		match (self, no_sweep) {
+			(BatchKind::Tree, false) => "leaf-2",
+			(BatchKind::Tree, true) => "leaf-3",
+			(BatchKind::Accumulator, false) => "accumulator-1",
+			(BatchKind::Accumulator, true) => "accumulator-4",
+		}
+	}
+}
+
+/// The leaf record formats this library reads, each named by its kind and its
+/// version byte: `leaf-2` and `leaf-3`, a tree's leaf with a sweep and without
+/// ([`crate::record::RECORD_VERSION`], [`crate::record::RECORD_VERSION_NO_SWEEP`]), and
+/// `accumulator-1` and `accumulator-4`, an accumulator batch's
+/// ([`crate::accumulator::ACCUMULATOR_RECORD_VERSION`],
+/// [`crate::accumulator::ACCUMULATOR_RECORD_VERSION_NO_SWEEP`]). A wallet names
+/// them in each participation it submits, so that an operator puts its leaves
+/// only in a batch whose record it reads ([`BatchKind::record_format`]).
+pub const RECORD_FORMATS: &[&str] = &["leaf-2", "leaf-3", "accumulator-1", "accumulator-4"];
+
+/// The leaf record formats an operator takes every participation to read,
+/// named or not: those of every wallet that ever took part in a round, before
+/// wallets named any. Every other format goes only to a participation that
+/// names it.
+pub const FORMATS_EVERY_WALLET_READS: &[&str] = &["leaf-2", "leaf-3", "accumulator-1"];
+
+/// Whether a participation naming `named` reads `format`
+/// ([`FORMATS_EVERY_WALLET_READS`], else one of `named`).
+pub fn reads_format(named: &[String], format: &str) -> bool {
+	FORMATS_EVERY_WALLET_READS.contains(&format) || named.iter().any(|n| n == format)
 }
 
 impl std::fmt::Display for BatchKind {
@@ -148,5 +181,25 @@ mod tests {
 			assert_eq!(BatchKind::parse(k.as_str()), Some(k));
 		}
 		assert_eq!(BatchKind::parse("node"), None);
+	}
+
+	/// Each format's name carries the version byte its record starts with.
+	#[test]
+	fn record_formats_name_their_version_bytes() {
+		use crate::accumulator::{ACCUMULATOR_RECORD_VERSION, ACCUMULATOR_RECORD_VERSION_NO_SWEEP};
+		use crate::record::{RECORD_VERSION, RECORD_VERSION_NO_SWEEP};
+		assert_eq!(BatchKind::Tree.record_format(false), format!("leaf-{}", RECORD_VERSION));
+		assert_eq!(BatchKind::Tree.record_format(true), format!("leaf-{}", RECORD_VERSION_NO_SWEEP));
+		assert_eq!(BatchKind::Accumulator.record_format(false), format!("accumulator-{}", ACCUMULATOR_RECORD_VERSION));
+		assert_eq!(BatchKind::Accumulator.record_format(true), format!("accumulator-{}", ACCUMULATOR_RECORD_VERSION_NO_SWEEP));
+		for k in [BatchKind::Tree, BatchKind::Accumulator] {
+			for s in [false, true] {
+				assert!(RECORD_FORMATS.contains(&k.record_format(s)), "this library reads every format it builds");
+			}
+		}
+		assert!(FORMATS_EVERY_WALLET_READS.iter().all(|f| RECORD_FORMATS.contains(f)));
+		assert!(reads_format(&[], "leaf-3") && reads_format(&[], "accumulator-1"));
+		assert!(!reads_format(&[], "accumulator-4"), "a participation naming nothing never gets a slot without a sweep");
+		assert!(reads_format(&["accumulator-4".into()], "accumulator-4"));
 	}
 }

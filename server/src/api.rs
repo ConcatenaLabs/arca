@@ -405,6 +405,14 @@ pub struct ParticipationsInfo {
 	/// (`batches.no_sweep`).
 	#[serde(default)]
 	pub forfeits_before_broadcast: bool,
+	/// The operator reads `record_formats` on a participation: the leaf
+	/// record formats its wallet reads, of which it puts each leaf only in a
+	/// batch whose record the wallet reads. A participation that names none
+	/// is taken to read those every wallet reads
+	/// (`arca_covenant::FORMATS_EVERY_WALLET_READS`), and so never gets a
+	/// slot of an accumulator batch without a sweep (`accumulator-4`).
+	#[serde(default)]
+	pub record_formats: bool,
 }
 
 /// The dates a board, and every coin resting on it, carries: those of a batch
@@ -1745,6 +1753,14 @@ pub struct SubmitParticipation {
 	/// that round is held until they are in.
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub forfeits_before_broadcast: bool,
+	/// The leaf record formats the wallet reads, by name
+	/// (`arca_covenant::RECORD_FORMATS`), when the operator reads them
+	/// (`info.participations.record_formats`): each leaf it wants goes only
+	/// into a batch whose record it reads. Naming none is reading only those
+	/// every wallet reads (`arca_covenant::FORMATS_EVERY_WALLET_READS`). Not
+	/// part of the participation's id.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub record_formats: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -148,7 +148,7 @@ pub use accumulator::{
 	Accumulator, AccumulatorError, AccumulatorParams, AccumulatorPolicy, AccumulatorRecord, AccumulatorRelease, Bitmap, Exit, ExitAuth,
 	ReleaseSpend, Released, SeenExit, SeenRelease, SeenSpend, Slot, ValidAccumulatorLeaf,
 };
-pub use batch::{Batch, BatchKind};
+pub use batch::{reads_format, Batch, BatchKind, FORMATS_EVERY_WALLET_READS, RECORD_FORMATS};
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signed};
 pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelSpend, ChannelTerms, State};
