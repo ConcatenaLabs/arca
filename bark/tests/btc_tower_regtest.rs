@@ -6,9 +6,11 @@
 //!
 //! The node runs with `-par=1`, so a block refused for a script names the
 //! script failure, and `-blockmintxfee` at 5 sat/vB, so a child paying less
-//! waits in the mempool as it would in a fee spike.
+//! waits in the mempool as it would in a fee spike. The towers log in as a
+//! user of their own limited to [TOWER_RPCS] (`-rpcwhitelist`), so every
+//! call a tower makes is shown to need nothing more.
 //!
-//!     ARCA_TEST_BITCOIND=/path/to/bitcoind (version 31 or later) \
+//!     ARCA_TEST_BITCOIND=/path/to/bitcoind (version 29 or later) \
 //!     cargo test -p arca-wallet --features onchain-bdk --test btc_tower_regtest -- --nocapture
 //!
 //! Without `ARCA_TEST_BITCOIND` the test says so and passes. It needs the
@@ -48,6 +50,25 @@ use bark::persist::sqlite::SqliteClient;
 const EXIT_DELTA: u16 = 12;
 const RATE: u64 = 10; // sat/vB the towers and payers use (the node's fallback)
 
+/// The RPCs a tower's login needs, and no more: the node refuses any other
+/// call by the towers' user.
+pub const TOWER_RPCS: &str = "getblockchaininfo,getnetworkinfo,getindexinfo,getblockcount,getbestblockhash,getblockhash,\
+getblockheader,getblock,getrawtransaction,gettxout,getrawmempool,getmempoolentry,estimatesmartfee,\
+sendrawtransaction,submitpackage";
+const TOWER_USER: &str = "tower";
+const TOWER_PASSWORD: &str = "tower-regtest-login";
+
+/// An `-rpcauth` line for `user` and `password`, as Bitcoin Core's rpcauth.py
+/// makes it.
+fn rpcauth(user: &str, password: &str) -> String {
+	use bitcoin::hashes::{hmac, HashEngine};
+	let salt = "0123456789abcdef0123456789abcdef";
+	let mut e = hmac::HmacEngine::<sha256::Hash>::new(salt.as_bytes());
+	e.input(password.as_bytes());
+	let h = hmac::Hmac::<sha256::Hash>::from_engine(e);
+	format!("{}:{}${}", user, salt, h)
+}
+
 struct Node {
 	child: Child,
 	rpc: Client,
@@ -79,6 +100,10 @@ impl Node {
 			&format!("-port={}", port + 1), "-listen=0", "-txindex=1", "-par=1", "-server=1",
 			"-fallbackfee=0.0001", "-blockmintxfee=0.00005", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1",
 			"-printtoconsole=0", "-dnsseed=0",
+			&format!("-rpcauth={}", rpcauth(TOWER_USER, TOWER_PASSWORD)),
+			&format!("-rpcwhitelist={}:{}", TOWER_USER, TOWER_RPCS),
+			// the cookie's user (the test, the holders) keeps every call
+			"-rpcwhitelistdefault=0",
 		]).spawn().expect("bitcoind");
 		let cookie = dir.join("regtest/.cookie");
 		let url = format!("http://127.0.0.1:{}", port);
@@ -139,6 +164,11 @@ impl Node {
 
 	fn spec(&self) -> ChainSourceSpec {
 		ChainSourceSpec::Bitcoind { url: self.url.clone(), auth: Auth::CookieFile(self.cookie.clone()), zmq: None }
+	}
+
+	/// The towers' own login, limited to [TOWER_RPCS].
+	fn tower_spec(&self) -> ChainSourceSpec {
+		ChainSourceSpec::Bitcoind { url: self.url.clone(), auth: Auth::UserPass(TOWER_USER.into(), TOWER_PASSWORD.into()), zmq: None }
 	}
 }
 
@@ -257,23 +287,33 @@ fn pay_out_of_round(from: &Vtxo<Full>, from_key: &Keypair, server: &Keypair, to:
 }
 
 async fn open_tower(node: &Node, dir: &Path, arks: Vec<PublicKey>) -> Tower {
+	open_tower_with(node, dir, arks, 5, btc_tower::RESCUE_MARGIN).await
+}
+
+async fn open_tower_with(node: &Node, dir: &Path, arks: Vec<PublicKey>, min_rate: u64, margin: u32) -> Tower {
 	Tower::open(dir, TowerConfig {
 		network: Network::Regtest,
-		chain: node.spec(),
-		min_rate: FeeRate::from_sat_per_vb(5).unwrap(),
+		chain: node.tower_spec(),
+		min_rate: FeeRate::from_sat_per_vb(min_rate).unwrap(),
 		fallback_rate: Some(FeeRate::from_sat_per_vb(RATE).unwrap()),
 		arks,
-		margin: btc_tower::RESCUE_MARGIN,
+		margin,
 	}).await.unwrap()
 }
 
 /// Funds a tower's own coins with `n` coins of 0.01 BTC.
 async fn fund_tower(node: &Node, t: &mut Tower, n: usize) {
+	fund_tower_with(node, t, n, Amount::from_sat(1_000_000)).await
+}
+
+/// Funds a tower's own coins with `n` coins of `each`, and lets it see them.
+async fn fund_tower_with(node: &Node, t: &mut Tower, n: usize, each: Amount) {
 	for _ in 0..n {
 		let a = t.funding_address().await.unwrap();
-		node.rpc.call::<Value>("sendtoaddress", &[json!(a.to_string()), json!(0.01)]).unwrap();
+		node.rpc.call::<Value>("sendtoaddress", &[json!(a.to_string()), json!(each.to_btc())]).unwrap();
 	}
 	node.mine(1);
+	t.pass().await.unwrap();
 }
 
 /// Mines one block at a time, running the towers' passes after each, until
@@ -371,7 +411,7 @@ async fn bitcoin_ark_towers() {
 	let r = tower_b.deposit(&bad).await;
 	println!("  NEG a claim with an amount moved: {}", r.as_ref().unwrap_err());
 	assert!(r.unwrap_err().to_string().contains("signature"));
-	let cheap = btc_tower::TowerTerms { min_rate: FeeRate::from_sat_per_vb(1).unwrap(), ..terms_b.clone() };
+	let cheap = btc_tower::TowerTerms { min_rate: FeeRate::from_sat_per_vb(1).unwrap(), rate: FeeRate::from_sat_per_vb(1).unwrap(), ..terms_b.clone() };
 	let (lowfee, _) = btc_tower::make_deposit(&c1, &h1, &h1_addr, &cheap, FeeRate::from_sat_per_vb(1).unwrap()).unwrap();
 	let r = tower_b.deposit(&lowfee).await;
 	println!("  NEG a rescue fee below the tower's rate: {}", r.as_ref().unwrap_err());
@@ -630,6 +670,21 @@ async fn a_wallet_plans_its_deposits() {
 	let server = key("server-w");
 	let mut tower = open_tower(&node, &base.join("tower"), vec![server.public_key()]).await;
 	let terms = TowerTerms::from_info(&tower.info().await).unwrap();
+	let plan0 = {
+		// unfunded, it can pay for nothing: the plan sends it nothing
+		let (wallet, _) = open_wallet(&node, &base.join("bark0"), "bark-wallet-0").await;
+		let k = futures_keys(&wallet).await;
+		let r = make_round(&node, &server, &[(&k[0], Amount::from_sat(1_000_000)), (&k[1], Amount::from_sat(30_000))], node.tip() + 250, "round-w0");
+		wallet.import_vtxos(&r.vtxos, bark::ImportVtxoArgs { skip_status_check: true, ..Default::default() }).await.unwrap();
+		let holder = Payer::new(&node, &base.join("holder0"), &phrase("bark-wallet-0")).await.first_address().await;
+		wallet.btc_tower_plan(&holder, &[("http://tower.example/btc-tower".to_string(), terms.clone())], &[],
+			FeeRate::from_sat_per_vb(RATE).unwrap()).await.unwrap()
+	};
+	println!("  an unfunded tower (capacity {}): deposit {}, uncovered {}", terms.capacity, plan0["deposit"], plan0["uncovered"]);
+	assert!(plan0["deposit"].as_array().unwrap().is_empty());
+	assert!(plan0["uncovered"][0]["reason"].as_str().unwrap().contains("can pay for"), "{}", plan0);
+	fund_tower(&node, &mut tower, 4).await;
+	let terms = TowerTerms::from_info(&tower.info().await).unwrap();
 
 	// A Bark wallet whose ark is unreachable: it holds the coins below.
 	let m = phrase("bark-wallet");
@@ -673,14 +728,15 @@ async fn a_wallet_plans_its_deposits() {
 	assert!(again["deposit"].as_array().unwrap().is_empty() && again["withdraw"].as_array().unwrap().is_empty(), "{}", again);
 	println!("  planned again: nothing to send");
 
-	// The wallet starts to exit the first coin: it no longer holds it in the ark.
+	// The wallet starts to exit the first coin: its deposit stays until the exit is claimed.
 	let first = wallet.get_vtxo_by_id(held[0].vtxo.parse().unwrap()).await.unwrap().vtxo;
 	wallet.exit_mgr().start_exit_for_vtxos(&[first]).await.unwrap();
 	let after = wallet.btc_tower_plan(&holder, &towers, &held, fast).await.unwrap();
-	let w = &after["withdraw"].as_array().unwrap()[0];
-	assert_eq!(w["vtxo"], json!(held[0].vtxo));
-	println!("  the exiting coin's deposit is withdrawn: {}", tower.withdraw(&w["body"]).unwrap());
-	assert_eq!(tower.deposits().as_array().unwrap().len(), 1);
+	assert!(after["withdraw"].as_array().unwrap().is_empty(), "{}", after);
+	let c = after["covered"].as_array().unwrap().iter().find(|c| c["vtxo"] == json!(held[0].vtxo)).unwrap();
+	assert_eq!(c["exiting"], json!(true));
+	println!("  the exiting coin keeps its deposit: {}", c);
+	assert_eq!(tower.deposits().as_array().unwrap().len(), 2);
 	println!("DONE");
 }
 
@@ -688,4 +744,365 @@ async fn futures_keys(w: &bark::Wallet) -> Vec<Keypair> {
 	let mut v = vec![];
 	for _ in 0..3 { v.push(w.derive_store_next_keypair().await.unwrap().0); }
 	v
+}
+
+/// A Bark wallet of phrase `tag` whose ark is unreachable, reading the chain
+/// from the node.
+async fn open_wallet(node: &Node, dir: &Path, tag: &str) -> (bark::Wallet, bip39::Mnemonic) {
+	let m = phrase(tag);
+	let seed = bark::WalletSeed::new_from_mnemonic(Network::Regtest, &m);
+	let mut cfg = bark::Config::network_default(Network::Regtest);
+	cfg.server_address = "http://127.0.0.1:9".into();
+	cfg.bitcoind_address = Some(node.url.clone());
+	cfg.bitcoind_cookiefile = Some(node.cookie.clone());
+	cfg.fallback_fee_rate = Some(FeeRate::from_sat_per_vb(RATE).unwrap());
+	let mut open = bark::OpenWalletArgs::default();
+	open.run_daemon = false;
+	open.datadir = Some(dir.to_path_buf());
+	open.create_without_server = true;
+	(bark::Wallet::open(Network::Regtest, seed, cfg, open).await.unwrap(), m)
+}
+
+fn start_node(tag: &str, offset: u16) -> Option<(Node, PathBuf)> {
+	let Ok(bin) = std::env::var("ARCA_TEST_BITCOIND") else {
+		println!("ARCA_TEST_BITCOIND is not set: the regtest proof did not run");
+		return None;
+	};
+	let base = PathBuf::from(std::env::var("ARCA_TEST_DIR").unwrap_or_else(|_| std::env::temp_dir().join("btc-tower-regtest").display().to_string())).join(tag);
+	let _ = std::fs::remove_dir_all(&base);
+	let port: u16 = std::env::var("ARCA_TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(28710) + offset;
+	let node = Node::start(&bin, &base.join("btc"), port);
+	Some((node, base))
+}
+
+fn held_of(plan: &Value, url: &str, tower_took: impl Fn(&Value) -> bool) -> Vec<btc_tower::Deposited> {
+	plan["deposit"].as_array().unwrap().iter().filter(|d| tower_took(&d["body"])).map(|d| btc_tower::Deposited {
+		tower: url.to_string(), vtxo: d["vtxo"].as_str().unwrap().into(), claim_txid: d["claim_txid"].as_str().unwrap().into(),
+	}).collect()
+}
+
+/// #562: a wallet starts a coin's own exit (as `exit_auto` does when the ark
+/// stops) and closes before the exit is done. Its deposit stays, the tower
+/// finishes the exit, and the operator's sweep at expiry finds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exit_the_wallet_started_stays_covered() {
+	let Some((node, base)) = start_node("own-exit", 40) else { return };
+	let server = key("ox-server");
+	let mut tower = open_tower(&node, &base.join("tower"), vec![]).await;
+	fund_tower(&node, &mut tower, 6).await;
+	let terms = TowerTerms::from_info(&tower.info().await).unwrap();
+	let (wallet, m) = open_wallet(&node, &base.join("bark"), "ox-wallet").await;
+	let k = futures_keys(&wallet).await;
+	let expiry = node.tip() + 200;
+	// each coin on its own round, so the sweep of one root is that coin alone
+	let ra = make_round(&node, &server, &[(&k[0], Amount::from_sat(1_000_000)), (&key("ox-f1"), Amount::from_sat(100_000))], expiry, "ox-a");
+	let rb = make_round(&node, &server, &[(&k[1], Amount::from_sat(1_000_000)), (&key("ox-f2"), Amount::from_sat(100_000))], expiry, "ox-b");
+	// CONTROL: a round of the same ark whose holder deposited nowhere
+	let rc = make_round(&node, &server, &[(&key("ox-c"), Amount::from_sat(1_000_000)), (&key("ox-f3"), Amount::from_sat(100_000))], expiry, "ox-c");
+	wallet.import_vtxos(&[ra.vtxos[0].clone(), rb.vtxos[0].clone()], bark::ImportVtxoArgs { skip_status_check: true, ..Default::default() }).await.unwrap();
+	let holder = Payer::new(&node, &base.join("holder"), &m).await.first_address().await;
+	let url = "http://tower.example/btc-tower".to_string();
+	let towers = vec![(url.clone(), terms.clone())];
+	let fast = FeeRate::from_sat_per_vb(RATE).unwrap();
+	let plan = wallet.btc_tower_plan(&holder, &towers, &[], fast).await.unwrap();
+	for d in plan["deposit"].as_array().unwrap() { tower.deposit(&d["body"]).await.unwrap(); }
+	let held = held_of(&plan, &url, |_| true);
+	assert_eq!(held.len(), 2);
+	// the wallet starts to exit coin A, plans, and closes
+	let first = wallet.get_vtxo_by_id(ra.vtxos[0].id()).await.unwrap().vtxo;
+	wallet.exit_mgr().start_exit_for_vtxos(&[first]).await.unwrap();
+	let after = wallet.btc_tower_plan(&holder, &towers, &held, fast).await.unwrap();
+	println!("  after the wallet starts coin A's exit: withdraw {}, covered {}", after["withdraw"], after["covered"]);
+	assert!(after["withdraw"].as_array().unwrap().is_empty(), "the plan withdrew a deposit: {}", after);
+	assert!(after["covered"].as_array().unwrap().iter().any(|c| c["vtxo"] == json!(ra.vtxos[0].id().to_string()) && c["exiting"] == json!(true)));
+	drop(wallet);
+	println!("  the wallet is closed with coin A's exit started and nothing broadcast");
+	run(&node, &mut [&mut tower], 220, |n| n.tip() + 1 >= expiry).await;
+	let (pa, pb) = (ra.vtxos[0].point(), rb.vtxos[0].point());
+	println!("  at tip {} (expiry {}): coin A's output on chain: {}; coin B's: {}", node.tip(), expiry, node.confirmed(&pa.txid), node.confirmed(&pb.txid));
+	assert!(node.confirmed(&pa.txid) && node.confirmed(&pb.txid));
+	node.mine(1);
+	let op = Address::from_str(&node.rpc.call::<String>("getnewaddress", &[]).unwrap()).unwrap().assume_checked();
+	expect_err(node.force(&[&sweep(&ra, &server, &op)]), "bad-txns-inputs-missingorspent", "the sweep of coin A's round (its exit started by the wallet)");
+	expect_err(node.force(&[&sweep(&rb, &server, &op)]), "bad-txns-inputs-missingorspent", "the sweep of coin B's round");
+	node.force(&[&sweep(&rc, &server, &op)]).expect("CONTROL: the sweep of a round nobody deposited");
+	println!("  CONTROL the sweep of round C (no deposit) was mined");
+	println!("DONE");
+}
+
+/// #563: worth and fee at one rate. A 40,000-sat coin at a tower charging
+/// testnet4's 30 sat/vB floor is not worth rescuing; the wallet plans no
+/// deposit even when its own fast rate is 1, and the tower refuses one made
+/// by hand at either rate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_coin_is_judged_at_the_rate_it_pays() {
+	let Some((node, base)) = start_node("worth", 50) else { return };
+	let server = key("w-server");
+	let mut tower = open_tower_with(&node, &base.join("tower"), vec![], 30, btc_tower::RESCUE_MARGIN).await;
+	fund_tower(&node, &mut tower, 4).await;
+	let info = tower.info().await;
+	let terms = TowerTerms::from_info(&info).unwrap();
+	println!("  the tower charges {} sat/vB (least {})", info["rate_sat_vb"], info["min_rate_sat_vb"]);
+	let (wallet, m) = open_wallet(&node, &base.join("bark"), "w-wallet").await;
+	let k = futures_keys(&wallet).await;
+	let r = make_round(&node, &server, &[(&k[0], Amount::from_sat(40_000)), (&k[1], Amount::from_sat(1_000_000)),
+		(&key("w-f1"), Amount::from_sat(100_000)), (&key("w-f2"), Amount::from_sat(100_000))], node.tip() + 400, "w-round");
+	let small = r.vtxos[0].clone();
+	wallet.import_vtxos(&r.vtxos[..2], bark::ImportVtxoArgs { skip_status_check: true, ..Default::default() }).await.unwrap();
+	let holder = Payer::new(&node, &base.join("holder"), &m).await.first_address().await;
+	let one = FeeRate::from_sat_per_vb(1).unwrap();
+	let vb = btc_tower::rescue_vbytes(&small).unwrap();
+	println!("  the 40,000-sat coin's rescue: {} vB; at 1 sat/vB {} sat (worth: {}), at 30 sat/vB {} sat ({}% of the coin)",
+		vb, vb, btc_tower::worth_rescuing(&small, one), vb * 30, vb * 30 * 100 / 40_000);
+	let plan = wallet.btc_tower_plan(&holder, &[("t".to_string(), terms.clone())], &[], one).await.unwrap();
+	println!("  plan at the wallet's 1 sat/vB: deposit {} coin(s); not worth {}", plan["deposit"].as_array().unwrap().len(), plan["not_worth"]);
+	assert_eq!(plan["not_worth"][0]["vtxo"], json!(small.id().to_string()));
+	assert_eq!(plan["not_worth"][0]["rate_sat_vb"], json!(30));
+	assert_eq!(plan["deposit"].as_array().unwrap().len(), 1, "the 1,000,000-sat coin is deposited");
+	assert_eq!(plan["deposit"][0]["rate_sat_vb"], json!(30));
+	let r1 = btc_tower::make_deposit(&small, &k[0], &holder, &terms, one);
+	println!("  NEG make_deposit for the small coin: {}", r1.as_ref().unwrap_err());
+	assert!(r1.unwrap_err().to_string().contains("not worth"));
+	// by hand: the claim paying the tower the rescue at 30 sat/vB, and at 1 sat/vB
+	for rate in [30u64, 1] {
+		let fee = Amount::from_sat(vb * rate);
+		let mut tx = btc_tower::claim_template(&small, &holder, &terms.payout, fee).unwrap();
+		btc_tower::sign_claim(&small, &mut tx, &k[0]).unwrap();
+		let e = tower.deposit(&btc_tower::deposit_body(&small, &tx)).await.unwrap_err().to_string();
+		println!("  NEG the small coin's deposit with a fee at {} sat/vB ({}): {}", rate, fee, e);
+		assert!(e.contains(if rate == 30 { "not worth" } else { "costs" }), "{}", e);
+	}
+	// the large coin is taken, at the plan's fee
+	println!("  the 1,000,000-sat coin: {}", tower.deposit(&plan["deposit"][0]["body"]).await.unwrap());
+	println!("DONE");
+}
+
+/// #564: a tower takes only what its own coins can pay for, and the wallet
+/// shows a coin covered only once a tower that can pay has taken it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tower_at_the_edge_of_its_coins() {
+	let Some((node, base)) = start_node("edge", 60) else { return };
+	let server = key("e-server");
+	let mut tower = open_tower(&node, &base.join("tower"), vec![]).await;
+	let (wallet, m) = open_wallet(&node, &base.join("bark"), "e-wallet").await;
+	let keys: Vec<Keypair> = { let mut v = vec![]; for _ in 0..4 { v.push(wallet.derive_store_next_keypair().await.unwrap().0); } v };
+	let users: Vec<(&Keypair, Amount)> = keys.iter().map(|k| (k, Amount::from_sat(1_000_000))).collect();
+	let r = make_round(&node, &server, &users, node.tip() + 400, "e-round");
+	wallet.import_vtxos(&r.vtxos, bark::ImportVtxoArgs { skip_status_check: true, ..Default::default() }).await.unwrap();
+	let holder = Payer::new(&node, &base.join("holder"), &m).await.first_address().await;
+	let fast = FeeRate::from_sat_per_vb(RATE).unwrap();
+	let fee = btc_tower::rescue_cost(&r.vtxos[0], fast).unwrap();
+	// coins for two and a half rescues
+	fund_tower_with(&node, &mut tower, 1, fee * 5 / 2).await;
+	let info = tower.info().await;
+	println!("  each rescue costs {}; the tower holds {} sat in {} coin(s), capacity {}", fee, info["float_sat"], info["float_coins"], info["capacity_sat"]);
+	let url = "http://tower.example/btc-tower".to_string();
+	let terms = TowerTerms::from_info(&info).unwrap();
+	let plan = wallet.btc_tower_plan(&holder, &[(url.clone(), terms)], &[], fast).await.unwrap();
+	println!("  plan: deposit {} coin(s); uncovered {}", plan["deposit"].as_array().unwrap().len(), plan["uncovered"]);
+	assert_eq!(plan["deposit"].as_array().unwrap().len(), 2, "two deposits fit the tower's coins");
+	assert!(plan["covered"].as_array().unwrap().is_empty(), "nothing is covered before the tower takes it");
+	let waiting: Vec<_> = plan["uncovered"].as_array().unwrap().iter().filter(|u| u["reason"] == json!("deposits sent, not yet accepted")).collect();
+	let unpaid: Vec<_> = plan["uncovered"].as_array().unwrap().iter().filter(|u| u["reason"].as_str().unwrap().contains("can pay for")).collect();
+	assert_eq!((waiting.len(), unpaid.len()), (2, 2));
+	for d in plan["deposit"].as_array().unwrap() { println!("  the tower takes {}: {}", d["vtxo"], tower.deposit(&d["body"]).await.unwrap()); }
+	// the next deposit, made by hand, is refused
+	let left: Vec<String> = unpaid.iter().map(|u| u["vtxo"].as_str().unwrap().to_string()).collect();
+	let i = r.vtxos.iter().position(|v| v.id().to_string() == left[0]).unwrap();
+	let (third, _) = btc_tower::make_deposit(&r.vtxos[i], &keys[i], &holder, &TowerTerms::from_info(&tower.info().await).unwrap(), fast).unwrap();
+	let e = tower.deposit(&third).await.unwrap_err().to_string();
+	println!("  NEG a third deposit: {}", e);
+	assert!(e.contains("can pay for"));
+	let info = tower.info().await;
+	println!("  tower info now: capacity {} committed {} short {}", info["capacity_sat"], info["committed_sat"], info["short_sat"]);
+	let held = held_of(&plan, &url, |_| true);
+	let again = wallet.btc_tower_plan(&holder, &[(url.clone(), TowerTerms::from_info(&info).unwrap())], &held, fast).await.unwrap();
+	println!("  plan again: covered {}, uncovered {}", again["covered"].as_array().unwrap().len(), again["uncovered"]);
+	assert_eq!(again["covered"].as_array().unwrap().len(), 2);
+	assert!(again["deposit"].as_array().unwrap().is_empty());
+	let third_id = r.vtxos[i].id().to_string();
+	assert!(again["uncovered"].as_array().unwrap().iter().any(|u| u["vtxo"] == json!(third_id) && u["reason"].as_str().unwrap().contains("can pay for")),
+		"the third coin is shown uncovered: {}", again);
+	assert_eq!(again["no_refresh"].as_array().unwrap().len(), 2, "only the covered coins skip their refresh");
+	// a tower short of coins for what it holds covers nothing
+	let mut short = info.clone();
+	short["short_sat"] = json!(1);
+	let s = wallet.btc_tower_plan(&holder, &[(url.clone(), TowerTerms::from_info(&short).unwrap())], &held, fast).await.unwrap();
+	assert!(s["covered"].as_array().unwrap().is_empty() && s["skipped"][0]["reason"].as_str().unwrap().contains("short"), "{}", s);
+	println!("  a tower reporting itself short: covered {}, skipped {}", s["covered"], s["skipped"]);
+
+	// throughput: a tower of one coin and a margin of 20 blocks brings about 10 exit transactions on chain in it
+	let mut slow = open_tower_with(&node, &base.join("slow"), vec![], 5, 20).await;
+	fund_tower_with(&node, &mut slow, 1, Amount::from_sat(5_000_000)).await;
+	let si = slow.info().await;
+	println!("  a tower of {} coin(s), margin 20: {} exit transactions per margin", si["float_coins"], si["exits_per_margin"]);
+	let st = TowerTerms::from_info(&si).unwrap();
+	let many: Vec<Keypair> = (0..16).map(|i| key(&format!("e-many-{}", i))).collect();
+	let users: Vec<(&Keypair, Amount)> = many.iter().map(|k| (k, Amount::from_sat(1_000_000))).collect();
+	let r16 = make_round(&node, &server, &users, node.tip() + 400, "e-round-16");
+	let mut took = 0;
+	let mut refused = None;
+	for (v, k) in r16.vtxos.iter().zip(&many) {
+		let (b, _) = btc_tower::make_deposit(v, k, &holder, &st, fast).unwrap();
+		match slow.deposit(&b).await { Ok(_) => took += 1, Err(e) => { refused = Some(e.to_string()); break; } }
+	}
+	let e = refused.expect("the slow tower took every coin");
+	println!("  it took {} of the round's coins; NEG the next: {}", took, e);
+	assert!(e.contains("exit transactions come due"));
+	println!("DONE");
+}
+
+/// #565: a coin gets a tower or a delegated refresh, never both. A coin with
+/// a refresh scheduled with the ark gets no deposit and its deposits are
+/// withdrawn; a covered coin is left out of the refreshes to schedule.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_gets_a_tower_or_a_refresh_never_both() {
+	let Some((node, base)) = start_node("tower-or-refresh", 70) else { return };
+	let server = key("tr-server");
+	let mut tower = open_tower(&node, &base.join("tower"), vec![]).await;
+	fund_tower(&node, &mut tower, 4).await;
+	let terms = TowerTerms::from_info(&tower.info().await).unwrap();
+	let (wallet, m) = open_wallet(&node, &base.join("bark"), "tr-wallet").await;
+	let k = futures_keys(&wallet).await;
+	let r = make_round(&node, &server, &[(&k[0], Amount::from_sat(1_000_000)), (&k[1], Amount::from_sat(1_200_000)), (&k[2], Amount::from_sat(1_300_000))],
+		node.tip() + 600, "tr-round");
+	wallet.import_vtxos(&r.vtxos, bark::ImportVtxoArgs { skip_status_check: true, ..Default::default() }).await.unwrap();
+	let [a, b, c] = [r.vtxos[0].id(), r.vtxos[1].id(), r.vtxos[2].id()];
+	let holder = Payer::new(&node, &base.join("holder"), &m).await.first_address().await;
+	let url = "http://tower.example/btc-tower".to_string();
+	let towers = vec![(url.clone(), terms)];
+	let fast = FeeRate::from_sat_per_vb(RATE).unwrap();
+	let none = std::collections::HashSet::new();
+	let before = wallet.refreshes_to_schedule(&none).await.unwrap();
+	let n: usize = before.iter().map(|(_, v)| v.len()).sum();
+	println!("  with no tower the wallet would schedule the refresh of {} coins", n);
+	assert_eq!(n, 3);
+	// coin A's refresh is scheduled with the ark (as a wallet that called schedule_refreshes has)
+	let scheduled: std::collections::HashSet<_> = [a].into_iter().collect();
+	let plan = wallet.btc_tower_plan_with(&holder, &towers, &[], fast, &scheduled).await.unwrap();
+	let dep: Vec<&str> = plan["deposit"].as_array().unwrap().iter().map(|d| d["vtxo"].as_str().unwrap()).collect();
+	println!("  plan with coin A's refresh scheduled: deposits for {:?}; uncovered {}", dep, plan["uncovered"]);
+	assert!(!dep.contains(&a.to_string().as_str()) && dep.len() == 2);
+	assert!(plan["uncovered"].as_array().unwrap().iter().any(|u| u["vtxo"] == json!(a.to_string()) && u["reason"].as_str().unwrap().contains("scheduled")));
+	for d in plan["deposit"].as_array().unwrap() { tower.deposit(&d["body"]).await.unwrap(); }
+	let held = held_of(&plan, &url, |_| true);
+	let again = wallet.btc_tower_plan_with(&holder, &towers, &held, fast, &scheduled).await.unwrap();
+	let except: std::collections::HashSet<ark::VtxoId> = again["no_refresh"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().parse().unwrap()).collect();
+	println!("  no_refresh {:?}", except);
+	assert_eq!(except, [b, c].into_iter().collect());
+	let after = wallet.refreshes_to_schedule(&except).await.unwrap();
+	let ids: Vec<ark::VtxoId> = after.iter().flat_map(|(_, v)| v.iter().map(|w| w.id())).collect();
+	println!("  the refreshes the wallet would schedule now: {:?}", ids);
+	assert_eq!(ids, vec![a], "only the coin no tower covers gets a refresh");
+	// coin B's refresh gets scheduled after all (a program that skipped `except`): its deposit is withdrawn
+	let both: std::collections::HashSet<_> = [a, b].into_iter().collect();
+	let w = wallet.btc_tower_plan_with(&holder, &towers, &held, fast, &both).await.unwrap();
+	println!("  with coin B's refresh scheduled too: withdraw {:?}", w["withdraw"].as_array().unwrap().iter().map(|x| x["vtxo"].clone()).collect::<Vec<_>>());
+	assert_eq!(w["withdraw"].as_array().unwrap().len(), 1);
+	assert_eq!(w["withdraw"][0]["vtxo"], json!(b.to_string()));
+	println!("  the tower: {}", tower.withdraw(&w["withdraw"][0]["body"]).unwrap());
+	assert!(w["covered"].as_array().unwrap().iter().all(|x| x["vtxo"] != json!(b.to_string())));
+	println!("DONE");
+}
+
+/// #561: a tower refuses a coin whose way out conflicts with a coin it holds,
+/// or is already spent on chain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tower_refuses_conflicting_and_spent_coins() {
+	let Some((node, base)) = start_node("conflicts", 80) else { return };
+	let server = key("cf-server");
+	let a = key("cf-a");
+	let mut tower = open_tower(&node, &base.join("tower"), vec![]).await;
+	fund_tower(&node, &mut tower, 4).await;
+	let terms = TowerTerms::from_info(&tower.info().await).unwrap();
+	let holder = Address::from_str(&node.rpc.call::<String>("getnewaddress", &[]).unwrap()).unwrap().assume_checked();
+	let expiry = node.tip() + 300;
+	let r = make_round(&node, &server, &[(&a, Amount::from_sat(1_000_000)), (&key("cf-o"), Amount::from_sat(1_000_000))], expiry, "cf-round");
+	let c = r.vtxos[0].clone();
+	// two out-of-round payments of one coin: two valid coins, only one can ever reach the chain
+	let (r1, r2) = (key("cf-r1"), key("cf-r2"));
+	let (p1, _) = pay_out_of_round(&c, &a, &server, &r1.public_key(), Amount::from_sat(700_000));
+	let (p2, _) = pay_out_of_round(&c, &a, &server, &r2.public_key(), Amount::from_sat(700_000));
+	println!("  the first: {}", tower.deposit(&deposit_for(&terms, &p1, &r1, &holder).0).await.unwrap());
+	let e = tower.deposit(&deposit_for(&terms, &p2, &r2, &holder).0).await.unwrap_err().to_string();
+	println!("  NEG a second payment of the same coin: {}", e);
+	assert!(e.contains("spends") && e.contains("differently"));
+	// a coin whose own output is spent on chain: its holder exits and claims it, then deposits it
+	let o = key("cf-o");
+	let oc = r.vtxos[1].clone();
+	let mut ow = Payer::new(&node, &base.join("o"), &phrase("cf-o")).await;
+	let oa = ow.first_address().await;
+	node.rpc.call::<Value>("sendtoaddress", &[json!(oa.to_string()), json!(0.02)]).unwrap();
+	node.rpc.call::<Value>("sendtoaddress", &[json!(oa.to_string()), json!(0.02)]).unwrap();
+	node.mine(1);
+	for t in oc.transactions().map(|i| i.tx) {
+		if !node.confirmed(&t.compute_txid()) { ow.push(&t, RATE).await; node.mine(1); }
+	}
+	node.mine(EXIT_DELTA as u64);
+	let mut own = btc_tower::claim_template(&oc, &oa, &oa, Amount::from_sat(1_000)).unwrap();
+	btc_tower::sign_claim(&oc, &mut own, &o).unwrap();
+	ow.push(&own, RATE).await;
+	node.mine(1);
+	assert!(node.confirmed(&own.compute_txid()));
+	let e = tower.deposit(&deposit_for(&terms, &oc, &o, &holder).0).await.unwrap_err().to_string();
+	println!("  NEG a coin already claimed on chain: {}", e);
+	assert!(e.contains("spent on chain"));
+	println!("DONE");
+}
+
+/// #566: a rescue a reorg undid, its transactions then dropped from the
+/// mempool, is broadcast again: the tower reads each deposit's state from
+/// the chain at every pass until its claim is buried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rescue_undone_by_a_reorg_is_broadcast_again() {
+	let Some((node, base)) = start_node("reorg", 90) else { return };
+	let server = key("rg-server");
+	let h = key("rg-h");
+	let mut tower = open_tower(&node, &base.join("tower"), vec![]).await;
+	fund_tower(&node, &mut tower, 6).await;
+	let terms = TowerTerms::from_info(&tower.info().await).unwrap();
+	let holder = Payer::new(&node, &base.join("h"), &phrase("rg-h")).await.first_address().await;
+	let expiry = node.tip() + 170;
+	let r = make_round(&node, &server, &[(&h, Amount::from_sat(1_000_000)), (&key("rg-o"), Amount::from_sat(1_000_000))], expiry, "rg-round");
+	let c = r.vtxos[0].clone();
+	let (d, ctxid) = deposit_for(&terms, &c, &h, &holder);
+	tower.deposit(&d).await.unwrap();
+	let mut worst_short = 0;
+	for _ in 0..80 {
+		let v = tower.pass().await.unwrap();
+		if v["acted"].as_array().is_some_and(|a| !a.is_empty()) { println!("  tower @{}: {}", v["tip"], v["acted"]); }
+		let i = tower.info().await;
+		worst_short = worst_short.max(i["short_sat"].as_u64().unwrap());
+		if node.confirmed(&ctxid) { break; }
+		node.mine(1);
+	}
+	assert!(node.confirmed(&ctxid));
+	tower.pass().await.unwrap();
+	println!("  during the rescue the tower never reported itself short (most: {} sat); committed now {}", worst_short, tower.info().await["committed_sat"]);
+	assert_eq!(worst_short, 0);
+	let state = |t: &Tower| t.deposits()[0]["state"].as_str().unwrap().to_string();
+	println!("  the claim {} confirmed at tip {}: deposit {}", ctxid, node.tip(), state(&tower));
+	assert_eq!(state(&tower), "claimed");
+	// a reorg from the block holding the coin's output, then the mempool drops what it took back
+	let leaf = c.point().txid;
+	let bh = node.rpc.call::<Value>("getrawtransaction", &[json!(leaf.to_string()), json!(true)]).unwrap()["blockhash"].as_str().unwrap().to_string();
+	node.rpc.call::<Value>("invalidateblock", &[json!(bh)]).unwrap();
+	let now = node.rpc.call::<Value>("getblockheader", &[json!(node.rpc.call::<String>("getbestblockhash", &[]).unwrap())]).unwrap()["time"].as_u64().unwrap();
+	node.rpc.call::<Value>("setmocktime", &[json!(now + 15 * 24 * 3600)]).unwrap();
+	node.rpc.call::<Value>("sendtoaddress", &[json!(node.miner.to_string()), json!(0.001)]).unwrap(); // a new entry expires the old
+	let in_pool = |t: &Txid| node.rpc.call::<Value>("getmempoolentry", &[json!(t.to_string())]).is_ok();
+	println!("  after the reorg and the mempool's expiry: the coin's output in a block {}, in the mempool {}; the claim in the mempool {}",
+		node.confirmed(&leaf), in_pool(&leaf), in_pool(&ctxid));
+	assert!(!node.confirmed(&leaf) && !in_pool(&leaf) && !in_pool(&ctxid));
+	run(&node, &mut [&mut tower], 40, |n| n.confirmed(&ctxid)).await;
+	println!("  the tower broadcast them again: the claim confirmed at tip {}; deposit {}", node.tip(), state(&tower));
+	while node.tip() + 1 < expiry { node.mine((expiry - 1 - node.tip()) as u64); }
+	node.mine(1);
+	let op = Address::from_str(&node.rpc.call::<String>("getnewaddress", &[]).unwrap()).unwrap().assume_checked();
+	expect_err(node.force(&[&sweep(&r, &server, &op)]), "bad-txns-inputs-missingorspent", "the sweep at expiry after the reorg");
+	// buried: the tower stops watching it
+	node.mine(btc_tower::tower::CLAIM_DEPTH as u64);
+	tower.pass().await.unwrap();
+	println!("  claimed and buried: {}", tower.deposits()[0]["note"]);
+	println!("DONE");
 }

@@ -366,7 +366,12 @@ pub trait BitcoinRpcExt: RpcApi {
 					if block.confirmations > 0 {
 						Ok(TxStatus::Confirmed(BlockRef { height: block.height as BlockHeight, hash: block.hash }))
 					} else {
-						Ok(TxStatus::Mempool)
+						// its block was reorged out: in the mempool only if the mempool took it back
+						match self.call::<serde_json::Value>("getmempoolentry", &[serde_json::to_value(txid).expect("serializable")]) {
+							Ok(_) => Ok(TxStatus::Mempool),
+							Err(e) if e.is_not_found() => Ok(TxStatus::NotFound),
+							Err(e) => Err(e),
+						}
 					}
 				},
 				None => Ok(TxStatus::Mempool),

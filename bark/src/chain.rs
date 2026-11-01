@@ -858,12 +858,20 @@ async fn bitcoind_tx_status(
 		&[serde_json::to_value(hash).expect("serializable"), true.into()],
 	).await?;
 	if header.confirmations > 0 {
-		Ok(TxStatus::Confirmed(BlockRef {
+		return Ok(TxStatus::Confirmed(BlockRef {
 			height: header.height as BlockHeight,
 			hash: header.hash,
-		}))
-	} else {
-		Ok(TxStatus::Mempool)
+		}));
+	}
+	// Its block was reorged out: the transaction index still finds it there,
+	// but it waits in the mempool only if the mempool took it back.
+	let entry: Result<serde_json::Value, _> = rpc.call_raw(
+		"getmempoolentry", &[serde_json::to_value(txid).expect("serializable")],
+	).await;
+	match entry {
+		Ok(_) => Ok(TxStatus::Mempool),
+		Err(e) if is_not_found(&e) => Ok(TxStatus::NotFound),
+		Err(e) => Err(e),
 	}
 }
 

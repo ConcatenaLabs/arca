@@ -43,6 +43,14 @@
 //! the tower its children's fees: the operator answers the old coin with the
 //! forfeit or checkpoint its holder signed, and the claim then has nothing to
 //! spend. The holder loses nothing.
+//!
+//! A tower takes only what its own coins can pay for, and states in its
+//! `info` what they can still pay for; a wallet counts a coin covered only by
+//! a tower that took it and is not short ([tower] has the rules). A coin
+//! gets a tower or a delegated refresh, never both
+//! ([Wallet::btc_tower_plan_with]).
+//!
+//! [Wallet::btc_tower_plan_with]: crate::Wallet::btc_tower_plan_with
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "onchain-bdk", feature = "sqlite"))]
 pub mod tower;
@@ -68,7 +76,8 @@ use bitcoin_ext::fee::P2A_SCRIPT;
 pub const RESCUE_MARGIN: u32 = 144;
 
 /// A coin is deposited when it is worth at least this many times its rescue
-/// cost at the day's fast fee rate.
+/// cost at the rate its claim's fee is priced at ([TowerTerms::deposit_rate]);
+/// a tower refuses a claim whose fee is more than this share of the coin.
 pub const WORTH_FACTOR: u64 = 20;
 
 /// The virtual size a child spending a P2A anchor and one coin of the payer's
@@ -83,19 +92,31 @@ pub const WITHDRAW_TAG: &[u8] = b"Arca/btc-tower-withdraw";
 pub const KIND: &str = "bitcoin-ark-watchtower";
 
 /// What a tower states in its `info`: the network it watches, where its
-/// rescue fee goes, the least rate a deposit's fee must cover, and the arks
-/// (their server keys) whose coins it takes; empty, any ark's.
+/// rescue fee goes, the least rate a deposit's fee must cover and the rate it
+/// charges today, the arks (their server keys) whose coins it takes (empty,
+/// any ark's), and what its own coins can still pay for.
 #[derive(Debug, Clone)]
 pub struct TowerTerms {
 	pub network: Network,
 	pub payout: Address,
 	pub min_rate: FeeRate,
+	/// The rate the tower prices a rescue at today: the higher of its least
+	/// rate and its chain's fast rate.
+	pub rate: FeeRate,
 	pub margin: u32,
 	pub arks: Vec<bitcoin::secp256k1::PublicKey>,
+	/// What the tower's own coins can still pay for: its coins less the
+	/// rescue fees of every deposit it holds.
+	pub capacity: Amount,
+	/// How far the rescue fees of the deposits it holds exceed its coins;
+	/// zero while it can pay for every one.
+	pub short: Amount,
 }
 
 impl TowerTerms {
-	/// The terms in a tower's `info` answer.
+	/// The terms in a tower's `info` answer. A tower that does not state what
+	/// its coins can pay for is refused: a wallet cannot tell whether it can
+	/// rescue anything.
 	pub fn from_info(info: &Value) -> anyhow::Result<TowerTerms> {
 		if info["kind"].as_str() != Some(KIND) {
 			bail!("it is not a Bitcoin ark watchtower");
@@ -106,15 +127,27 @@ impl TowerTerms {
 			.context("payout")?.require_network(network).context("payout is for another network")?;
 		let min_rate = FeeRate::from_sat_per_vb(info["min_rate_sat_vb"].as_u64().context("no min_rate_sat_vb")?)
 			.context("min_rate_sat_vb")?;
+		let rate = info["rate_sat_vb"].as_u64().and_then(FeeRate::from_sat_per_vb).unwrap_or(min_rate).max(min_rate);
 		let margin = info["margin"].as_u64().unwrap_or(RESCUE_MARGIN as u64) as u32;
 		let arks = info["arks"].as_array().map(|a| a.iter().filter_map(|k| k.as_str())
 			.filter_map(|k| bitcoin::secp256k1::PublicKey::from_str(k).ok()).collect()).unwrap_or_default();
-		Ok(TowerTerms { network, payout, min_rate, margin, arks })
+		let capacity = Amount::from_sat(info["capacity_sat"].as_u64()
+			.context("it does not state what its coins can pay for (no capacity_sat)")?);
+		let short = Amount::from_sat(info["short_sat"].as_u64().unwrap_or(0));
+		Ok(TowerTerms { network, payout, min_rate, rate, margin, arks, capacity, short })
 	}
 
 	/// Whether the tower takes coins of the ark whose server key is `server`.
 	pub fn watches(&self, server: &bitcoin::secp256k1::PublicKey) -> bool {
 		self.arks.is_empty() || self.arks.contains(server)
+	}
+
+	/// The one rate a deposit with this tower is judged and priced at: the
+	/// highest of the wallet's fast rate, the tower's least rate and the rate
+	/// it charges today. Whether a coin is worth rescuing ([worth_rescuing])
+	/// and the fee its claim pays ([rescue_fee]) both use it.
+	pub fn deposit_rate(&self, fast: FeeRate) -> FeeRate {
+		fast.max(self.min_rate).max(self.rate)
 	}
 }
 
@@ -151,19 +184,26 @@ pub fn rescue_cost(vtxo: &Vtxo<Full>, rate: FeeRate) -> anyhow::Result<Amount> {
 	Ok(Amount::from_sat(rescue_vbytes(vtxo)?.saturating_mul(rate.to_sat_per_vb_ceil())))
 }
 
-/// Whether a coin is worth a deposit: at least [WORTH_FACTOR] times its rescue
-/// cost at `fast`, the day's fast rate.
-pub fn worth_rescuing(vtxo: &Vtxo<Full>, fast: FeeRate) -> bool {
-	match rescue_cost(vtxo, fast) {
-		Ok(c) => vtxo.amount().to_sat() >= c.to_sat().saturating_mul(WORTH_FACTOR),
+/// Whether a rescue fee of `fee` is worth paying for a coin of `amount`: the
+/// coin is at least [WORTH_FACTOR] times the fee.
+pub fn fee_is_worth(amount: Amount, fee: Amount) -> bool {
+	amount.to_sat() >= fee.to_sat().saturating_mul(WORTH_FACTOR)
+}
+
+/// Whether a coin is worth a deposit at `rate`: at least [WORTH_FACTOR] times
+/// its rescue cost at that rate. For a deposit with a tower, `rate` is
+/// [TowerTerms::deposit_rate], the rate its claim's fee is priced at.
+pub fn worth_rescuing(vtxo: &Vtxo<Full>, rate: FeeRate) -> bool {
+	match rescue_cost(vtxo, rate) {
+		Ok(c) => fee_is_worth(vtxo.amount(), c),
 		Err(_) => false,
 	}
 }
 
-/// The rescue fee a deposit with `terms` carries: the rescue's cost at the
-/// higher of `fast` and the tower's least rate.
+/// The rescue fee a deposit with `terms` carries: the rescue's cost at
+/// [TowerTerms::deposit_rate].
 pub fn rescue_fee(vtxo: &Vtxo<Full>, terms: &TowerTerms, fast: FeeRate) -> anyhow::Result<Amount> {
-	rescue_cost(vtxo, fast.max(terms.min_rate))
+	rescue_cost(vtxo, terms.deposit_rate(fast))
 }
 
 fn template(vtxo: &Vtxo<Full>, holder: &ScriptBuf, payout: &ScriptBuf, fee: Amount) -> anyhow::Result<Transaction> {
@@ -312,6 +352,10 @@ pub fn make_deposit(
 		bail!("the tower does not watch this coin's ark");
 	}
 	let fee = rescue_fee(vtxo, terms, fast)?;
+	if !fee_is_worth(vtxo.amount(), fee) {
+		bail!("the coin ({}) is not worth rescuing at {} sat/vB: its rescue fee {} is more than 1/{} of it",
+			vtxo.amount(), terms.deposit_rate(fast).to_sat_per_vb_ceil(), fee, WORTH_FACTOR);
+	}
 	let mut tx = claim_template(vtxo, holder, &terms.payout, fee)?;
 	sign_claim(vtxo, &mut tx, key)?;
 	let txid = tx.compute_txid();
@@ -325,6 +369,7 @@ pub fn coin_point(vtxo: &Vtxo<Full>) -> OutPoint {
 
 /// A deposit a tower holds for this wallet, as the program running the
 /// wallet keeps it: the tower's URL, the coin's id and the claim's txid.
+/// The program lists a deposit here once the tower has accepted it.
 #[derive(Debug, Clone)]
 pub struct Deposited {
 	pub tower: String,
@@ -334,12 +379,11 @@ pub struct Deposited {
 
 impl crate::Wallet {
 	/// What to send the towers named in `towers` (each with its terms from its
-	/// `info`): a deposit for each coin worth rescuing at `fast` that a tower
-	/// watching its ark does not hold yet, its claim paying `holder`; a
-	/// withdrawal for each of `deposited` whose coin the wallet no longer
-	/// holds in the ark; which coins are covered and by whom, which are too
-	/// small to rescue, and which are within `2 × M` of expiry and so due for
-	/// a refresh while the wallet is open.
+	/// `info`), and which coins are covered. See [Wallet::btc_tower_plan_with];
+	/// this reads the coins whose refresh is scheduled with the ark from the
+	/// wallet.
+	///
+	/// [Wallet::btc_tower_plan_with]: crate::Wallet::btc_tower_plan_with
 	pub async fn btc_tower_plan(
 		&self,
 		holder: &Address,
@@ -347,63 +391,173 @@ impl crate::Wallet {
 		deposited: &[Deposited],
 		fast: FeeRate,
 	) -> anyhow::Result<Value> {
-		use std::collections::HashSet;
+		let scheduled = self.scheduled_refresh_heights().await?.into_keys().collect();
+		self.btc_tower_plan_with(holder, towers, deposited, fast, &scheduled).await
+	}
+
+	/// What to send the towers named in `towers`, given the coins whose
+	/// delegated refresh is scheduled with the ark (`scheduled`).
+	///
+	/// A coin the wallet holds counts while it is in the ark and also while
+	/// its own exit is under way, until that exit is claimed: a wallet that
+	/// starts an exit and closes leaves the rest of it to its towers, which
+	/// pay the same holder.
+	///
+	/// - `deposit`: for each coin and each tower watching its ark that does
+	///   not hold it yet, a deposit, when the coin is worth rescuing at that
+	///   tower's [TowerTerms::deposit_rate] (the rate its claim's fee is
+	///   priced at too) and the tower's capacity, less the deposits planned
+	///   before it, pays for its rescue;
+	/// - `withdraw`: each of `deposited` whose coin the wallet holds no
+	///   longer (spent in the ark, or its exit claimed), or whose refresh is
+	///   scheduled with the ark;
+	/// - `covered`: the coins a tower that is not short of coins holds a
+	///   deposit for, with those towers; `uncovered`: the coins worth
+	///   rescuing that no such tower holds, each with why; `not_worth`: the
+	///   coins too small to rescue at any tower's rate, with that rate;
+	/// - `refresh_due`: the coins within `2 × M` of expiry that the wallet
+	///   refreshes while it is open, those covered only until `expiry − M`;
+	///   `rescuing`: the covered coins past `expiry − M`, which the wallet
+	///   leaves to its towers rather than refresh;
+	/// - `no_refresh`: the coins covered or planned for a deposit, for which
+	///   the wallet schedules no refresh ([Wallet::schedule_refreshes_except]).
+	///
+	/// A coin gets either a tower or a delegated refresh, never both: a
+	/// scheduled refresh cannot be cancelled with the ark, so a coin that has
+	/// one is left to it (no deposit, and its deposits withdrawn), and a coin
+	/// a tower covers gets no refresh scheduled. The tower cannot tell a
+	/// refreshed coin from an abandoned one, so it would rescue the old coin
+	/// anyway, at the holder's cost, while the new one waits in the ark.
+	///
+	/// [Wallet::schedule_refreshes_except]: crate::Wallet::schedule_refreshes_except
+	pub async fn btc_tower_plan_with(
+		&self,
+		holder: &Address,
+		towers: &[(String, TowerTerms)],
+		deposited: &[Deposited],
+		fast: FeeRate,
+		scheduled: &std::collections::HashSet<ark::VtxoId>,
+	) -> anyhow::Result<Value> {
+		use std::collections::{HashMap, HashSet};
+		use crate::exit::ExitStateKind;
 		use crate::vtxo::VtxoStateKind;
 
 		let net = self.network().await?;
 		let tip = self.chain().tip().await?;
 		let mut skipped = vec![];
+		let mut capacity: HashMap<&str, Amount> = HashMap::new();
 		let towers: Vec<&(String, TowerTerms)> = towers.iter().filter(|(url, t)| {
 			if t.network != net {
 				skipped.push(json!({"tower": url, "reason": format!("it watches {}", t.network)}));
 				false
-			} else { true }
+			} else if t.short > Amount::ZERO {
+				skipped.push(json!({"tower": url, "reason": format!(
+					"its coins no longer pay for every deposit it holds ({} short)", t.short)}));
+				false
+			} else {
+				capacity.insert(url.as_str(), t.capacity);
+				true
+			}
 		}).collect();
 		let held: HashSet<(&str, &str)> = deposited.iter().map(|d| (d.tower.as_str(), d.vtxo.as_str())).collect();
-		let exiting = self.exit_mgr().get_exit_vtxo_ids().await;
-		let live: Vec<_> = self.vtxos().await?.into_iter()
-			.filter(|v| VtxoStateKind::UNSPENT_STATES.contains(&v.state.kind()))
-			.filter(|v| !exiting.contains(&v.vtxo.id()))
-			.collect();
-		let live_ids: HashSet<String> = live.iter().map(|v| v.vtxo.id().to_string()).collect();
 
-		let (mut deposit, mut covered, mut not_worth, mut refresh_due) = (vec![], vec![], vec![], vec![]);
-		for v in &live {
-			let full = self.get_full_vtxo(v.vtxo.id()).await?;
+		// the coins the wallet holds: in the ark, or on their own way out
+		let exiting: HashSet<ark::VtxoId> = self.exit_mgr().get_exit_vtxos().await.into_iter()
+			.filter(|e| ExitStateKind::LIVE_STATES.contains(&e.state().kind()))
+			.map(|e| e.id()).collect();
+		let mut coins: Vec<ark::VtxoId> = self.vtxos().await?.into_iter()
+			.filter(|v| VtxoStateKind::UNSPENT_STATES.contains(&v.state.kind()))
+			.map(|v| v.vtxo.id()).filter(|id| !exiting.contains(id)).collect();
+		coins.extend(exiting.iter().copied());
+		let kept: HashSet<String> = coins.iter().filter(|id| !scheduled.contains(id)).map(|id| id.to_string()).collect();
+
+		let (mut deposit, mut covered, mut uncovered, mut not_worth) = (vec![], vec![], vec![], vec![]);
+		let (mut refresh_due, mut rescuing, mut no_refresh) = (vec![], vec![], vec![]);
+		for cid in &coins {
+			let full = self.get_full_vtxo(*cid).await?;
 			let id = full.id().to_string();
-			if full.expiry_height().saturating_sub(tip) <= 2 * RESCUE_MARGIN {
-				refresh_due.push(json!(id));
-			}
+			let expiry = full.expiry_height();
+			let left = expiry.saturating_sub(tip);
+			let is_exiting = exiting.contains(cid);
 			if exit_clause(&full).is_err() {
+				if !is_exiting && left <= 2 * RESCUE_MARGIN { refresh_due.push(json!(id)); }
 				continue;
 			}
-			if !worth_rescuing(&full, fast) {
-				not_worth.push(json!({"vtxo": id, "amount": full.amount().to_sat(),
-					"rescue_cost": rescue_cost(&full, fast).map(|c| c.to_sat()).ok()}));
+			if scheduled.contains(cid) {
+				uncovered.push(json!({"vtxo": id, "amount": full.amount().to_sat(),
+					"reason": "its refresh is scheduled with the ark, which renews it"}));
+				if !is_exiting && left <= 2 * RESCUE_MARGIN { refresh_due.push(json!(id)); }
 				continue;
 			}
-			let key = self.get_vtxo_key(&full).await?;
-			let mut by = vec![];
+			let (mut by, mut sent, mut why) = (vec![], vec![], vec![]);
+			let mut margin = 0u32;
+			let mut cheapest: Option<(FeeRate, Amount)> = None;
 			for (url, terms) in &towers {
 				if !terms.watches(&full.server_pubkey()) {
 					continue;
 				}
-				by.push(json!(url));
 				if held.contains(&(url.as_str(), id.as_str())) {
+					by.push(json!(url));
+					margin = margin.max(terms.margin);
 					continue;
 				}
+				let rate = terms.deposit_rate(fast);
+				let fee = match rescue_cost(&full, rate) {
+					Ok(f) => f,
+					Err(e) => { why.push(format!("{}: {}", url, e)); continue; },
+				};
+				if cheapest.map_or(true, |(_, c)| fee < c) { cheapest = Some((rate, fee)); }
+				if !fee_is_worth(full.amount(), fee) {
+					continue;
+				}
+				let cap = capacity.get(url.as_str()).copied().unwrap_or(Amount::ZERO);
+				if fee > cap {
+					why.push(format!("{}: its coins can pay for {} more, this rescue costs {}", url, cap, fee));
+					continue;
+				}
+				let key = self.get_vtxo_key(&full).await?;
 				match make_deposit(&full, &key, holder, terms, fast) {
-					Ok((body, txid)) => deposit.push(json!({"tower": url, "vtxo": id, "claim_txid": txid.to_string(), "body": body})),
-					Err(e) => skipped.push(json!({"tower": url, "vtxo": id, "reason": e.to_string()})),
+					Ok((body, txid)) => {
+						capacity.insert(url.as_str(), cap - fee);
+						sent.push(json!(url));
+						deposit.push(json!({"tower": url, "vtxo": id, "claim_txid": txid.to_string(),
+							"rate_sat_vb": rate.to_sat_per_vb_ceil(), "rescue_fee": fee.to_sat(), "body": body}));
+					},
+					Err(e) => why.push(format!("{}: {}", url, e)),
 				}
 			}
-			covered.push(json!({"vtxo": id, "amount": full.amount().to_sat(), "expiry_height": full.expiry_height(),
-				"rescued_from": full.expiry_height().saturating_sub(RESCUE_MARGIN), "towers": by}));
+
+			if !by.is_empty() {
+				let from = expiry.saturating_sub(margin);
+				covered.push(json!({"vtxo": id, "amount": full.amount().to_sat(), "expiry_height": expiry,
+					"rescued_from": from, "towers": by, "exiting": is_exiting}));
+				no_refresh.push(json!(id));
+				if !is_exiting {
+					if tip >= from { rescuing.push(json!(id)); }
+					else if left <= 2 * RESCUE_MARGIN { refresh_due.push(json!(id)); }
+				}
+				continue;
+			}
+			if !is_exiting && left <= 2 * RESCUE_MARGIN { refresh_due.push(json!(id)); }
+			if !sent.is_empty() {
+				no_refresh.push(json!(id));
+				uncovered.push(json!({"vtxo": id, "amount": full.amount().to_sat(),
+					"reason": "deposits sent, not yet accepted", "towers": sent}));
+			} else if why.is_empty() && cheapest.is_some() {
+				let (rate, fee) = cheapest.unwrap();
+				not_worth.push(json!({"vtxo": id, "amount": full.amount().to_sat(),
+					"rate_sat_vb": rate.to_sat_per_vb_ceil(), "rescue_cost": fee.to_sat()}));
+			} else if why.is_empty() {
+				uncovered.push(json!({"vtxo": id, "amount": full.amount().to_sat(),
+					"reason": "no tower named watches its ark"}));
+			} else {
+				uncovered.push(json!({"vtxo": id, "amount": full.amount().to_sat(), "reason": why.join("; ")}));
+			}
 		}
 
 		let mut withdraw = vec![];
 		for d in deposited {
-			if live_ids.contains(&d.vtxo) {
+			if kept.contains(&d.vtxo) {
 				continue;
 			}
 			let r: anyhow::Result<Value> = async {
@@ -420,8 +574,9 @@ impl crate::Wallet {
 		}
 		Ok(json!({
 			"tip": tip, "fast_rate": fast.to_sat_per_vb_ceil(), "holder_address": holder.to_string(),
-			"deposit": deposit, "withdraw": withdraw, "covered": covered, "not_worth": not_worth,
-			"refresh_due": refresh_due, "skipped": skipped,
+			"deposit": deposit, "withdraw": withdraw, "covered": covered, "uncovered": uncovered,
+			"not_worth": not_worth, "refresh_due": refresh_due, "rescuing": rescuing, "no_refresh": no_refresh,
+			"skipped": skipped,
 		}))
 	}
 }
@@ -442,8 +597,11 @@ mod tests {
 			network: Network::Regtest,
 			payout: addr(7),
 			min_rate: FeeRate::from_sat_per_vb(1).unwrap(),
+			rate: FeeRate::from_sat_per_vb(1).unwrap(),
 			margin: RESCUE_MARGIN,
 			arks: vec![],
+			capacity: Amount::from_sat(1_000_000),
+			short: Amount::ZERO,
 		}
 	}
 
@@ -482,6 +640,22 @@ mod tests {
 		check_withdrawal(Network::Regtest, &pk, &tx.compute_txid(), w["sig"].as_str().unwrap()).unwrap();
 		assert!(check_withdrawal(Network::Regtest, &pk, &a.compute_txid(), w["sig"].as_str().unwrap()).is_err());
 		assert!(check_withdrawal(Network::Testnet4, &pk, &tx.compute_txid(), w["sig"].as_str().unwrap()).is_err());
+	}
+
+	#[test]
+	fn one_rate_for_worth_and_fee() {
+		let v = &VTXO_VECTORS.round1_vtxo;
+		let r = |n| FeeRate::from_sat_per_vb(n).unwrap();
+		let t = TowerTerms { min_rate: r(5), rate: r(30), ..terms() };
+		assert_eq!(t.deposit_rate(r(1)), r(30));
+		assert_eq!(t.deposit_rate(r(40)), r(40));
+		assert_eq!(rescue_fee(v, &t, r(1)).unwrap(), rescue_cost(v, r(30)).unwrap());
+		// a tower that does not state what its coins pay for is not used
+		let mut info = json!({"kind": KIND, "network": "regtest", "payout": addr(7).to_string(), "min_rate_sat_vb": 5});
+		assert!(TowerTerms::from_info(&info).unwrap_err().to_string().contains("capacity_sat"));
+		info["capacity_sat"] = json!(1000);
+		let t = TowerTerms::from_info(&info).unwrap();
+		assert_eq!((t.rate, t.capacity, t.short), (r(5), Amount::from_sat(1000), Amount::ZERO));
 	}
 
 	#[test]

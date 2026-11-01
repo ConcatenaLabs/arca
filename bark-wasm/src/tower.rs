@@ -5,17 +5,23 @@
 //! `fetch`, a native program with its own client) and keeps which deposits
 //! each tower holds:
 //!
-//! - `deposit`: one body per coin worth rescuing ([bark::btc_tower::worth_rescuing]
-//!   at the day's fast rate) and per tower that watches its ark and does not
-//!   hold it yet, its claim paying the phrase's first BIP84 address (the
-//!   address the dual-chain wallet shows for BTC);
-//! - `withdraw`: one body per deposit the program lists that names a coin the
-//!   wallet no longer holds in the ark;
-//! - `covered` and `not_worth`: which coins are watched, by which towers, and
-//!   which are too small to rescue, for developer mode;
+//! - `deposit`: one body per coin worth rescuing and per tower that watches
+//!   its ark, does not hold it yet and can still pay for its rescue, priced
+//!   and judged at one rate ([bark::btc_tower::TowerTerms::deposit_rate]),
+//!   its claim paying the phrase's first BIP84 address (the address the
+//!   dual-chain wallet shows for BTC);
+//! - `withdraw`: one body per deposit the program lists whose coin the wallet
+//!   no longer holds (spent in the ark, or its own exit claimed), or whose
+//!   refresh is scheduled with the ark;
+//! - `covered`, `uncovered` and `not_worth`: which coins are watched, by which
+//!   towers, which are not and why, and which are too small to rescue, for
+//!   developer mode;
 //! - `refresh_due`: the coins within `2 × M` blocks of expiry, which the wallet
 //!   refreshes while it is open, so a holder who opened it recently is never
-//!   rescued.
+//!   rescued; `rescuing`: the covered coins a tower may be bringing on chain;
+//! - `no_refresh`: the coins `schedule_refreshes` must leave out (`except`).
+//!
+//! See [bark::Wallet::btc_tower_plan_with].
 //!
 //! Arguments: `{"towers": [{"url", "info"}], "deposited": [{"tower",
 //! "vtxo", "claim_txid"}], "fast_rate"?}` (`info` is the tower's `GET
