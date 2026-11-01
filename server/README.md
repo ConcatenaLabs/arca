@@ -1536,14 +1536,27 @@ too):
 - After a drop, the participations that handed their forfeits over run
   again at once, alone: while any of them can run, the next round of the
   asset takes them and no newcomer. An answering participation so goes out
-  at most one window late for each participant that drops out beside it,
-  whoever joins meanwhile.
-- Each coin a voided participation gave up, and each batch leaf or board it
-  rests on (so a coin paid on from it out of round too), is struck. A
-  participation giving one up waits (`This waits until median time …`), the
-  window at first and doubling with each strike up to a day, and then runs
-  only in a round of its own, where it holds back nobody. A round that goes
-  out with it clears the strike. Its void reason says so.
+  at most one window late for each participation that drops out beside it,
+  whoever joins meanwhile. The bound is per participation, not per holder:
+  the server cannot tell holders apart. A wallet draws a fresh key for every
+  coin; anyone can bind its own leaves to another wallet's mailbox key,
+  since only the leaf's key signs that binding; and the payer and the payee
+  of a payment out of round rest on the same board or batch leaf. So one
+  holder that brings several coins, each in a participation of its own, and
+  lets one drop in each round, holds the others back one window per coin.
+  Each such coin costs it a board, and the operator a spend that kills the
+  dropped round.
+- Each coin a voided participation gave up is struck, and with it every
+  coin paid on from it out of round, by its holder or by whoever it paid:
+  the server follows each reassignment and fill output back to the coins
+  its transaction spent. A coin beside a struck one, paid from the same
+  parent (a payer's change, a maker's coins beside a taker's fill), is not
+  struck. A participation giving up a struck coin waits (`This waits until
+  median time …`), the window at first and doubling with each strike on it
+  or on the coins it was paid on from, up to a day, and then runs only in a
+  round of its own, where it holds back nobody. A round that goes out with
+  it clears the strike, on it and on the coins it was paid on from. Its void
+  reason says so.
 - A wallet that hands over its forfeits before broadcast says so on the
   participation (`forfeits_before_broadcast`, which
   `info.participations.forfeits_before_broadcast` says the operator reads).
@@ -3376,7 +3389,11 @@ participants that drop out of held rounds: a hostile one rejoining with the
 same coin every cycle never shares a round again and every honest refresh
 goes out; the answering participations rebuilt alone first; a struck coin,
 and one paid on from it out of round, waiting and then running alone, its
-strike cleared once it answers; and a wallet that hands over its forfeits
+strike cleared once it answers; a payee that drops out leaving its payer's
+change unstruck, in the next shared round, while the payee's coin and the
+coins it pays on from it wait and run alone; one holder with three coins
+holding an honest refresh back one window per coin, the bound; and a wallet
+that hands over its forfeits
 only after broadcast refused in words, its coin untouched, while an operator
 with a sweep takes it. The collection of the coins whose own paths finish
 them runs in the suites of those paths: an `htlc-1` receive never claimed,

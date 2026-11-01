@@ -548,40 +548,64 @@ impl Store {
 		Ok(r.get(0))
 	}
 
-	/// Strikes each coin of `ids` ([`Rounds`]' held-round back-off): its
-	/// count goes up by one and it waits until `now` plus `base` doubled for
-	/// each strike before this one, at most `cap`. Returns the latest wait.
-	pub async fn strike_coins(&self, ids: &[[u8; 32]], now: u32, base: u32, cap: u32) -> Result<u32, StoreError> {
+	/// The coins of `ids` and every coin each was paid on from out of round,
+	/// back to the batch leaf or board it rests on: a reassignment's or a
+	/// fill's output names the coins its transaction spends (the inputs, and
+	/// a fill's order coin), and so on up. A coin beside one of them, paid
+	/// from the same parent (a payer's change), is not among them.
+	pub async fn coin_lineage(&self, ids: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;
+		lineage_in(&*conn, ids).await
+	}
+
+	/// Strikes each coin of `ids` ([`Rounds`]' held-round back-off): each
+	/// comes to one strike more than the most on any coin of their lineage
+	/// ([`Self::coin_lineage`]), so a coin paid on from a struck coin that
+	/// drops out too counts on from it, and waits until `now` plus `base`
+	/// doubled for each strike before this one, at most `cap`. Only the coins
+	/// of `ids` are written. Returns the latest wait.
+	pub async fn strike_coins(&self, ids: &[[u8; 32]], now: u32, base: u32, cap: u32) -> Result<u32, StoreError> {
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		let lineage = lineage_in(&t, ids).await?;
+		let all: Vec<&[u8]> = lineage.iter().map(|i| &i[..]).collect();
+		let r = t.query_one("SELECT COALESCE(MAX(strikes), 0) FROM held_strike WHERE leaf_id = ANY($1)", &[&all]).await?;
+		let before: i32 = r.get(0);
+		let strikes = before.max(0).saturating_add(1);
 		let mut latest = 0u32;
 		for id in ids {
-			let r = conn.query_one(
-				"INSERT INTO held_strike (leaf_id, strikes, until_mtp) VALUES ($1, 1, $2::BIGINT + LEAST($3::BIGINT, $4::BIGINT))
-				 ON CONFLICT (leaf_id) DO UPDATE SET strikes = held_strike.strikes + 1,
-				   until_mtp = $2::BIGINT + LEAST($3::BIGINT * POWER(2, LEAST(held_strike.strikes, 30))::BIGINT, $4::BIGINT)
+			let r = t.query_one(
+				"INSERT INTO held_strike (leaf_id, strikes, until_mtp)
+				 VALUES ($1, $2, $3::BIGINT + LEAST($4::BIGINT * POWER(2, LEAST($2 - 1, 30))::BIGINT, $5::BIGINT))
+				 ON CONFLICT (leaf_id) DO UPDATE SET strikes = EXCLUDED.strikes, until_mtp = EXCLUDED.until_mtp
 				 RETURNING until_mtp",
-				&[&&id[..], &(now as i64), &(base as i64), &(cap as i64)]).await?;
+				&[&&id[..], &strikes, &(now as i64), &(base as i64), &(cap as i64)]).await?;
 			let until: i64 = r.get(0);
 			latest = latest.max(u32::try_from(until).unwrap_or(u32::MAX));
 		}
+		t.commit().await?;
 		Ok(latest)
 	}
 
-	/// The strike on any coin of `ids`: the most strikes, and the latest
-	/// median time they wait until. `None` when none is struck.
+	/// The strike on any coin of `ids` or of their lineage
+	/// ([`Self::coin_lineage`]): the most strikes, and the latest median time
+	/// they wait until. `None` when none is struck.
 	pub async fn strike_of(&self, ids: &[[u8; 32]]) -> Result<Option<(u32, u32)>, StoreError> {
 		let conn = self.conn().await?;
-		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let lineage = lineage_in(&*conn, ids).await?;
+		let ids: Vec<&[u8]> = lineage.iter().map(|i| &i[..]).collect();
 		let r = conn.query_one("SELECT MAX(strikes), MAX(until_mtp) FROM held_strike WHERE leaf_id = ANY($1)", &[&ids]).await?;
 		let n: Option<i32> = r.get(0);
 		let until: Option<i64> = r.get(1);
 		Ok(n.zip(until).map(|(n, u)| (n.max(0) as u32, u32::try_from(u).unwrap_or(u32::MAX))))
 	}
 
-	/// Clears the strikes on `ids`: a round with them went out.
+	/// Clears the strikes on `ids` and their lineage ([`Self::coin_lineage`]):
+	/// a round with them went out.
 	pub async fn clear_strikes(&self, ids: &[[u8; 32]]) -> Result<u64, StoreError> {
 		let conn = self.conn().await?;
-		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let lineage = lineage_in(&*conn, ids).await?;
+		let ids: Vec<&[u8]> = lineage.iter().map(|i| &i[..]).collect();
 		Ok(conn.execute("DELETE FROM held_strike WHERE leaf_id = ANY($1)", &[&ids]).await?)
 	}
 
@@ -810,4 +834,25 @@ impl Store {
 			value: r.get::<_, i64>(5) as u64,
 		})).collect()
 	}
+}
+
+/// [`Store::coin_lineage`] on `c`, a connection or a transaction.
+async fn lineage_in<C: tokio_postgres::GenericClient>(c: &C, ids: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
+	let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+	let rows = c.query(
+		"WITH RECURSIVE up (leaf_id) AS (
+			SELECT unnest($1::BYTEA[])
+			UNION
+			SELECT p.parent FROM up
+			JOIN transfer_output o ON o.leaf_id = up.leaf_id
+			CROSS JOIN LATERAL (
+				SELECT i.leaf_id AS parent FROM transfer_input i WHERE i.transfer_id = o.transfer_id
+				UNION ALL
+				SELECT f.order_leaf FROM order_fill f WHERE f.transfer_id = o.transfer_id
+			) p
+		 )
+		 SELECT leaf_id FROM up ORDER BY leaf_id",
+		&[&ids],
+	).await?;
+	rows.iter().map(|r| array32(r.get(0), "leaf id")).collect()
 }
