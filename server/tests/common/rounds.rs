@@ -112,17 +112,31 @@ pub async fn hand_over(r: &Running, id: &[u8; 32], m: &super::client::Made) -> V
 	let round: Transaction = elements::encode::deserialize(&unhex(st["round"]["tx"].as_str().unwrap_or_else(|| panic!("the held round's transaction: {}", st)))).unwrap();
 	assert_eq!(round.txid().to_string(), st["round"]["txid"].as_str().unwrap());
 	let mut news = vec![];
+	let mut acc_news = vec![];
 	let mut leaves = vec![];
 	for (j, l) in m.leaves.iter().enumerate() {
 		let Some((owner, nonce)) = l else { continue };
 		let o = &st["outputs"][j];
 		let published = r.http.post("tree", &json!({"txid": st["round"]["txid"], "vout": o["batch_vout"]})).ok();
-		let record = rebuild(&published).record(o["leaf_index"].as_u64().unwrap() as usize);
-		let valid = record.validate(&round, &accept_policy(r), owner, nonce).unwrap();
-		if let Some(k) = super::client::key_of(owner) {
-			leaves.push(auths_json(&valid, &k, created(&record)));
+		let index = o["leaf_index"].as_u64().unwrap() as usize;
+		match super::client::rebuild_batch(&published) {
+			arca_covenant::Batch::Tree(tree) => {
+				let record = tree.record(index);
+				let valid = record.validate(&round, &accept_policy(r), owner, nonce).unwrap();
+				if let Some(k) = super::client::key_of(owner) {
+					leaves.push(auths_json(&valid, &k, created(&record)));
+				}
+				news.push(valid);
+			},
+			// A leaf of an accumulator batch: its one exit authorisation.
+			arca_covenant::Batch::Accumulator(acc) => {
+				let valid = acc.record(index).validate(&round, &accept_policy(r), owner, nonce).unwrap();
+				if let Some(k) = super::client::key_of(owner) {
+					leaves.push(super::client::exit_auth_json(&valid, &k, super::client::two_hours_ago()));
+				}
+				acc_news.push(valid);
+			},
 		}
-		news.push(valid);
 	}
 	let c = st["round"]["connector_vout"].as_u64().unwrap() as u32;
 	let delay = arca_covenant::RelativeTime::from_units(st["refund_delay_units"].as_u64().unwrap() as u16).unwrap();
@@ -135,9 +149,10 @@ pub async fn hand_over(r: &Running, id: &[u8; 32], m: &super::client::Made) -> V
 		let margin: u64 = input["margin"].as_str().unwrap().parse().unwrap();
 		// A participation with no leaf of its own (a distribution's payer)
 		// signs against the unlock hash and connector its status names.
-		let f = match news.first() {
-			Some(new) => arca_covenant::Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, new, &round, c, delay, margin).unwrap(),
-			None => {
+		let f = match (news.first(), acc_news.first()) {
+			(Some(new), _) => arca_covenant::Forfeit::for_refresh(old.leaf, (old.asset, old.value), old.id, new, &round, c, delay, margin).unwrap(),
+			(None, Some(new)) => new.forfeit_for(old.leaf, (old.asset, old.value), old.id, &round, c, delay, margin).unwrap(),
+			(None, None) => {
 				let unlock: [u8; 32] = unhex(st["unlock_hash"].as_str().unwrap()).try_into().unwrap();
 				arca_covenant::Forfeit::new(old.leaf, (old.asset, old.value), old.id, unlock, arca_covenant::connector_asset(round.txid(), c),
 					delay, margin).unwrap()

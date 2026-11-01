@@ -1,6 +1,6 @@
 //! The forfeit swap: an owner hands over the forfeits of the coins it gave up
 //! and gets the preimage that completes its new leaves; then it releases the
-//! lowest nodes of the coins it gave up.
+//! lowest nodes (or the accumulator slots) of the coins it gave up.
 //!
 //! `forfeit_leaves` is accepted only for a participation in a round the
 //! finality service calls final, or for one that gives up coins in a round
@@ -82,6 +82,14 @@
 //! before the participation's preimage went out; while the participation's
 //! round is not final; and for a coin that has no lowest node (a board, or a
 //! coin a reassignment made). Each release is stored with its round and `M`.
+//!
+//! A coin that is a slot of an accumulator batch without a sweep
+//! (`arca/accumulator-2`) is released the same way, by the same rules: the
+//! owner's signature with the slot's key over
+//! `SHA256(SHA256("Arca/accumulator-release") ‖ genesis_hash ‖ ROOT ‖ rec_j ‖ M)`
+//! ([`AccumulatorRelease`]), `ROOT` the batch's root and `rec_j` the slot's
+//! record, which the server rebuilds from the record it holds. A slot of an
+//! accumulator batch with a sweep has no release (`no_lowest_node`).
 //! When a round is lost, the releases given for it are retired: their `M`
 //! is not issued while the round is out of the chain. A lost round that is
 //! final again is restored, and its releases with it.
@@ -93,6 +101,7 @@ use elements::hashes::Hash;
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::{AssetId, Transaction, Txid};
 
+use arca_covenant::accumulator::AccumulatorRelease;
 use arca_covenant::sign::verify_digest;
 use arca_covenant::{
 	connector_asset, CoinRecord, Forfeit, LeafId, MedianTime, Pair, RelativeTime, Release, WalletPolicy,
@@ -597,6 +606,31 @@ impl Forfeits {
 					}
 					self.store.insert_release(&r.leaf_id.0, id, round.round_id, &node, &m.into_inner().to_byte_array(),
 						r.signature.as_ref()).await?;
+					done.push(r.leaf_id);
+					continue;
+				},
+				// A slot of an accumulator batch without a sweep: its owner
+				// releases the slot itself. An accumulator batch with a sweep
+				// has no release.
+				Ok(CoinRecord::Accumulator { record, .. }) => {
+					if record.schedule.expires() {
+						return Err(ForfeitError::NoLowestNode(r.leaf_id));
+					}
+					if r.node.is_some() {
+						return Err(ForfeitError::NotOnNode(r.leaf_id));
+					}
+					if let Some(named) = r.connector.filter(|n| *n != m) {
+						return Err(ForfeitError::WrongRound { leaf: r.leaf_id, named, round: m });
+					}
+					let exit = record.exit().map_err(|e| ForfeitError::Internal(e.to_string()))?;
+					let (root, _) = exit.root().ok_or_else(|| ForfeitError::Internal("a slot's path weighs nothing".into()))?;
+					let release = AccumulatorRelease {
+						chain: self.params.chain, root, slot: exit.slot, record: exit.record.record(exit.slot), owner: exit.record.owner, connector: m,
+					};
+					if release.verify(&r.signature).is_err() {
+						return Err(ForfeitError::BadRelease(r.leaf_id));
+					}
+					self.store.insert_slot_release(&r.leaf_id.0, id, round.round_id, &m.into_inner().to_byte_array(), r.signature.as_ref()).await?;
 					done.push(r.leaf_id);
 					continue;
 				},

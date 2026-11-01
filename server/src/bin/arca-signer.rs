@@ -1,6 +1,7 @@
 //! `arca-signer`: holds the operator key `S` and signs the rebindable messages
 //! of collaborative paths, the spends of the operator's own paths and the
-//! operator's unroll and accumulator exit authorisations, each built by the signer itself, and
+//! operator's unroll and accumulator exit authorisations and the outputs of its accumulator
+//! releases, each built by the signer itself, and
 //! nothing else, for the server on a Unix socket. See `server::signer` for
 //! the protocol.
 //!
@@ -1338,6 +1339,39 @@ async fn answer(state: &State, line: &str) -> Response {
 			rand::rngs::OsRng.fill_bytes(&mut aux);
 			let sig = sign_digest(key, &message.digest, &aux);
 			eprintln!("arca-signer: signed the unroll authorisation of the node with children hash {} from {}", hex(&h), time);
+			Response { signature: Some(hex(sig.as_ref())), ..none }
+		},
+		Request::AccumulatorRelease { tx, prevouts, input, root, bitmap } => {
+			let parsed = (|| -> Result<_, String> {
+				let tx: elements::Transaction = elements::encode::deserialize(&unhex(&tx)?).map_err(|e| format!("tx: {}", e))?;
+				let prevouts = prevouts.iter()
+					.map(|p| elements::encode::deserialize::<elements::TxOut>(&unhex(p)?).map_err(|e| format!("prevout: {}", e)))
+					.collect::<Result<Vec<_>, String>>()?;
+				if prevouts.len() != tx.input.len() {
+					return Err(format!("{} spent outputs for {} inputs", prevouts.len(), tx.input.len()));
+				}
+				let root = unhex32(&root).map_err(|e| format!("root: {}", e))?;
+				let bitmap = arca_covenant::accumulator::Bitmap::from_bytes(&unhex(&bitmap)?).ok_or("bitmap: not 128 bytes")?;
+				let st = arca_covenant::AccumulatorPolicy { root, operator: key.x_only_public_key().0, bitmap, sweep: None };
+				let spent = prevouts.get(input as usize).ok_or_else(|| format!("input {} of {}", input, tx.input.len()))?;
+				if spent.script_pubkey != st.script_pubkey() {
+					return Err(format!("input {} spends no output of the accumulator batch of root {} in that state under this signer's key",
+						input, hex(&root)));
+				}
+				// The operator keeps no unit of an asset this signer mints.
+				let minted: Vec<elements::AssetId> = state.issuers.iter().map(|i| i.limiter.asset).collect();
+				server::issuer::check_spend_burns(&minted, &tx)?;
+				Ok((tx.txid(), arca_covenant::accumulator::payout_digest(chain, &st, input, &tx), st.bitmap.count()))
+			})();
+			let (txid, digest, left) = match parsed {
+				Ok(p) => p,
+				Err(e) => return declined(e),
+			};
+			let mut aux = [0u8; 32];
+			rand::rngs::OsRng.fill_bytes(&mut aux);
+			let sig = sign_digest(key, &digest, &aux);
+			eprintln!("arca-signer: signed the outputs of the release {} of slots of the accumulator batch {} ({} slots gone before)", txid,
+				root, left);
 			Response { signature: Some(hex(sig.as_ref())), ..none }
 		},
 		Request::AccumulatorExit { root, record: slot_record, time } => {

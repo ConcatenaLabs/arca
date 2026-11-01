@@ -17,7 +17,8 @@
 //! branch; one exit from an accumulator batch). The server
 //! answers with the preimage that opens the new leaves; the wallet checks it
 //! against their unlock hash, keeps them, and releases the lowest node of each
-//! old batch leaf: the releases are signed with the forfeits and kept with
+//! old batch leaf, or its slot of an accumulator batch without a sweep
+//! (`AccumulatorRelease`): the releases are signed with the forfeits and kept with
 //! the participation, and handed to the server once the participation is
 //! completed, however it completes (the server's answer, the preimage read
 //! from the published tree or from a claim on the chain), retried at each
@@ -33,7 +34,7 @@ use serde_json::{json, Value};
 use arca_covenant::encode::Encoding;
 use arca_covenant::spend::{margin_for, FeeSource};
 use arca_covenant::tree::{LeafSpec, ReserveRule, TreeParams};
-use arca_covenant::accumulator::{ACCUMULATOR_RECORD_VERSION, ACCUMULATOR_RECORD_VERSION_NO_SWEEP};
+use arca_covenant::accumulator::{AccumulatorRelease, ACCUMULATOR_RECORD_VERSION, ACCUMULATOR_RECORD_VERSION_NO_SWEEP};
 use arca_covenant::{connector_asset, AccumulatorRecord, Batch, BatchKind, Chain, ClockSchedule, CoinRecord, ExplicitOutput, Forfeit,
 	HtlcTerms, Landing, LeafId, LeafPolicy, LeafRecord, MedianTime, OffboardPolicy, OrderLeafTerms, Release, RelativeTime, SpendError,
 	Template, ValidAccumulatorLeaf, ValidLeaf, WalletPolicy};
@@ -1744,6 +1745,19 @@ impl Wallet {
 						(None, None) => unreachable!("refused above"),
 					}.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
 					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rel.message().digest).as_ref())}));
+				}
+			} else if let (CoinRecord::Accumulator { .. }, arca_covenant::ValidOrigin::Accumulator { valid, .. }) = (&record, &old.origin) {
+				// A slot of an accumulator batch without a sweep is released
+				// itself, for this round alone, as a lowest node is. One with
+				// a sweep has no release.
+				if valid.policy.no_sweep() {
+					let rel = match (new, offboard) {
+						(Some(NewValid::Tree(v)), _) => AccumulatorRelease::for_refresh(valid, v, &round, c),
+						(Some(NewValid::Accumulator(v)), _) => AccumulatorRelease::for_accumulator_refresh(valid, v, &round, c),
+						(None, Some(p)) => AccumulatorRelease::for_offboard(valid, p, &round, c),
+						(None, None) => unreachable!("refused above"),
+					}.map_err(|e| Error::Refused(format!("the release of {}: {}", l, e)))?;
+					releases.push(json!({"leaf_id": l, "signature": hex(sign(&key, &rel.digest()).as_ref())}));
 				}
 			} else if matches!(record, CoinRecord::Transfer(_) | CoinRecord::Fill(_)) && !old.release_nodes().is_empty()
 				// The order resting again after a fill carries the order

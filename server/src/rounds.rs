@@ -151,8 +151,11 @@
 //!
 //! With [`RoundConfig::no_sweep`] (`[batches] no_sweep`, always on the main
 //! chain) every batch is built with [`ClockSchedule::never`]: no token, no
-//! clock, no sweep leaf anywhere, a tree always, and each batch output
-//! followed by the next with no token's atom between them. Its service
+//! clock, no sweep leaf anywhere, and each batch output followed by the next
+//! with no token's atom between them. A batch is a tree, or, where
+//! [`BatchKind::choose`] picks one, an accumulator batch without a sweep
+//! (`arca/accumulator-2`), whose records are of their own format version;
+//! a holder's own batch is always a tree. Its service
 //! horizon, [`Params::collect_after_seconds`] after the round, is recorded
 //! with it; the watcher collects it on the chain there ([`crate::watcher`]).
 //! Nothing then takes back a new leaf whose owner never hands its forfeit
@@ -793,11 +796,6 @@ impl Rounds {
 		&self.config
 	}
 
-	/// The kind of batch the runner builds `specs` of `asset` as: an
-	/// accumulator batch when the operator expects few enough of them to
-	/// leave on their own ([`BatchKind::choose`]); a tree for an
-	/// issuer-operated asset, whose batches the mint's signer rebuilds as
-	/// trees.
 	/// The holder of participation `row` when it moves its coins soon after
 	/// it gets them: a coin it gives up rests on a batch made within
 	/// [`RoundConfig::holder_window`] of now. The holder is the mailbox key
@@ -886,11 +884,14 @@ impl Rounds {
 		Ok(out)
 	}
 
-	/// A batch's kind: a holder's own batch (`own`) is a tree, so that it can
-	/// be reclaimed, and so is every batch without a sweep, since the watcher
-	/// releases no accumulator slot.
+	/// A batch's kind: a holder's own batch (`own`) is a tree, so that its
+	/// holder's next refresh takes the whole of it back by one reclaim;
+	/// every other batch is what [`Self::kind_of`] chooses. A batch without a
+	/// sweep may be an accumulator batch (`arca/accumulator-2`): the watcher
+	/// releases each slot its owner released, and collects the rest at the
+	/// service horizon.
 	fn kind_for(&self, own: bool, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
-		if own || self.config.no_sweep { BatchKind::Tree } else { self.kind_of(asset, specs) }
+		if own { BatchKind::Tree } else { self.kind_of(asset, specs) }
 	}
 
 	/// A batch's schedule: [`ClockSchedule::never`] without a sweep, else the
@@ -903,6 +904,12 @@ impl Rounds {
 		}
 	}
 
+	/// The kind of batch the runner builds `specs` of `asset` as: an
+	/// accumulator batch when the operator expects few enough of them to
+	/// leave on their own ([`BatchKind::choose`], with the larger exit of a
+	/// batch without a sweep when it builds those); a tree for an
+	/// issuer-operated asset, whose batches the mint's signer rebuilds as
+	/// trees.
 	fn kind_of(&self, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
 		let issuer = self.params.assets.get(asset).is_some_and(|a| a.issuer.is_some());
 		BatchKind::choose(specs, self.config.radix, self.config.accumulator_exit_rate_ppm, issuer, self.config.no_sweep)

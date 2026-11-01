@@ -677,6 +677,46 @@ impl Store {
 		Ok(n == 1)
 	}
 
+	/// Records an owner's release of the slot of `leaf_id`, a leaf of an
+	/// accumulator batch without a sweep given up in participation `id`, for
+	/// its round `round_id`, whose connector asset the release names. A
+	/// release already recorded for that coin and round stays as it was;
+	/// returns whether this one is new.
+	pub async fn insert_slot_release(&self, leaf_id: &[u8; 32], id: &[u8; 32], round_id: i64, connector_asset: &[u8; 32],
+		signature: &[u8; 64]) -> Result<bool, StoreError>
+	{
+		let conn = self.conn().await?;
+		let n = conn.execute(
+			"INSERT INTO slot_release (leaf_id, round_id, participation_id, connector_asset, signature)
+			 VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+			&[&&leaf_id[..], &round_id, &&id[..], &&connector_asset[..], &&signature[..]],
+		).await?;
+		Ok(n == 1)
+	}
+
+	/// The slot releases recorded for the leaves of the accumulator batch at
+	/// output `vout` of the round `batch_round`, but those retired with a lost
+	/// round: each coin, the round and connector asset it names, and its
+	/// owner's signature, by the leaf's index in the batch (its slot), lowest
+	/// first. A coin's release for its latest round comes first.
+	pub async fn slot_releases(&self, batch_round: i64, vout: u32) -> Result<Vec<(u32, ReleaseRow)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT bl.idx, sr.leaf_id, sr.round_id, sr.connector_asset, sr.signature FROM slot_release sr
+			 JOIN batch_leaf bl ON bl.leaf_id = sr.leaf_id
+			 WHERE bl.round_id = $1 AND bl.vout = $2 AND NOT sr.retired ORDER BY bl.idx, sr.round_id DESC",
+			&[&batch_round, &(vout as i32)]).await?;
+		rows.iter().map(|r| {
+			let sig: Vec<u8> = r.get(4);
+			Ok((r.get::<_, i32>(0) as u32, ReleaseRow {
+				leaf_id: array32(r.get(1), "leaf id")?,
+				round_id: r.get(2),
+				connector_asset: array32(r.get(3), "connector asset")?,
+				signature: sig.try_into().map_err(|_| StoreError::Corrupt("signature".into()))?,
+			}))
+		}).collect()
+	}
+
 	/// The releases recorded for the lowest node whose children hash is
 	/// `node_hash`, but those retired with a lost round: each coin, the round
 	/// and connector asset it names, and its owner's signature. A reclaim
@@ -924,6 +964,7 @@ impl Store {
 				&[&&id[..], &round_id, &attempt],
 			).await?;
 			t.execute("UPDATE node_release SET retired = false WHERE participation_id = $1 AND round_id = $2", &[&&id[..], &round_id]).await?;
+			t.execute("UPDATE slot_release SET retired = false WHERE participation_id = $1 AND round_id = $2", &[&&id[..], &round_id]).await?;
 			out.restored.push(id);
 		}
 		out.credited = credit(&t, round_id).await?;
@@ -1269,6 +1310,8 @@ async fn retire_in(t: &tokio_postgres::Transaction<'_>, round_id: i64, keep: &st
 		// Releases given for this round name its connector asset, which
 		// is not issued while the round is out of the chain.
 		t.execute("UPDATE node_release SET retired = true WHERE participation_id = $1 AND round_id = $2",
+			&[&&id[..], &round_id]).await?;
+		t.execute("UPDATE slot_release SET retired = true WHERE participation_id = $1 AND round_id = $2",
 			&[&&id[..], &round_id]).await?;
 		if keep.contains(&id) {
 			continue;
