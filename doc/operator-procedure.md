@@ -366,8 +366,12 @@ What it changes for the operator:
   the node takes the batch's asset).
 - **No plans.** The server refuses offline-refresh plans, and stops an open
   one before its next step.
-- **No accumulator batches.** `accumulator_exit_rate_ppm` is ignored: every
-  batch is a tree.
+- **Accumulator batches without a sweep.** With `accumulator_exit_rate_ppm`
+  set, a batch the operator expects few exits from is an accumulator batch
+  without a sweep (`arca/accumulator-2`): the watcher releases each slot its
+  owner released (up to 14 in one transaction, with an atom of each round's
+  connector asset), and collects the rest at the service horizon as it does
+  a tree. A holder's own batch is always a tree.
 - **The bond's notice** must cover the horizon: `notice_units` at least the
   longer of 28 days and `collect_after_seconds`, plus the longest exit
   delay, plus a day.

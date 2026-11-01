@@ -55,7 +55,11 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V35__release_delegation.sql`](schema/V35__release_delegation.sql),
 [`schema/V36__paid_send_releases.sql`](schema/V36__paid_send_releases.sql),
 [`schema/V37__claim_lapse.sql`](schema/V37__claim_lapse.sql),
-[`schema/V38__no_sweep_batches.sql`](schema/V38__no_sweep_batches.sql)). `Store::connect` builds it
+[`schema/V38__no_sweep_batches.sql`](schema/V38__no_sweep_batches.sql),
+[`schema/V39__claim_vest.sql`](schema/V39__claim_vest.sql),
+[`schema/V40__held_strikes.sql`](schema/V40__held_strikes.sql),
+[`schema/V41__strikes_on_dropped_coins.sql`](schema/V41__strikes_on_dropped_coins.sql),
+[`schema/V42__slot_releases.sql`](schema/V42__slot_releases.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -246,7 +250,8 @@ final), and where each asset's value is besides the wallet (`pool`): what its
 live batches hold until a reclaim or their expiry brings it back (`locked`), of
 that what holders released and is not reclaimed yet (`released`), in lowest
 nodes every leaf of which is released, which the watcher unrolls toward and
-reclaims on its next passes (`reclaimable`), and in leaves paid on out of round (a transfer's input, or a
+reclaims on its next passes, and in accumulator slots released, which it
+releases on its next pass (`reclaimable`), and in leaves paid on out of round (a transfer's input, or a
 resting order's coin a fill spent) and not reclaimed, whose
 owners can release nothing, so that they come back by RECLAIM-D once every
 coin they became is refreshed and released, and otherwise at their batch's
@@ -1456,13 +1461,16 @@ whose expected exits cost less from one output than through a tree is built
 as an accumulator batch instead (`arca_covenant::BatchKind::choose`): one
 output of up to 1,024 leaves, each behind the same entry, from which one
 owner leaves in one transaction (`arca-covenant`'s `accumulator`). That holds
-for up to about 77 expected exits of 1,024. A batch with a resting order or a
-channel, and an issuer-operated asset's batch, is always a tree. An
+for up to about 77 expected exits of 1,024, and 61 for a batch without a
+sweep, whose exit is larger (1,072 vB against 979). A batch with a resting
+order or a channel, and an issuer-operated asset's batch, is always a tree. An
 accumulator leaf's owner hands over one exit authorisation for it (its
 signature over the exit digest, and the time) where a tree leaf's owner hands
 over one unroll authorisation per node, and its coin record is
-`CoinRecord::Accumulator`. Its old leaves are never released, since an
-accumulator batch has no lowest node to reclaim. A batch in an asset
+`CoinRecord::Accumulator`. A leaf of an accumulator batch with a sweep is
+never released, since that batch has no release; a slot of one without a
+sweep is released by its owner, as a lowest node is (see The forfeit swap),
+and the watcher releases it (see Reclaim, under The watcher). A batch in an asset
 the node does not accept for fees carries a reserve of one atom on every node
 and every entry, so whoever unrolls it attaches a fee coin in an asset that is
 accepted. A coin is checked again under the horizon it was taken under, its
@@ -1499,13 +1507,18 @@ With `[batches] no_sweep` (always on when the node's chain is `sequentia`,
 the main chain; off by default elsewhere) every batch is built with
 `arca_covenant::ClockSchedule::never`: no token is issued, no clock is paid,
 and no output above a leaf carries a sweep leaf (`arca-covenant`'s README,
-"Batches without a sweep"). Every batch is then a tree, never an accumulator
-batch, and a holder's own batch needs no coin to issue a token. The round
+"Batches without a sweep"). A batch is a tree, or, with
+`accumulator_exit_rate_ppm` set, an accumulator batch without a sweep
+(`arca/accumulator-2`, whose records are of format 4) where
+`BatchKind::choose` prices its exits below a tree's; a holder's own batch is
+always a tree, and needs no coin to issue a token. The round
 pays each batch output with nothing after it, then the offboards, the
 connector, change and the fee. Nobody, the operator included, can take such a
 batch's coins from a holder who stays away: a node can only be unrolled into
 its pinned children, a lowest node taken back only with its owners' releases,
-and an entry only opened into its owner's leaf. `info.batches` publishes the
+an accumulator slot taken out only into its owner's entry or released only
+with its owner's release, and an entry only opened into its owner's leaf.
+`info.batches` publishes the
 switch and the service horizon (`no_sweep`, `collect_after_seconds`).
 
 Such a round takes every forfeit before it is broadcast, as a round that
@@ -1603,7 +1616,8 @@ is in flight. A refresh on a node that can come back only at its batch's
 expiry (a coin on it moved without a delegation, or refreshed or offboarded
 with no release) is held by the cap like any
 other, and a coin on an accumulator batch, which has no lowest node, counts
-in flight and never completes one. A cap of `"0"` fronts nothing, for
+in flight and never completes one: a slot of one without a sweep comes back
+by its own release, once its owner gives it up. A cap of `"0"` fronts nothing, for
 an asset whose pool is empty.
 
 The participations are taken against what the operator's wallet can spend of the asset now: what
@@ -2304,6 +2318,19 @@ with its round and `M`. Once every owner under a lowest node has released it,
 the operator may reclaim the node before expiry, with one atom of each `M`
 its owners' releases name.
 
+A slot of an accumulator batch without a sweep is released by the same
+request and the same rules: the owner's signature with the slot's key over
+`SHA256(SHA256("Arca/accumulator-release") ‖ genesis_hash ‖ ROOT ‖ rec_j ‖ M)`
+(`arca_covenant::accumulator::AccumulatorRelease`), `ROOT` the batch's root and
+`rec_j` the slot's record, which the server rebuilds from the record it holds,
+and `M` the participation's round's connector asset. A slot of an
+accumulator batch with a sweep has no release (`no_lowest_node`). The
+release is kept with its round and `M` (`schema/V42__slot_releases.sql`),
+retired while that round is lost and restored with it, and needs no other
+owner: the watcher releases the slot on its next pass. A wallet that sends
+no release for its slot leaves it to the batch's collection, which claims its
+forfeit.
+
 ## The watcher
 
 The watcher (`watcher`) is everything the operator does on the chain after a
@@ -2412,10 +2439,12 @@ meanwhile.
   the token to `R`. Between the release and the sweep, with
   `unroll_at_release`, every live coin of the batch is brought on the chain
   under its holder's key, a step a coin each pass (see Coins are taken on the
-  chain before the sweep). An accumulator batch's output moves with every exit: the
-  watcher follows it from the round through each exit the chain holds (every
-  exit pays an entry, whose script it watches, and publishes the whole state
-  it spends) and sweeps it where the last exit left it, with every entry an
+  chain before the sweep). An accumulator batch's output moves with every exit
+  (and, without a sweep, every release): the watcher follows it from the
+  round through each spend the chain holds (every exit pays an entry, whose
+  script it watches; every release is its own; any spend of an output it
+  watches is recorded; and each publishes the whole state it spends) and
+  sweeps it where the last exit left it, with every entry an
   exit paid that is still unspent. A leaf on the chain is its owner's and is
   never swept. A coin a sweep takes from its holder is owed back to it, less
   the late-refresh fee, once the sweep is final (see Swept coins are
@@ -2452,6 +2481,18 @@ meanwhile.
   early only when all its leaves are refreshed, which is why a holder that
   moves its coins soon has a batch of its own (see Rounds), and why a
   shared batch keeps each holder's leaves side by side.
+  The slots of an accumulator batch without a sweep whose owners released
+  them are released from where the batch is now, up to 14 in one
+  transaction, lowest first, with an atom of each connector asset their
+  releases name (paid back to the wallet for the next), the slots' value
+  paid to the wallet less the fee (burned whole, the fee from a coin of
+  another asset, for an issuer-operated asset); further slots go in the next
+  release, once this one's rest is in a block. The operator's signature over
+  the release's outputs comes from the signer (`accumulator_release`); the
+  program takes a slot only with its owner's release and pins the rest under
+  the next state. A release names one slot and one round, so one whose round
+  is lost is retired and not tried, and is good again if the round returns.
+  A release of one slot is 1,305 vB, of 14 slots 3,317 vB.
   A leaf paid on out of round is never released (a release is its owner's,
   over the round of its own new leaf), so its batch comes back at its
   expiry, or, without a sweep, at its collection.
@@ -2459,7 +2500,11 @@ meanwhile.
   service horizon, `[batches] collect_after_seconds` after its round's median
   time, the watcher brings what is left of it on the chain, a step a coin
   each pass. A lowest node every owner of which has released it, or
-  consented through a delegation, is left to its RECLAIM or RECLAIM-D above.
+  consented through a delegation, is left to its RECLAIM or RECLAIM-D above,
+  and an accumulator slot whose owner released it to its release. A slot of
+  an accumulator batch goes out by the operator's own exit authorisation,
+  which pays only the slot's own entry, from where the batch is now,
+  followed through every exit and release.
   Every other leaf is brought on the chain by the authorisations and the
   entry preimage the server holds, paid from the reserves (or a wallet coin
   where the node does not take the batch's asset): a live coin lands as its
@@ -2709,6 +2754,16 @@ operator's unroll authorisation for a node (`unroll`), `S`'s signature over
 median time: `S` is a member of every node, and the watcher answers a holder
 who brings home a coin it gave up for a step of an offline refresh only after
 unrolling that step's leaf, whose tree did not exist when the holder signed.
+For an accumulator batch it signs the operator's exit authorisation for a
+slot (`accumulator_exit`), over `arca_covenant::accumulator::exit_digest`
+built from the batch's root, the slot's record and a time, which pays only
+the slot's own entry; and the operator's signature over a release's outputs
+(`accumulator_release`), `arca_covenant::accumulator::payout_digest` built
+from the transaction once it has checked that the input it names spends the
+output of an accumulator batch without a sweep, of the state named, under
+`S`. The program takes a slot only with its owner's release and pins the
+rest under the next state, so what this signature fixes is where the
+operator's own value goes.
 For an issuer-operated asset whose mint limiter it was started with
 (`--issuer <instance file>=<mnemonic file>`), it answers one more request:
 the mint at input 0 of a round (`reissue`), which it checks as Issuer-operated
@@ -3889,6 +3944,23 @@ holds an accumulator coin record that resolves. One owner leaves on its own
 coin and authorisation still good against the new state; then the release at
 the expiry, no sweep during the notice, and the sweep of the batch output
 where the exit left it.
+
+`tests/accumulator_no_sweep.rs` runs an operator with `no_sweep` and
+`accumulator_exit_rate_ppm`: 24 boards refresh into one accumulator batch
+without a sweep, which pays no token, every record of format 4 and passing
+`WalletPolicy::no_sweep`. Owners refresh out of it and release their slots,
+and the watcher releases them on the chain, final, each paying the operator
+what the slots weighed less its fee: one slot (1,299 vB), four slots of two
+rounds with an atom of each round's connector asset (1,872 vB), and sixteen
+slots in two releases (14 slots, 3,181 vB; 2 slots, 1,446 vB). `pool` shows
+the value released and reclaimable, and `locked` falling by what each release
+paid back. At the horizon an absent owner's slot goes out by the operator's
+own exit authorisation from where the last release left the batch and lands
+as the owner's leaf, final; a slot given up with its forfeit and no release
+is claimed; a coin paid on out of round from a slot lands under its holder's
+key. A second test loses the refresh round whose slot releases are stored:
+they are retired while it is lost and no release is tried, and once it
+returns final they are restored and released.
 
 `tests/watcher.rs` drives the watcher a pass at a time, a block between
 passes, except where it runs on its own as the server's task. Refreshed boards

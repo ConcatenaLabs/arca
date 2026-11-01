@@ -508,6 +508,23 @@ pub fn auths_json(valid: &ValidLeaf, key: &Keypair, t: arca_covenant::MedianTime
 	})
 }
 
+/// A leaf of an accumulator batch's one exit authorisation, signed with
+/// `key` for the time `t`, as `forfeit_leaves` takes it.
+pub fn exit_auth_json(valid: &arca_covenant::ValidAccumulatorLeaf, key: &Keypair, t: arca_covenant::MedianTime) -> Value {
+	json!({
+		"leaf_id": valid.leaf_id.to_string(),
+		"auths": [{"signature": hex(sign_digest(key, &valid.exit_digest(t), &random32()).as_ref()), "time": t.to_consensus_u32()}],
+	})
+}
+
+/// Two hours before the wall clock: a time an owner signs an authorisation
+/// for that is usable at once, as a wallet signs one for a batch that
+/// carries no date.
+pub fn two_hours_ago() -> arca_covenant::MedianTime {
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+	arca_covenant::MedianTime::from_consensus(now - 2 * 3_600).unwrap()
+}
+
 /// The owner's signature over forfeit `f`.
 pub fn forfeit_sig(f: &Forfeit, key: &Keypair) -> String {
 	hex(sign_digest(key, &f.message().digest, &random32()).as_ref())

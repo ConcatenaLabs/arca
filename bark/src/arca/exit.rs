@@ -55,7 +55,7 @@ use elements::secp256k1_zkp::Keypair;
 use elements::{AssetId, OutPoint, Script, Transaction, TxOut};
 use serde_json::{json, Value};
 
-use arca_covenant::accumulator::read_exit;
+use arca_covenant::accumulator::read_spend;
 use arca_covenant::spend::{FeeSource, KeySpend};
 use arca_covenant::{AccumulatorPolicy, CoinRecord, ExplicitOutput, HtlcDirection, UnrollTx, ValidAccumulatorLeaf, ValidCoin, ValidOrigin};
 
@@ -682,8 +682,8 @@ impl Wallet {
 	}
 
 	/// Where `valid`'s accumulator batch output is now: followed from the
-	/// round's batch output through each exit that spent it, read from its
-	/// witness (every exit publishes the state it spends), on the chain, in
+	/// round's batch output through each exit or release that spent it, read
+	/// from its witness (every one publishes the state it spends), on the chain, in
 	/// the mempool, or among `built`, the transactions an exit built already
 	/// (two coins of one transfer can rest on one batch). An exit whose
 	/// witness names another state than the one before it is refused.
@@ -713,19 +713,22 @@ impl Wallet {
 				},
 			};
 			let k = sp.input.iter().position(|i| i.previous_output == at).expect("spends it");
-			let Some(seen) = read_exit(&sp.input[k].witness.script_witness) else {
+			// An exit, or the operator's release of slots whose owners gave
+			// them up (a batch without a sweep); anything else spending the
+			// batch is its sweep.
+			let Some(seen) = read_spend(&sp.input[k].witness.script_witness) else {
 				return Ok(BatchNow::Swept(state, at, sp));
 			};
-			if seen.root != state.root || seen.operator != state.operator.serialize() || seen.bitmap != state.bitmap {
+			if seen.root() != state.root || seen.operator() != state.operator.serialize() || seen.bitmap() != state.bitmap {
 				return Err(Error::Refused(format!("{} spends the accumulator batch at {} from another state than the one before it", sp.txid(), at)));
 			}
-			if seen.last {
+			if seen.last() {
 				return Ok(BatchNow::Emptied);
 			}
-			state = state.after(seen.slot);
+			state = state.after_all(&seen.slots());
 			let rest = 2 * k + 1;
 			held = sp.output.get(rest).filter(|o| o.script_pubkey == state.script_pubkey()).and_then(|o| o.value.explicit())
-				.ok_or_else(|| Error::Refused(format!("exit {} of the accumulator batch leaves no rest at its output {}", sp.txid(), rest)))?;
+				.ok_or_else(|| Error::Refused(format!("{} of the accumulator batch leaves no rest at its output {}", sp.txid(), rest)))?;
 			at = OutPoint::new(sp.txid(), rest as u32);
 		}
 	}

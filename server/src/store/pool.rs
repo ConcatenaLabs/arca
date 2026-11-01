@@ -11,13 +11,16 @@ pub struct PoolFlow {
 	/// What the asset's live batches hold (rounds broadcast or final, not
 	/// swept by a final sweep), less what reclaims of them paid back.
 	pub locked: u64,
-	/// Of that, the leaves whose holders released their lowest node, not
-	/// reclaimed yet: back once every leaf of their batch is released.
+	/// Of that, the leaves whose holders released their lowest node, or their
+	/// slot of an accumulator batch, not reclaimed yet: back once every leaf
+	/// of their lowest node is released, a slot on its own.
 	pub released: u64,
 	/// Of that, the lowest nodes of tree batches every leaf of which is
 	/// released: the watcher unrolls toward them and reclaims them on its
 	/// next passes, whoever else rests on their batch. Leaves are laid into
 	/// lowest nodes as the builder lays them ([`arca_covenant::tree::spread`]).
+	/// A released slot of an accumulator batch is reclaimable on its own: the
+	/// watcher releases it on its next pass.
 	pub reclaimable: u64,
 	/// Of `locked`, the leaves paid on out of round (given up in a
 	/// transfer, or a resting order's coin a fill spent), not reclaimed yet: no release of their lowest node can come
@@ -103,7 +106,8 @@ impl Store {
 			   WHERE w.kind = 'reclaim' AND n.state <> 'lost'),
 			 leaves AS (
 			   SELECT bl.round_id, bl.vout, bl.idx, bl.value, live.radix, live.kind,
-			          EXISTS (SELECT 1 FROM node_release nr WHERE nr.leaf_id = bl.leaf_id AND NOT nr.retired) AS released,
+			          (EXISTS (SELECT 1 FROM node_release nr WHERE nr.leaf_id = bl.leaf_id AND NOT nr.retired)
+			           OR EXISTS (SELECT 1 FROM slot_release sr WHERE sr.leaf_id = bl.leaf_id AND NOT sr.retired)) AS released,
 			          (EXISTS (SELECT 1 FROM node_release nr JOIN reclaimed_node k USING (node_hash)
 			                  WHERE nr.leaf_id = bl.leaf_id)
 			           OR EXISTS (SELECT 1 FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid)
@@ -130,7 +134,11 @@ impl Store {
 			          bool_and(p.released) AS all_released
 			   FROM placed p GROUP BY 1, 2, 3),
 			 node_back AS (
-			   SELECT round_id, vout, sum(released) AS reclaimable FROM per_node WHERE all_released GROUP BY 1, 2),
+			   SELECT round_id, vout, sum(released) AS reclaimable FROM per_node WHERE all_released GROUP BY 1, 2
+			   UNION ALL
+			   -- A slot of an accumulator batch is released on its own.
+			   SELECT l.round_id, l.vout, sum(l.value) FROM leaves l WHERE l.kind = 'accumulator' AND l.released AND NOT l.reclaimed
+			   GROUP BY 1, 2),
 			 back AS (
 			   SELECT x.round_id, x.vout, sum(c.value) AS v
 			   FROM (SELECT b.round_id, b.vout, b.asset, k.txid FROM live b
@@ -148,7 +156,7 @@ impl Store {
 			          sum(coalesce(nb.reclaimable, 0)) AS reclaimable,
 			          sum(coalesce(p.transferred, 0)) AS transferred
 			   FROM live b LEFT JOIN per_batch p USING (round_id, vout) LEFT JOIN back bk USING (round_id, vout)
-			   LEFT JOIN node_back nb USING (round_id, vout)
+			   LEFT JOIN (SELECT round_id, vout, sum(reclaimable) AS reclaimable FROM node_back GROUP BY 1, 2) nb USING (round_id, vout)
 			   GROUP BY 1),
 			 drawn AS (
 			   SELECT asset, sum(v) AS drawn FROM (

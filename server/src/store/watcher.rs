@@ -406,6 +406,20 @@ impl Store {
 		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
 	}
 
+	/// The batches, `(round id, output)`, of rounds not lost holding a leaf
+	/// whose owner released its slot of an accumulator batch: those a release
+	/// may be due in.
+	pub async fn batches_with_slot_releases(&self) -> Result<Vec<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT DISTINCT bl.round_id, bl.vout FROM slot_release sr JOIN batch_leaf bl ON bl.leaf_id = sr.leaf_id
+			 JOIN round r ON r.round_id = bl.round_id
+			 WHERE NOT sr.retired AND r.state = 'final' ORDER BY bl.round_id, bl.vout",
+			&[],
+		).await?;
+		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
+	}
+
 	/// The offboard outputs of final rounds whose participation is released,
 	/// expired or void and that no final transaction of the watcher's
 	/// spends: those that may still be unlocked or reclaimed.

@@ -66,7 +66,11 @@
 //!    expires, whoever else rests on the batch: an upper node on the chain
 //!    shows no wallet a leaf or checkpoint of its coin. A lowest node with an
 //!    owner who has not released is never unrolled by the watcher, since
-//!    that would put the owner's leaf on the chain.
+//!    that would put the owner's leaf on the chain. The slots of an
+//!    accumulator batch without a sweep whose owners released them are
+//!    released from where the batch is now, up to
+//!    [`arca_covenant::accumulator::RELEASE_PLACES`] in one transaction, with
+//!    an atom of each `M` their releases name ([`Watcher::release_slots`]).
 //! 7. **Absent makers' orders.** A resting order whose coin is live at its
 //!    exit deadline (three days before the earliest expiry in its lineage),
 //!    its maker not back to refresh or take it home, is landed by the
@@ -91,8 +95,10 @@
 //!    ([`Params::collect_after_seconds`] after its round) the watcher brings
 //!    what is left of it on the chain, one step a coin a pass
 //!    ([`Watcher::collect_batch`]): a lowest node every owner of which
-//!    released or consented is left to its reclaim (6); every other live
-//!    coin lands as its holder's own leaf, every given-up coin is brought down
+//!    released or consented, and an accumulator slot its owner released, is
+//!    left to its reclaim or release (6); every other live coin lands as its
+//!    holder's own leaf (a slot of an accumulator batch by the operator's own
+//!    exit authorisation), every given-up coin is brought down
 //!    to its leaf for its forfeit (1, 3), and every coin paid on out of round
 //!    lands through its lineage's checkpoints and reassignments (1). A
 //!    claim leaf of a distribution nobody took up is left to its lapse (8);
@@ -133,7 +139,7 @@ use arca_covenant::encode::Encoding;
 use arca_covenant::node::{connector_index, reclaim_items};
 use arca_covenant::sign::{script_spend_sighash, verify_digest};
 use arca_covenant::spend::{FeeSource, KeySpend, Rebindable};
-use arca_covenant::accumulator::{read_exit, Accumulator, AccumulatorParams, AccumulatorPolicy, ExitAuth};
+use arca_covenant::accumulator::{read_spend, Accumulator, AccumulatorParams, AccumulatorPolicy, ExitAuth, Released, RELEASE_PLACES};
 use arca_covenant::tree::Tree;
 use arca_covenant::{
 	connector_asset, sweep_tx, ClaimTx, Clock, ClockSchedule, CoinRecord, ConnectorPolicy, ExplicitOutput, Forfeit, LeafId, MedianTime,
@@ -829,11 +835,15 @@ impl Watcher {
 	}
 
 	/// Where an accumulator batch is now: its output, the state it holds and
-	/// its value, after every exit the chain (a block or the mempool) holds,
-	/// followed from the round's output through each exit's rest. Every
-	/// exit pays a slot's entry, whose script the watcher sees, so the exits
-	/// are the transactions that paid an entry of the batch. `None` once an
-	/// exit took the last of it.
+	/// its value, after every exit and release the chain (a block or the
+	/// mempool) holds, followed from the round's output through each one's
+	/// rest. A spend of the batch is found three ways: an exit pays a slot's
+	/// entry, whose script the watcher sees; a release (and an exit of the
+	/// watcher's own) is a transaction of the watcher's, which only the
+	/// operator's signature makes; and any spend of an output the nursery
+	/// watches is recorded as it is seen. Each one counts only while the node
+	/// holds it, and its witness says which slots it took ([`read_spend`]).
+	/// `None` once one took the last of it.
 	async fn accumulator_now(&self, round: &RoundRow, vout: u32, acc: &Accumulator)
 		-> Result<Option<(OutPoint, AccumulatorPolicy, u64)>, WatcherError>
 	{
@@ -846,29 +856,45 @@ impl Watcher {
 				}
 			}
 		}
-		let mut exits: Vec<Transaction> = Vec::with_capacity(txids.len());
+		let fetch = |t: Txid| async move {
+			self.finality.call(move |c| c.transaction(&t)).await.map_err(|e| WatcherError::Chain(e.to_string()))
+		};
+		let mut spends: Vec<Transaction> = Vec::with_capacity(txids.len());
 		for t in txids {
-			let tx = self.finality.call(move |c| c.transaction(&t)).await.map_err(|e| WatcherError::Chain(e.to_string()))?;
-			exits.extend(tx);
+			spends.extend(fetch(t).await?);
 		}
 		let mut at = OutPoint::new(txid_of(&round.txid), vout);
 		let mut state = *acc.policy();
 		let mut value = acc.total();
 		loop {
-			let next = exits.iter().find_map(|t| t.input.iter().position(|i| i.previous_output == at).map(|k| (t, k)));
+			let mut next = spends.iter().find_map(|t| t.input.iter().position(|i| i.previous_output == at).map(|k| (t.clone(), k)));
+			if next.is_none() {
+				let (t, v) = (at.txid.to_byte_array(), at.vout);
+				let mut by = vec![];
+				by.extend(self.store.watcher_spend(&t, v).await?.map(|w| txid_of(&w.txid)));
+				by.extend(self.store.outpoint_spender(&t, v).await?.map(|b| txid_of(&b)));
+				for b in by {
+					if let Some(tx) = fetch(b).await? {
+						if let Some(k) = tx.input.iter().position(|i| i.previous_output == at) {
+							next = Some((tx, k));
+							break;
+						}
+					}
+				}
+			}
 			let Some((t, k)) = next else { break };
-			let seen = read_exit(&t.input[k].witness.script_witness)
-				.ok_or_else(|| WatcherError::Build(format!("{} spends the batch at {} and is no exit", t.txid(), at)))?;
-			if seen.root != state.root || seen.bitmap != state.bitmap {
+			let seen = read_spend(&t.input[k].witness.script_witness)
+				.ok_or_else(|| WatcherError::Build(format!("{} spends the batch at {} and is no exit or release", t.txid(), at)))?;
+			if seen.root() != state.root || seen.bitmap() != state.bitmap {
 				return Err(WatcherError::Build(format!("{} spends the batch at {} from another state", t.txid(), at)));
 			}
-			if seen.last {
+			if seen.last() {
 				return Ok(None);
 			}
-			state = state.after(seen.slot);
+			state = state.after_all(&seen.slots());
 			let rest = 2 * k as u32 + 1;
-			value = t.output.get(rest as usize).and_then(|o| o.value.explicit())
-				.ok_or_else(|| WatcherError::Build(format!("exit {} has no rest at {}", t.txid(), rest)))?;
+			value = t.output.get(rest as usize).filter(|o| o.script_pubkey == state.script_pubkey()).and_then(|o| o.value.explicit())
+				.ok_or_else(|| WatcherError::Build(format!("{} leaves no rest of the batch at {}", t.txid(), rest)))?;
 			at = OutPoint::new(t.txid(), rest);
 		}
 		Ok(Some((at, state, value)))
@@ -1245,10 +1271,13 @@ impl Watcher {
 
 	/// Takes the next step that brings a leaf of an accumulator batch onto
 	/// the chain: its entry's unlock with the preimage, once an exit has paid
-	/// the entry; otherwise the exit of its slot from where the batch is now,
-	/// by `auth` (its owner's, or the operator's own).
+	/// the entry; otherwise the exit of its slot from where the batch is now
+	/// (followed through every exit and release), by `auth`, its owner's
+	/// authorisation, when it is usable now, else by the operator's own, an
+	/// hour old (the operator is a member of every slot's exit, which pays
+	/// only the slot's own entry).
 	async fn bring_accumulator_leaf(&self, coin: &ValidCoin, valid: &arca_covenant::ValidAccumulatorLeaf, preimage: &[u8; 32],
-		auth: &ExitAuth, now: MedianTime) -> Result<(), WatcherError>
+		auth: Option<&ExitAuth>, now: MedianTime) -> Result<(), WatcherError>
 	{
 		for (txid, vout) in self.store.sightings_of(valid.leaf.script_pubkey().as_bytes()).await? {
 			if self.unspent(OutPoint::new(txid_of(&txid), vout)).await?.is_some() {
@@ -1279,9 +1308,20 @@ impl Watcher {
 				format!("the entry of coin {} unlocked into its leaf", coin.id)).await?;
 			return Ok(());
 		}
-		if auth.time.to_consensus_u32() > now.to_consensus_u32() {
-			return Err(WatcherError::Build("the exit authorisation is not usable yet".into()));
-		}
+		let auth = match auth.filter(|a| a.time.to_consensus_u32() <= now.to_consensus_u32()) {
+			Some(a) => *a,
+			None => {
+				let t = MedianTime::from_consensus(now.to_consensus_u32().saturating_sub(3_600).max(arca_covenant::time::LOCKTIME_THRESHOLD))
+					.map_err(build("a time"))?;
+				let record = valid.exit.record.record(valid.exit.slot);
+				let signature = self.signer.accumulator_exit(&valid.policy.root, &record, t).await?;
+				if !verify_digest(&signature, &valid.exit_digest(t), &self.params.operator) {
+					return Err(WatcherError::Build("the signer signed another exit authorisation than the server asked for".into()));
+				}
+				ExitAuth { by_operator: true, time: t, signature }
+			},
+		};
+		let auth = &auth;
 		let acc = self.accumulator(&round, valid.batch_vout).await?;
 		let Some((at, state, held)) = self.accumulator_now(&round, valid.batch_vout, &acc).await? else {
 			return Err(WatcherError::Build(format!("the accumulator batch of coin {} has no output left", coin.id)));
@@ -1767,7 +1807,7 @@ impl Watcher {
 	async fn bring_on_chain(&self, coin: &ValidCoin, now: MedianTime) -> Result<(), WatcherError> {
 		match &coin.origin {
 			ValidOrigin::Board { .. } => Ok(()),
-			ValidOrigin::Accumulator { valid, preimage, auth } => self.bring_accumulator_leaf(coin, valid, preimage, auth, now).await,
+			ValidOrigin::Accumulator { valid, preimage, auth } => self.bring_accumulator_leaf(coin, valid, preimage, Some(auth), now).await,
 			ValidOrigin::Leaf { valid, preimage, auths } => {
 				let branch = &valid.branch;
 				// The leaf itself on the chain: the rest is the answer's.
@@ -2422,7 +2462,7 @@ impl Watcher {
 	/// nodes all of whose owners have.
 	async fn reclaims(&self, now: MedianTime) -> Result<(), WatcherError> {
 		let mut batches = self.store.batches_with_releases().await?;
-		for b in self.store.batches_with_delegations().await? {
+		for b in self.store.batches_with_delegations().await?.into_iter().chain(self.store.batches_with_slot_releases().await?) {
 			if !batches.contains(&b) {
 				batches.push(b);
 			}
@@ -2441,6 +2481,9 @@ impl Watcher {
 	}
 
 	async fn reclaim_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
+		if b.kind == arca_covenant::BatchKind::Accumulator {
+			return self.release_slots(round, b).await;
+		}
 		let schedule = ClockSchedule::decode(&b.schedule).map_err(build("the schedule"))?;
 		// A batch without a sweep never expires: its token is no output.
 		let expired = schedule.expires() && {
@@ -2504,6 +2547,100 @@ impl Watcher {
 				}
 			}
 		}
+		Ok(())
+	}
+
+	/// Releases the slots of the accumulator batch `b` without a sweep whose
+	/// owners released them, from where the batch is now: up to
+	/// [`RELEASE_PLACES`] of them, lowest first, in one transaction, with an
+	/// atom of each connector asset `M` their releases name, paid back to
+	/// the wallet for the next. What the slots weigh is the operator's, paid
+	/// to the wallet less the fee ([`Self::payout`]); a slot whose release
+	/// names a round that is lost is not taken. More slots wait for the next
+	/// pass, after this release.
+	async fn release_slots(&self, round: &RoundRow, b: &crate::store::BatchRow) -> Result<(), WatcherError> {
+		let rows = self.store.slot_releases(round.round_id, b.vout).await?;
+		if rows.is_empty() {
+			return Ok(());
+		}
+		let acc = self.accumulator(round, b.vout).await?;
+		if !acc.policy().no_sweep() {
+			return Ok(());
+		}
+		let Some((at, state, held)) = self.accumulator_now(round, b.vout, &acc).await? else { return Ok(()) };
+		if self.spending(&at).await? || self.unspent(at).await?.is_none() {
+			return Ok(());
+		}
+		// One release a slot, its latest round's first; only slots still in
+		// the batch.
+		let mut picked: Vec<(u16, crate::store::ReleaseRow)> = vec![];
+		for (idx, r) in rows {
+			let slot = u16::try_from(idx).map_err(|_| WatcherError::Build(format!("a slot {}", idx)))?;
+			if state.bitmap.is_left(slot) || picked.last().is_some_and(|(s, _)| *s == slot) {
+				continue;
+			}
+			if picked.len() == RELEASE_PLACES {
+				break;
+			}
+			picked.push((slot, r));
+		}
+		if picked.is_empty() {
+			return Ok(());
+		}
+		let mut named: Vec<i64> = picked.iter().map(|(_, r)| r.round_id).collect();
+		named.sort();
+		named.dedup();
+		let mut atoms: Vec<WalletCoin> = vec![];
+		for r in named {
+			match self.connector_atom(r).await? {
+				Some(a) => atoms.push(a),
+				None => return Ok(()),
+			}
+		}
+		let conns: Vec<(OutPoint, elements::TxOut)> = atoms.iter().map(|a| (
+			OutPoint::new(txid_of(&a.txid), a.vout),
+			sequentia_ext::explicit_txout(AssetAmount::new(AssetId::from_byte_array(a.asset), a.value), Script::from(a.script_pubkey.clone())),
+		)).collect();
+		let mut released = Vec::with_capacity(picked.len());
+		for (slot, r) in &picked {
+			released.push(Released {
+				exit: acc.exit(*slot as usize), connector: AssetId::from_byte_array(r.connector_asset),
+				signature: Signature::from_slice(&r.signature).map_err(build("a stored release"))?,
+			});
+		}
+		let chain = self.params.chain;
+		let weight = state.check_release_slots(&chain, &released).map_err(build("the releases"))?;
+		let asset = acc.params().asset;
+		let back = self.to_wallet().await?;
+		let wallet_inputs: Vec<usize> = (1..=conns.len()).collect();
+		let pay = self.payout(asset, weight, &wallet_inputs, |outs, fee| {
+			let rs = state.release_tx(&chain, at, (asset, held), &released, &conns, outs, back.clone(), fee).map_err(|e| e.to_string())?;
+			let t = rs.clone().finish(&dummy_sig());
+			Ok((rs, t))
+		}).await?;
+		let rs = pay.made;
+		let txid = rs.tx.txid();
+		self.wallet.take(&atoms.iter().collect::<Vec<_>>(), &txid).await?;
+		let sig = match self.signer.accumulator_release(&rs.tx, &rs.prevouts, 0, &state).await {
+			Ok(sig) if verify_digest(&sig, &rs.digest(&chain), &self.params.operator) => sig,
+			Ok(_) => {
+				self.wallet.release(&txid).await?;
+				return Err(WatcherError::Build("the signer signed another release than the server built".into()));
+			},
+			Err(e) => {
+				self.wallet.release(&txid).await?;
+				return Err(e.into());
+			},
+		};
+		let slots = rs.slots();
+		let n = rs.tx.input.len();
+		let tx = rs.finish(&sig);
+		let mut wallet: Vec<(usize, WalletCoin)> = atoms.into_iter().enumerate().map(|(i, a)| (i + 1, a)).collect();
+		wallet.extend(pay.fee_coin.map(|c| (n - 1, c)));
+		let leaf_ids: Vec<[u8; 32]> = picked.iter().map(|(_, r)| r.leaf_id).collect();
+		self.store.insert_reclaimed_leaves(&txid.to_byte_array(), &leaf_ids).await?;
+		self.publish(Ready { tx, wallet, fee: Some(pay.fee) }, "reclaim", state.root.to_vec(),
+			format!("slots {:?} of an accumulator batch, released by their owners, {} of {} back", slots, weight, asset)).await?;
 		Ok(())
 	}
 
@@ -2577,14 +2714,25 @@ impl Watcher {
 	/// chain once its outcome is the operator's ([`Self::htlc_decided`]),
 	/// and its refund or claim then finishes it; one still open is left.
 	async fn collect_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
-		if b.kind != arca_covenant::BatchKind::Tree {
-			return Ok(());
-		}
-		let tree = self.tree(round, b.vout).await?;
 		let Some((_, leaves)) = self.store.batch(&round.txid, b.vout).await? else { return Ok(()) };
-		let (released, consents) = self.slots(b, &tree, &leaves).await?;
-		let reclaimed = |i: usize| tree.levels()[0].iter().any(|n| n.leaves.contains(&i)
-			&& n.leaves.clone().all(|j| released.contains_key(&j) || consents.contains_key(&j)));
+		// What is left to its reclaim: a tree's lowest nodes every slot of
+		// which consents, an accumulator batch's slots whose owners released
+		// them.
+		let left: HashSet<usize> = match b.kind {
+			arca_covenant::BatchKind::Tree => {
+				let tree = self.tree(round, b.vout).await?;
+				let (released, consents) = self.slots(b, &tree, &leaves).await?;
+				tree.levels()[0].iter().filter(|n| n.leaves.clone().all(|j| released.contains_key(&j) || consents.contains_key(&j)))
+					.flat_map(|n| n.leaves.clone()).collect()
+			},
+			arca_covenant::BatchKind::Accumulator => {
+				if !self.accumulator(round, b.vout).await?.policy().no_sweep() {
+					return Ok(());
+				}
+				self.store.slot_releases(round.round_id, b.vout).await?.into_iter().map(|(i, _)| i as usize).collect()
+			},
+		};
+		let reclaimed = |i: usize| left.contains(&i);
 		let mut stack = vec![];
 		let mut claims = HashSet::new();
 		for (i, bl) in leaves.iter().enumerate() {
@@ -2627,6 +2775,11 @@ impl Watcher {
 					if !self.htlc_decided(&leaf, terms, &paid, now).await? {
 						return Ok(false);
 					}
+				}
+				// A slot of an accumulator batch goes out by the operator's own
+				// exit authorisation, whatever the held one says.
+				if let ValidOrigin::Accumulator { valid, preimage, .. } = &coin.origin {
+					return self.bring_accumulator_leaf(&coin, valid, preimage, None, now).await.map(|_| true);
 				}
 				self.bring_on_chain(&coin, now).await.map(|_| true)
 			}.await;

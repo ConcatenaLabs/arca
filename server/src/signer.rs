@@ -64,6 +64,22 @@
 //!   creates the children its node pins, and the reserves are the
 //!   operator's.
 //!
+//! - `{"op":"accumulator_exit","root":…,"record":…,"time":…}`: the
+//!   operator's exit authorisation for a slot of an accumulator batch, `S`'s
+//!   signature over `arca_covenant::accumulator::exit_digest`, which the
+//!   signer builds itself from the root, the slot's record and the time. Like
+//!   an unroll, an exit moves no coin but into the slot's own entry.
+//! - `{"op":"accumulator_release","tx":…,"prevouts":[…],"input":…,"root":…,"bitmap":…}`:
+//!   `S`'s signature over the outputs of a release of slots of an
+//!   accumulator batch without a sweep (`arca/accumulator-2`),
+//!   `arca_covenant::accumulator::payout_digest` of the state `root` and
+//!   `bitmap` under `S` at input `input`, which the signer builds itself from
+//!   the transaction, once it has checked that the input spends that state's
+//!   output. The program takes a slot only with its owner's release, and
+//!   pins the rest under the next state; what this signature fixes is where
+//!   the released value goes, the operator's own. A spend that pays a unit
+//!   of an asset the signer mints anywhere but a burn is refused.
+//!
 //! - `{"op":"channel_state","channel":{…},"state":{…},"owner_sig":…}`: `S`'s
 //!   signature over a state of a `channel-1` coin ([`arca_covenant::channel`]),
 //!   `SHA256(Q ‖ le8(n) ‖ P_n)`, which the signer builds itself from the
@@ -441,6 +457,13 @@ pub enum Request {
 	/// from the median time `time` on: the operator's path out of an
 	/// accumulator batch, as an unroll authorisation is out of a tree.
 	AccumulatorExit { root: String, record: String, time: u32 },
+	/// The operator's signature over the outputs of a release of slots of an
+	/// accumulator batch without a sweep, whose state is `root` and `bitmap`
+	/// (32 and 128 bytes, hex) under `S`, spent at input `input` of `tx`
+	/// (`prevouts` the outputs every input spends): its signature over
+	/// [`arca_covenant::accumulator::payout_digest`], which the signer builds
+	/// itself, once it has checked that input spends that state's output.
+	AccumulatorRelease { tx: String, prevouts: Vec<String>, input: u32, root: String, bitmap: String },
 	/// An issuer-operated asset's mint at input 0 of a round: the witness of
 	/// the limiter's coin, once the signer has checked the round
 	/// ([`crate::issuer::check_reissue`]) and the limiter's tool signed it.
@@ -2514,6 +2537,29 @@ impl SignerClient {
 	/// builds itself.
 	pub async fn unroll(&self, children_hash: &[u8; 32], t: MedianTime) -> Result<Signature, SignerError> {
 		let r = self.ask(&Request::Unroll { children_hash: hex(children_hash), time: t.to_consensus_u32() }).await?;
+		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
+		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
+	}
+
+	/// `S`'s signature over the outputs of `tx`, a release of slots from the
+	/// accumulator batch output of state `state` it spends at input `input`
+	/// (`prevouts` the outputs every input spends): over
+	/// [`arca_covenant::accumulator::payout_digest`], which the signer builds
+	/// itself. The transaction goes without its witnesses.
+	pub async fn accumulator_release(&self, tx: &elements::Transaction, prevouts: &[elements::TxOut], input: usize,
+		state: &arca_covenant::AccumulatorPolicy) -> Result<Signature, SignerError>
+	{
+		let mut bare = tx.clone();
+		for i in &mut bare.input {
+			i.witness = Default::default();
+		}
+		let r = self.ask(&Request::AccumulatorRelease {
+			tx: hex(&elements::encode::serialize(&bare)),
+			prevouts: prevouts.iter().map(|p| hex(&elements::encode::serialize(p))).collect(),
+			input: input as u32,
+			root: hex(&state.root),
+			bitmap: hex(&state.bitmap.to_bytes()),
+		}).await?;
 		let s = r.signature.ok_or_else(|| SignerError::Answer("no signature".into()))?;
 		Signature::from_slice(&unhex(&s).map_err(SignerError::Answer)?).map_err(|e| SignerError::Answer(e.to_string()))
 	}
