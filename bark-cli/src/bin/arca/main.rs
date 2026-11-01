@@ -10,6 +10,7 @@
 //! with its reason and exits with status 1.
 
 mod bitcoin;
+mod btc_tower;
 mod tower;
 
 use std::path::{Path, PathBuf};
@@ -517,6 +518,12 @@ enum Cmd {
 	/// path's reserves cannot from this wallet's own on-chain coins.
 	#[command(subcommand)]
 	Watchtower(TowerCmd),
+	/// A watchtower for coins of a Bitcoin ark, in `<datadir>/btc-watchtower`:
+	/// it takes holders' deposits (each coin with a claim its holder signed)
+	/// and, a day before a coin's expiry, brings it on chain and claims it to
+	/// its holder's address, paying the fees from its own Bitcoin coins.
+	#[command(subcommand, name = "btc-watchtower")]
+	BtcWatchtower(btc_tower::BtcTowerCmd),
 	/// Cancels the steps of an offline-refresh plan that have not started.
 	PlanCancel {
 		plan: String,
@@ -1237,6 +1244,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	if let Cmd::Bitcoin { args } = &cli.command {
 		return bitcoin(&datadir, args);
 	}
+	let cli = match cli.command {
+		Cmd::BtcWatchtower(c) => return btc_tower::run(&datadir, c),
+		_ => cli,
+	};
 	// The Bitcoin side of Lightning is Bark's, on the Bitcoin ark wallet: it
 	// needs nothing of the Arca wallet's store or operator.
 	match &cli.command {
@@ -1385,7 +1396,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		}
 	}
 	match cli.command {
-		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } => unreachable!("handled above"),
+		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } | Cmd::BtcWatchtower(_) => unreachable!("handled above"),
 		Cmd::Info => w.info(),
 		Cmd::Supply { asset: a } => w.supply(asset(&a)?),
 		Cmd::LeafTemplate { template } => w.leaf_template(template.as_deref()),

@@ -102,6 +102,8 @@ services:
   arcad: { <<: *daemon, command: arcad, stop_signal: SIGINT }
   # The watchtower for the peer operator's users (PEER_ARCA_URL).
   watchtower: { <<: *daemon, command: watchtower }
+  # The watchtower for Bitcoin ark coins (BTC_TOWER_ARKS, any ark by default).
+  btc-watchtower: { <<: *daemon, command: btc-watchtower }
   caddy: { <<: *daemon, command: caddy }
 
 volumes:

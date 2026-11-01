@@ -658,6 +658,18 @@ impl<P: Policy> Vtxo<Full, P> {
 		}).collect()
 	}
 
+	/// The positions, in [Vtxo::transactions] order, of the transactions that
+	/// spend a coin out of round (an arkoor transition, a checkpoint among
+	/// them). Each spends an output an earlier holder could bring on chain
+	/// and claim alone after its exit delta, so once the transaction before
+	/// it is on chain, it must follow within that delta.
+	pub fn arkoor_levels(&self) -> Vec<usize> {
+		self.genesis.items.iter().enumerate()
+			.filter(|(_, g)| matches!(g.transition, GenesisTransition::Arkoor(_)))
+			.map(|(i, _)| i)
+			.collect()
+	}
+
 	/// Whether all transaction witnesses are present
 	///
 	/// It is possible to represent unsigned or otherwise unfinished VTXOs,

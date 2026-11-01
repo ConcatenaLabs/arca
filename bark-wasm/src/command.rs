@@ -26,6 +26,7 @@ pub const COMMANDS: &[&str] = &[
 	"pay", "pay_status", "pay_fee", "invoice", "receive_status", "receive_fee",
 	"offboard", "offboard_fee", "refresh", "schedule_refreshes", "sync", "catch_up", "history",
 	"coins", "exit_estimate", "exit_start", "exit_progress", "exit_claim", "exit_status", "exit_auto",
+	"tower_plan",
 ];
 
 /// The Bitcoin network a name stands for. Testnet4 is the network the
@@ -337,6 +338,7 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 			Ok(json!({ "tip": tip, "coins": coins }))
 		},
 		c if crate::exit::COMMANDS.contains(&c) => crate::exit::run(wallet, c, args).await,
+		c if crate::tower::COMMANDS.contains(&c) => crate::tower::run(wallet, c, args).await,
 		other => bail!("unknown command '{}'", other),
 	}
 }

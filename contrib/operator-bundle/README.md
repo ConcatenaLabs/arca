@@ -3,7 +3,8 @@
 Everything an Arca operator runs, on both chains, on one machine (Linux,
 macOS or Windows): the
 Sequentia and Bitcoin nodes, PostgreSQL, `arcad` and `arca-signer`, a
-watchtower for the peer operator's users, Bark's `captaind` and `watchmand`,
+watchtower for the peer operator's users, a watchtower for Bitcoin ark coins,
+Bark's `captaind` and `watchmand`,
 and a Lightning gateway on each chain (SeqLN for the assets, Core Lightning
 for BTC). [doc/operator-bundle.md](../../doc/operator-bundle.md)
 is the runbook: how to install it, fund it, connect it to another operator

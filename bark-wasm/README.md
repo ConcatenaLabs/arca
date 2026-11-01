@@ -74,6 +74,24 @@ starts nothing. In every case it moves exits already under way on and claims
 what has finished. A page calls it after each sync; developer mode offers
 `exit_estimate` and `exit_start` as a button.
 
+## Watchtowers for coins away
+
+A holder who goes away past a coin's expiry would otherwise rely on the
+operator not to sweep it. `tower_plan` answers what to send the Bitcoin ark
+watchtowers the program names (each one's `GET /v1/info`, read by the
+program): for every coin worth rescuing (at least 20 times its rescue cost at
+the day's fast rate), a deposit for each watchtower that watches the coin's
+ark and does not hold it yet, its claim (signed now by the coin's key) paying
+the phrase's first BIP84 address, less the rescue fee; a withdrawal for each
+deposit the program lists whose coin the wallet no longer holds in the ark;
+and, for developer mode, which coins are covered and by whom (`covered`) and
+which are too small (`not_worth`). `refresh_due` lists the coins within 288
+blocks (two days) of expiry, which the program refreshes while the wallet is
+open, so a holder who opened it recently is never rescued. The program posts
+each `body` to `<tower>/v1/deposit` or `<tower>/v1/withdraw` and keeps the
+`tower`, `vtxo` and `claim_txid` of each deposit a tower took, to pass back as
+`deposited`. Default mode shows none of this.
+
 ## Commands
 
 `BtcArk.open(network, mnemonic, server, esplora)`, then `run(command, json)`.
@@ -105,6 +123,7 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `exit_progress` | `address`? | `exits` (each `id`, `state`, `claimable_height`, `error`), `claimed` (`txid`, `address`, `amount`, `coins`, or null), `pending`, `claimable_at` |
 | `exit_claim` | `address`? | `txid`, `address`, `amount`, `coins` |
 | `exit_status` | | `exits`: every exit, live or finished, with its `state` |
+| `tower_plan` | `towers` (each `url`, `info`), `deposited`? (each `tower`, `vtxo`, `claim_txid`), `fast_rate`? (sat/vB) | `deposit` and `withdraw` (each `tower`, `vtxo`, `claim_txid`, `body`), `covered` (each `vtxo`, `amount`, `expiry_height`, `rescued_from`, `towers`), `not_worth` (each `vtxo`, `amount`, `rescue_cost`), `refresh_due`, `skipped` (with `reason`), `holder_address`, `fast_rate`, `tip` |
 | `exit_auto` | `address`?, `ark_refused`?, `margin`? | `action` (`none`, `started`, `cannot_start` with `reason`, the coins' `amount` and, when the address holds too little for the fees, `needed` and `available`), `ark` (`answering`, `refused`, `unreachable`), `not_worth` (coins due but not worth their exit), `started`, `progress` |
 
 An exit's states are `starting`, `on_its_way`, `waiting_out_its_delay`,

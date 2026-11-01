@@ -8,6 +8,7 @@
 
 pub mod command;
 pub mod exit;
+pub mod tower;
 
 use std::sync::Arc;
 
