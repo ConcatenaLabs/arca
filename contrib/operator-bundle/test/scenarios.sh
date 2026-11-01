@@ -214,9 +214,11 @@ scenario_down_lightning() {
   : "${PEER_OPERATOR_URL:?}" "${PEER_ROUND:-}"
   mkwallet dl1
   PEER=1 mkwallet dl2
-  board dl1 "$(atoms 3000000 3)"
+  board dl1 "$(atoms 3000000 4)"
   local inv hash
-  inv=$(must dl2 lightning receive "$ASSET" "$(atoms 200000)")
+  # Two leaves: the receiver's claim margins come off what it receives, and
+  # one leaf less them is below the smallest leaf (arca#520).
+  inv=$(must dl2 lightning receive "$ASSET" "$(atoms 200000 2)")
   hash=$(jq -r .payment_hash <<<"$inv"); inv=$(jq -r .invoice <<<"$inv")
   try dl1 lightning pay "$inv" --wait 2
   verbatim "dl1 lightning pay" "$(jq -c '{payment, error}' <<<"$OUT" | head -c 600)"
