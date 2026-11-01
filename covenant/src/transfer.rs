@@ -487,6 +487,21 @@ pub enum TransferError {
 }
 
 impl TransferError {
+	/// Whether the record is of a format, a template or a template version
+	/// this library does not know, rather than malformed: a later build that
+	/// reads it may take it.
+	pub fn is_unknown_format(&self) -> bool {
+		let record = |e: &RecordError| matches!(e, RecordError::Version(_) | RecordError::Template(_) | RecordError::TemplateVersion { .. });
+		match self {
+			TransferError::Version(_) => true,
+			TransferError::Record(e) => record(e),
+			TransferError::Accumulator(AccumulatorError::Record(e)) => record(e),
+			_ => false,
+		}
+	}
+}
+
+impl TransferError {
 	/// A short name for the kind of error.
 	pub fn kind(&self) -> &'static str {
 		use TransferError::*;
@@ -1752,4 +1767,22 @@ fn read_outputs(r: &mut Reader) -> Result<Vec<ExplicitOutput>, TransferError> {
 		outputs.push(ExplicitOutput::new(asset, value, Script::from(r.bytes(len as usize)?.to_vec())));
 	}
 	Ok(outputs)
+}
+
+#[cfg(test)]
+mod format_tests {
+	use super::*;
+
+	/// A coin record of a version this library does not know is an unknown
+	/// format, which a later build may read; a truncated one of a known
+	/// version is malformed.
+	#[test]
+	fn an_unknown_version_is_an_unknown_format_and_a_truncated_record_is_not() {
+		let unknown = CoinRecord::from_bytes(&[COIN_RECORD_VERSION + 1]).unwrap_err();
+		assert!(unknown.is_unknown_format(), "{}", unknown);
+		let truncated = CoinRecord::from_bytes(&[COIN_RECORD_VERSION]).unwrap_err();
+		assert!(!truncated.is_unknown_format(), "{}", truncated);
+		assert!(TransferError::Record(RecordError::Version(4)).is_unknown_format());
+		assert!(TransferError::Accumulator(AccumulatorError::Record(RecordError::Template("x".into()))).is_unknown_format());
+	}
 }
