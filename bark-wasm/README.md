@@ -120,7 +120,9 @@ the `native` feature, open the wallet with `arca_bark_wasm::open` and call
 exits can pay their fees. `examples/regtest_drive.rs` does so against the regtest
 ark of `contrib/bitcoin-ark-regtest`, one command a run, the wallet closed
 between runs (`funding_address` answers the phrase's first BIP84 address, to
-fund an exit's fees from):
+fund an exit's fees from, and `board_funding` `{"sats"}` boards from those
+coins). With `NETWORK` and `ESPLORA` in place of `BITCOIND` and `COOKIE` it
+drives a wallet on any Bitcoin ark, the chain read from Esplora:
 
     ARK=… BITCOIND=… COOKIE=… MNEMONIC="…" [FEERATE=5] \
     cargo run --features native --example regtest_drive -- DATADIR COMMAND [JSON]
