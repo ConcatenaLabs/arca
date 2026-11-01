@@ -65,7 +65,17 @@ fn respond(s: &mut TcpStream, status: u16, body: &Value) {
 
 /// Reads one request from `s` (its head, then exactly its body), hands it to
 /// the wallet's loop and writes the answer.
-fn handle(mut s: TcpStream, tx: mpsc::Sender<Request>) {
+fn handle(s: TcpStream, tx: mpsc::Sender<Request>) {
+	handle_with(s, |call, body| {
+		let (reply, answer) = mpsc::channel();
+		tx.send(Request { call, body, reply }).ok()?;
+		answer.recv_timeout(Duration::from_secs(600)).ok()
+	})
+}
+
+/// Reads one request from `s` and writes what `answer` makes of its call and
+/// body (nothing, when it gives none).
+fn handle_with(mut s: TcpStream, answer: impl FnOnce(String, Value) -> Option<(u16, Value)>) {
 	let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
 	let mut buf = Vec::new();
 	let mut chunk = [0u8; 4096];
@@ -110,13 +120,28 @@ fn handle(mut s: TcpStream, tx: mpsc::Sender<Request>) {
 			Err(e) => return respond(&mut s, 422, &json!({"error": {"code": "malformed", "message": format!("the body: {}", e)}})),
 		}
 	};
-	let (reply, answer) = mpsc::channel();
-	if tx.send(Request { call, body, reply }).is_err() {
-		return;
-	}
-	if let Ok((status, v)) = answer.recv_timeout(Duration::from_secs(600)) {
+	if let Some((status, v)) = answer(call, body) {
 		respond(&mut s, status, &v);
 	}
+}
+
+/// Answers calls on `listen`, each on its connection's own thread with
+/// `answer`, in the background; returns once it listens.
+pub fn serve_each(
+	listen: &str,
+	name: &str,
+	answer: std::sync::Arc<dyn Fn(&str, &Value) -> (u16, Value) + Send + Sync>,
+) -> Result<std::net::SocketAddr, Error> {
+	let listener = TcpListener::bind(listen).map_err(|e| Error::Io(format!("{}: {}", listen, e)))?;
+	let at = listener.local_addr().map_err(|e| Error::Io(e.to_string()))?;
+	eprintln!("{}: listening on {}", name, at);
+	std::thread::spawn(move || {
+		for s in listener.incoming().flatten() {
+			let answer = answer.clone();
+			std::thread::spawn(move || handle_with(s, |call, body| Some(answer(&call, &body))));
+		}
+	});
+	Ok(at)
 }
 
 /// Serves the watchtower on `listen` until the process is stopped.

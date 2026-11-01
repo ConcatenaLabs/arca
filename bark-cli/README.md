@@ -1295,6 +1295,14 @@ It refuses a deposit
   block, and the exit transactions of the coins due within one margin of each
   other may not exceed its coins times half the margin.
 
+Its own coins' wallet reads the chain from the tower's birthday (the first
+block within two hours of its phrase being made, kept in `birthday`), never
+from genesis. It answers while a pass runs: `info` at once, from what it last
+stated, and deposits and withdrawals while the pass brings its wallet up to
+the chain, which holds only that wallet. `info`'s `float_synced_to` is the
+height its wallet has read to; until that reaches the tip, `float_sat` and
+`capacity_sat` can be behind, and it refuses deposits they cannot cover.
+
 So fund it with BTC for the rescues it is to pay for (a rescue is about 1,400
 vB: about 42,000 sat at 30 sat/vB), split into several coins.
 
@@ -1315,7 +1323,7 @@ and the rate it prices a rescue at today (`rate_sat_vb`, the higher of that
 and the chain's fast rate), and what its BTC can still pay for: `float_sat`,
 `committed_sat` (the rescue fees of the deposits it holds), `capacity_sat`,
 `short_sat` (above zero when spent coins leave it unable to pay for every
-deposit it holds), `float_coins` and `exits_per_margin`. Wallets make their
+deposit it holds), `float_coins`, `exits_per_margin` and `float_synced_to`. Wallets make their
 deposits and withdrawals with `tower_plan` (`bark-wasm`), which judges a coin
 and prices its claim at one rate, and counts a coin covered only by a
 watchtower that took it and is not short.
