@@ -292,6 +292,30 @@ time to claim Q's leaf is over: in the run P's lock ran until median time
 failed the receive back and P's swap read `refunded`, its 100,000 atoms
 back less 416 atoms of transfer fees.
 
+### On the public testnet
+
+`down-idle`, `down-transfer` and `down-lightning` also ran against a second
+operator on the public testnet, a bundle beside sequentiatestnet.com's with
+leaves of at least 1,000,000 atoms and an exit delay of 254 units (36 hours),
+paying across to sequentiatestnet.com's operator over Lightning:
+
+- **Idle**: no holder's total moved while it was down; it came back in 1.1 s
+  with the same key, and the holder that had waited paid at once. The two
+  holders that went home alone had their exits on the chain, waiting out the
+  36-hour delay.
+- **A payment in flight**: with the signer gone the payment was refused
+  (`503 signer_unavailable`) and nothing changed; killed in flight, the payment
+  went out; after the restart (17.3 s) every receiver held what it was paid.
+- **A payment over Lightning to the other operator**: paid with this operator
+  stopped 0.3 s later. The other operator held the payment for its next round
+  and the receiver held 1,999,584 of its 2,000,000 atoms 142 s later (the rest
+  is the claim's margins). The payer read `paying` until this operator came
+  back, and `paid` with its preimage 2 s after the restart.
+
+On a live chain the scenarios wait for blocks and for the other operator's
+round where regtest makes them at once, and their amounts are leaf-sized:
+each run's funding costs a few hundredths of a unit of the asset.
+
 ## Load
 
 `operator-tests.sh load` makes many wallets, funds them all in one round (a
