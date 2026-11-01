@@ -349,7 +349,7 @@ pub fn check_server_url(base: &str) -> Result<(), Error> {
 /// test compares the two lists.
 pub const REFUSALS: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
-	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
+	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "forfeits_after_broadcast", "frozen", "hash_reused", "htlc", "in_round", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
 	"key_reused", "lapsed", "leaf_set", "malformed", "margin", "merge", "no_lightning", "no_lowest_node", "nonce_unknown", "nonce_used", "not_accepted",
 	"not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "not_withdrawable", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
 	"order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed", "owed_withdrawn", "planned",

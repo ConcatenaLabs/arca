@@ -217,6 +217,10 @@ pub struct ParticipationRequest {
 	pub fees: Vec<(AssetId, u64)>,
 	/// The earliest median time of a round it may run in.
 	pub not_before: Option<MedianTime>,
+	/// The wallet hands over its forfeits before the round is broadcast
+	/// ([`ParticipationError::ForfeitsAfterBroadcast`]). Not covered by the
+	/// id.
+	pub forfeits_before_broadcast: bool,
 }
 
 impl ParticipationRequest {
@@ -393,6 +397,13 @@ pub enum ParticipationError {
 	/// predecessor can still come home.
 	#[error("{0}")]
 	Planned(String),
+	/// A participation giving up coins from a wallet that hands over its
+	/// forfeits only once its round is broadcast, to an operator that holds
+	/// every such round until they are in ([`crate::params::Params::no_sweep`]).
+	#[error("this wallet hands over its forfeits only after a round is broadcast, and this operator builds batches without a sweep, \
+		whose rounds go out only once every forfeit is in: update the wallet to refresh, offboard or pay out here. Nothing was taken: \
+		the coins given up are still yours")]
+	ForfeitsAfterBroadcast,
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
 	/// The operator's signer holds a forfeit or a spend under a coin's salt.
@@ -465,6 +476,7 @@ impl ParticipationError {
 			ReturnScriptReused => "script_reused",
 			NotSynced => "not_synced",
 			Planned(_) => "planned",
+			ForfeitsAfterBroadcast => "forfeits_after_broadcast",
 			SignedAlready(_) => "double_spend",
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
 			Signer(SignerError::Declined(_)) => "declined",
@@ -724,6 +736,13 @@ impl Participations {
 		let id = req.id(&p.chain, &p.operator);
 		if self.store.participation(&id).await?.is_some() {
 			return self.status(&id).await;
+		}
+		// A round giving up coins without a sweep goes out only once every
+		// forfeit is in: a wallet that hands them over only after broadcast
+		// would hold back every round it joins, so it is refused here, in
+		// words, rather than voided there.
+		if p.no_sweep && !req.forfeits_before_broadcast {
+			return Err(ParticipationError::ForfeitsAfterBroadcast);
 		}
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();

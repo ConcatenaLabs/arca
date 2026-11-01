@@ -108,6 +108,9 @@ pub const MAX_LAPSE_WINDOW: u32 = 400 * 86_400;
 pub struct DistributionRequest {
 	pub distribution: Distribution,
 	pub attestations: Vec<Signature>,
+	/// The payer hands over its forfeits before the round is broadcast
+	/// ([`ParticipationError::ForfeitsAfterBroadcast`]).
+	pub forfeits_before_broadcast: bool,
 }
 
 /// What the operator asks for a distribution under `schedule`: the refresh
@@ -147,6 +150,9 @@ impl Participations {
 		let id = d.id(&p.chain, &p.operator);
 		if self.store.participation(&id).await?.is_some() {
 			return self.status(&id).await;
+		}
+		if p.no_sweep && !req.forfeits_before_broadcast {
+			return Err(ParticipationError::ForfeitsAfterBroadcast);
 		}
 		// A coin whose holder is frozen is refused before anything else.
 		crate::supervision::gate(&self.store, &self.finality, p, &d.inputs).await?;

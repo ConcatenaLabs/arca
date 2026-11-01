@@ -31,7 +31,7 @@ pub struct ErrorDetail {
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
-	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "internal", "invalid_coin",
+	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "forfeits_after_broadcast", "frozen", "hash_reused", "htlc", "in_round", "in_use", "internal", "invalid_coin",
 	"invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "lapsed", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
@@ -396,6 +396,13 @@ pub struct ParticipationsInfo {
 	/// in a refresh that may wait and still pay with it.
 	#[serde(default)]
 	pub withdraw: bool,
+	/// The operator reads `forfeits_before_broadcast` on a participation:
+	/// a wallet that hands over its forfeits against a round's transaction
+	/// before it is broadcast says so, and one that does not is refused, in
+	/// words, by an operator that holds its refresh rounds for them
+	/// (`batches.no_sweep`).
+	#[serde(default)]
+	pub forfeits_before_broadcast: bool,
 }
 
 /// The dates a board, and every coin resting on it, carries: those of a batch
@@ -1728,6 +1735,14 @@ pub struct SubmitParticipation {
 	pub fees: Vec<FeeAmount>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub not_before: Option<u32>,
+	/// The wallet hands over its forfeits against the round's transaction
+	/// served before broadcast (`info.participations.forfeits_before_broadcast`).
+	/// An operator that builds batches without a sweep refuses a
+	/// participation giving up coins without it (`forfeits_after_broadcast`):
+	/// such a wallet would hand them over only once its round is out, and
+	/// that round is held until they are in.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub forfeits_before_broadcast: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2464,6 +2479,10 @@ pub struct Distribute {
 	/// `vest-1`, and nothing moves it before then. Only with a deadline.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub vest: Option<u32>,
+	/// As for `submit_participation`: the payer hands over its forfeits
+	/// before the round is broadcast.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub forfeits_before_broadcast: bool,
 }
 
 /// One claim of a distribution: the named key (x-only, hex), the payer's

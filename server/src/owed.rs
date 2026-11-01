@@ -142,7 +142,8 @@ pub struct ClaimRequest {
 
 /// The repayment participation's id for a claim wanting `leaf`.
 pub fn repayment_id(chain: &Chain, operator: &XOnlyPublicKey, leaf: &OutputRequest) -> [u8; 32] {
-	ParticipationRequest { inputs: vec![], outputs: vec![leaf.clone()], key_proofs: vec![], fees: vec![], not_before: None }
+	ParticipationRequest { inputs: vec![], outputs: vec![leaf.clone()], key_proofs: vec![], fees: vec![], not_before: None,
+		forfeits_before_broadcast: true }
 		.id(chain, operator)
 }
 

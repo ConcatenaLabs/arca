@@ -162,6 +162,26 @@
 //! one that does not within the window is voided, the round dropped, killed
 //! on the chain and built again without it ([`Rounds::pass`]).
 //!
+//! A held round never waits on a participant that does not answer more than
+//! once ([`Rounds::run_round_of`]):
+//! - After a drop, the participations that did hand their forfeits over run
+//!   again at once, in a round of their own: while any of them can run, the
+//!   next round of the asset takes them and no newcomer. So an answering
+//!   participation goes out at most one window late for each participant
+//!   that drops out beside it, whoever joins meanwhile.
+//! - The coins a voided participation gave up, and the batch leaves and
+//!   boards each rests on (so a coin paid on from one out of round is caught
+//!   too), are struck ([`Store::strike_coins`]). A participation giving one
+//!   up waits a back-off, the window at first and doubling with each strike
+//!   up to a day, and then runs only in a round of its own
+//!   ([`Rounds::run_solo_round_of`]), where it holds back nobody. Once a
+//!   round with it goes out, the strike is cleared.
+//! - A wallet that hands over its forfeits only after a round is broadcast
+//!   would be voided from every such round: it is refused when it submits,
+//!   saying why (`forfeits_after_broadcast`), and never joins one. A wallet
+//!   that hands them over before says so on the participation
+//!   (`forfeits_before_broadcast`).
+//!
 //! # Rounds that fill on-chain orders
 //!
 //! A take ([`crate::participations::Participations::take`]) runs in a round
@@ -354,6 +374,46 @@ fn lowest_of(record: &[u8]) -> Option<[u8; 32]> {
 /// beyond the five before expiry from which a wallet asks for a refresh by
 /// itself and the four from which it takes the coin on the chain instead.
 pub const CAP_EXEMPT: u32 = 6 * 86_400;
+
+/// The longest a struck coin waits before its round of its own: a day.
+pub const STRIKE_CAP: u32 = 86_400;
+
+/// How a pending participation stands toward a held round.
+enum Standing {
+	/// It has not been in a dropped round, and gives up no struck coin.
+	Fresh,
+	/// It handed its forfeits over for a held round dropped because another
+	/// participation's did not come: it runs again first.
+	Rerun,
+	/// It gives up a struck coin whose wait is over: it runs only alone.
+	Solo,
+	/// It gives up a struck coin still waiting, until this median time.
+	Waits(u32),
+}
+
+/// The pending participations a round may take, by how they stand.
+#[derive(Default)]
+struct Picks {
+	/// Every one that runs beside others, in the store's order.
+	shared: Vec<[u8; 32]>,
+	/// Those of `shared` that run again after a dropped round.
+	reruns: Vec<[u8; 32]>,
+	/// Those that run only alone.
+	solo: Vec<[u8; 32]>,
+}
+
+impl Picks {
+	/// The candidate lists to build a shared round from, in turn: the
+	/// re-runs alone while there are any, then everyone shared (when no
+	/// re-run can run now, so none of them holds newcomers back for good).
+	fn shared_passes(&self) -> Vec<Vec<[u8; 32]>> {
+		if self.reruns.is_empty() {
+			vec![self.shared.clone()]
+		} else {
+			vec![self.reruns.clone(), self.shared.clone()]
+		}
+	}
+}
 
 impl Default for RoundConfig {
 	/// The specification's: radix 4, a 36-hour notice, three steps of 28
@@ -1004,23 +1064,27 @@ impl Rounds {
 		let mut failed = vec![];
 		self.plans_due().await?;
 		for asset in self.assets_waiting().await? {
-			match self.run_round_of(asset).await {
-				Ok(Some(b)) => built.push(b),
-				Ok(None) => {},
-				Err(e) => {
-					log::warn!("rounds: the round of asset {}: {}", asset, e);
-					failed.push((asset, e));
-				},
+			for solo in [false, true] {
+				match if solo { self.run_solo_round_of(asset).await } else { self.run_round_of(asset).await } {
+					Ok(Some(b)) => built.push(b),
+					Ok(None) => {},
+					Err(e) => {
+						log::warn!("rounds: the round of asset {}: {}", asset, e);
+						failed.push((asset, e));
+					},
+				}
 			}
 		}
 		for asset in self.takes_waiting().await? {
-			match self.run_fill_round_of(asset).await {
-				Ok(Some(b)) => built.push(b),
-				Ok(None) => {},
-				Err(e) => {
-					log::warn!("rounds: the fill round of asset {}: {}", asset, e);
-					failed.push((asset, e));
-				},
+			for solo in [false, true] {
+				match if solo { self.run_solo_fill_round_of(asset).await } else { self.run_fill_round_of(asset).await } {
+					Ok(Some(b)) => built.push(b),
+					Ok(None) => {},
+					Err(e) => {
+						log::warn!("rounds: the fill round of asset {}: {}", asset, e);
+						failed.push((asset, e));
+					},
+				}
 			}
 		}
 		Ok((built, failed))
@@ -1082,15 +1146,47 @@ impl Rounds {
 	/// the node finds spent when the round is put to it. Returns `None` when
 	/// nothing of it waits.
 	pub async fn run_fill_round_of(&self, asset: AssetId) -> Result<Option<Built>, RoundError> {
+		self.fill_round_of(asset, false).await
+	}
+
+	/// Builds a fill round of `asset` for the first take giving up a struck
+	/// coin whose wait is over, alone ([`Rounds::run_solo_round_of`]).
+	pub async fn run_solo_fill_round_of(&self, asset: AssetId) -> Result<Option<Built>, RoundError> {
+		self.fill_round_of(asset, true).await
+	}
+
+	async fn fill_round_of(&self, asset: AssetId, solo: bool) -> Result<Option<Built>, RoundError> {
 		let _one = self.running.lock().await;
 		let now = self.now().await?;
 		if !self.params.assets.contains(&asset) {
 			return Ok(None);
 		}
+		let picks = self.picks(now, |row| row.fill.is_some()
+			&& row.outputs.first().map(|o| AssetId::from_byte_array(o.asset)) == Some(asset)).await?;
+		if solo {
+			for id in picks.solo {
+				if let Some(b) = self.fill_round_from(asset, now, &[id]).await? {
+					return Ok(Some(b));
+				}
+			}
+			return Ok(None);
+		}
+		for ids in picks.shared_passes() {
+			if let Some(b) = self.fill_round_from(asset, now, &ids).await? {
+				return Ok(Some(b));
+			}
+		}
+		Ok(None)
+	}
+
+	/// Builds a fill round of `asset` from the pending takes `ids`.
+	async fn fill_round_from(&self, asset: AssetId, now: MedianTime, ids: &[[u8; 32]]) -> Result<Option<Built>, RoundError> {
 		let mut chosen: Vec<ParticipationRow> = vec![];
-		for id in self.store.participations_in(ParticipationState::Pending).await? {
-			let Some(row) = self.store.participation(&id).await? else { continue };
-			if row.fill.is_none() || row.outputs.first().map(|o| AssetId::from_byte_array(o.asset)) != Some(asset) {
+		for id in ids {
+			let Some(row) = self.store.participation(id).await? else { continue };
+			if row.state != ParticipationState::Pending || row.fill.is_none()
+				|| row.outputs.first().map(|o| AssetId::from_byte_array(o.asset)) != Some(asset)
+			{
 				continue;
 			}
 			if row.not_before.is_some_and(|t| t > now.to_consensus_u32()) {
@@ -1326,8 +1422,14 @@ impl Rounds {
 	/// `None` when nothing waits.
 	pub async fn run_round(&self) -> Result<Option<Built>, RoundError> {
 		self.plans_due().await?;
-		for asset in self.assets_waiting().await? {
-			if let Some(b) = self.run_round_of(asset).await? {
+		let assets = self.assets_waiting().await?;
+		for asset in &assets {
+			if let Some(b) = self.run_round_of(*asset).await? {
+				return Ok(Some(b));
+			}
+		}
+		for asset in &assets {
+			if let Some(b) = self.run_solo_round_of(*asset).await? {
 				return Ok(Some(b));
 			}
 		}
@@ -1346,22 +1448,118 @@ impl Rounds {
 	/// Builds the next round of `asset` from its pending participations, if
 	/// any: see the [module documentation](self). The round carries `asset`
 	/// alone. Returns `None` when nothing of it waits.
+	///
+	/// A participation that handed its forfeits over for a held round
+	/// dropped for another's runs again first: while any such re-run of the
+	/// asset can run, the round takes them alone. One giving up a struck
+	/// coin never runs here ([`Self::run_solo_round_of`]).
 	pub async fn run_round_of(&self, asset: AssetId) -> Result<Option<Built>, RoundError> {
 		let _one = self.running.lock().await;
 		let now = self.now().await?;
 		if !self.params.assets.contains(&asset) {
 			return Ok(None);
 		}
+		let picks = self.picks(now, |row| row.fill.is_none() && Self::asset_of(row) == Some(asset)).await?;
+		for ids in picks.shared_passes() {
+			if let Some(b) = self.round_from(asset, now, &ids).await? {
+				return Ok(Some(b));
+			}
+		}
+		Ok(None)
+	}
 
-		// The participations of the asset, whole, within the batch size.
+	/// Builds a round of `asset` for the first participation giving up a
+	/// struck coin whose wait is over, alone: its coins' last participation
+	/// was voided because its forfeits for a held round did not come, so it
+	/// runs where it holds back nobody, and its strike is cleared once that
+	/// round goes out. Returns `None` when none can run.
+	pub async fn run_solo_round_of(&self, asset: AssetId) -> Result<Option<Built>, RoundError> {
+		let _one = self.running.lock().await;
+		let now = self.now().await?;
+		if !self.params.assets.contains(&asset) {
+			return Ok(None);
+		}
+		let picks = self.picks(now, |row| row.fill.is_none() && Self::asset_of(row) == Some(asset)).await?;
+		for id in picks.solo {
+			if let Some(b) = self.round_from(asset, now, &[id]).await? {
+				return Ok(Some(b));
+			}
+		}
+		Ok(None)
+	}
+
+	/// The coins participation `row` gives up, and the batch leaves and
+	/// boards each rests on: what a strike names.
+	async fn struck_ids(&self, row: &ParticipationRow) -> Result<Vec<[u8; 32]>, RoundError> {
+		let mut ids = vec![];
+		for i in &row.inputs {
+			ids.push(i.leaf_id);
+			if let Some(l) = self.store.leaf(&i.leaf_id).await? {
+				if let Ok(rec) = CoinRecord::from_bytes(&l.record) {
+					crate::http::root_leaf_ids(&rec, &mut ids);
+				}
+			}
+		}
+		ids.sort();
+		ids.dedup();
+		Ok(ids)
+	}
+
+	/// How `row` stands toward a held round at `now`.
+	async fn standing(&self, row: &ParticipationRow, now: MedianTime) -> Result<Standing, RoundError> {
+		if !row.inputs.is_empty() {
+			if let Some((_, until)) = self.store.strike_of(&self.struck_ids(row).await?).await? {
+				return Ok(if now.to_consensus_u32() < until { Standing::Waits(until) } else { Standing::Solo });
+			}
+		}
+		if row.attempt > 0 {
+			if let Some(a) = self.store.attempts(&row.id).await?.first() {
+				if a.round_lost && self.store.round_held(a.round_id).await? {
+					return Ok(Standing::Rerun);
+				}
+			}
+		}
+		Ok(Standing::Fresh)
+	}
+
+	/// The pending participations `of` keeps, by how each stands at `now`.
+	/// One giving up a struck coin still waiting is told why.
+	async fn picks(&self, now: MedianTime, of: impl Fn(&ParticipationRow) -> bool) -> Result<Picks, RoundError> {
+		let mut picks = Picks::default();
+		for id in self.store.participations_in(ParticipationState::Pending).await? {
+			let Some(row) = self.store.participation(&id).await? else { continue };
+			if !of(&row) {
+				continue;
+			}
+			match self.standing(&row, now).await? {
+				Standing::Fresh => picks.shared.push(id),
+				Standing::Rerun => {
+					picks.shared.push(id);
+					picks.reruns.push(id);
+				},
+				Standing::Solo => picks.solo.push(id),
+				Standing::Waits(until) => {
+					let why = format!("This waits until median time {}: an earlier participation giving up these coins was voided because \
+						its forfeits did not reach the operator in time, and its round was dropped. They then run in a round of their own, \
+						where nobody else waits on them; each time this repeats, the wait doubles, up to a day", until);
+					self.wait_for(&row, &why).await?;
+				},
+			}
+		}
+		Ok(picks)
+	}
+
+	/// Builds a round of `asset` from the pending participations `ids`, in
+	/// order, whole, within the batch size.
+	async fn round_from(&self, asset: AssetId, now: MedianTime, ids: &[[u8; 32]]) -> Result<Option<Built>, RoundError> {
 		let mut chosen: Vec<ParticipationRow> = vec![];
 		let mut count = 0usize;
-		for id in self.store.participations_in(ParticipationState::Pending).await? {
-			let row = match self.store.participation(&id).await? {
+		for id in ids {
+			let row = match self.store.participation(id).await? {
 				Some(r) => r,
 				None => continue,
 			};
-			if row.fill.is_some() || Self::asset_of(&row) != Some(asset) {
+			if row.state != ParticipationState::Pending || row.fill.is_some() || Self::asset_of(&row) != Some(asset) {
 				continue;
 			}
 			if row.not_before.is_some_and(|t| t > now.to_consensus_u32()) {
@@ -2360,24 +2558,47 @@ impl Rounds {
 	/// from when the round was built) has passed without them, the round is
 	/// dropped unbroadcast: its coins are freed, each participation whose
 	/// forfeits did not come is voided, saying why, and the others run again.
+	///
+	/// Each coin a voided participation gave up is struck
+	/// ([`Store::strike_coins`]): it then waits, and runs only alone. A
+	/// round that goes out clears the strikes of every coin given up in it.
 	async fn forfeits_ready(&self, r: &RoundRow) -> Result<bool, RoundError> {
 		let mut missing = vec![];
-		for id in self.store.round_participations(r.round_id).await? {
-			let (n, whole, unsigned) = self.store.forfeit_count(&id, r.round_id).await?;
+		let ids = self.store.round_participations(r.round_id).await?;
+		for id in &ids {
+			let (n, whole, unsigned) = self.store.forfeit_count(id, r.round_id).await?;
 			if whole + unsigned < n {
-				missing.push(id);
+				missing.push(*id);
 			}
 		}
 		if missing.is_empty() {
+			for id in &ids {
+				if let Some(p) = self.store.participation(id).await? {
+					if !p.inputs.is_empty() {
+						self.store.clear_strikes(&self.struck_ids(&p).await?).await?;
+					}
+				}
+			}
 			return Ok(true);
 		}
-		let now = self.now().await?.to_consensus_u32() as u64;
-		if now < r.created_mtp as u64 + self.params.fill_forfeit_window_seconds as u64 {
+		let now = self.now().await?.to_consensus_u32();
+		let window = self.params.fill_forfeit_window_seconds;
+		if (now as u64) < r.created_mtp as u64 + window as u64 {
 			return Ok(false);
 		}
-		let why = format!("its forfeits did not come within {} s of its round being built: a round that fills orders, or holds a batch \
-			without a sweep, goes out only once every participation in it has handed over its forfeits", self.params.fill_forfeit_window_seconds);
-		let voids: Vec<([u8; 32], String)> = missing.into_iter().map(|id| (id, why.clone())).collect();
+		let mut voids: Vec<([u8; 32], String)> = vec![];
+		for id in missing {
+			let mut why = format!("its forfeits did not come within {} s of its round being built: a round that fills orders, or holds a \
+				batch without a sweep, goes out only once every participation in it has handed over its forfeits", window);
+			if let Some(p) = self.store.participation(&id).await? {
+				if !p.inputs.is_empty() {
+					let until = self.store.strike_coins(&self.struck_ids(&p).await?, now, window.max(1), STRIKE_CAP).await?;
+					why.push_str(&format!(". The coins it gave up run again only in a round of their own, from median time {}, so that \
+						nobody else waits on them", until));
+				}
+			}
+			voids.push((id, why));
+		}
 		self.drop_held_round(r, &voids).await?;
 		Ok(false)
 	}

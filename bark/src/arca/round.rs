@@ -1125,9 +1125,25 @@ impl Wallet {
 		};
 		// The forfeit window and whether rounds are held for forfeits, so
 		// that the wallet keeps in touch until its round is built.
-		if let Ok(info) = self.server_info() {
-			self.remember_fills(&info)?;
+		let info = self.server_info().ok();
+		if let Some(info) = &info {
+			self.remember_fills(info)?;
 		}
+		// The wallet hands over its forfeits against the served round before
+		// it is broadcast, and says so to an operator that reads it (one
+		// that builds batches without a sweep refuses a participation that
+		// does not). An older operator refuses fields it does not know, so it
+		// is told only when it asks. Not part of the participation's id.
+		let told;
+		let body = match info.as_ref().map(|i| i["participations"]["forfeits_before_broadcast"].as_bool() == Some(true)) {
+			Some(true) if call != "take_order" && body.is_object() => {
+				let mut b = body.clone();
+				b["forfeits_before_broadcast"] = json!(true);
+				told = b;
+				&told
+			},
+			_ => body,
+		};
 		match self.server.post(call, body) {
 			Ok(a) => {
 				self.store.set_participation(pid, a["state"].as_str().unwrap_or("pending"), None, None)?;
