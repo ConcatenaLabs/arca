@@ -1056,24 +1056,45 @@ impl Wallet {
 		Ok(json!({"participation": pid, "state": "void", "live_again": back, "void_reason": st["void_reason"]}))
 	}
 
-	/// Takes back every refresh of the wallet's in `asset` that the operator
-	/// still holds pending (not a take, a distribution or an offboard), so a
-	/// payment or a trade the live coins of `asset` cannot cover can use the
-	/// coins it gave up. Answers what it took back; nothing when the operator
-	/// takes no withdrawal.
-	pub(crate) fn withdraw_refreshes(&self, asset: AssetId) -> Result<Vec<Value>, Error> {
-		if self.quoting.load(std::sync::atomic::Ordering::Relaxed) || !Self::operator_withdraws(&self.server_info()?) {
-			return Ok(vec![]);
+	/// Whether participation `body` is a refresh: not a take, a distribution
+	/// or an offboard, its every output a leaf. Only a refresh is taken back
+	/// for the owner of its coins ([`Self::withdraw_refreshes`],
+	/// [`Self::withdraw_waited`]).
+	pub(crate) fn is_refresh(body: &Value) -> bool {
+		!Self::is_take(body) && body.get("claims").is_none()
+			&& body["outputs"].as_array().is_some_and(|o| !o.is_empty() && o.iter().all(|o| o.get("leaf").is_some()))
+	}
+
+	/// Each coin given up in a refresh the store holds pending, by its leaf
+	/// id: that refresh's id.
+	pub(crate) fn refresh_waiting_coins(&self) -> Result<std::collections::BTreeMap<String, String>, Error> {
+		let mut out = std::collections::BTreeMap::new();
+		for (pid, body, given, _, state, _, _) in self.store.participations()? {
+			if state != "pending" {
+				continue;
+			}
+			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+			if !Self::is_refresh(&body) {
+				continue;
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			for l in given {
+				out.insert(l, pid.clone());
+			}
 		}
+		Ok(out)
+	}
+
+	/// The wallet's refreshes the store holds pending that give up a coin of
+	/// `asset`, oldest first: each one's id and the coins it gives up.
+	fn pending_refreshes_of(&self, asset: AssetId) -> Result<Vec<(String, Vec<String>)>, Error> {
 		let mut out = vec![];
 		for (pid, body, given, _, state, _, _) in self.store.participations()? {
 			if state != "pending" {
 				continue;
 			}
 			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
-			let refresh = !Self::is_take(&body) && body.get("claims").is_none()
-				&& body["outputs"].as_array().is_some_and(|o| !o.is_empty() && o.iter().all(|o| o.get("leaf").is_some()));
-			if !refresh {
+			if !Self::is_refresh(&body) {
 				continue;
 			}
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
@@ -1081,9 +1102,24 @@ impl Wallet {
 			for l in &given {
 				of_asset |= self.store.coin(l)?.is_some_and(|c| c.asset == asset.to_string());
 			}
-			if !of_asset {
-				continue;
+			if of_asset {
+				out.push((pid, given));
 			}
+		}
+		Ok(out)
+	}
+
+	/// Takes back every refresh of the wallet's in `asset` that the operator
+	/// still holds pending (not a take, a distribution or an offboard), so a
+	/// payment or a trade the live coins of `asset` cannot cover can use the
+	/// coins it gave up. Answers what it took back; nothing when the operator
+	/// takes no withdrawal, or while a quote runs.
+	pub(crate) fn withdraw_refreshes(&self, asset: AssetId) -> Result<Vec<Value>, Error> {
+		if self.quoting.load(std::sync::atomic::Ordering::Relaxed) || !Self::operator_withdraws(&self.server_info()?) {
+			return Ok(vec![]);
+		}
+		let mut out = vec![];
+		for (pid, _) in self.pending_refreshes_of(asset)? {
 			match self.withdraw_participation(&pid) {
 				Ok(v) => out.push(v),
 				Err(e @ Error::Unreachable(_)) => return Err(e),
@@ -1093,21 +1129,95 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// Marks a quote under way until the guard is dropped: a quote takes back
-	/// no refresh ([`Self::withdraw_refreshes`]), and says what the live coins
-	/// can pay.
-	pub(crate) fn quoting(&self) -> Quoting {
-		Quoting { flag: self.quoting.clone(), was: self.quoting.swap(true, std::sync::atomic::Ordering::Relaxed) }
+	/// What a payment or a trade the live coins of `asset` fall short for
+	/// does first: it takes back every refresh of `asset` that waits
+	/// ([`Self::withdraw_refreshes`]), answering whether any came back. While
+	/// a quote runs it takes nothing back, and counts instead the coins of
+	/// each such refresh the operator answers pending at its first attempt,
+	/// which it always lets the wallet take back (a re-run only once its
+	/// earlier round can never return, which its status does not say, so a
+	/// quote does not count one), so the quote prices what the
+	/// trade itself would pay with ([`Self::spendable_coins`]); the quote
+	/// says which ([`Self::quoted`]).
+	pub(crate) fn free_refreshes(&self, asset: AssetId) -> Result<bool, Error> {
+		if !self.quoting.load(std::sync::atomic::Ordering::Relaxed) {
+			return Ok(self.withdraw_refreshes(asset)?.iter().any(|v| v["state"] == "void"));
+		}
+		if !Self::operator_withdraws(&self.server_info()?) {
+			return Ok(false);
+		}
+		let mut counted = false;
+		for (pid, given) in self.pending_refreshes_of(asset)? {
+			if self.quote_frees.borrow().iter().any(|(p, _)| *p == pid) {
+				counted = true;
+				continue;
+			}
+			let st = match self.server.post("participation_status", &json!({"participation_id": pid})) {
+				Ok(st) => st,
+				Err(e @ Error::Unreachable(_)) => return Err(e),
+				Err(_) => continue,
+			};
+			if st["state"] == "pending" && st["attempt"].as_u64().unwrap_or(0) == 0 {
+				self.quote_frees.borrow_mut().push((pid, given));
+				counted = true;
+			}
+		}
+		Ok(counted)
 	}
 
-	/// [`Self::withdraw_refreshes`] when the live coins of `asset` the wallet
-	/// can pay with hold less than `need`: whether it took any back.
+	/// The coins of `asset` given up in refreshes the quote under way counts
+	/// as the trade's to pay with ([`Self::free_refreshes`]); none outside a
+	/// quote.
+	pub(crate) fn counted_given(&self, asset: AssetId) -> Result<Vec<super::store::CoinRow>, Error> {
+		if !self.quoting.load(std::sync::atomic::Ordering::Relaxed) {
+			return Ok(vec![]);
+		}
+		let mut out = vec![];
+		for (_, given) in self.quote_frees.borrow().iter() {
+			for l in given {
+				if let Some(c) = self.store.coin(l)?.filter(|c| c.state == "given" && c.asset == asset.to_string()) {
+					out.push(c);
+				}
+			}
+		}
+		Ok(out)
+	}
+
+	/// Marks a quote under way until the guard is dropped: a quote takes back
+	/// no refresh ([`Self::withdraw_refreshes`]); it counts the coins the
+	/// trade would take back ([`Self::free_refreshes`]).
+	pub(crate) fn quoting(&self) -> Quoting {
+		let was = self.quoting.swap(true, std::sync::atomic::Ordering::Relaxed);
+		if !was {
+			self.quote_frees.borrow_mut().clear();
+		}
+		Quoting { flag: self.quoting.clone(), was }
+	}
+
+	/// A quote's answer `q`, saying which refreshes that wait the trade would
+	/// take back first to pay with their coins (`takes_back`, each its
+	/// participation and coins), when it counted any
+	/// ([`Self::free_refreshes`]). The quote itself took nothing back.
+	pub(crate) fn quoted(&self, q: Result<Value, Error>) -> Result<Value, Error> {
+		let mut q = q?;
+		let frees = self.quote_frees.borrow();
+		if !frees.is_empty() && q.is_object() {
+			q["takes_back"] = json!(frees.iter().map(|(p, g)| json!({"participation": p, "coins": g})).collect::<Vec<_>>());
+			q["takes_back_note"] = json!("coins given up in a refresh that waits for a round count as the wallet's to pay with: the \
+				trade takes that refresh back first, and is refused, the coins still given up, if a round has taken it meanwhile");
+		}
+		Ok(q)
+	}
+
+	/// [`Self::free_refreshes`] when the live coins of `asset` the wallet
+	/// can pay with hold less than `need`: whether any came back (or, while
+	/// a quote runs, were counted).
 	pub(crate) fn free_when_short(&self, asset: AssetId, need: u64) -> Result<bool, Error> {
 		let have: u64 = self.spendable_coins(asset)?.iter().map(|i| i.coin.value).sum();
 		if have >= need {
 			return Ok(false);
 		}
-		Ok(self.withdraw_refreshes(asset)?.iter().any(|v| v["state"] == "void"))
+		self.free_refreshes(asset)
 	}
 
 	/// Posts the participation `pid` of `body`, a take's to `take_order`.

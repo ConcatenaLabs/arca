@@ -797,6 +797,12 @@ impl Store {
 
 	/// `(id, body, given, wanted, state, preimage, round)` of every participation.
 	#[allow(clippy::type_complexity)]
+	/// When the wallet recorded participation `id` (its wall-clock seconds).
+	pub fn participation_created(&self, id: &str) -> Result<Option<u64>, Error> {
+		self.conn.query_row("SELECT created_at FROM participation WHERE id = ?1", params![id], |r| r.get::<_, i64>(0)).optional()
+			.map(|t| t.map(|t| t.max(0) as u64)).map_err(db)
+	}
+
 	pub fn participations(&self) -> Result<Vec<(String, String, String, String, String, Option<String>, Option<String>)>, Error> {
 		let mut st = self.conn.prepare("SELECT id, body, given, wanted, state, preimage, round FROM participation ORDER BY created_at").map_err(db)?;
 		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))

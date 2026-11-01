@@ -184,7 +184,7 @@ impl Wallet {
 		let _quote = self.quoting();
 		let info = self.server_info()?;
 		let plan = self.distribution_plan(&info, asset, claims)?;
-		Ok(json!({
+		self.quoted(Ok(json!({
 			"asset": asset.to_string(), "claims": claims.len(), "total": plan.total.to_string(), "fee": plan.fee.to_string(),
 			"coins": plan.coins.iter().map(|c| json!({"leaf_id": c.leaf_id, "value": c.value.to_string(), "expiry": c.expiry}))
 				.collect::<Vec<_>>(),
@@ -192,7 +192,7 @@ impl Wallet {
 			"note": "the fee is the operator's refresh fee of each coin given up, its fixed part for each claim leaf, and its offboard's \
 				fixed part once, for the payment of what no holder takes up back to the return script; with `split`, the wallet first pays \
 				itself a coin of exactly the claims and the fee, out of round",
-		}))
+		})))
 	}
 
 	/// Pays `claims` (each a key named and what its leaf holds) in `asset`
@@ -351,7 +351,22 @@ impl Wallet {
 	}
 
 	/// The coins a distribution of `claims` in `asset` gives up, and its fee.
+	/// When the live coins cannot pay it, every refresh of `asset` that
+	/// waits is taken back first, and its coins pay as well (a quote counts
+	/// them, taking nothing back: [`Wallet::free_refreshes`]).
 	fn distribution_plan(&self, info: &Value, asset: AssetId, claims: &[(XOnlyPublicKey, u64)]) -> Result<Plan, Error> {
+		match self.distribution_plan_from(info, asset, claims)? {
+			Ok(p) => Ok(p),
+			Err(short) => match self.free_refreshes(asset)? {
+				true => self.distribution_plan_from(info, asset, claims)?,
+				false => Err(short),
+			},
+		}
+	}
+
+	/// [`Self::distribution_plan`] from the coins the wallet can pay with
+	/// now: `Ok(Err(..))` when they hold too little.
+	fn distribution_plan_from(&self, info: &Value, asset: AssetId, claims: &[(XOnlyPublicKey, u64)]) -> Result<Result<Plan, Error>, Error> {
 		if claims.is_empty() || claims.len() > MAX_CLAIMS {
 			return Err(Error::Refused(format!("{} claims; a distribution names 1 to {}", claims.len(), MAX_CLAIMS)));
 		}
@@ -377,7 +392,7 @@ impl Wallet {
 		let now = self.now()?.to_consensus_u32();
 		let coins = self.spendable_coins(asset)?;
 		if coins.is_empty() {
-			return Err(Error::Refused(format!("the wallet holds no live coin of asset {} to distribute from", asset)));
+			return Ok(Err(Error::Refused(format!("the wallet holds no live coin of asset {} to distribute from", asset))));
 		}
 		let fee_of = |value: u128, expiry: u32| -> Result<u64, Error> {
 			let f = fixed + refresh_fee(&schedule, value.min(u64::MAX as u128) as u64, expiry, now) as u128;
@@ -395,7 +410,7 @@ impl Wallet {
 			let fee = fee_of(c.coin.value as u128, c.row.expiry)?;
 			if c.coin.value as u128 == total + fee as u128 {
 				bound(fee)?;
-				return Ok(Plan { coins: vec![c.row.clone()], total, fee, split: false });
+				return Ok(Ok(Plan { coins: vec![c.row.clone()], total, fee, split: false }));
 			}
 		}
 		// Otherwise a coin of exactly that, paid to the wallet itself first:
@@ -424,10 +439,10 @@ impl Wallet {
 		// coin the wallet would pay itself comes out of its live coins.
 		let held: u128 = coins.iter().map(|c| c.coin.value as u128).sum();
 		if held < total + fee as u128 {
-			return Err(Error::Refused(format!("the wallet's live coins of asset {} hold {}, and the claims and the fee take {}",
-				asset, held, total + fee as u128)));
+			return Ok(Err(Error::Refused(format!("the wallet's live coins of asset {} hold {}, and the claims and the fee take {}",
+				asset, held, total + fee as u128))));
 		}
-		Ok(Plan { coins: vec![], total, fee, split: true })
+		Ok(Ok(Plan { coins: vec![], total, fee, split: true }))
 	}
 
 	/// Pays the wallet itself, out of round, a coin of exactly `need` of

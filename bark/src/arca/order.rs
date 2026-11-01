@@ -144,7 +144,8 @@ impl Wallet {
 	pub fn order_quote(&mut self, ask: &OrderAsk, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
 		let _quote = self.quoting();
 		let info = self.server_info()?;
-		self.order_plan(&info, ask, max_fee_ppm).map(|(q, _)| q)
+		let q = self.order_plan(&info, ask, max_fee_ppm).map(|(q, _)| q);
+		self.quoted(q)
 	}
 
 	fn order_plan(&mut self, info: &Value, ask: &OrderAsk, max_fee_ppm: Option<u64>) -> Result<(Value, Plan), Error> {

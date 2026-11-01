@@ -118,7 +118,8 @@ impl Wallet {
 		let _quote = self.quoting();
 		let o = self.read_order(text)?;
 		let info = self.server_info()?;
-		self.quote_of(&o, &info, amount, max_fee_ppm).map(|(q, _)| q)
+		let q = self.quote_of(&o, &info, amount, max_fee_ppm).map(|(q, _)| q);
+		self.quoted(q)
 	}
 
 	fn quote_of(&self, o: &Order, info: &Value, amount: Option<u64>, max_fee_ppm: Option<u64>) -> Result<(Value, Option<String>), Error> {

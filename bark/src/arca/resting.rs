@@ -130,7 +130,8 @@ impl Wallet {
 	pub fn order_rest_quote(&mut self, ask: &RestAsk, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
 		let _quote = self.quoting();
 		let info = self.server_info()?;
-		self.rest_plan(&info, ask, max_fee_ppm).map(|(q, _)| q)
+		let q = self.rest_plan(&info, ask, max_fee_ppm).map(|(q, _)| q);
+		self.quoted(q)
 	}
 
 	fn rest_plan(&mut self, info: &Value, ask: &RestAsk, max_fee_ppm: Option<u64>) -> Result<(Value, RestPlan), Error> {
@@ -492,7 +493,7 @@ impl Wallet {
 		};
 		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
 		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;
-		Ok(f.quote(order, &o))
+		self.quoted(Ok(f.quote(order, &o)))
 	}
 
 	/// The order `order` as the operator serves it now, resting.

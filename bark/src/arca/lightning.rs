@@ -245,7 +245,7 @@ impl Wallet {
 		let min = Self::min_leaf(&p.info, p.asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
 		let (inputs, margin, change) = self.choose_coins(&p.info, p.asset, p.value + p.fee, &htlc_out, min)?;
-		Ok(Self::pay_quote_of(&p, &inputs, margin, change))
+		self.quoted(Ok(Self::pay_quote_of(&p, &inputs, margin, change)))
 	}
 
 	/// The quote of a payment as [`Self::lightning_pay_quote`] answers it.

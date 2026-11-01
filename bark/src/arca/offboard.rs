@@ -87,7 +87,8 @@ impl Wallet {
 	pub fn offboard_quote(&mut self, asset: AssetId, amount: u64, script: &Script, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
 		let _quote = self.quoting();
 		let info = self.server_info()?;
-		self.offboard_plan(&info, asset, amount, script, max_fee_ppm).map(|(q, _)| q)
+		let q = self.offboard_plan(&info, asset, amount, script, max_fee_ppm).map(|(q, _)| q);
+		self.quoted(q)
 	}
 
 	fn offboard_plan(&self, info: &Value, asset: AssetId, amount: u64, script: &Script, max_fee_ppm: Option<u64>)
