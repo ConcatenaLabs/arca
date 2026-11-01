@@ -26,8 +26,9 @@ tapscript collaborative path; its one pruned program comes from
 sequentia-contracts too.
 An accumulator batch (`accumulator`) holds its leaves as a fixed root of leaf
 records and a bitmap of the leaves that have left, under the Simplicity
-program `arca/accumulator-1`, whose two pruned forms also come from
-sequentia-contracts (`accumulator_programs`).
+program `arca/accumulator-1`, or `arca/accumulator-2` for a batch without a
+sweep, whose pruned forms also come from sequentia-contracts
+(`accumulator_programs`).
 
 ## What it builds
 
@@ -50,7 +51,7 @@ sequentia-contracts (`accumulator_programs`).
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
 | `order` | `order-3` (and `order-2`): an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program; `landing_tx` builds the landing, a fee coin paying; `publish_digest` is what the leaf's key signs to publish the order to its operator |
 | `plan` | No output of its own: offline refresh's plan, a chain of refresh steps the operator applies without the holder (`Plan`, its id what the holder's keys sign, `PlanStep`), and each step's refund (`Refund`), which stands in for the forfeit the holder cannot sign before the step's round exists | None of its own: the refund spends the coin given up and the step's new leaf together, each by the `vtxo-1` collaborative path, into the holder's `v(i)` at output 0 and the rest to the operator at output 1, so every use of either half pays the holder |
-| `accumulator` | An accumulator batch output (`AccumulatorPolicy`): up to 1,024 leaves of one asset as a fixed Merkle-sum root of slot records (`Slot`: the owner key, the SHA256 of the leaf's entry's scriptPubKey, the entry's value and the reserve of the slot's exit), the operator's key and a bitmap of the slots that have left, in a hidden data leaf beside the program | EXIT (`arca/accumulator-1`, Simplicity): one slot out in one transaction, under the owner's or the operator's signature over `exit_digest` (chain, root, record and a not-before time, no outpoint and no bitmap) with the lock time at or after that time; the slot's entry at `2k`, the rest at `2k+1` under the same state with the slot's bit set (`exit_tx`; `check` mirrors the program); SWEEP, the tree's batch-output sweep behind the token. `read_exit` and `follow` read the state from the exits on the chain |
+| `accumulator` | An accumulator batch output (`AccumulatorPolicy`): up to 1,024 leaves of one asset as a fixed Merkle-sum root of slot records (`Slot`: the owner key, the SHA256 of the leaf's entry's scriptPubKey, the entry's value and the reserve of the slot's exit), the operator's key and a bitmap of the slots that have left, in a hidden data leaf beside the program | EXIT (`arca/accumulator-1`, Simplicity): one slot out in one transaction, under the owner's or the operator's signature over `exit_digest` (chain, root, record and a not-before time, no outpoint and no bitmap) with the lock time at or after that time; the slot's entry at `2k`, the rest at `2k+1` under the same state with the slot's bit set (`exit_tx`; `check` mirrors the program); SWEEP, the tree's batch-output sweep behind the token. Without a sweep (`arca/accumulator-2`, `TapBranch(X2, D)`): the same EXIT, and RELEASE of 1 to 14 slots in one transaction, each under its owner's signature over `release_digest` (chain, root, record and the connector asset `M` of the round that made the owner's new coin, read from an input) and the operator's over `payout_digest` (chain, state, index and every output), the rest at `2k+1` with the bits set (`release_tx`, `AccumulatorRelease` for the owner's release; `check_release` mirrors the program). `read_spend` and `follow` read the state from the exits and releases on the chain |
 | `limiter` | No output of Arca's: the mint limiter of sequentia-contracts (`templates/mint_limiter`), which holds an issuer-operated asset's reissuance token (`LimiterParams`, read from the instance file the limiter's tool writes, and `LimiterState`) | None of Arca's: the coin's script in each state (`script_pubkey`, rebuilt from the template's root and the data leaf, equal to the template's address vectors), the state a mint leads to by the program's own rule (`mint`, `room`), what a spend of the coin did (`follow`: a mint, the brake applied or lifted, the recovery), and the reissuance a round's input 0 carries (`reissuance`). The limiter's tool signs and satisfies a mint (`mint-limiter sign`) |
 | `issuer` | No output of its own: an issuer-operated batch's burn (`burn`, a bare `OP_RETURN` of explicit asset and value) and the supply a transaction moves (`issued`, `burned`, `reissuing_inputs`) | None |
 | `bond` | The operator's equivocation bond (`BondPolicy`: the chain, `S`, the withdrawal key `W`, the notice delay `D`), and the notice output a withdrawal waits in | SLASH, in both outputs: the salt, two messages `S` signed under it (each a form, `Rebind` for a collaborative path's message `SHA256(K ‖ rest)` or `Fill` for an `order-2` fill's `SHA256(F ‖ salt ‖ rest)`, its rest in three chunks of at most 80 bytes, and `S`'s signature), the digests computed in the script and required to differ, and the output at the input's own index a bare `OP_RETURN` of its whole amount, so a slash pays no one; NOTICE, `W`'s signature, the bond whole to the notice output; WITHDRAW, on the notice output, `W`'s signature `D` after the notice confirmed. `slash_tx`, `notice_tx` and `withdraw_tx` build the three spends, a fee coin paying; `check` judges evidence as SLASH will; `rebind_signed_in` reads `S`'s signature and its message from a collaborative spend found on the chain, and `collab2_signed_in` from a `vtxo-2` spend given the outputs its named inputs spend; `cosigned_by` lists every message `S` signed that a coin's lineage rests on, each under its salt, which a holder hands a watcher |
@@ -373,8 +374,13 @@ connector asset `M` of its round, which the round's txid fixes, so the wallet
 validates its new leaf against the built transaction and signs
 (`Forfeit::for_refresh`, `Release::for_refresh`) before it is broadcast.
 
-An accumulator batch keeps its expiry: `Accumulator::build` refuses the never
-schedule, and an accumulator record without a sweep is refused.
+An accumulator batch built with the never schedule is `arca/accumulator-2`
+([The accumulator batch without a sweep](#the-accumulator-batch-without-a-sweep)):
+no token, no clock and no sweep leaf on the batch output or an entry. The
+operator takes back the slots whose owners moved on by RELEASE, and otherwise
+takes a slot out by its own exit authorisation, which pays the owner's entry,
+then claims the forfeit or opens the entry into the owner's leaf, as for a
+tree.
 
 ## Claim leaves that lapse
 
@@ -917,6 +923,62 @@ fee from the slot's reserve, against 2,854 vB for the five node transactions of
 a 1,024-leaf tree; the entry's unlock (234 vB) and the leaf's exit follow in
 both (`covenant/tests/accumulator.rs`).
 
+### The accumulator batch without a sweep
+
+A batch built with `ClockSchedule::never(S)` is `arca/accumulator-2`:
+`P2TR(NUMS, TapBranch(X2, D))`, the same state, records and tree, and no
+sweep (`AccumulatorPolicy::sweep` is `None`). Its EXIT is the one above, the
+same authorisation. Its RELEASE takes back, in one transaction, the slots
+`j_1 < … < j_n` whose owners gave them up, `n` from 1 to 14
+(`RELEASE_PLACES`, the most whose cost the witness pays for with no annex):
+
+- each slot's record on its path to `ROOT`, its bit clear, and its owner's
+  signature over `release_digest`, `SHA256(SHA256("Arca/accumulator-release")
+  ‖ genesis ‖ ROOT ‖ rec_j ‖ M)`, `M` the explicit asset of the input the slot
+  names: the connector asset of the round that made the owner's new coin;
+- the operator's signature over `payout_digest`,
+  `SHA256(SHA256("Arca/accumulator-release-outputs") ‖ genesis ‖ D ‖ k ‖
+  outputs_hash)`, `D` the state the coin holds and `outputs_hash` the chain's
+  commitment to every output (`accumulator::outputs_hash`);
+- the rest at `2k+1` under the same state with the slots' bits set, holding
+  the input less every released weight. Output `2k` and what the slots held
+  are the operator's; for an issuer-operated asset the operator pays them to a
+  burn.
+
+`M` exists only while its round is in the chain, so a release is void with
+that round, as a tree's release is. A release names one slot of one batch for
+one round on one chain, and no outpoint or bitmap, so releases signed at
+different times ride one transaction; a slot's bit, once set, refuses it
+again. Nothing else spends the batch: no path moves a slot its owner has
+neither taken out nor released.
+
+A wallet signs its slot's release with `AccumulatorRelease::for_refresh`,
+`for_accumulator_refresh` or `for_offboard`, which take the slot from the old
+leaf it validated and `M` from the round its new coin was validated against,
+and refuse a batch with a sweep; it signs once it holds the new coin's preimage
+and that round is final. The operator gathers releases and spends them with
+`AccumulatorPolicy::release_tx`: the batch output at input 0, an atom of each
+round's `M` after it, paid back to itself, its payout at output 0, then the
+operator's signature over `ReleaseSpend::digest` (`finish`).
+
+```rust
+use arca_covenant::accumulator::{AccumulatorRelease, Released};
+
+let r = AccumulatorRelease::for_refresh(&old_valid, &new_valid, &round, c)?;   // the slot from the old leaf, M from the round
+let sig = sign_digest(&old_key, &r.digest(), &aux);                         // the owner's release
+r.verify(&sig)?;                                                            // the server's check
+let slots = [Released { exit: old_valid.exit.clone(), connector: r.connector, signature: sig }];
+let rs = state.release_tx(&chain, batch_coin, (asset, held), &slots, &[(m_coin, m_txout)], &[payout], m_back_to, &FeeSource::Reserve)?;
+let tx = rs.finish(&sign_digest(&operator, &rs.digest(&chain), &aux));      // then the M atom's own witness
+```
+
+Such a record is format version 2 (no token, notice, burn or expiry), and
+`WalletPolicy::no_sweep` takes it while it refuses an `arca/accumulator-1`
+record. Measured on regtest (`covenant/tests/accumulator_release.rs`): an
+exit is 1,072 vB with its fee from the slot's reserve; a release of one slot
+1,305 vB, of 14 slots 3,317 vB, and of the last nine slots, leaving no rest,
+2,320 vB, each with one or two atoms of `M` beside it.
+
 ## In-tree fills of a resting order
 
 An `order-3` leaf (`order`), or an `order-2` leaf, is filled off the chain by a transaction that
@@ -1210,6 +1272,23 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   claim and a dormant owner's entry opened into its own leaf, which only that
   owner takes home; and each removed sweep (batch output, lowest nodes, an
   entry, a checkpoint) refused in a block with `Witness program hash mismatch`.
+- `tests/accumulator_release.rs`: on an anchored regtest chain, an
+  accumulator batch without a sweep (`arca/accumulator-2`): its records
+  (format version 2) and the wallet policy that takes them and refuses
+  `arca/accumulator-1`; owners refreshing into a round that is rolled back and
+  replaced, and into another; releases of one slot and of 14 slots of two
+  rounds, each paying the operator exactly what the slots weighed, exits by an
+  owner and by the operator between them, and the release of the last nine,
+  which leaves no rest; every spend read back by `follow`. Refused in a block:
+  a release signed by a stranger, by another slot's owner and by the operator
+  for the owner, an owner's release under another batch's root, a release for
+  the rolled-back round with its atom and with the replacement's, a slot twice
+  and slots out of order, a slot already released, the rest under another
+  root, another operator key or with the slot's bit clear, the operator taking
+  one atom more, the operator's signature missing or over another payout, an
+  annex, and the removed sweep leaf with a real token at `R` beside it (by its
+  twin's control block and as a lone leaf, while the same leaf, token and
+  signature sweep the twin that has it).
 - `tests/reclaim.rs`: on an anchored regtest chain, the reclaim of a lowest
   node whose owners refreshed into new rounds, each release built with
   `Release::for_refresh`. The reclaim with an atom of `M` confirms; without it,

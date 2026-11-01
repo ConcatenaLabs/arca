@@ -68,7 +68,7 @@ fn accumulator_matches_the_regtest_suites_vectors() {
 	let state = *acc.policy();
 	same("root", &state.root, &v["root"]);
 	assert_eq!(acc.total(), v["total"].as_u64().unwrap(), "total");
-	same("sweep script", state.sweep.script().as_bytes(), &v["sweep_script"]);
+	same("sweep script", state.sweep.unwrap().script().as_bytes(), &v["sweep_script"]);
 	same("data", &state.data_bytes(), &v["data"]);
 	same("data leaf", &state.data_leaf(), &v["data_leaf"]);
 	same("merkle root", &state.tree_root(), &v["merkle_root"]);

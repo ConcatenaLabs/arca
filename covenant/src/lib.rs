@@ -145,8 +145,8 @@ pub mod unroll;
 pub mod witness;
 
 pub use accumulator::{
-	Accumulator, AccumulatorError, AccumulatorParams, AccumulatorPolicy, AccumulatorRecord, Bitmap, Exit, ExitAuth, SeenExit, Slot,
-	ValidAccumulatorLeaf,
+	Accumulator, AccumulatorError, AccumulatorParams, AccumulatorPolicy, AccumulatorRecord, AccumulatorRelease, Bitmap, Exit, ExitAuth,
+	ReleaseSpend, Released, SeenExit, SeenRelease, SeenSpend, Slot, ValidAccumulatorLeaf,
 };
 pub use batch::{Batch, BatchKind};
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
