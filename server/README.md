@@ -1546,7 +1546,9 @@ too):
   `info.participations.forfeits_before_broadcast` says the operator reads).
   One that does not, a wallet that would hand them over only once its round
   is out, is refused when it submits a participation or a distribution
-  (`forfeits_after_broadcast`: update the wallet; nothing was taken), and
+  (`declined`, saying to update the wallet and that nothing was taken: a
+  code every installed wallet takes as a refusal, so its coins are live
+  again; an unknown code it would take for a server it cannot reach), and
   never joins a held round. A take is unaffected: every wallet hands a
   take's forfeits over before broadcast.
 

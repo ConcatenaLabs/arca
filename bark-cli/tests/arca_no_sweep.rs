@@ -181,3 +181,270 @@ async fn wallets_sign_before_broadcast_and_a_silent_one_is_left_out() {
 	println!("reclaim {} ({:?}), {} vB: {}", tx.txid(), k.state, tx.vsize(), k.detail);
 	assert_eq!(k.state, NurseryState::Final);
 }
+
+/// Boards `amount` of `asset` for each of `ws`, credited.
+async fn boarded(r: &mut Running, ws: &[&Arca], asset: elements::AssetId, amount: u64) {
+	for w in ws {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, amount + 3_000_000);
+	}
+	r.produce().await;
+	for w in ws {
+		w.ok(&["board", &asset.to_string(), &amount.to_string()]);
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the boards credited", || ws.iter().all(|w| w.ok(&["boards"]).as_array().unwrap().iter()
+		.all(|b| b["server"]["state"] == "credited"))).await;
+}
+
+/// The state of the round `txid` at the server.
+async fn round_of(r: &Running, txid: &elements::Txid) -> RoundState {
+	r.server.store.round_by_txid(&txid.to_byte_array()).await.unwrap().unwrap().state
+}
+
+/// A wallet that drops out of a held round holds back nobody: the wallets
+/// that answered run again at once, alone, and go out; the one that dropped
+/// out, back again, waits and runs in a round of its own, where it answers
+/// and goes out. A wallet built before forfeits came before broadcast for
+/// refreshes (the `arca` at `ARCA_CLI_OLDER`, when set) is refused when it
+/// asks, in words that tell its holder to update it, and its coin stays its
+/// own; it never joins a round.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_that_drops_out_holds_back_nobody_and_an_older_one_is_told_to_update() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x_id = r.x;
+	let x = x_id.to_string();
+	r.fund_server(x_id, 100_000_000).await;
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (a, h) = (Arca::new("A drop"), Arca::new("H drop"));
+	let older = std::env::var("ARCA_CLI_OLDER").ok().map(|p| Arca::built_from("O drop", std::path::Path::new(&p)));
+	let mut ws = vec![&a, &h];
+	if let Some(o) = &older {
+		ws.push(o);
+	}
+	for w in &ws {
+		w.ok(&create);
+	}
+	boarded(&mut r, &ws, x_id, 2_000_000).await;
+
+	// The older wallet asks for a refresh: refused, in words, nothing taken.
+	match &older {
+		Some(o) => {
+			let (ok, v) = o.run(&["participate"]);
+			println!("the older wallet's refresh: ok {} {}", ok, v);
+			let text = v.to_string();
+						assert!(text.contains("update the wallet"), "the holder is told to update: {}", v);
+			assert_ne!(v["error"]["kind"], "unreachable", "taken as the operator's refusal, not as a server it cannot reach: {}", v);
+			let coins = o.ok(&["coins"]);
+			println!("the older wallet's coins: {}", coins);
+			assert!(coins.as_array().unwrap().iter().any(|c| c["state"] == "live"), "its coin is still its own: {}", coins);
+		},
+		None => println!("ARCA_CLI_OLDER is not set: the older wallet's half is not run"),
+	}
+
+	// A and H ask; H goes away before its round is built.
+	for w in [&a, &h] {
+		let p = w.ok(&["participate"]);
+		assert!(p["participations"].as_array().unwrap().iter().all(|x| x["state"] == "pending"), "{}", p);
+	}
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.len(), 1);
+	assert_eq!(built[0].participations, 2, "A and H share the first round");
+	a.ok(&["sync"]);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 700));
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(round_of(&r, &built[0].tx.txid()).await, RoundState::Lost, "dropped for H");
+
+	// A runs again at once, alone, though a newcomer N asks meanwhile.
+	let n = Arca::new("N drop");
+	n.ok(&create);
+	boarded(&mut r, &[&n], x_id, 2_000_000).await;
+	n.ok(&["participate"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let (again, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed.iter().map(|f| f.1.to_string()).collect::<Vec<_>>());
+	println!("after the drop: {} round(s) built, of {:?} participation(s)", again.len(), again.iter().map(|b| b.participations).collect::<Vec<_>>());
+	assert_eq!(again[0].participations, 1, "A alone, first");
+	for w in [&a, &n] {
+		w.ok(&["sync"]);
+	}
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(round_of(&r, &again[0].tx.txid()).await, RoundState::Broadcast, "A's refresh goes out");
+	// N's round follows.
+	let (next, _) = r.server.rounds.run_rounds().await.unwrap();
+	let mut out = vec![again[0].tx.txid()];
+	for b in &next {
+		out.push(b.tx.txid());
+	}
+	n.ok(&["sync"]);
+	r.server.rounds.pass().await.unwrap();
+	for t in &out {
+		assert_eq!(round_of(&r, t).await, RoundState::Broadcast);
+	}
+	r.produce().await;
+	r.bury().await;
+	for t in &out {
+		r.round_state(t, RoundState::Final).await;
+	}
+	for w in [&a, &n] {
+		let s = w.ok(&["sync"]);
+		assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] == "released"), "{}", s);
+	}
+
+	// H comes back: its participation was void, its coin its own. Asked
+	// again, it waits, then runs in a round of its own, answers, goes out.
+	let sh = h.ok(&["sync"]);
+	println!("H back: {}", sh["participations"]);
+	assert_eq!(sh["participations"][0]["state"], "void", "{}", sh);
+	h.ok(&["participate"]);
+	let (none, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(none.is_empty(), "H's coin waits");
+	let st = h.ok(&["sync"]);
+	let note = st["participations"][0]["note"].as_str().unwrap_or("").to_string();
+	println!("H waits, its sync says: {}", note);
+	assert!(note.contains("a round of their own"), "the wallet shows why it waits: {}", st);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 700));
+	r.synced().await;
+	let (solo, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(solo.len(), 1);
+	assert_eq!(solo[0].participations, 1, "H alone");
+	h.ok(&["sync"]);
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(round_of(&r, &solo[0].tx.txid()).await, RoundState::Broadcast, "H answered: its refresh goes out");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&solo[0].tx.txid(), RoundState::Final).await;
+	let s = h.ok(&["sync"]);
+	assert!(s["participations"].as_array().unwrap().iter().any(|p| p["state"] == "released"), "{}", s);
+	println!("H's refresh went out in a round of its own, once it answered");
+}
+
+/// arca#488. Two wallets refresh into a batch without a sweep whose service
+/// horizon is six days on. F keeps syncing: from its refresh date (two days
+/// before its exit date, five before the horizon) its sync asks for the
+/// refresh by itself, and its coin moves into a new batch before the
+/// horizon. E goes away: at the horizon the operator collects the batch and
+/// E's coin lands on the chain under E's key. When E syncs again it shows
+/// the coin plainly (moved out of the Ark to keep it safe while you were
+/// away), takes it home, and boards it back by itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_collected_at_the_horizon_is_shown_and_boarded_back() {
+	const DAY: u32 = 86_400;
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+		c.batches.collect_after_seconds = Some(6 * DAY);
+	}).await;
+	let x_id = r.x;
+	let x = x_id.to_string();
+	r.fund_server(x_id, 100_000_000).await;
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (e, f) = (Arca::new("E horizon"), Arca::new("F horizon"));
+	for w in [&e, &f] {
+		w.ok(&create);
+	}
+	boarded(&mut r, &[&e, &f], x_id, 2_000_000).await;
+	refresh_all(&r, &[&e, &f]).await;
+	let leaf_of = |w: &Arca| -> Value {
+		w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["state"] == "live").cloned().expect("a live coin")
+	};
+	let (ce, cf) = (leaf_of(&e), leaf_of(&f));
+	println!("E's coin {} dates {}; F's coin {}", ce["leaf_id"], ce["dates"], cf["leaf_id"]);
+	let e_value: u64 = ce["value"].as_str().map(|v| v.parse().unwrap()).or(ce["value"].as_u64()).unwrap();
+
+	// F syncs each day; from its refresh date its sync asks by itself.
+	let mut f_refreshed = false;
+	for day in 0..4 {
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, DAY));
+		r.synced().await;
+		let s = f.ok(&["sync"]);
+		let asked = s["participations"].as_array().map(|p| p.iter().any(|x| x["state"] == "pending")).unwrap_or(false)
+			|| s.to_string().contains("\"pending\"");
+		println!("F's sync on day {}: asked {}", day + 1, asked);
+		let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+		if !built.is_empty() {
+			f.ok(&["sync"]);
+			r.server.rounds.pass().await.unwrap();
+			r.produce().await;
+			r.bury().await;
+			for b in &built {
+				r.round_state(&b.tx.txid(), RoundState::Final).await;
+			}
+			let s = f.ok(&["sync"]);
+			if s["participations"].as_array().unwrap().iter().any(|p| p["state"] == "released") {
+				f_refreshed = true;
+				println!("F's coin refreshed by its own sync on day {}", day + 1);
+				break;
+			}
+		}
+	}
+	assert!(f_refreshed, "F's sync refreshed its coin before the horizon");
+
+	// Past the horizon the operator collects E's coin onto the chain.
+	let horizon = ce["expiry"].as_u64().expect("E's coin names its horizon") as u32;
+	let now = common::node::median_time(&r.rt);
+	println!("E's coin: horizon {} (median time now {})", horizon, now);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, horizon.saturating_sub(now) + 3_600));
+	let hex = ce["leaf_id"].as_str().unwrap();
+	let e_id: [u8; 32] = (0..32).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()).collect::<Vec<u8>>().try_into().unwrap();
+	let e_script = Script::from(r.server.store.leaf(&e_id).await.unwrap().expect("E's leaf at the server").script_pubkey);
+	let mut landed = false;
+	for _ in 0..12 {
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		let start = std::time::Instant::now();
+		while !r.server.store.nursery_in(NurseryState::Pending).await.unwrap().iter().all(|n| n.broadcasts > 0) {
+			assert!(start.elapsed() < Duration::from_secs(30));
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		r.produce().await;
+		if !e_script.is_empty() && !r.server.store.sightings_of(e_script.as_bytes()).await.unwrap().is_empty() {
+			landed = true;
+			break;
+		}
+	}
+	for w in r.server.store.watcher_log().await.unwrap() {
+		println!("  watcher: {} {}", w.kind, w.detail.chars().take(110).collect::<String>());
+	}
+	assert!(landed, "E's leaf landed on the chain at the horizon");
+	r.bury().await;
+	r.synced().await;
+
+	// E comes back: the coin is shown kept safe, taken home, boarded back.
+	let mut reboard = Value::Null;
+	for _ in 0..12 {
+		let s = e.ok(&["sync"]);
+		if !s["reboards"].is_null() && s["reboards"].as_array().is_some_and(|a| !a.is_empty()) {
+			reboard = s["reboards"].clone();
+			break;
+		}
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 1_200));
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+	}
+	let coins = e.ok(&["coins"]);
+	let kept = coins.as_array().unwrap().iter().find(|c| c["leaf_id"] == ce["leaf_id"]).cloned().expect("E's coin");
+	println!("E's coin after the horizon: state {} kept_safe {} note {:?}", kept["state"], kept["kept_safe"], kept["kept_safe_note"]);
+	assert_eq!(kept["kept_safe"], true, "{}", kept);
+	assert_eq!(kept["kept_safe_note"], "moved out of the Ark to keep it safe while you were away");
+	println!("E's reboard: {}", reboard);
+	assert!(reboard[0]["boarded"].is_object(), "E boarded its coin back by itself: {}", reboard);
+	let bal = e.ok(&["balance"]);
+	println!("E's balance: {} (its coin held {})", bal["arca"], e_value);
+	let _ = x;
+}

@@ -31,7 +31,7 @@ pub struct ErrorDetail {
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
-	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "forfeits_after_broadcast", "frozen", "hash_reused", "htlc", "in_round", "in_use", "internal", "invalid_coin",
+	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "internal", "invalid_coin",
 	"invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "lapsed", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
@@ -1738,7 +1738,7 @@ pub struct SubmitParticipation {
 	/// The wallet hands over its forfeits against the round's transaction
 	/// served before broadcast (`info.participations.forfeits_before_broadcast`).
 	/// An operator that builds batches without a sweep refuses a
-	/// participation giving up coins without it (`forfeits_after_broadcast`):
+	/// participation giving up coins without it (`declined`, saying why):
 	/// such a wallet would hand them over only once its round is out, and
 	/// that round is held until they are in.
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
