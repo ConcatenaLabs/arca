@@ -49,7 +49,9 @@ impl BatchKind {
 	/// of its own (no `order-3` or `order-2`, which it lands for an absent maker), and the
 	/// batch's sweep is not burn-only (an issuer-operated asset's batches are
 	/// rebuilt by the mint's signer, which builds trees). Otherwise a tree.
-	pub fn choose(leaves: &[LeafSpec], radix: usize, exit_rate_ppm: Option<u32>, burn: bool) -> BatchKind {
+	/// `no_sweep` prices the exits of a batch without a sweep
+	/// (`arca/accumulator-2`), which are larger.
+	pub fn choose(leaves: &[LeafSpec], radix: usize, exit_rate_ppm: Option<u32>, burn: bool, no_sweep: bool) -> BatchKind {
 		let Some(ppm) = exit_rate_ppm else { return BatchKind::Tree };
 		let n = leaves.len();
 		if burn || n > SLOTS || leaves.iter().any(|l| matches!(l.template, Template::Order2 | Template::Order3 | Template::Channel1 | Template::Claim1
@@ -57,7 +59,7 @@ impl BatchKind {
 			return BatchKind::Tree;
 		}
 		let exits = n as f64 * ppm as f64 / 1_000_000.0;
-		if prefer_accumulator(n, radix, exits) { BatchKind::Accumulator } else { BatchKind::Tree }
+		if prefer_accumulator(n, radix, exits, no_sweep) { BatchKind::Accumulator } else { BatchKind::Tree }
 	}
 }
 
