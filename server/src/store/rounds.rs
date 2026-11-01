@@ -627,6 +627,33 @@ impl Store {
 		Ok(r.and_then(|r| r.get::<_, Option<i64>>(0)).map(|t| t as u32))
 	}
 
+	/// Each batch without a sweep that holds claim leaves: its round, its
+	/// output, its service horizon and the latest deadline of its claims
+	/// ([`crate::params::Params::collect_mtp`]).
+	pub async fn claim_batch_deadlines(&self) -> Result<Vec<(i64, i32, u32, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT b.round_id, b.vout, b.collect_mtp, o.claim FROM batch b
+			   JOIN batch_leaf l ON l.round_id = b.round_id AND l.vout = b.vout
+			   JOIN participation_output o ON o.participation_id = l.participation_id AND o.idx = l.output_idx
+			  WHERE b.collect_mtp IS NOT NULL AND o.claim IS NOT NULL", &[]).await?;
+		let mut out: std::collections::BTreeMap<(i64, i32), (u32, u32)> = std::collections::BTreeMap::new();
+		for r in rows {
+			let d = super::participations::claim_of(&r.get::<_, Vec<u8>>(3))?.deadline.to_consensus_u32();
+			let e = out.entry((r.get(0), r.get(1))).or_insert((r.get::<_, i64>(2) as u32, d));
+			e.1 = e.1.max(d);
+		}
+		Ok(out.into_iter().map(|((round, vout), (at, d))| (round, vout, at, d)).collect())
+	}
+
+	/// Moves the service horizon of the batch at output `vout` of round
+	/// `round_id` to `at`, if it was earlier.
+	pub async fn raise_collect_mtp(&self, round_id: i64, vout: i32, at: u32) -> Result<u64, StoreError> {
+		let conn = self.conn().await?;
+		Ok(conn.execute("UPDATE batch SET collect_mtp = $3 WHERE round_id = $1 AND vout = $2 AND collect_mtp < $3",
+			&[&round_id, &vout, &(at as i64)]).await?)
+	}
+
 	/// The participations issued in the round `round_id`, in id order.
 	pub async fn round_participations(&self, round_id: i64) -> Result<Vec<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;

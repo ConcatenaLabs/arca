@@ -358,7 +358,9 @@ What it changes for the operator:
   `[batches] delegated_reclaim`, one whose coins were paid on out of round
   comes back by RECLAIM-D once their current holders refresh and release.
   Whatever is left of a batch at its service horizon
-  (`[batches] collect_after_seconds`, 28 days by default) is collected on
+  (`[batches] collect_after_seconds`, 28 days by default, after its round;
+  for a batch of claim leaves, after their deadline where that is later, so
+  that a holder takes a claim up whenever it vests) is collected on
   the chain: each holder's coin lands as its own leaf, each given-up coin is
   forfeited and claimed, each coin paid on out of round (a claim taken up
   included) lands through its lineage, and each `htlc-1` coin whose payment
