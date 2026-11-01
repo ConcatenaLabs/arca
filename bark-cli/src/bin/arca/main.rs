@@ -341,6 +341,12 @@ enum Cmd {
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
 	},
+	/// Takes back a participation of the wallet's that the operator holds
+	/// pending, before a round takes it: its coins are live again.
+	WithdrawParticipation {
+		/// The participation's id, as `participations` lists it.
+		participation: String,
+	},
 	/// Takes an on-chain order in the operator's round: a fill of an order
 	/// resting on the chain under SeqDEX's fill covenant, paid with the
 	/// wallet's coins of the asset it is paid in, for a leaf of what it fills.
@@ -1479,6 +1485,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			w.speed_up(txid, fee_asset.as_deref().map(asset).transpose()?, rate, max_fee)
 		},
 		Cmd::RefreshReceived { max_fee_ppm } => w.refresh_received(max_fee_ppm),
+		Cmd::WithdrawParticipation { participation } => w.withdraw_participation(&participation),
 		Cmd::Exit { leaf_id, fee_asset, quote: true, .. } => w.exit_quote(&leaf_id, fee_asset.as_deref().map(asset).transpose()?),
 		Cmd::Exit { leaf_id, fee_asset, quote: false, shown } => {
 			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)

@@ -137,6 +137,26 @@ pub fn key_proof_digest(id: &[u8; 32]) -> [u8; 32] {
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of the digest the owner of each coin a participation gives up
+/// signs to withdraw it while it waits.
+pub const WITHDRAW_TAG: &[u8] = b"Arca/participation-withdraw";
+
+/// What the owner key of each coin given up signs to withdraw participation
+/// `id` before a round takes it: `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ id)`,
+/// `T = SHA256("Arca/participation-withdraw")`. The tag keeps it apart from the
+/// attestation over the id itself, which gives the coin up, and from the key
+/// proof; the genesis hash and `S` keep it to one chain and one operator.
+pub fn withdraw_digest(chain: &Chain, operator: &XOnlyPublicKey, id: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(WITHDRAW_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(id);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// A coin given up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRequest {
@@ -350,6 +370,14 @@ pub enum ParticipationError {
 	Fee(String),
 	#[error("no participation {0} is known")]
 	Unknown(String),
+	/// A withdrawal of a participation a round has taken, or one past it.
+	#[error("participation {0} is {1}: a round has taken it, so it is no longer withdrawn; its coins are given up in that round")]
+	InRound(String, &'static str),
+	/// A withdrawal of a pending participation of a kind no owner withdraws.
+	#[error("participation {0} cannot be withdrawn: {1}")]
+	NotWithdrawable(String, String),
+	#[error("input {0}: the withdrawal is not the coin's owner's signature over the participation's withdrawal digest")]
+	BadWithdrawal(usize),
 	#[error("leaf {0} is no claim of a distribution this server knows")]
 	UnknownClaim(LeafId),
 	#[error("claim leaf {0} is not open yet: its distribution is not released, so no preimage opens its entry; it is taken up once \
@@ -427,6 +455,9 @@ impl ParticipationError {
 			Unbalanced(_) => "unbalanced",
 			Fee(_) => "fee",
 			Unknown(_) => "unknown_participation",
+			InRound(..) => "in_round",
+			NotWithdrawable(..) => "not_withdrawable",
+			BadWithdrawal(_) => "bad_signature",
 			UnknownClaim(_) => "unknown_leaf",
 			ClaimNotReleased(_) => "not_live",
 			ClaimLapsed(..) => "lapsed",
@@ -1220,6 +1251,43 @@ impl Participations {
 			}
 		}
 		Ok((coins, last_times))
+	}
+
+	/// Withdraws the pending participation `id` for the owners of the coins
+	/// it gives up: `signatures` holds, for each coin in its order, its owner
+	/// key's signature over [`withdraw_digest`]. Taken under the round
+	/// builder's lock ([`crate::rounds::Rounds::withdraw`]), so a round either
+	/// took the participation before, and the withdrawal is refused
+	/// (`in_round`), or never takes it: it becomes void, its coins live again.
+	/// A take, a distribution, a plan's step, and one that was in a round
+	/// that went out of the chain are not withdrawn (`not_withdrawable`). One
+	/// already void is answered with its status.
+	pub async fn withdraw(&self, id: &[u8; 32], signatures: &[Signature], rounds: &crate::rounds::Rounds)
+		-> Result<Status, ParticipationError>
+	{
+		let row = self.store.participation(id).await?.ok_or_else(|| ParticipationError::Unknown(hex(id)))?;
+		if signatures.len() != row.inputs.len() {
+			return Err(ParticipationError::Malformed(format!("{} signatures for {} coins given up", signatures.len(), row.inputs.len())));
+		}
+		let digest = withdraw_digest(&self.params.chain, &self.params.operator, id);
+		for (k, (i, sig)) in row.inputs.iter().zip(signatures).enumerate() {
+			let leaf = self.store.leaf(&i.leaf_id).await?
+				.ok_or_else(|| ParticipationError::Internal(format!("coin {} of participation {} is not recorded", LeafId(i.leaf_id), hex(id))))?;
+			let owner = arca_covenant::CoinRecord::from_bytes(&leaf.record).ok().and_then(|r| r.owner()).map(|(k, _)| k)
+				.ok_or_else(|| ParticipationError::Internal(format!("coin {} has no owner its record names", LeafId(i.leaf_id))))?;
+			if !verify_digest(sig, &digest, &owner) {
+				return Err(ParticipationError::BadWithdrawal(k));
+			}
+		}
+		use crate::store::Withdrawal;
+		match rounds.withdraw(id).await.map_err(|e| ParticipationError::Internal(e.to_string()))? {
+			Withdrawal::Withdrawn => log::info!("participation {} withdrawn by the owners of its coins", hex(id)),
+			Withdrawal::AlreadyVoid => {},
+			Withdrawal::InRound(s) => return Err(ParticipationError::InRound(hex(id), s.as_str())),
+			Withdrawal::Refused(why) => return Err(ParticipationError::NotWithdrawable(hex(id), why)),
+			Withdrawal::Unknown => return Err(ParticipationError::Unknown(hex(id))),
+		}
+		self.status(id).await
 	}
 
 	/// The participation `id` and where it stands.

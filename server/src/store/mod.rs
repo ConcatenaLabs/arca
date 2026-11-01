@@ -85,7 +85,7 @@ pub use orders::{NewOrderFill, OrderFillRow, RestingOrderRow};
 pub use owed::{ClaimOutcome, NewOwed, OwedRow, OwedState};
 pub use participations::{
 	AttemptRow, FillRow, ForfeitRow, NewForfeit, NewParticipation, ParticipationInput, ParticipationOutput, ParticipationRow,
-	ParticipationState, ReleaseRow, Restored, WantedKind,
+	ParticipationState, ReleaseRow, Restored, WantedKind, Withdrawal,
 };
 pub use rounds::{
 	BatchLeafRow, BatchRow, MintRow, NewBatch, NewBatchLeaf, NewOffboard, NewRerun, NewRound, NewRoundFill, OffboardRow, Placement,

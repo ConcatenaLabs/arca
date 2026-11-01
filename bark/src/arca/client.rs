@@ -51,6 +51,25 @@ pub fn key_proof_digest(id: &[u8; 32]) -> [u8; 32] {
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of the digest each coin's owner signs to withdraw a waiting
+/// participation.
+pub const WITHDRAW_TAG: &[u8] = b"Arca/participation-withdraw";
+
+/// What the owner key of each coin a participation gives up signs to
+/// withdraw it before a round takes it: `SHA256(T ‖ T ‖ genesis ‖ S ‖ id)`,
+/// `T = SHA256("Arca/participation-withdraw")`. The server's
+/// (`server::participations::withdraw_digest`).
+pub fn withdraw_digest(chain: &Chain, operator: &XOnlyPublicKey, id: &[u8; 32]) -> [u8; 32] {
+	let tag = sha256::Hash::hash(WITHDRAW_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(id);
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// The tag of a signed head of the operator's signer's record.
 pub const RECORD_HEAD_TAG: &[u8] = b"Arca/record-head";
 
@@ -330,9 +349,9 @@ pub fn check_server_url(base: &str) -> Result<(), Error> {
 /// test compares the two lists.
 pub const REFUSALS: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
-	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
+	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
 	"key_reused", "lapsed", "leaf_set", "malformed", "margin", "merge", "no_lightning", "no_lowest_node", "nonce_unknown", "nonce_used", "not_accepted",
-	"not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
+	"not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "not_withdrawable", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
 	"order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed", "owed_withdrawn", "planned",
 	"receive_cap", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt", "script_reused", "template",
 	"unauthenticated", "unbalanced",

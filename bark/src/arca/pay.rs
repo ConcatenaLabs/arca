@@ -530,8 +530,30 @@ impl Wallet {
 	/// pays, plus `extra` atoms more), each input's checkpoint keeping its
 	/// value less its margin; returns the inputs, the reassignment's margin
 	/// when `pays_margin`, and the change.
+	///
+	/// When the live coins cannot cover it, every refresh of `asset` the
+	/// operator still holds pending is taken back first
+	/// ([`Self::withdraw_refreshes`]), and the coins it gave up are chosen
+	/// from as well: a coin given up in a refresh that waits still pays.
 	#[allow(clippy::too_many_arguments)]
 	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
+		other_inputs: usize) -> Result<(Vec<In>, u64, u64), Error>
+	{
+		match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs) {
+			Err(e @ Error::Refused(_)) => {
+				if self.withdraw_refreshes(asset)?.iter().any(|v| v["state"] == "void") {
+					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs)
+				} else {
+					Err(e)
+				}
+			},
+			r => r,
+		}
+	}
+
+	/// [`Self::choose`] from the coins live now.
+	#[allow(clippy::too_many_arguments)]
+	fn choose_live(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		let margins = Margins::of(info, asset)?;
@@ -1814,6 +1836,7 @@ impl Wallet {
 	/// refused as [`Wallet::swap_accept`] refuses them. A program shows this
 	/// and hands it to `swap_accept` as `shown`.
 	pub fn swap_read(&self, offer_text: &str, near_deadline: bool) -> Result<Value, Error> {
+		let _quote = self.quoting();
 		let o = self.swap_offer_checked(offer_text)?;
 		let info = self.server_info()?;
 		let min_want = Self::min_leaf(&info, o.want_asset)?;

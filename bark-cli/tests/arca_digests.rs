@@ -103,6 +103,9 @@ fn the_wallets_digests_are_the_servers() {
 			template, owner: k, owner_nonce: [3; 32], exit_delay: d, order: terms, landing: land, channel: None }], &fees, nb);
 		assert_eq!(mine, theirs);
 		assert_eq!(key_proof_digest(&mine), server::participations::key_proof_digest(&theirs));
+		assert_eq!(bark::arca::client::withdraw_digest(&chain, &s, &mine), server::participations::withdraw_digest(&chain, &s, &theirs));
+		assert_ne!(bark::arca::client::withdraw_digest(&chain, &s, &mine), mine, "a withdrawal never signs the id an attestation signs");
+		assert_ne!(bark::arca::client::withdraw_digest(&chain, &s, &mine), key_proof_digest(&mine), "nor a key proof's digest");
 		assert_ne!(key_proof_digest(&mine), mine, "a key proof is not the attestation of a coin");
 		ids_seen.push(mine);
 	}

@@ -162,6 +162,10 @@ pub struct Wallet {
 	/// owner nonce the store does not hold is taken when its key is the one
 	/// the mnemonic derives from that nonce, as the lost store would have.
 	pub(crate) adopting: std::cell::Cell<bool>,
+	/// While a quote runs ([`Wallet::quoting`]): it signs, asks and stores
+	/// nothing, so it takes back no refresh that waits
+	/// ([`Wallet::withdraw_refreshes`]) when the live coins fall short.
+	pub(crate) quoting: std::sync::Arc<std::sync::atomic::AtomicBool>,
 	/// While `sync` asks the operator: the median time the exit steps were
 	/// last taken at, so one whose date comes meanwhile is taken at once
 	/// ([`Wallet::exits_meanwhile`]), and what those steps did.
@@ -814,7 +818,7 @@ impl Wallet {
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
-			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), exit_watch: Default::default(),
+			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default() })
 	}
 

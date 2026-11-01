@@ -230,6 +230,7 @@ impl Wallet {
 	/// the coins less the change), with the coins (`gives`) and the change. A program shows it, then pays with
 	/// `shown` ([`Self::lightning_pay_shown`]).
 	pub fn lightning_pay_quote(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let _quote = self.quoting();
 		let p = self.pay_checks(invoice, from, max_fee_ppm)?;
 		// A probe of the leaf the payment would make, for the margins: its key
 		// is derived and kept nowhere.

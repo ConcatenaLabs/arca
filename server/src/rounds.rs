@@ -617,6 +617,9 @@ fn participation_key(k: usize) -> [u8; 32] {
 	b
 }
 
+/// Why a participation its owners withdrew is void.
+pub const WITHDRAWN: &str = "withdrawn by the owners of its coins before a round took it: its coins are theirs again, live";
+
 /// How long [`Rounds::fundable_now`] serves what it last read.
 pub const FUNDABLE_FOR: Duration = Duration::from_secs(10);
 
@@ -1314,6 +1317,15 @@ impl Rounds {
 			}
 		}
 		Ok(None)
+	}
+
+	/// Withdraws participation `id` for its owners ([`Store::withdraw_participation`])
+	/// under the lock every round build holds from choosing its participations
+	/// to recording the round: a round either took it before, and it is not
+	/// withdrawn, or is built after, without it.
+	pub async fn withdraw(&self, id: &[u8; 32]) -> Result<crate::store::Withdrawal, RoundError> {
+		let _one = self.running.lock().await;
+		Ok(self.store.withdraw_participation(id, WITHDRAWN).await?)
 	}
 
 	/// Builds the next round of `asset` from its pending participations, if
