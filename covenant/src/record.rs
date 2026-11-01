@@ -65,8 +65,8 @@
 //!
 //! ```text
 //! u8    format version, 2
-//! u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing), 7 (channel) or 8 (claim)
-//! u8    template version, 1 (vtxo, htlc, landing, channel, claim), or 2 or 3 (order)
+//! u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing), 7 (channel), 8 (claim) or 9 (vest)
+//! u8    template version, 1 (vtxo, htlc, landing, channel, claim, vest), or 2 or 3 (order)
 //! [32]  owner key A                   the vtxo-1 parameters
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
 //! [32]  operator nonce
@@ -96,6 +96,10 @@
 //! u64   the fee allowance: the lapse's output holds at least the value less
 //!       this; below the value
 //! u16   the return script's length, 1 to 10,000, then the return script
+//!       for vest-1 only (a vesting distribution's claim leaf, [`crate::claim`]):
+//!       claim-1's fields, then
+//! u32   the vest time V, a median time before D; a vest-1 record is
+//!       format version 3, of a batch without a sweep
 //! [32]  asset                         the leaf and its entry
 //! u64   value
 //! [32]  unlock hash h
@@ -159,7 +163,7 @@ use crate::gate::{GateCommitment, MemberProof, Members, MAX_DEPTH};
 use crate::leaf::leaf_salt;
 use crate::message::{release_message, unroll_authorisation, Chain, CsfsMessage};
 use crate::node::{
-	node_taproot_delegated, reclaim_delegated_items, reclaim_delegated_script, reclaim_script, reclaim_tx, unroll_script,
+	node_taproot_delegated, reclaim_delegated_items, reclaim_delegated_script, reclaim_script, unroll_script,
 	ReleaseTree, MAX_CHILDREN,
 };
 use crate::script::{asset_bytes, children_hash, sha256, Child, ExplicitOutput};
@@ -239,14 +243,19 @@ pub enum Template {
 	/// claim key, and the lapse, which after the distribution's deadline pays
 	/// its return script what the holder did not take up ([`crate::claim`]).
 	Claim1,
+	/// `vest-1`, a vesting distribution's claim leaf: `claim-1` whose
+	/// collaborative path and exit wait for the vest time `V`, in a batch
+	/// without a sweep whose lowest nodes' RECLAIM waits for it too
+	/// ([`crate::claim`]).
+	Vest1,
 }
 
 impl Template {
 	/// Every template this crate knows, in the order of their ids and
 	/// versions. The operator publishes those its rounds make
 	/// (`info.templates`), which leaves out `order-2`.
-	pub const ALL: [Template; 10] = [Template::Vtxo1, Template::Vtxo2, Template::Board1, Template::Htlc1, Template::Order2,
-		Template::Order3, Template::Landing1, Template::Enclave1, Template::Channel1, Template::Claim1];
+	pub const ALL: [Template; 11] = [Template::Vtxo1, Template::Vtxo2, Template::Board1, Template::Htlc1, Template::Order2,
+		Template::Order3, Template::Landing1, Template::Enclave1, Template::Channel1, Template::Claim1, Template::Vest1];
 
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
@@ -264,6 +273,8 @@ impl Template {
 	pub const CHANNEL: u8 = 7;
 	/// The template id of `claim`.
 	pub const CLAIM: u8 = 8;
+	/// The template id of `vest`.
+	pub const VEST: u8 = 9;
 
 	/// Its id in the binary form.
 	pub fn id(self) -> u8 {
@@ -277,6 +288,7 @@ impl Template {
 			Template::Enclave1 => Template::ENCLAVE,
 			Template::Vtxo2 => Template::VTXO,
 			Template::Claim1 => Template::CLAIM,
+			Template::Vest1 => Template::VEST,
 		}
 	}
 
@@ -284,7 +296,7 @@ impl Template {
 	pub fn version(self) -> u8 {
 		match self {
 			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 | Template::Enclave1 | Template::Channel1
-			| Template::Claim1 => 1,
+			| Template::Claim1 | Template::Vest1 => 1,
 			Template::Order2 | Template::Vtxo2 => 2,
 			Template::Order3 => 3,
 		}
@@ -301,6 +313,7 @@ impl Template {
 			Template::Channel1 => "channel",
 			Template::Enclave1 => "enclave",
 			Template::Claim1 => "claim",
+			Template::Vest1 => "vest",
 		}
 	}
 
@@ -317,6 +330,7 @@ impl Template {
 			(Template::CHANNEL, 1) => Ok(Template::Channel1),
 			(Template::ENCLAVE, 1) => Ok(Template::Enclave1),
 			(Template::CLAIM, 1) => Ok(Template::Claim1),
+			(Template::VEST, 1) => Ok(Template::Vest1),
 			(Template::VTXO, v) => Err(RecordError::TemplateVersion { template: "vtxo".into(), version: v as u64 }),
 			(Template::BOARD, v) => Err(RecordError::TemplateVersion { template: "board".into(), version: v as u64 }),
 			(Template::HTLC, v) => Err(RecordError::TemplateVersion { template: "htlc".into(), version: v as u64 }),
@@ -325,6 +339,7 @@ impl Template {
 			(Template::CHANNEL, v) => Err(RecordError::TemplateVersion { template: "channel".into(), version: v as u64 }),
 			(Template::ENCLAVE, v) => Err(RecordError::TemplateVersion { template: "enclave".into(), version: v as u64 }),
 			(Template::CLAIM, v) => Err(RecordError::TemplateVersion { template: "claim".into(), version: v as u64 }),
+			(Template::VEST, v) => Err(RecordError::TemplateVersion { template: "vest".into(), version: v as u64 }),
 			(t, _) => Err(RecordError::Template(t.to_string())),
 		}
 	}
@@ -356,6 +371,7 @@ impl FromStr for Template {
 			"channel" => &[Template::Channel1],
 			"enclave" => &[Template::Enclave1],
 			"claim" => &[Template::Claim1],
+			"vest" => &[Template::Vest1],
 			_ => return Err(RecordError::Template(s.into())),
 		};
 		match version.parse::<u64>() {
@@ -665,11 +681,18 @@ pub(crate) fn check_template(template: Template, htlc: &Option<HtlcTerms>, order
 	exit_delay: RelativeTime) -> Result<(), RecordError>
 {
 	match (template, claim) {
-		(Template::Claim1, Some(l)) if htlc.is_none() && order.is_none() && landing.is_none() => {
+		(Template::Claim1, Some(l)) if htlc.is_none() && order.is_none() && landing.is_none() && l.vest.is_none() => {
+			l.terms(asset, value).map_err(RecordError::Claim)?;
+			return Ok(());
+		},
+		(Template::Vest1, Some(l)) if htlc.is_none() && order.is_none() && landing.is_none() && l.vest.is_some() => {
 			l.terms(asset, value).map_err(RecordError::Claim)?;
 			return Ok(());
 		},
 		(Template::Claim1, None) => return Err(RecordError::Template("claim-1 without its terms".into())),
+		(Template::Vest1, None) => return Err(RecordError::Template("vest-1 without its terms".into())),
+		(Template::Claim1, Some(_)) => return Err(RecordError::Template("claim-1 with a vest time".into())),
+		(Template::Vest1, Some(_)) => return Err(RecordError::Template("vest-1 without a vest time".into())),
 		(t, Some(_)) => return Err(RecordError::Template(format!("{} with another template's terms", t))),
 		_ => {},
 	}
@@ -719,7 +742,7 @@ pub(crate) fn leaf_policy(template: Template,
 		// the script is the one such a record names.
 		claim: claim.as_ref().map(|l| crate::claim::LapseTerms {
 			deadline: l.deadline, pin: crate::claim::script_pin(&l.return_script), asset,
-			min_value: value.saturating_sub(l.allowance),
+			min_value: value.saturating_sub(l.allowance), vest: l.vest,
 		}),
 	}
 }
@@ -764,6 +787,9 @@ impl LeafRecord {
 	pub fn check(&self) -> Result<(), RecordError> {
 		if self.burn && !self.schedule.expires() {
 			return Err(RecordError::Template("burn-only sweeps in a batch without a sweep".into()));
+		}
+		if self.template == Template::Vest1 && self.schedule.expires() {
+			return Err(RecordError::Template("vest-1 in a batch with a sweep".into()));
 		}
 		match (self.template, &self.channel) {
 			(Template::Channel1, None) => return Err(RecordError::Template("channel-1 without its terms".into())),
@@ -860,10 +886,14 @@ impl LeafRecord {
 		let reclaim = reclaim_script(&prefix, &owners, &operator);
 		let delegated = self.delegated
 			.then(|| reclaim_delegated_script(&prefix, &self.chain.delegation_prefix(), &owners, &operator));
+		// A batch of vest-1 leaves: every leaf vests at V, and RECLAIM waits
+		// for it as their paths do.
+		let lock = self.claim.as_ref().and_then(|c| c.vest).filter(|_| self.template == Template::Vest1);
+		let (reclaim, delegated) = (crate::claim::vested(lock, reclaim), delegated.map(|d| crate::claim::vested(lock, d)));
 		let node = BranchNode::new(
 			children, l.index as usize, l.reserve, operator, members.commitment(),
 			members.proof(1 + l.index as usize), self.schedule.sweep_path(level != 0, self.burn),
-			Some(Reclaim { owners, prefix, script: reclaim, delegated }),
+			Some(Reclaim { owners, prefix, script: reclaim, delegated, lock }),
 		)?;
 		child = Child::new(self.asset, node.value, node.program());
 		nodes.push(node);
@@ -1009,6 +1039,9 @@ impl LeafRecord {
 			w.extend(l.allowance.to_le_bytes());
 			w.extend((l.return_script.len() as u16).to_le_bytes());
 			w.extend(l.return_script.as_bytes());
+			if self.template == Template::Vest1 {
+				w.extend(l.vest.map_or(0, |v| v.to_consensus_u32()).to_le_bytes());
+			}
 		}
 		w.extend(asset_bytes(self.asset));
 		w.extend(self.value.to_le_bytes());
@@ -1088,11 +1121,16 @@ impl LeafRecord {
 			_ => None,
 		};
 		let claim = match template {
-			Template::Claim1 => {
+			Template::Claim1 | Template::Vest1 => {
 				let deadline = r.median_time()?;
 				let allowance = r.u64()?;
 				let n = r.u16()? as usize;
-				Some(Lapse { deadline, allowance, return_script: Script::from(r.bytes(n)?.to_vec()) })
+				let return_script = Script::from(r.bytes(n)?.to_vec());
+				let vest = match template {
+					Template::Vest1 => Some(r.median_time()?),
+					_ => None,
+				};
+				Some(Lapse { deadline, allowance, return_script, vest })
 			},
 			_ => None,
 		};
@@ -1424,6 +1462,8 @@ pub struct Reclaim {
 	pub script: Script,
 	/// RECLAIM-D, when the batch was built with it.
 	pub delegated: Option<Script>,
+	/// The vest time both wait for, in a batch of `vest-1` leaves.
+	pub lock: Option<crate::time::MedianTime>,
 }
 
 impl Reclaim {
@@ -1533,7 +1573,7 @@ impl BranchNode {
 	) -> Result<crate::spend::KeySpend, crate::spend::SpendError> {
 		let r = self.reclaim.as_ref().ok_or(crate::Error::NoOwners)?;
 		let spent = self.output().txout();
-		reclaim_tx(self.taproot.clone(), r.script.clone(), (node, spent), connectors, outputs, connector_to, fee)
+		crate::node::reclaim_tx_at(r.lock, self.taproot.clone(), r.script.clone(), (node, spent), connectors, outputs, connector_to, fee)
 	}
 
 	/// The operator's reclaim of this node by RECLAIM-D, for a node that
@@ -1550,7 +1590,7 @@ impl BranchNode {
 		let r = self.reclaim.as_ref().ok_or(crate::Error::NoOwners)?;
 		let script = r.delegated.clone().ok_or(crate::Error::NoOwners)?;
 		let spent = self.output().txout();
-		reclaim_tx(self.taproot.clone(), script, (node, spent), connectors, outputs, connector_to, fee)
+		crate::node::reclaim_tx_at(r.lock, self.taproot.clone(), script, (node, spent), connectors, outputs, connector_to, fee)
 	}
 
 	/// The items below RECLAIM-D: the operator's signature and one tree per

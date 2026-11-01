@@ -82,6 +82,18 @@
 //! - **Fees.** The allowance pays the fee in the leaf's asset where the node
 //!   takes it. Where it does not (the asset delisted), a coin of any accepted
 //!   asset pays the fee and the return gets the whole value ([`LeafPolicy::lapse_tx`]).
+//!
+//! # The claim leaf that vests: `vest-1`
+//!
+//! A distribution whose lapse names a vest time `V` before `D`
+//! ([`DistributionLapse::vest`]) pays `vest-1` leaves: `claim-1` whose
+//! collaborative path and exit start with `<V> OP_CHECKLOCKTIMEVERIFY
+//! OP_DROP` ([`vest_lock`]), its collaborative constant `K ‖ V`, in a batch
+//! without a sweep of `vest-1` leaves of one `V` whose lowest nodes' RECLAIM
+//! waits for `V` too. Before `V` no transaction that moves the leaf's value
+//! is final, owner and operator together included; the lapse waits for `D`.
+//! A pair made for the leaf names `V`, so it spends no leaf of another
+//! template or vest time.
 
 use elements::hashes::{sha256, Hash, HashEngine};
 use elements::secp256k1_zkp::{Keypair, Scalar, XOnlyPublicKey};
@@ -135,6 +147,8 @@ pub enum ClaimError {
 	Fees(usize),
 	#[error("claim {index} holds {value}, not above the lapse's fee allowance of {allowance}")]
 	LapseAllowance { index: usize, value: u64, allowance: u64 },
+	#[error("the claims vest at {vest}, not before their deadline {deadline}: a holder could never take one up")]
+	VestAfterDeadline { vest: u32, deadline: u32 },
 }
 
 /// Why a claim leaf's lapse cannot be built or does not fit.
@@ -146,6 +160,8 @@ pub enum LapseError {
 	ReturnScript(usize),
 	#[error("the lapse's output at its input's index is not the return script, explicitly in the leaf's asset, holding at least {min}")]
 	Output { min: u64 },
+	#[error("a vest-1 leaf vests at {vest}, not before its deadline {deadline}")]
+	Vest { vest: u32, deadline: u32 },
 }
 
 /// `SHA256(program ‖ version + 2)` of `script_pubkey`: the script part of the
@@ -168,6 +184,10 @@ pub struct Lapse {
 	pub allowance: u64,
 	/// The distribution's return script, the payer's.
 	pub return_script: Script,
+	/// `V`, for a `vest-1` leaf: no path but the lapse spends the leaf, and
+	/// no RECLAIM its lowest node, before the chain's median time passes it.
+	/// Before `D`. `None` for a `claim-1` leaf.
+	pub vest: Option<MedianTime>,
 }
 
 impl Lapse {
@@ -179,7 +199,8 @@ impl Lapse {
 		if self.allowance >= value {
 			return Err(LapseError::Allowance { allowance: self.allowance, value });
 		}
-		Ok(LapseTerms { deadline: self.deadline, pin: script_pin(&self.return_script), asset, min_value: value - self.allowance })
+		check_vest(self.vest, self.deadline)?;
+		Ok(LapseTerms { deadline: self.deadline, pin: script_pin(&self.return_script), asset, min_value: value - self.allowance, vest: self.vest })
 	}
 }
 
@@ -196,6 +217,35 @@ pub struct LapseTerms {
 	/// The least the lapse's output holds: the leaf's value less the
 	/// allowance.
 	pub min_value: u64,
+	/// `V`, for a `vest-1` leaf ([`Lapse::vest`]).
+	pub vest: Option<MedianTime>,
+}
+
+/// Refuses a vest time at or after the deadline.
+pub(crate) fn check_vest(vest: Option<MedianTime>, deadline: MedianTime) -> Result<(), LapseError> {
+	match vest {
+		Some(v) if v.to_consensus_u32() >= deadline.to_consensus_u32() =>
+			Err(LapseError::Vest { vest: v.to_consensus_u32(), deadline: deadline.to_consensus_u32() }),
+		_ => Ok(()),
+	}
+}
+
+/// `<V> OP_CHECKLOCKTIMEVERIFY OP_DROP`: what a `vest-1` leaf's collaborative
+/// path and exit, and the RECLAIM of its lowest node, start with.
+pub fn vest_lock(vest: MedianTime) -> Vec<u8> {
+	Builder::new().push_int(vest.to_consensus_u32() as i64).ops(&[OP_CLTV, OP_DROP]).into_script().into_bytes()
+}
+
+/// `script` behind [`vest_lock`] where `vest` is set.
+pub fn vested(vest: Option<MedianTime>, script: Script) -> Script {
+	match vest {
+		None => script,
+		Some(v) => {
+			let mut b = vest_lock(v);
+			b.extend(script.as_bytes());
+			Script::from(b)
+		},
+	}
 }
 
 impl LapseTerms {
@@ -250,6 +300,9 @@ pub fn lapse_allowance(floor_per_kvb: Option<u64>, multiple: u64) -> u64 {
 pub struct DistributionLapse {
 	pub deadline: MedianTime,
 	pub allowance: u64,
+	/// `V`: the claims are `vest-1` leaves that vest then; before the
+	/// deadline. `None` for `claim-1` leaves.
+	pub vest: Option<MedianTime>,
 }
 
 /// `t = SHA256(T ‖ T ‖ A ‖ n)`, `T = SHA256("Arca/claim-key")`, as 32 bytes.
@@ -373,6 +426,10 @@ impl Distribution {
 			if let Some((index, c)) = self.claims.iter().enumerate().find(|(_, c)| c.value <= l.allowance) {
 				return Err(ClaimError::LapseAllowance { index, value: c.value, allowance: l.allowance });
 			}
+			if check_vest(l.vest, l.deadline).is_err() {
+				return Err(ClaimError::VestAfterDeadline { vest: l.vest.map_or(0, |v| v.to_consensus_u32()),
+					deadline: l.deadline.to_consensus_u32() });
+			}
 		}
 		Ok(())
 	}
@@ -380,7 +437,7 @@ impl Distribution {
 	/// The lapse every claim leaf's record keeps; `None` for a distribution
 	/// without a deadline, whose claims are `vtxo-1` leaves.
 	pub fn claim_lapse(&self) -> Option<Lapse> {
-		self.lapse.map(|l| Lapse { deadline: l.deadline, allowance: l.allowance, return_script: self.return_script.clone() })
+		self.lapse.map(|l| Lapse { deadline: l.deadline, allowance: l.allowance, return_script: self.return_script.clone(), vest: l.vest })
 	}
 
 	/// What the claims hold together.
@@ -400,7 +457,12 @@ impl Distribution {
 	///      ‖ 0, or 1 and the earliest round time (u32)
 	///      ‖ for a distribution with a deadline only: 1, the deadline (u32)
 	///        and the lapse's fee allowance (u64)
+	///      ‖ for a vesting distribution only: the vest time V (u32)
 	/// ```
+	///
+	/// The vest time is the last field and only a distribution with a
+	/// deadline has one, so every id of a distribution without it is as it
+	/// was, and no two distributions share a preimage.
 	///
 	/// Integers little-endian, asset ids in internal byte order. Its tag is its
 	/// own, so no attestation of a distribution is one of a participation or a
@@ -444,6 +506,9 @@ impl Distribution {
 			e.input(&[1]);
 			e.input(&l.deadline.to_consensus_u32().to_le_bytes());
 			e.input(&l.allowance.to_le_bytes());
+			if let Some(v) = l.vest {
+				e.input(&v.to_consensus_u32().to_le_bytes());
+			}
 		}
 		sha256::Hash::from_engine(e).to_byte_array()
 	}
@@ -579,8 +644,11 @@ mod tests {
 		changed(&|x| x.fees[0].1 = 31);
 		changed(&|x| x.fees.clear());
 		changed(&|x| x.not_before = Some(MedianTime::from_consensus(1_800_000_000).unwrap()));
-		let lapse = |t: u32, a: u64| Some(DistributionLapse { deadline: MedianTime::from_consensus(t).unwrap(), allowance: a });
+		let lapse = |t: u32, a: u64| Some(DistributionLapse { deadline: MedianTime::from_consensus(t).unwrap(), allowance: a, vest: None });
 		changed(&|x| x.lapse = lapse(1_800_000_000, 0));
+		let vest = |v: u32| Some(DistributionLapse { vest: Some(MedianTime::from_consensus(v).unwrap()), ..lapse(1_800_000_000, 0).unwrap() });
+		changed(&|x| x.lapse = vest(1_700_000_000));
+		changed(&|x| x.lapse = vest(1_700_000_001));
 		changed(&|x| x.lapse = lapse(1_800_000_001, 0));
 		changed(&|x| x.lapse = lapse(1_800_000_000, 1));
 		assert_ne!(d.id(&Chain::new(elements::BlockHash::from_byte_array([0x12; 32])), &s), id, "another chain");
@@ -608,9 +676,14 @@ mod tests {
 		d.fees.push(d.fees[0]);
 		assert_eq!(d.check(), Err(ClaimError::Fees(2)));
 		let mut d = distribution();
-		d.lapse = Some(DistributionLapse { deadline: MedianTime::from_consensus(1_800_000_000).unwrap(), allowance: 1_000 });
+		d.lapse = Some(DistributionLapse { deadline: MedianTime::from_consensus(1_800_000_000).unwrap(), allowance: 1_000, vest: None });
 		assert_eq!(d.check(), Err(ClaimError::LapseAllowance { index: 0, value: 1_000, allowance: 1_000 }));
-		d.lapse = Some(DistributionLapse { deadline: MedianTime::from_consensus(1_800_000_000).unwrap(), allowance: 999 });
+		d.lapse = Some(DistributionLapse { deadline: MedianTime::from_consensus(1_800_000_000).unwrap(), allowance: 999, vest: None });
+		assert!(d.check().is_ok());
+		let at = |t: u32| Some(MedianTime::from_consensus(t).unwrap());
+		d.lapse = Some(DistributionLapse { vest: at(1_800_000_000), ..d.lapse.unwrap() });
+		assert_eq!(d.check(), Err(ClaimError::VestAfterDeadline { vest: 1_800_000_000, deadline: 1_800_000_000 }));
+		d.lapse = Some(DistributionLapse { vest: at(1_799_999_999), ..d.lapse.unwrap() });
 		assert!(d.check().is_ok());
 	}
 }

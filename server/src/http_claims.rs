@@ -107,6 +107,7 @@ pub(super) async fn distribute(State(app): State<Arc<App>>, body: Result<Bytes, 
 			(Some(t), Some(a)) => Some(arca_covenant::DistributionLapse {
 				deadline: MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("deadline: {}", e)))?,
 				allowance: amount(a)?,
+				vest: None,
 			}),
 			(None, None) => None,
 			_ => return Err(Refusal::malformed("a deadline and a lapse allowance come together")),

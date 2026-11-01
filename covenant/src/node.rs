@@ -124,6 +124,7 @@ pub struct NodePolicy {
 	sweep: Option<Sweep>,
 	reclaim: Option<Chain>,
 	delegated: bool,
+	reclaim_lock: Option<MedianTime>,
 }
 
 impl NodePolicy {
@@ -148,7 +149,25 @@ impl NodePolicy {
 		if reclaim.is_some() && owners.is_empty() {
 			return Err(Error::NoOwners);
 		}
-		Ok(NodePolicy { children, operator, owners, sweep, reclaim, delegated: false })
+		Ok(NodePolicy { children, operator, owners, sweep, reclaim, delegated: false, reclaim_lock: None })
+	}
+
+	/// The same lowest node with RECLAIM, and RECLAIM-D where it carries it,
+	/// behind `<V> OP_CHECKLOCKTIMEVERIFY OP_DROP`: the lowest node of a
+	/// batch of `vest-1` leaves, which nobody takes back before they vest
+	/// ([`crate::claim`]). Refuses a node without RECLAIM.
+	pub fn with_reclaim_lock(mut self, vest: MedianTime) -> Result<NodePolicy, Error> {
+		if self.reclaim.is_none() {
+			return Err(Error::NoOwners);
+		}
+		self.reclaim_lock = Some(vest);
+		Ok(self)
+	}
+
+	/// The time RECLAIM waits for, on the lowest node of a batch of
+	/// `vest-1` leaves.
+	pub fn reclaim_lock(&self) -> Option<MedianTime> {
+		self.reclaim_lock
 	}
 
 	/// The same lowest node with RECLAIM-D beside RECLAIM, so that the
@@ -221,7 +240,7 @@ impl NodePolicy {
 
 	/// The RECLAIM leaf, for a lowest node.
 	pub fn reclaim_script(&self) -> Option<Script> {
-		Some(reclaim_script(&self.release_prefix()?, &self.owners, &self.operator))
+		Some(crate::claim::vested(self.reclaim_lock, reclaim_script(&self.release_prefix()?, &self.owners, &self.operator)))
 	}
 
 	/// The RECLAIM-D leaf, for a lowest node built with it.
@@ -230,7 +249,8 @@ impl NodePolicy {
 			return None;
 		}
 		let chain = self.reclaim?;
-		Some(reclaim_delegated_script(&self.release_prefix()?, &chain.delegation_prefix(), &self.owners, &self.operator))
+		Some(crate::claim::vested(self.reclaim_lock,
+			reclaim_delegated_script(&self.release_prefix()?, &chain.delegation_prefix(), &self.owners, &self.operator)))
 	}
 
 	/// The node's output: `[UNROLL, SWEEP]`, `[UNROLL, [SWEEP, RECLAIM]]` for
@@ -308,7 +328,7 @@ impl NodePolicy {
 	) -> Result<KeySpend, SpendError> {
 		let script = self.reclaim_delegated_script().ok_or(Error::NoOwners)?;
 		let spent = explicit_txout(self.children[0].asset, value, self.script_pubkey());
-		reclaim_tx(self.taproot(), script, (node, spent), connectors, outputs, connector_to, fee)
+		reclaim_tx_at(self.reclaim_lock, self.taproot(), script, (node, spent), connectors, outputs, connector_to, fee)
 	}
 
 	/// The operator's reclaim of this lowest node at `node`, holding `value`
@@ -324,7 +344,7 @@ impl NodePolicy {
 	) -> Result<KeySpend, SpendError> {
 		let script = self.reclaim_script().ok_or(Error::NoOwners)?;
 		let spent = explicit_txout(self.children[0].asset, value, self.script_pubkey());
-		reclaim_tx(self.taproot(), script, (node, spent), connectors, outputs, connector_to, fee)
+		reclaim_tx_at(self.reclaim_lock, self.taproot(), script, (node, spent), connectors, outputs, connector_to, fee)
 	}
 }
 
@@ -444,8 +464,28 @@ pub fn reclaim_tx(
 	connector_to: Script,
 	fee: &FeeSource,
 ) -> Result<KeySpend, SpendError> {
+	reclaim_tx_at(None, tap, script, node, connectors, outputs, connector_to, fee)
+}
+
+/// [`reclaim_tx`] for a RECLAIM behind `lock` ([`NodePolicy::with_reclaim_lock`]):
+/// its lock time is `lock` and the node's input is not final.
+#[allow(clippy::too_many_arguments)]
+pub fn reclaim_tx_at(
+	lock: Option<MedianTime>,
+	tap: TapOutput,
+	script: Script,
+	node: (OutPoint, TxOut),
+	connectors: &[(OutPoint, TxOut)],
+	outputs: &[ExplicitOutput],
+	connector_to: Script,
+	fee: &FeeSource,
+) -> Result<KeySpend, SpendError> {
 	let mut all = outputs.to_vec();
-	let mut inputs = vec![(node.0, node.1, FINAL)];
+	let (lock_time, sequence) = match lock {
+		Some(v) => (elements::LockTime::from_consensus(v.to_consensus_u32()), elements::Sequence::ENABLE_LOCKTIME_NO_RBF),
+		None => (elements::LockTime::ZERO, FINAL),
+	};
+	let mut inputs = vec![(node.0, node.1, sequence)];
 	for (at, out) in connectors {
 		match (out.asset.explicit(), out.value.explicit()) {
 			(Some(m), Some(v)) => all.push(ExplicitOutput::new(m, v, connector_to.clone())),
@@ -453,7 +493,7 @@ pub fn reclaim_tx(
 		}
 		inputs.push((*at, out.clone(), FINAL));
 	}
-	KeySpend::build(tap, script, inputs, &all, fee)
+	KeySpend::build_at(lock_time, tap, script, inputs, &all, fee)
 }
 
 /// The gated, timed UNROLL leaf of a node whose member tree is `gate_commitment`

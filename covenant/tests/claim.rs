@@ -167,7 +167,7 @@ fn a_claim_leaf_lapses_to_its_payer_after_the_deadline() {
 	let h = hash(&preimage);
 	let deadline = mt(c.net.mtp() + 3 * DAY);
 	let ret = elements::Script::from([&[0x00u8, 0x14][..], &label32("lapse return")[..20]].concat());
-	let lapse = Lapse { deadline, allowance: 1_500, return_script: ret.clone() };
+	let lapse = Lapse { deadline, allowance: 1_500, return_script: ret.clone(), vest: None };
 	let specs: Vec<tree::LeafSpec> = holders.iter().zip(&nonces).enumerate().map(|(i, (k, n))| tree::LeafSpec {
 		claim: Some(lapse.clone()),
 		template: Template::Claim1, owner: claim_key(&xonly(k), n).unwrap(), value: LEAF + i as u64,

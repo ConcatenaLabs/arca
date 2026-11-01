@@ -261,7 +261,7 @@ impl Ctx {
 		let ret = Script::from(hex(&p["return_script"]));
 		assert_eq!(arca_covenant::script_pin(&ret), h32(&p["return_pin"]));
 		let lapse = arca_covenant::Lapse {
-			deadline: time(&p["deadline"]), allowance: p["allowance"].as_u64().unwrap(), return_script: ret.clone(),
+			deadline: time(&p["deadline"]), allowance: p["allowance"].as_u64().unwrap(), return_script: ret.clone(), vest: None,
 		};
 		let terms = lapse.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
 		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());

@@ -244,6 +244,11 @@ pub enum TreeError {
 	TooDeep(usize),
 	#[error("the clock schedule runs backwards at step {0}")]
 	ScheduleBackwards(usize),
+	/// A batch holding a `vest-1` leaf holds only `vest-1` leaves of one
+	/// vest time, and has no sweep: its lowest nodes' RECLAIM waits for that
+	/// time, and a sweep would take what has not vested.
+	#[error("a batch of vest-1 leaves holds only vest-1 leaves of one vest time, without a sweep")]
+	VestBatch,
 	#[error(transparent)]
 	Policy(#[from] crate::Error),
 }
@@ -274,6 +279,24 @@ pub(crate) fn fee_rate_reserve(floor_per_kvb: u64, multiple: u64, witness: Vec<V
 	tx.input[0].witness.script_witness = witness;
 	let vsize = tx.vsize() as u64;
 	vsize.saturating_mul(floor_per_kvb).div_ceil(1000).saturating_mul(multiple)
+}
+
+/// The vest time of a batch of `vest-1` leaves; `None` for a batch with
+/// none. Refuses a batch that mixes them with other leaves or vest times, or
+/// has a sweep ([`TreeError::VestBatch`]).
+pub(crate) fn vest_of(params: &TreeParams, leaves: &[LeafSpec]) -> Result<Option<crate::time::MedianTime>, TreeError> {
+	let vests: std::collections::BTreeSet<Option<u32>> = leaves.iter()
+		.map(|l| l.claim.as_ref().and_then(|c| c.vest).filter(|_| l.template == Template::Vest1).map(|v| v.to_consensus_u32()))
+		.collect();
+	let any = leaves.iter().any(|l| l.template == Template::Vest1 || l.claim.as_ref().is_some_and(|c| c.vest.is_some()));
+	if !any {
+		return Ok(None);
+	}
+	match (vests.len(), vests.iter().next()) {
+		(1, Some(Some(_))) if !params.schedule.expires() =>
+			Ok(leaves[0].claim.as_ref().and_then(|c| c.vest)),
+		_ => Err(TreeError::VestBatch),
+	}
 }
 
 /// The leaves of a batch, each behind its hash-locked entry, by the rules
@@ -310,16 +333,16 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 			_ => None,
 		};
 		let claim = match (spec.template, &spec.claim) {
-			(Template::Claim1, Some(l)) if spec.htlc.is_none() && spec.order.is_none() && spec.landing.is_none()
-				&& spec.channel.is_none() => match l.terms(params.asset, spec.value) {
+			(Template::Claim1 | Template::Vest1, Some(l)) if spec.htlc.is_none() && spec.order.is_none() && spec.landing.is_none()
+				&& spec.channel.is_none() && l.vest.is_some() == (spec.template == Template::Vest1) => match l.terms(params.asset, spec.value) {
 				Ok(t) => Some(t),
 				Err(_) => return Err(TreeError::Template { leaf: i }),
 			},
-			(Template::Claim1, _) | (_, Some(_)) => return Err(TreeError::Template { leaf: i }),
+			(Template::Claim1 | Template::Vest1, _) | (_, Some(_)) => return Err(TreeError::Template { leaf: i }),
 			_ => None,
 		};
 		let landing = match (spec.template, &spec.htlc, &spec.order, &spec.landing) {
-			(Template::Channel1 | Template::Claim1, None, None, None) => None,
+			(Template::Channel1 | Template::Claim1 | Template::Vest1, None, None, None) => None,
 			(Template::Vtxo1 | Template::Vtxo2, None, None, None) => None,
 			(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
 			(Template::Order2 | Template::Order3, None, Some(o), None)
@@ -397,6 +420,7 @@ impl Tree {
 		}
 		let operator = params.schedule.operator;
 		let tree_leaves = build_leaves(&params, leaves)?;
+		let vest = vest_of(&params, leaves)?;
 
 		// The nodes, bottom-up.
 		let mut below: Vec<(Child, Range<usize>)> =
@@ -416,6 +440,9 @@ impl Tree {
 				let mut policy = NodePolicy::new(children, operator, owners, sweep, lowest.then_some(params.chain))?;
 				if lowest && params.delegated_reclaim {
 					policy = policy.with_delegation()?;
+				}
+				if let Some(v) = vest.filter(|_| lowest) {
+					policy = policy.with_reclaim_lock(v)?;
 				}
 				let taproot = policy.taproot();
 				let members = policy.members();

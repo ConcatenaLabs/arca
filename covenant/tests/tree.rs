@@ -93,6 +93,7 @@ fn the_builder_rebuilds_every_record_vector() {
 				deadline: MedianTime::from_consensus(q["deadline"].as_u64().unwrap() as u32).unwrap(),
 				allowance: q["allowance"].as_u64().unwrap(),
 				return_script: elements::Script::from(Vec::<u8>::from_hex(q["return_script"].as_str().unwrap()).unwrap()),
+				vest: None,
 			});
 			LeafSpec {
 				template: if let Some(o) = &order { o.template() } else if htlc.is_some() { Template::Htlc1 }

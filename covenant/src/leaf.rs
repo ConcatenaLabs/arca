@@ -55,6 +55,12 @@
 //! the collaborative path and the exit and adds the lapse, which after the
 //! distribution's deadline pays its return script: `[collab, [exit, lapse]]`.
 //!
+//! A `vest-1` leaf ([`crate::claim`]), a vesting distribution's claim leaf,
+//! is a `claim-1` leaf whose collaborative path and exit both start with
+//! `<V> OP_CHECKLOCKTIMEVERIFY OP_DROP`, and whose collaborative constant is
+//! `K ‖ V`: before the median time passes `V`, nothing but the lapse (which
+//! waits for the later `D`) spends it.
+//!
 //! A `vtxo-2` leaf ([`crate::collab`]) keeps the exit and replaces the
 //! collaborative script with the Simplicity program `arca/collab-2` and its
 //! data leaf, `[[program, data], exit]`: owner and operator sign the coin's
@@ -65,7 +71,7 @@ use elements::opcodes::all::*;
 use elements::script::Builder;
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::secp256k1_zkp::XOnlyPublicKey;
-use elements::{AssetId, Script};
+use elements::{AssetId, LockTime, Script};
 
 use crate::channel::{ChannelPolicy, ChannelTerms};
 use crate::claim::LapseTerms;
@@ -192,18 +198,37 @@ impl LeafPolicy {
 	/// What the collaborative script pushes and its message starts with:
 	/// `K`, for `landing-1` `K ‖ P` ([`Chain::landing_prefix`]), for
 	/// `enclave-1` `K ‖ D` ([`Chain::enclave_prefix`]).
+	/// For `vest-1` it is `K ‖ V` (V as u32), so a pair made for a vesting
+	/// leaf spends no leaf that does not vest at the same time.
 	pub fn collab_prefix(&self) -> Vec<u8> {
-		match (&self.landing, &self.enclave) {
-			(Some(l), _) => self.chain.landing_prefix(&self.salt, &l.program),
-			(None, Some(e)) => self.chain.enclave_prefix(&self.salt, &e.enclave.digest()),
-			(None, None) => self.leaf_constant().to_vec(),
+		match (&self.landing, &self.enclave, self.vest()) {
+			(Some(l), ..) => self.chain.landing_prefix(&self.salt, &l.program),
+			(None, Some(e), _) => self.chain.enclave_prefix(&self.salt, &e.enclave.digest()),
+			(None, None, Some(v)) => {
+				let mut b = self.leaf_constant().to_vec();
+				b.extend(v.to_consensus_u32().to_le_bytes());
+				b
+			},
+			(None, None, None) => self.leaf_constant().to_vec(),
 		}
 	}
 
+	/// `V` of a `vest-1` leaf; `None` for every other template.
+	pub fn vest(&self) -> Option<crate::time::MedianTime> {
+		self.claim.and_then(|c| c.vest)
+	}
+
+	/// The lock time a spend of this leaf by its collaborative path or its
+	/// exit carries: `V` for a `vest-1` leaf, else 0.
+	pub fn lock_time(&self) -> LockTime {
+		self.vest().map_or(LockTime::ZERO, |v| LockTime::from_consensus(v.to_consensus_u32()))
+	}
+
 	/// The tapscript collaborative path. A `vtxo-2` leaf's tree does not
-	/// carry it: its path is [`Self::collab2`].
+	/// carry it: its path is [`Self::collab2`]. A `vest-1` leaf's starts
+	/// with `<V> OP_CHECKLOCKTIMEVERIFY OP_DROP`.
 	pub fn collab_script(&self) -> Script {
-		rebindable_two_party(&self.owner, &self.operator, &self.collab_prefix())
+		crate::claim::vested(self.vest(), rebindable_two_party(&self.owner, &self.operator, &self.collab_prefix()))
 	}
 
 	/// The parameters of `arca/collab-2` for this leaf: what a `vtxo-2`
@@ -218,7 +243,7 @@ impl LeafPolicy {
 		match (&self.landing, &self.enclave) {
 			(Some(l), _) => l.script(&self.owner, self.exit_delay),
 			(None, Some(e)) => e.exit_script(&self.owner, self.exit_delay),
-			(None, None) => exit_script(&self.owner, self.exit_delay),
+			(None, None) => crate::claim::vested(self.vest(), exit_script(&self.owner, self.exit_delay)),
 		}
 	}
 
@@ -266,7 +291,7 @@ impl LeafPolicy {
 	/// ([`crate::order`]), the fill the template's program.
 	/// `channel-1`: `[collab, [update(0), settle(0)]]` ([`crate::channel`]).
 	/// `vtxo-2`: `[[arca/collab-2, data], exit]` ([`crate::collab`]).
-	/// `claim-1`: `[collab, [exit, lapse]]` ([`crate::claim`]).
+	/// `claim-1` and `vest-1`: `[collab, [exit, lapse]]` ([`crate::claim`]).
 	pub fn taproot(&self) -> TapOutput {
 		if let Some(c) = self.channel_policy() {
 			return c.taproot(&c.opening());
@@ -299,9 +324,11 @@ impl LeafPolicy {
 	}
 
 	/// The template it follows: `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3` (or
-	/// `order-2`), `landing-1`, `enclave-1`, `channel-1` or `claim-1`.
+	/// `order-2`), `landing-1`, `enclave-1`, `channel-1`, `claim-1` or `vest-1`.
 	pub fn template(&self) -> crate::Template {
-		if self.claim.is_some() {
+		if self.vest().is_some() {
+			crate::Template::Vest1
+		} else if self.claim.is_some() {
 			crate::Template::Claim1
 		} else if self.channel.is_some() {
 			crate::Template::Channel1

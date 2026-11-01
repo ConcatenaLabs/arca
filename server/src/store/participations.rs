@@ -97,6 +97,7 @@ pub(crate) fn claim_of(b: &[u8]) -> Result<arca_covenant::Lapse, StoreError> {
 			.map_err(|e| StoreError::Corrupt(format!("a lapse's deadline: {}", e)))?,
 		allowance: u64::from_le_bytes(b[4..12].try_into().expect("8 bytes")),
 		return_script: elements::Script::from(b[12..].to_vec()),
+		vest: None,
 	})
 }
 

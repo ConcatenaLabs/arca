@@ -690,7 +690,7 @@ impl Accumulator {
 		}
 		// A channel-1 leaf's terms, and a claim-1 leaf's, are not in an
 		// accumulator record: a channel and a claim go in a tree.
-		if let Some(i) = leaves.iter().position(|l| matches!(l.template, Template::Channel1 | Template::Claim1) || l.channel.is_some()
+		if let Some(i) = leaves.iter().position(|l| matches!(l.template, Template::Channel1 | Template::Claim1 | Template::Vest1) || l.channel.is_some()
 			|| l.claim.is_some()) {
 			return Err(TreeError::Template { leaf: i });
 		}
