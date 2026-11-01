@@ -526,19 +526,53 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// Takes back participation `pid`, a refresh of received coins
-	/// ([`Self::refresh_received`]), once it has waited [`WITHDRAW_AFTER`]
+	/// Takes back participation `pid`, a refresh (not a take, a
+	/// distribution or an offboard), once it has waited [`WITHDRAW_AFTER`]
 	/// seconds and the operator's status `st` says it waits for funds or for
 	/// the in-flight cap: its coins are live again, to pay with, and each is
-	/// given up again no sooner than [`RETRY_AFTER`] seconds later. `None`
-	/// for any other participation, or one that has not waited so long.
+	/// given up again no sooner than [`RETRY_AFTER`] seconds later. It waited
+	/// from when the wallet gave the coins up ([`Self::refresh_received`]
+	/// keeps that), or else from when the wallet recorded the participation,
+	/// which covers one made by `participate` and one given up by an earlier
+	/// wallet. `None` for any other participation, one that has not waited
+	/// so long, one the operator does not withdraw (`not_withdrawable`: run
+	/// again after a round that may still return), and one giving up a coin
+	/// in its free window,
+	/// whose refresh is due: that one waits for the operator's funds; and
+	/// every one with an operator that takes no withdrawal.
 	pub(crate) fn withdraw_waited(&self, pid: &str, st: &Value) -> Result<Option<Value>, Error> {
-		let Some(since) = self.store.meta(&received_key(pid))?.and_then(|t| t.parse::<u64>().ok()) else { return Ok(None) };
+		let since = match self.store.meta(&received_key(pid))?.and_then(|t| t.parse::<u64>().ok()) {
+			Some(t) => t,
+			None => match self.store.participation_created(pid)? {
+				Some(t) => t,
+				None => return Ok(None),
+			},
+		};
 		let wall = wall_now();
 		if st["waiting"].as_str().is_none() || wall < since.saturating_add(WITHDRAW_AFTER) {
 			return Ok(None);
 		}
-		let mut v = self.withdraw_participation(pid)?;
+		let Some((_, body, given, ..)) = self.store.participations()?.into_iter().find(|p| p.0 == pid) else { return Ok(None) };
+		let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+		if !Self::is_refresh(&body) {
+			return Ok(None);
+		}
+		let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+		for l in &given {
+			if self.store.coin(l)?.is_some_and(|c| c.expiry != u32::MAX && super::round::in_free_window(c.expiry, wall as u32)) {
+				return Ok(None);
+			}
+		}
+		if !Self::operator_withdraws(&self.server_info()?) {
+			return Ok(None);
+		}
+		// A re-run is withdrawn only once the round it was in can never
+		// return, which its status does not say: the operator answers.
+		let mut v = match self.withdraw_participation(pid) {
+			Ok(v) => v,
+			Err(Error::Server { code, .. }) if code == "not_withdrawable" => return Ok(None),
+			Err(e) => return Err(e),
+		};
 		if v["state"] == "void" {
 			for l in v["live_again"].as_array().cloned().unwrap_or_default() {
 				if let Some(l) = l.as_str() {
@@ -546,7 +580,7 @@ impl Wallet {
 				}
 			}
 			v["note"] = json!(format!("the refresh waited {} s for the operator ({}): taken back, its coins live again; given up again \
-				no sooner than {} s from now", wall - since, st["waiting"].as_str().unwrap_or(""), RETRY_AFTER));
+				no sooner than {} s from now", wall.saturating_sub(since), st["waiting"].as_str().unwrap_or(""), RETRY_AFTER));
 		}
 		self.store.delete_meta(&received_key(pid))?;
 		Ok(Some(v))

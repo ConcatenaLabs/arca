@@ -677,15 +677,22 @@ operator cannot fund holds back no other's.
 A refresh can still wait at the operator, for its funds or its cap. Its
 coins stay the wallet's to pay with:
 
-- `sync` takes a refresh of received coins back once it has waited two
-  minutes and the operator's status says it waits (`withdraw_participation`):
-  its coins are live again, and are given up again no sooner than ten
-  minutes later;
-- a payment, a swap, a Lightning payment, a take, an offboard or an order
-  that the live coins of its asset cannot cover first takes back every
-  refresh of that asset the operator still holds pending, and pays with
-  their coins as well (a quote takes nothing back, and answers what the live
-  coins can pay);
+- `sync` takes a refresh back once it has waited two minutes and the
+  operator's status says it waits (`withdraw_participation`): its coins are
+  live again, and are given up again no sooner than ten minutes later. It
+  counts the wait from when the wallet gave the coins up, or, for a refresh
+  that kept no such time (one made by `participate`, or by an earlier
+  wallet), from when the wallet recorded it. It leaves a refresh of a coin in
+  its free window, whose refresh is due, to wait for the operator's funds;
+- a payment, a swap, a Lightning payment, a take, a distribution, an offboard
+  or an order that the live coins of its asset cannot cover first takes back
+  every refresh of that asset the operator still holds pending, and pays with
+  their coins as well. Its quote takes nothing back: it counts the coins of
+  each such refresh the operator answers pending at its first attempt,
+  prices the trade as the trade would pay, and names those refreshes
+  (`takes_back`). Should a round take one before the trade runs, the trade
+  is refused for want of live coins, and the refresh completes as any other;
+- `coins` names the refresh a given-up coin waits in (`refresh_waiting`);
 - `arca withdraw-participation ID` takes back any pending participation of
   the wallet's by hand.
 

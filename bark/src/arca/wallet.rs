@@ -166,6 +166,10 @@ pub struct Wallet {
 	/// nothing, so it takes back no refresh that waits
 	/// ([`Wallet::withdraw_refreshes`]) when the live coins fall short.
 	pub(crate) quoting: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	/// The refreshes that wait whose coins the quote under way counts as the
+	/// trade's to pay with, each its participation and coins
+	/// ([`Wallet::free_refreshes`]).
+	pub(crate) quote_frees: std::cell::RefCell<Vec<(String, Vec<String>)>>,
 	/// While `sync` asks the operator: the median time the exit steps were
 	/// last taken at, so one whose date comes meanwhile is taken at once
 	/// ([`Wallet::exits_meanwhile`]), and what those steps did.
@@ -818,7 +822,7 @@ impl Wallet {
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
-			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), exit_watch: Default::default(),
+			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default() })
 	}
 
@@ -3111,10 +3115,19 @@ impl Wallet {
 		let unreachable = self.unreachable()?;
 		let refused = self.refused_refreshes()?;
 		let given_up = self.given_up_set()?;
+		let waiting = self.refresh_waiting_coins()?;
 		let mut fee_view: Option<Vec<FeeHolding>> = None;
 		let mut out = vec![];
 		for c in self.store.coins()? {
 			let mut v = Self::coin_json(&c);
+			// Given up in a refresh the operator has not put in a round (as
+			// the wallet last knew): a payment or a trade that needs it takes
+			// that refresh back first, and its quote counts it.
+			if c.state == "given" {
+				if let Some(pid) = waiting.get(&c.leaf_id) {
+					v["refresh_waiting"] = json!(pid);
+				}
+			}
 			let (kept, reboarded) = self.kept_safe(&c.leaf_id)?;
 			if kept {
 				v[super::tower::KEPT_SAFE] = json!(true);

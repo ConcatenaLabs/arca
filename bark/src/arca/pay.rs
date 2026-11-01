@@ -449,7 +449,8 @@ impl Wallet {
 	/// largest first among those of one date, each resolved; a coin past its
 	/// exit deadline is not paid on (the operator co-signs no spend of it,
 	/// and `sync` takes it on the chain), nor one an offline-refresh plan
-	/// names ([`super::plan`]).
+	/// names ([`super::plan`]). While a quote runs, the coins it counts in
+	/// refreshes that wait as well ([`Self::counted_given`]).
 	fn spendable(&self, asset: AssetId) -> Result<Vec<In>, Error> {
 		let mut out = vec![];
 		let now = self.now()?.to_consensus_u32() as u64;
@@ -457,7 +458,11 @@ impl Wallet {
 		// wallet signed, valid while its script is unspent: it is paid out of
 		// round by no wallet, and is refreshed in a round first.
 		let planned = self.planned_coins()?;
-		for row in self.store.coins_in("live")?.into_iter().filter(|c| c.asset == asset.to_string()) {
+		// While a quote runs, the coins of the refreshes that wait it counts
+		// as the trade's ([`Self::free_refreshes`]): the trade takes them back
+		// first, and then holds them live.
+		let rows = self.store.coins_in("live")?.into_iter().filter(|c| c.asset == asset.to_string()).chain(self.counted_given(asset)?);
+		for row in rows {
 			if row.expiry != u32::MAX && now + WalletPolicy::EXIT_DEADLINE as u64 >= row.expiry as u64 {
 				continue;
 			}
@@ -533,15 +538,17 @@ impl Wallet {
 	///
 	/// When the live coins cannot cover it, every refresh of `asset` the
 	/// operator still holds pending is taken back first
-	/// ([`Self::withdraw_refreshes`]), and the coins it gave up are chosen
-	/// from as well: a coin given up in a refresh that waits still pays.
+	/// ([`Self::free_refreshes`]), and the coins it gave up are chosen
+	/// from as well: a coin given up in a refresh that waits still pays. A
+	/// quote takes nothing back and chooses from those coins as the trade
+	/// would.
 	#[allow(clippy::too_many_arguments)]
 	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs) {
 			Err(e @ Error::Refused(_)) => {
-				if self.withdraw_refreshes(asset)?.iter().any(|v| v["state"] == "void") {
+				if self.free_refreshes(asset)? {
 					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs)
 				} else {
 					Err(e)
@@ -1852,7 +1859,7 @@ impl Wallet {
 				arca_covenant::leaf::MAX_OUTPUTS)));
 		}
 		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
-		Ok(Self::swap_terms(&o, &mine, change, dates))
+		self.quoted(Ok(Self::swap_terms(&o, &mine, change, dates)))
 	}
 
 	/// What a taker is shown of a swap, by [`Wallet::swap_read`] and
