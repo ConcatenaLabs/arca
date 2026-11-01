@@ -95,7 +95,11 @@
 //!    coin lands as its holder's own leaf, every given-up coin is brought down
 //!    to its leaf for its forfeit (1, 3), and every coin paid on out of round
 //!    lands through its lineage's checkpoints and reassignments (1). A
-//!    claim leaf of a distribution is left to its lapse (8).
+//!    claim leaf of a distribution nobody took up is left to its lapse (8);
+//!    a coin taken up from one lands as any coin paid on out of round. An
+//!    `htlc-1` coin is brought on the chain once its outcome is the
+//!    operator's (a receive past its timeout whose preimage never came, a
+//!    send the operator paid), and refunded or claimed from there.
 //!
 //! A fee is paid from the value a transaction takes, or from the margin its
 //! signers left, when the node accepts that asset for fees now (the fee the
@@ -2567,8 +2571,11 @@ impl Watcher {
 	/// claim takes; and a coin paid on out of round, through its lineage, its
 	/// checkpoints and reassignments published by the answers to stale exits,
 	/// so its current holder's coin is an on-chain leaf of its own. A claim
-	/// leaf of a distribution, and an `htlc-1` leaf, are left to their own
-	/// paths.
+	/// leaf of a distribution nobody took up is left to its lapse or return;
+	/// one taken up is followed to the coin its holder took, which lands as
+	/// any coin paid on out of round. An `htlc-1` leaf is brought on the
+	/// chain once its outcome is the operator's ([`Self::htlc_decided`]),
+	/// and its refund or claim then finishes it; one still open is left.
 	async fn collect_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
 		if b.kind != arca_covenant::BatchKind::Tree {
 			return Ok(());
@@ -2579,11 +2586,19 @@ impl Watcher {
 		let reclaimed = |i: usize| tree.levels()[0].iter().any(|n| n.leaves.contains(&i)
 			&& n.leaves.clone().all(|j| released.contains_key(&j) || consents.contains_key(&j)));
 		let mut stack = vec![];
+		let mut claims = HashSet::new();
 		for (i, bl) in leaves.iter().enumerate() {
-			if !reclaimed(i) && !self.store.is_distribution(&bl.participation_id).await? {
-				stack.push(bl.leaf_id);
+			if reclaimed(i) {
+				continue;
 			}
+			if self.store.is_distribution(&bl.participation_id).await? {
+				claims.insert(bl.leaf_id);
+			}
+			stack.push(bl.leaf_id);
 		}
+		// The htlc-1 coins of paid payments: the operator paid the invoice,
+		// and claims each once it is on the chain.
+		let paid: HashSet<[u8; 32]> = self.store.sends_paid().await?.into_iter().map(|s| s.htlc_leaf_id).collect();
 		let mut visited = HashSet::new();
 		let (mut live, mut given) = (0usize, 0usize);
 		while let Some(leaf) = stack.pop() {
@@ -2592,6 +2607,9 @@ impl Watcher {
 			}
 			let Some(row) = self.store.leaf(&leaf).await? else { continue };
 			let forfeited = match row.state {
+				// A claim leaf nobody took up: its lapse, or its return, pays
+				// the payer.
+				LeafState::Live if claims.contains(&leaf) => continue,
 				LeafState::Live => false,
 				LeafState::Spent if self.live_forfeit(&leaf).await?.is_some() => true,
 				LeafState::Spent => {
@@ -2605,8 +2623,10 @@ impl Watcher {
 			}
 			let r = async {
 				let coin = self.coin(&leaf).await?;
-				if coin.leaf.htlc.is_some() {
-					return Ok(false);
+				if let Some(terms) = &coin.leaf.htlc {
+					if !self.htlc_decided(&leaf, terms, &paid, now).await? {
+						return Ok(false);
+					}
 				}
 				self.bring_on_chain(&coin, now).await.map(|_| true)
 			}.await;
@@ -2622,6 +2642,23 @@ impl Watcher {
 				given);
 		}
 		Ok(())
+	}
+
+	/// Whether the outcome of the `htlc-1` coin `leaf` under `terms` is the
+	/// operator's, so the collection brings it on the chain for its own path
+	/// to finish: a received payment past its timeout whose preimage never
+	/// came (refunded, [`Self::refund_unclaimed_receives`]), or a sent one
+	/// the operator paid (claimed, [`Self::claim_paid_htlcs`]). One still
+	/// open, or its holder's (a receive claimed, a send failed), is left.
+	async fn htlc_decided(&self, leaf: &[u8; 32], terms: &arca_covenant::HtlcTerms, paid: &HashSet<[u8; 32]>, now: MedianTime)
+		-> Result<bool, WatcherError>
+	{
+		Ok(match terms.direction {
+			arca_covenant::HtlcDirection::Send => paid.contains(leaf),
+			arca_covenant::HtlcDirection::Receive => now > terms.timeout
+				&& self.store.receive(&terms.payment_hash).await?.is_some_and(|r|
+					matches!(r.state, crate::store::ReceiveState::Accepted | crate::store::ReceiveState::Cancelled)),
+		})
 	}
 
 	/// Unrolls `node`, on the chain at `op`, toward a lowest node under it

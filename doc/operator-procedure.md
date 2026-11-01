@@ -360,8 +360,9 @@ What it changes for the operator:
   Whatever is left of a batch at its service horizon
   (`[batches] collect_after_seconds`, 28 days by default) is collected on
   the chain: each holder's coin lands as its own leaf, each given-up coin is
-  forfeited and claimed, each coin paid on out of round lands through its
-  lineage. Keep the wallet able to pay those fees (the reserves pay them where
+  forfeited and claimed, each coin paid on out of round (a claim taken up
+  included) lands through its lineage, and each `htlc-1` coin whose payment
+  is decided in the operator's favour is refunded or claimed. Keep the wallet able to pay those fees (the reserves pay them where
   the node takes the batch's asset).
 - **No plans.** The server refuses offline-refresh plans, and stops an open
   one before its next step.

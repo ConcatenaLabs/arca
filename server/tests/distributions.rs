@@ -641,3 +641,133 @@ async fn vesting_claims_move_only_after_their_vest_time() {
 		}
 	}
 }
+
+/// arca#508. A distribution with a deadline from a batch without a sweep:
+/// holder 0 takes its claim up out of round and goes away; holders 1 and 2
+/// never take theirs. After the deadline the two untaken leaves lapse to the
+/// payer. Past the batch's service horizon the collection follows holder 0's
+/// claim leaf to the coin it took, which lands on the chain under its own
+/// key, final, through the claim leaf, its checkpoint and its reassignment;
+/// nothing of the lapsed leaves is touched again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_taken_up_from_a_batch_without_a_sweep_lands_at_the_horizon() {
+	let mut r = Running::start_with(|c, y| {
+		c.assets.push(server::server::AssetSection::new(y, common::running::MIN_LEAF));
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+		c.batches.collect_after_seconds = Some(20 * DAY);
+	}).await;
+	for _ in 0..2 {
+		let x = r.x;
+		r.fund_wallet_in(x, 50_000_000).await;
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let x = r.x;
+	let payer = keypair("NS payer");
+	let (b1, tx1) = credited_board(&mut r, &payer, x).await;
+	let holders: Vec<Keypair> = (0..3).map(|i| keypair(&format!("NS holder {}", i))).collect();
+	let value = VALUE / 3;
+	let claims: Vec<Claim> = holders.iter().map(|h| Claim { named: xonly(h), nonce: random32(), value }).collect();
+	let fee = VALUE - 3 * value;
+	let ret = Script::from([vec![0x00, 0x14], vec![9u8; 20]].concat());
+	let deadline = MedianTime::from_consensus(mtp(&r).to_consensus_u32() + 8 * DAY).unwrap();
+	let allowance = 20_000;
+	let lapse = DistributionLapse { deadline, allowance, vest: None };
+	let (body, id) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(), Some(lapse));
+	assert_eq!(r.http.post("distribute", &body).ok()["state"], "pending");
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	assert!(built.broadcast.starts_with("held"), "a round giving up a coin without a sweep is held: {}", built.broadcast);
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let st = status(&r, &id);
+	let txid = st["round"]["txid"].as_str().unwrap().to_string();
+	let vout = st["outputs"][0]["batch_vout"].as_u64().unwrap();
+	let tree = rebuild(&r.http.post("tree", &json!({"txid": txid, "vout": vout})).ok());
+	let round = r.rt.client().raw_transaction(&common::client::txid(&txid)).unwrap();
+	let rec = tree.record(st["outputs"][0]["leaf_index"].as_u64().unwrap() as usize);
+	assert!(!rec.schedule.expires(), "a batch without a sweep");
+	let new0 = rec.validate(&round, &accept_policy(&r), &claims[0].owner().unwrap(), &claims[0].nonce).unwrap();
+	let old = b1.record.resolve(std::slice::from_ref(&tx1), &r.policy()).unwrap();
+	let f = forfeit_for(&old, &new0, &round, &st);
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&id), "forfeits": [
+		{"leaf_id": b1.id.to_string(), "signature": forfeit_sig(&f, &b1.key)}], "leaves": []})).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+
+	// Holder 0 takes its claim up, out of round, then goes away.
+	let found = lookup(&r, &[&holders[0], &holders[1], &holders[2]]).ok();
+	let f0 = found["claims"].as_array().unwrap().iter().find(|c| c["key"] == json!(hex(&xonly(&holders[0]).serialize()))).unwrap().clone();
+	let pre: [u8; 32] = unhex(f0["preimage"].as_str().unwrap()).try_into().unwrap();
+	let t = MedianTime::from_consensus(mtp(&r).to_consensus_u32() - HOUR).unwrap();
+	let (v0, rec0, round0) = checked(&r, &f0, &holders[0]);
+	let n0: [u8; 32] = unhex(f0["nonce"].as_str().unwrap()).try_into().unwrap();
+	let claim0 = claim_keypair(&holders[0], &n0).unwrap();
+	let a0 = auths(&v0, &claim0, t);
+	assert_eq!(r.http.post("claim_leaf", &auths_body(&v0.leaf_id, &a0)).ok()["state"], "open");
+	let held0 = Held { key: claim0, nonce: n0, id: v0.leaf_id, record: CoinRecord::Leaf { record: rec0, preimage: pre, auths: a0 } };
+	let c0 = held0.record.resolve(std::slice::from_ref(&round0), &r.policy()).unwrap();
+	let own = keypair("NS holder 0, its own leaf");
+	let (to, to_nonce) = new_leaf(&own);
+	let kept = c0.value - 2_000;
+	let up = r.http.post("cosign_transfer", &transfer_body(&[(&held0, c0, kept)], &[(x, kept - 2_000, to)], xonly(&r.s), r.chain)).ok();
+	let up_record = CoinRecord::from_bytes(&unhex(up["outputs"][0]["record"].as_str().unwrap())).unwrap();
+	let up_valid = up_record.validate(std::slice::from_ref(&round0), &r.policy(), &xonly(&own), &to_nonce).unwrap();
+	let up_spk = r.server.store.leaf(&up_valid.id.0).await.unwrap().unwrap().script_pubkey;
+	println!("holder 0 took its claim up out of round: coin {} of {}", up_valid.id, up_valid.value);
+
+	// The deadline passes: the two untaken leaves lapse to the payer.
+	advance_mtp(&r, 8 * DAY + HOUR).await;
+	r.synced().await;
+	let mut lapsed = false;
+	for pass in 0..40 {
+		r.server.watcher.pass().await.unwrap();
+		settle(&r).await;
+		if pass % 4 == 3 {
+			advance_mtp(&r, 12 * HOUR).await;
+		}
+		let ds = r.http.post("distribution_status", &json!({"distribution_id": hex(&id)})).ok();
+		if ds["claims"].as_array().unwrap().iter().filter(|c| c["state"] == "lapsed").count() == 2 {
+			lapsed = true;
+			break;
+		}
+	}
+	assert!(lapsed, "both untaken leaves lapse");
+	let lapses_before = common::flow::log(&r).await.iter().filter(|w| w.kind == "lapse").count();
+
+	// Past the horizon, holder 0's coin lands under its own key.
+	let row = r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(round.txid())).await.unwrap().unwrap();
+	let b = r.server.store.batches(row.round_id).await.unwrap().remove(0);
+	let horizon = b.collect_mtp.expect("a batch without a sweep");
+	let now = mtp(&r).to_consensus_u32();
+	if now < horizon + HOUR {
+		advance_mtp(&r, horizon + HOUR - now).await;
+	}
+	let mut landed = None;
+	for pass in 0..40 {
+		r.server.watcher.pass().await.unwrap();
+		settle(&r).await;
+		if pass % 4 == 3 {
+			advance_mtp(&r, 12 * HOUR).await;
+		}
+		if let Some((t, v)) = r.server.store.sightings_of(&up_spk).await.unwrap().first().copied() {
+			let txid = elements::Txid::from_raw_hash(elements::hashes::Hash::from_byte_array(t));
+			if r.server.finality.status(&txid).await.unwrap().is_final() {
+				landed = Some((txid, v));
+				break;
+			}
+		}
+	}
+	for w in common::flow::log(&r).await {
+		println!("  watcher: {} {}", w.kind, w.detail.chars().take(110).collect::<String>());
+	}
+	let (txid, v) = landed.expect("holder 0's taken-up coin lands on the chain");
+	let tx = r.rt.client().raw_transaction(&txid).unwrap();
+	let out = &tx.output[v as usize];
+	println!("holder 0's coin on the chain at {}:{} ({} vB), {} of X under its own leaf script, final", txid, v, tx.vsize(),
+		out.value.explicit().unwrap());
+	assert_eq!(out.script_pubkey.as_bytes(), &up_spk[..]);
+	let lapses_after = common::flow::log(&r).await.iter().filter(|w| w.kind == "lapse").count();
+	assert_eq!(lapses_before, lapses_after, "the lapsed leaves are not touched again");
+}
