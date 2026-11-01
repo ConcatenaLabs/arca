@@ -114,7 +114,7 @@ impl Batch {
 	pub fn clock0_script_pubkey(&self) -> Option<Script> {
 		match self {
 			Batch::Tree(t) => t.clock0_script_pubkey(),
-			Batch::Accumulator(a) => Some(a.clock0_script_pubkey()),
+			Batch::Accumulator(a) => a.clock0_script_pubkey(),
 		}
 	}
 

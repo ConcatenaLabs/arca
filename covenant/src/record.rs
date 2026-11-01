@@ -605,8 +605,6 @@ pub enum RecordError {
 	BatchOutputRepeated(usize),
 	#[error("the output is not the batch output the record rebuilds")]
 	BatchOutputMismatch,
-	#[error("an accumulator batch always expires: a record of one without a sweep is refused")]
-	NoSweepAccumulator,
 	#[error("the batch has a sweep, and this wallet accepts only batches that never expire")]
 	SweepRefused,
 	#[error("the board transaction pays no output equal to the leaf the record rebuilds")]
@@ -656,7 +654,6 @@ impl RecordError {
 			Hex(_) => "hex",
 			Key(_) => "key",
 			BatchOutputMissing | BatchOutputRepeated(_) | BatchOutputMismatch => "batch_output",
-			NoSweepAccumulator => "template",
 			SweepRefused => "policy",
 			BoardOutputMissing | BoardOutputRepeated(_) => "board_output",
 			Round(_) => "round",

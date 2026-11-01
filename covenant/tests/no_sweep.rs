@@ -270,8 +270,11 @@ fn a_batch_without_a_sweep_is_recovered_without_one() {
 	c.net.print();
 }
 
+/// An accumulator batch built with the never schedule is
+/// `arca/accumulator-2`, which has no sweep (its release and exits are proven
+/// on the chain in `accumulator_release.rs`); it has no sweep to be burn-only.
 #[test]
-fn an_accumulator_batch_keeps_its_expiry() {
+fn an_accumulator_batch_without_a_sweep_is_accumulator_2() {
 	let s = keypair("no-sweep accumulator operator");
 	let chain = Chain::new(elements::BlockHash::from_byte_array(label32("no-sweep chain")));
 	let owners: Vec<Keypair> = (0..4).map(|i| keypair(&format!("acc owner {}", i))).collect();
@@ -280,7 +283,12 @@ fn an_accumulator_batch_keeps_its_expiry() {
 		asset: asset("acc asset"), chain, schedule: ClockSchedule::never(xonly(&s)), burn: false,
 		reserve: ReserveRule::Fixed { node: 1_000, entry: 1_000 }, min_leaf: 1,
 	};
-	assert!(arca_covenant::accumulator::Accumulator::build(params, &leaves).is_err());
+	let acc = arca_covenant::accumulator::Accumulator::build(params.clone(), &leaves).unwrap();
+	assert!(acc.policy().no_sweep() && acc.policy().sweep_leaf().is_none() && acc.clock0_script_pubkey().is_none());
+	assert!(acc.leaves().iter().all(|l| l.entry.sweep.is_none()), "no entry carries a sweep");
+	assert_eq!(acc.record(0).to_bytes().unwrap()[0], arca_covenant::accumulator::ACCUMULATOR_RECORD_VERSION_NO_SWEEP);
+	let burnt = arca_covenant::accumulator::AccumulatorParams { burn: true, ..params };
+	assert!(arca_covenant::accumulator::Accumulator::build(burnt, &leaves).is_err());
 }
 
 #[test]

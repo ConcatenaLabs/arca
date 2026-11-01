@@ -2365,7 +2365,7 @@ impl Watcher {
 		let mut seen: HashSet<OutPoint> = HashSet::new();
 		if let Some((at, state, value)) = self.accumulator_now(round, b.vout, &acc).await? {
 			if self.confirmed(at).await? && !self.spending(&at).await? {
-				out.push(state.sweepable(at, (acc.params().asset, value)));
+				out.extend(state.sweepable(at, (acc.params().asset, value)));
 			}
 			seen.insert(at);
 		}

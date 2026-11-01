@@ -348,7 +348,7 @@ fn accumulator_batch_on_regtest() {
 	let held4 = held3 - acc.slots()[900].weight().unwrap();
 	let state4 = state3.after(900);
 	let sweep = |net: &Net| {
-		let swept = [state4.sweepable(batch4, (x, held4))];
+		let swept = [state4.sweepable(batch4, (x, held4)).unwrap()];
 		let to = [ExplicitOutput::new(x, held4 - 5_000, op_true_spk())];
 		let sw = sweep_tx(&sched, at_r, &swept, &to, &FeeSource::Reserve).unwrap();
 		let sigs: Vec<_> = (0..2).map(|i| sig(&s, &sw.sighash(i, net.genesis).unwrap())).collect();
@@ -381,9 +381,9 @@ fn sweep_in_roll(net: &Net, sched: &ClockSchedule, state: &AccumulatorPolicy, ba
 		.input(clock0, explicit(sched.token, 1, clocks[0].output.script_pubkey()), 0xffff_fffe)
 		.outputs(vec![explicit(net.x, held - 5_000, op_true_spk()), explicit(sched.token, 1, clocks[1].output.script_pubkey()),
 			fee(net.x, 5_000)]);
-	let s0 = sp.sign(s, 0, &state.sweep.script(), net.genesis);
+	let s0 = sp.sign(s, 0, &state.sweep.unwrap().script(), net.genesis);
 	let s1 = sp.sign(s, 1, &roll, net.genesis);
-	sp.witness(0, tap.witness(&state.sweep.script(), Sweep::witness_items(&s0, 1)));
+	sp.witness(0, tap.witness(&state.sweep.unwrap().script(), Sweep::witness_items(&s0, 1)));
 	sp.witness(1, clocks[0].output.witness(&roll, Clock::witness_items(&s1)));
 	sp.tx
 }

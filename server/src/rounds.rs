@@ -883,8 +883,8 @@ impl Rounds {
 	}
 
 	/// A batch's kind: a holder's own batch (`own`) is a tree, so that it can
-	/// be reclaimed, and so is every batch without a sweep, which an
-	/// accumulator batch cannot yet be.
+	/// be reclaimed, and so is every batch without a sweep, since the watcher
+	/// releases no accumulator slot.
 	fn kind_for(&self, own: bool, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
 		if own || self.config.no_sweep { BatchKind::Tree } else { self.kind_of(asset, specs) }
 	}
