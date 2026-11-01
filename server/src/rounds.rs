@@ -1441,9 +1441,43 @@ impl Rounds {
 	/// under the lock every round build holds from choosing its participations
 	/// to recording the round: a round either took it before, and it is not
 	/// withdrawn, or is built after, without it.
+	///
+	/// A participation run again after a held round that was dropped
+	/// unbroadcast is withdrawn too, once that round can never return
+	/// ([`Self::never_returns`]): it was never broadcast, and one of its own
+	/// coins is spent by a final transaction.
 	pub async fn withdraw(&self, id: &[u8; 32]) -> Result<crate::store::Withdrawal, RoundError> {
 		let _one = self.running.lock().await;
-		Ok(self.store.withdraw_participation(id, WITHDRAWN).await?)
+		let mut gone = vec![];
+		for a in self.store.attempts(id).await? {
+			if self.never_returns(a.round_id).await? {
+				gone.push(a.round_id);
+			}
+		}
+		Ok(self.store.withdraw_participation(id, WITHDRAWN, &gone).await?)
+	}
+
+	/// Whether the round `round_id` can never confirm: a held round dropped
+	/// unbroadcast (lost, never handed to the nursery) one of whose inputs
+	/// another transaction spends, final. Nothing then completes a forfeit
+	/// signed for it, and nothing it would pay can exist.
+	async fn never_returns(&self, round_id: i64) -> Result<bool, RoundError> {
+		let Some(r) = self.store.round(round_id).await? else { return Ok(false) };
+		if r.state != RoundState::Lost || !self.store.round_held(r.round_id).await? || self.store.nursery_get(&r.txid).await?.is_some() {
+			return Ok(false);
+		}
+		let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
+		for i in &tx.input {
+			let (t, v) = (i.previous_output.txid.to_byte_array(), i.previous_output.vout);
+			let by = self.store.wallet_coin_at(&t, v).await?.and_then(|c| c.spent_by).filter(|b| *b != r.txid)
+				.or(self.store.outpoint_spender(&t, v).await?.filter(|b| *b != r.txid));
+			if let Some(by) = by {
+				if self.finality.status(&Txid::from_byte_array(by)).await.map_err(|e| RoundError::Chain(e.to_string()))?.is_final() {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
 	}
 
 	/// Builds the next round of `asset` from its pending participations, if

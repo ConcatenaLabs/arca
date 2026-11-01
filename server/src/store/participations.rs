@@ -1018,7 +1018,12 @@ impl Store {
 	/// with no forfeit recorded. It becomes void with `why`, its coins live
 	/// again and the keys it wanted free, as [`Store::void_participation`]
 	/// leaves them. A participation already void is answered as it stands.
-	pub async fn withdraw_participation(&self, id: &[u8; 32], why: &str) -> Result<Withdrawal, StoreError> {
+	///
+	/// A participation run again after an earlier round is withdrawn only
+	/// when every round it was in, and every round a forfeit of it names, is
+	/// one of `gone`: rounds that can never return (a held round dropped
+	/// unbroadcast, its kill spend final, [`crate::rounds::Rounds::withdraw`]).
+	pub async fn withdraw_participation(&self, id: &[u8; 32], why: &str, gone: &[i64]) -> Result<Withdrawal, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
 		let Some(row) = t.query_opt(
@@ -1051,8 +1056,14 @@ impl Store {
 			return refused("it is a step of an offline-refresh plan: cancel the plan instead");
 		}
 		if attempt > 0 || forfeit {
-			return refused("it was in a round that went out of the chain and may still return with it: it runs again, or its coins \
-				are given back once that round is gone");
+			let all_gone: bool = t.query_one(
+				"SELECT NOT EXISTS (SELECT 1 FROM participation_attempt a WHERE a.participation_id = $1 AND NOT (a.round_id = ANY($2)))
+				    AND NOT EXISTS (SELECT 1 FROM forfeit f WHERE f.participation_id = $1 AND NOT (f.round_id = ANY($2)))",
+				&[&&id[..], &gone]).await?.get(0);
+			if !all_gone {
+				return refused("it was in a round that went out of the chain and may still return with it: it runs again, or its coins \
+					are given back once that round is gone");
+			}
 		}
 		t.execute(
 			"UPDATE participation SET state = 'void', void_reason = $2, updated_at = now() WHERE participation_id = $1 AND state = 'pending'",
