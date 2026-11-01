@@ -28,6 +28,11 @@
 //! same round, the others' in the accumulator batch, and the round goes out
 //! once every forfeit is in. A round of such wallets alone pays a tree.
 //!
+//! A fourth test runs the same operator with accumulator batches off (no
+//! `accumulator_exit_rate_ppm`): there the formats named make no difference,
+//! and a round mixing participations that name them with ones that name none
+//! pays one tree, the same batch output as a round of namers alone.
+//!
 //! A second test loses the refresh round whose releases are stored and
 //! brings it back: while it is lost its releases are retired and the watcher
 //! tries none; once it is final again they are restored and released.
@@ -39,6 +44,8 @@
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
 mod common;
+
+use std::collections::BTreeSet;
 
 use elements::hashes::Hash;
 use elements::{AssetId, OutPoint, Transaction, Txid};
@@ -64,10 +71,16 @@ const HORIZON: u32 = 5 * 86_400;
 const OWNERS: usize = 24;
 
 async fn start() -> Running {
-	let mut r = Running::start_with(|c, _| {
+	start_at(Some(10_000)).await
+}
+
+/// An operator with `no_sweep` expecting `ppm` exits per million leaves, or
+/// building trees alone (`None`).
+async fn start_at(ppm: Option<u32>) -> Running {
+	let mut r = Running::start_with(move |c, _| {
 		c.batches.no_sweep = true;
 		c.batches.holder_batches = Some(0);
-		c.batches.accumulator_exit_rate_ppm = Some(10_000);
+		c.batches.accumulator_exit_rate_ppm = ppm;
 		c.batches.collect_after_seconds = Some(HORIZON);
 	}).await;
 	for _ in 0..4 {
@@ -603,4 +616,43 @@ async fn a_wallet_naming_no_record_formats_gets_a_tree_beside_the_slots() {
 	let kinds: Vec<String> = r.server.store.batches(row.round_id).await.unwrap().iter().map(|b| format!("{} {}", b.vout, b.kind)).collect();
 	println!("round {} of two naming none: batches {:?}", alone[0].round.txid(), kinds);
 	assert_eq!(kinds.len(), 1);
+}
+
+/// With accumulator batches off, a round of four refreshes pays one tree
+/// whether all four name the record formats or two name none: no second tree
+/// for the ones that name none: the two rounds pay the same batch output and
+/// no other output of their own, the operator's change apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_accumulators_off_every_participation_shares_one_tree() {
+	let mut r = start_at(None).await;
+	let x = r.x;
+	let mut boards = vec![];
+	for i in 0..8 {
+		let (held, tx) = credited_board(&mut r, &keypair(&format!("off board {}", i)), x).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let mut sizes = vec![];
+	for (tag, lo, names) in [("all name formats", 0, [true; 4]), ("two name none", 4, [true, false, true, false])] {
+		let outs = refresh_naming(&mut r, tag, &boards[lo..lo + 4].iter().collect::<Vec<_>>(), &[false; 4], &names).await;
+		let round = outs[0].round.clone();
+		assert!(outs.iter().all(|o| o.round.txid() == round.txid()), "one round");
+		let vouts: BTreeSet<u32> = outs.iter().map(|o| match &o.new {
+			New::Tree(v) => v.batch_vout,
+			New::Acc(_) => panic!("{}: a slot with accumulator batches off", tag),
+		}).collect();
+		let row = r.server.store.round_by_txid(&round.txid().to_byte_array()).await.unwrap().unwrap();
+		assert_eq!(row.state, RoundState::Final);
+		let kinds: Vec<String> = r.server.store.batches(row.round_id).await.unwrap().iter().map(|b| format!("{} {}", b.vout, b.kind)).collect();
+		println!("{}: round {} batches {:?}, {} vB, {} outputs", tag, round.txid(), kinds, round.vsize(), round.output.len());
+		assert_eq!(kinds, vec!["0 tree".to_string()], "{}: one tree", tag);
+		assert_eq!(vouts.len(), 1, "{}: every leaf in the one tree", tag);
+		// The round's own outputs (the batch, the connector, the fee) apart
+		// from the operator's change, which its wallet splits as it likes.
+		let own: Vec<(Option<u64>, usize)> = round.output.iter().filter(|o| !o.script_pubkey.is_v0_p2wpkh())
+			.map(|o| (o.value.explicit(), o.script_pubkey.len())).collect();
+		let change = round.output.len() - own.len();
+		println!("{}: {} outputs besides {} of the operator's change: {:?}", tag, own.len(), change, own);
+		sizes.push((own.len(), own[0].0, round.vsize(), change));
+	}
+	assert_eq!((sizes[0].0, sizes[0].1), (sizes[1].0, sizes[1].1), "the mixed round pays the same batch output, and no other");
 }

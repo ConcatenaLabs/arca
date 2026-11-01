@@ -1524,7 +1524,10 @@ read only the formats every wallet reads
 their own beside the accumulator batch, in the same round, so that it reads
 its new leaf, hands over its forfeits and holds back nobody; a wallet that
 could not read its slot would never hand them over, and the round, held for
-them, would be lost for everyone in it. The round
+them, would be lost for everyone in it. Where no batch of the asset can be an
+accumulator batch (`accumulator_exit_rate_ppm` unset, or an asset with an
+issuer), the formats named make no difference: every participation's leaves
+share one tree, as they do with a sweep. The round
 pays each batch output with nothing after it, then the offboards, the
 connector, change and the fee. Nobody, the operator included, can take such a
 batch's coins from a holder who stays away: a node can only be unrolled into
@@ -3982,7 +3985,11 @@ returns final they are restored and released. A third refreshes five
 participations that name the record formats beside one that names none, as
 an older wallet: the round pays the five's accumulator batch and a tree with
 the sixth's leaf, every owner hands over its forfeit and the round is final;
-two that name none, alone, get a tree; seventeen names are refused.
+two that name none, alone, get a tree; seventeen names are refused. A fourth
+runs the operator with accumulator batches off: four refreshes, two naming
+the formats and two naming none, share one tree, the same batch output a
+round of four namers pays (1,212 vB for the round of namers; the mixed round
+pays one more change output of the operator's).
 
 `tests/fill_strikes.rs` strikes one side of a fill of a resting order: a
 struck taker's fill strikes the maker's credit and the taker's own coins but
