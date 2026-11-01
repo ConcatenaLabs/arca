@@ -126,12 +126,28 @@ pub fn run(datadir: &Path, cmd: BtcTowerCmd) -> Result<Value, Error> {
 		if bitcoind.is_none() && esplora.is_none() {
 			return Err(Error::Refused("name a chain source: --bitcoind or --esplora".into()));
 		}
-		std::fs::create_dir_all(&d).map_err(|e| Error::Io(e.to_string()))?;
+		if !d.exists() {
+			std::fs::create_dir_all(&d).map_err(|e| Error::Io(e.to_string()))?;
+			// its phrase and its wallet go in it: only its owner reads them
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::PermissionsExt;
+				std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700)).map_err(|e| Error::Io(e.to_string()))?;
+			}
+		}
 		let c = json!({"network": network, "bitcoind": bitcoind, "bitcoind_cookie": bitcoind_cookie, "bitcoind_user": bitcoind_user,
 			"esplora": esplora, "arks": arks, "min_rate": min_rate, "fallback_rate": fallback_rate});
 		std::fs::write(d.join("config.json"), serde_json::to_vec_pretty(&c).unwrap()).map_err(|e| Error::Io(e.to_string()))?;
-		let cfg = config(&d)?;
-		let t = rt.block_on(Tower::open(&d, cfg)).map_err(err)?;
+		// A tower that cannot open (its chain does not answer, the login is
+		// wrong) leaves no settings behind, so `create` can be run again.
+		let opened = config(&d).and_then(|cfg| rt.block_on(Tower::open(&d, cfg)).map_err(err));
+		let t = match opened {
+			Ok(t) => t,
+			Err(e) => {
+				let _ = std::fs::remove_file(d.join("config.json"));
+				return Err(e);
+			},
+		};
 		return Ok(rt.block_on(t.info()));
 	}
 	let cfg = config(&d)?;
