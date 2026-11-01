@@ -549,10 +549,18 @@ impl Store {
 	}
 
 	/// The coins of `ids` and every coin each was paid on from out of round,
-	/// back to the batch leaf or board it rests on: a reassignment's or a
-	/// fill's output names the coins its transaction spends (the inputs, and
-	/// a fill's order coin), and so on up. A coin beside one of them, paid
-	/// from the same parent (a payer's change), is not among them.
+	/// back to the batch leaf or board it rests on: a reassignment's output
+	/// names the coins its transaction spends, and so on up. A fill's outputs
+	/// belong to two holders, so each names the coins it was paid from and
+	/// the coins its own holder gave up, and never the other side's alone:
+	/// the maker's credit and the taker's bought leaf name both the order
+	/// coin and the taker's coins (one side paid the other); the order
+	/// resting again (output 1 of a partial fill) names the order coin
+	/// alone, and the taker's change (a taker's output in the asset the
+	/// order is paid in, which `Orders::fill` keeps apart from the asset it
+	/// sells) the taker's coins alone. A coin beside one of them, paid from
+	/// the same parent (a payer's change, the other side's own coin of a
+	/// fill), is not among them.
 	pub async fn coin_lineage(&self, ids: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;
 		lineage_in(&*conn, ids).await
@@ -845,10 +853,16 @@ async fn lineage_in<C: tokio_postgres::GenericClient>(c: &C, ids: &[[u8; 32]]) -
 			UNION
 			SELECT p.parent FROM up
 			JOIN transfer_output o ON o.leaf_id = up.leaf_id
+			JOIN leaf ol ON ol.leaf_id = o.leaf_id
+			LEFT JOIN (order_fill f JOIN leaf fl ON fl.leaf_id = f.order_leaf) ON f.transfer_id = o.transfer_id
 			CROSS JOIN LATERAL (
-				SELECT i.leaf_id AS parent FROM transfer_input i WHERE i.transfer_id = o.transfer_id
+				-- The coins spent, but for the order resting again.
+				SELECT i.leaf_id AS parent FROM transfer_input i
+				WHERE i.transfer_id = o.transfer_id AND NOT (f.transfer_id IS NOT NULL AND f.partial AND o.idx = 1)
 				UNION ALL
-				SELECT f.order_leaf FROM order_fill f WHERE f.transfer_id = o.transfer_id
+				-- A fill's order coin, but for the taker's change.
+				SELECT f.order_leaf WHERE f.transfer_id IS NOT NULL
+					AND NOT (o.idx > (CASE WHEN f.partial THEN 1 ELSE 0 END) AND ol.asset <> fl.asset)
 			) p
 		 )
 		 SELECT leaf_id FROM up ORDER BY leaf_id",
