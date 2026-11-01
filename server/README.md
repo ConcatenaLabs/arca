@@ -1562,9 +1562,14 @@ too):
 - Each coin a voided participation gave up is struck, and with it every
   coin paid on from it out of round, by its holder or by whoever it paid:
   the server follows each reassignment and fill output back to the coins
-  its transaction spent. A coin beside a struck one, paid from the same
-  parent (a payer's change, a maker's coins beside a taker's fill), is not
-  struck. A participation giving up a struck coin waits (`This waits until
+  its transaction spent. A fill's outputs belong to two holders, so each
+  names the coins it was paid from and the coins its own holder gave up:
+  the maker's credit and the taker's bought leaf follow both the order coin
+  and the taker's coins, while the order resting again follows the order
+  coin alone and the taker's change the taker's coins alone. A coin beside a
+  struck one, paid from the same parent (a payer's change, the other side's
+  own coin of a fill), is not struck, and a struck holder's own coins stay
+  struck through any fill. A participation giving up a struck coin waits (`This waits until
   median time …`), the window at first and doubling with each strike on it
   or on the coins it was paid on from, up to a day, and then runs only in a
   round of its own, where it holds back nobody. A round that goes out with
@@ -3961,6 +3966,13 @@ is claimed; a coin paid on out of round from a slot lands under its holder's
 key. A second test loses the refresh round whose slot releases are stored:
 they are retired while it is lost and no release is tried, and once it
 returns final they are restored and released.
+
+`tests/fill_strikes.rs` strikes one side of a fill of a resting order: a
+struck taker's fill strikes the maker's credit and the taker's own coins but
+not the maker's remainder, which refreshes beside an untouched coin in one
+round; a fill of a struck maker's order strikes the maker's coins and the
+taker's bought leaf but not the taker's change, whose lineage is the
+taker's coin alone.
 
 `tests/watcher.rs` drives the watcher a pass at a time, a block between
 passes, except where it runs on its own as the server's task. Refreshed boards
