@@ -570,7 +570,7 @@ enum Cmd {
 		channels: bool,
 	},
 	/// The claims paid to this wallet, found by asking the operator under its
-	/// OpenAMP account key and each address key: their distribution, value,
+	/// OpenAMP account key, its staking key and each address key: their distribution, value,
 	/// state and deadline.
 	Claims {
 		/// How many receive addresses to ask under, from the first; by
@@ -578,8 +578,8 @@ enum Cmd {
 		#[arg(long)]
 		scan: Option<u32>,
 	},
-	/// Takes up the open claims paid to this wallet's OpenAMP account key and
-	/// its on-chain addresses (those named, as `DISTRIBUTION:INDEX` or by leaf id, or every one):
+	/// Takes up the open claims paid to this wallet's OpenAMP account key, its
+	/// staking key and its on-chain addresses (those named, as `DISTRIBUTION:INDEX` or by leaf id, or every one):
 	/// each is checked, kept, and paid out of round to a fresh leaf of the
 	/// wallet's own.
 	Claim {

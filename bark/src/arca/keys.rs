@@ -33,6 +33,12 @@
 //!   wallet looks for claims under it ([`super::claim`]), so a payer that
 //!   knows only that account, as SeqPal knows its holders, can pay the wallet;
 //!   here it signs nothing but the proof of a claims lookup.
+//! - **The staking key**, `m/2/0` (unhardened), as the kit derives it: the
+//!   key a stake is bonded to, and the key a site's sign-in names when the
+//!   wallet signs it as a staker (Levo's). The wallet looks for claims under
+//!   it too, so a vesting sale's lot paid to the key its buyer signed in with
+//!   is found; here it signs nothing but the proof of a claims lookup and,
+//!   for such a claim, the claim key derived from it.
 //! - **Order keys**, `m/86'/coin'/0'/0/<index>`, one for each order the
 //!   wallet places on the chain: the key itself is the order's REFUND key
 //!   (`maker_x`), and its key-path output, tweaked with no script tree (the
@@ -155,6 +161,12 @@ impl Keys {
 	pub fn openamp(&self) -> Result<Keypair, Error> {
 		let normal = |i: u32| ChildNumber::from_normal_idx(i).map_err(|_| Error::Keys(format!("{} is not a normal index", i)));
 		self.keypair_at(&DerivationPath::from(vec![normal(5)?, normal(0)?]))
+	}
+
+	/// The staking key, `m/2/0` (unhardened), as the kit derives it.
+	pub fn staker(&self) -> Result<Keypair, Error> {
+		let normal = |i: u32| ChildNumber::from_normal_idx(i).map_err(|_| Error::Keys(format!("{} is not a normal index", i)));
+		self.keypair_at(&DerivationPath::from(vec![normal(2)?, normal(0)?]))
 	}
 
 	/// The unblinded P2WPKH script of the on-chain key at `chain/index`.

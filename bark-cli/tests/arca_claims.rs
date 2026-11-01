@@ -271,6 +271,9 @@ async fn settle(r: &Running) {
 /// (`arca openamp-key`), one that exists only as a mnemonic until after the
 /// round. Each finds its claim under that key (`named_as: openamp`) and takes
 /// it up, signing for the claim leaf with the claim key of its OpenAMP key.
+/// A third holder is named by its staking key (`m/2/0`), as a vesting sale
+/// names the key its buyer signed in with as a staker, and finds and takes
+/// its claim up the same way (`named_as: staker`).
 #[tokio::test(flavor = "multi_thread")]
 async fn holders_named_by_their_openamp_key_take_their_claims_up() {
 	let mut r = Running::start().await;
@@ -297,8 +300,10 @@ async fn holders_named_by_their_openamp_key_take_their_claims_up() {
 	let mnemonic = bip39::Mnemonic::from_entropy(&[42u8; 16]).unwrap().to_string();
 	let k1 = hex(&Keys::new(&mnemonic, 0, 1).unwrap().openamp().unwrap().x_only_public_key().0.serialize());
 	assert_ne!(k0, k1);
+	let staker_mnemonic = bip39::Mnemonic::from_entropy(&[43u8; 16]).unwrap().to_string();
+	let k2 = hex(&Keys::new(&staker_mnemonic, 0, 1).unwrap().staker().unwrap().x_only_public_key().0.serialize());
 	let path = payer.dir.join("openamp-claims.txt");
-	std::fs::write(&path, format!("{} 1000000\n{} 1200000\n", k0, k1)).unwrap();
+	std::fs::write(&path, format!("{} 1000000\n{} 1200000\n{} 900000\n", k0, k1, k2)).unwrap();
 	let file = path.to_string_lossy().to_string();
 	let fee = atoms(&payer.ok(&["distribute", &file, "--asset", &x, "--quote"])["fee"]);
 	payer.ok(&["distribute", &file, "--asset", &x, "--shown", &fee.to_string()]);
@@ -313,10 +318,16 @@ async fn holders_named_by_their_openamp_key_take_their_claims_up() {
 	let mut args = create.to_vec();
 	args.extend(["--mnemonic", mnemonic.as_str()]);
 	late.ok(&args);
-	for (w, key, value) in [(&shown_key, &k0, 1_000_000u64), (&late, &k1, 1_200_000)] {
+	let staker = Arca::new("named by its staking key");
+	let mut args = create.to_vec();
+	args.extend(["--mnemonic", staker_mnemonic.as_str()]);
+	staker.ok(&args);
+	for (w, key, value, named) in [(&shown_key, &k0, 1_000_000u64, "openamp"), (&late, &k1, 1_200_000, "openamp"),
+		(&staker, &k2, 900_000, "staker")]
+	{
 		let found = w.ok(&["claims"]);
 		assert_eq!(found.as_array().unwrap().len(), 1, "{}: {}", w.name, found);
-		assert_eq!(found[0]["named_as"], "openamp", "{}", found);
+		assert_eq!(found[0]["named_as"], named, "{}", found);
 		assert_eq!(found[0]["key"], json!(key));
 		assert!(found[0]["address"].is_null());
 		let taken = w.ok(&["claim"]);
@@ -328,5 +339,5 @@ async fn holders_named_by_their_openamp_key_take_their_claims_up() {
 	}
 	let st = shown(&payer);
 	assert!(st["claims"].as_array().unwrap().iter().all(|c| c["state"] == "claimed"), "{}", st);
-	println!("two holders named by their OpenAMP keys took their claims up: {}", st);
+	println!("two holders named by their OpenAMP keys and one by its staking key took their claims up: {}", st);
 }

@@ -22,11 +22,12 @@
 //! [`Wallet::distributions`] shows the deadline, every claim's state and
 //! every lapse.
 //!
-//! **The holder.** A wallet named by one of its on-chain receive keys, or by
+//! **The holder.** A wallet named by one of its on-chain receive keys, by
 //! its OpenAMP account key ([`super::keys::Keys::openamp`], the key a
-//! SeqPal ID is), finds its claims by asking the operator
-//! ([`Wallet::claims`]), proving each key it asks under: the OpenAMP key, and
-//! the receive keys from the first index to [`super::wallet`]'s gap past the
+//! SeqPal ID is) or by its staking key ([`super::keys::Keys::staker`], the
+//! key a staker's sign-in names), finds its claims by asking the operator
+//! ([`Wallet::claims`]), proving each key it asks under: the OpenAMP key, the
+//! staking key, and the receive keys from the first index to [`super::wallet`]'s gap past the
 //! last it handed out. [`Wallet::claim`] takes each open claim up: it checks the
 //! leaf as a leaf of its own refresh is checked (rebuilt from the published
 //! tree, validated against its round, final, under the claim key of its own
@@ -91,6 +92,8 @@ pub enum Named {
 	Onchain(u32, u32),
 	/// The OpenAMP account key, `m/5/0`.
 	OpenAmp,
+	/// The staking key, `m/2/0`.
+	Staker,
 }
 
 impl std::fmt::Display for Named {
@@ -98,17 +101,19 @@ impl std::fmt::Display for Named {
 		match self {
 			Named::Onchain(c, i) => write!(f, "on-chain key {}/{}", c, i),
 			Named::OpenAmp => write!(f, "the OpenAMP account key"),
+			Named::Staker => write!(f, "the staking key"),
 		}
 	}
 }
 
 /// The purpose a claim leaf's nonce is recorded under: the key that was
 /// named, `claim <chain>/<index>` for an on-chain key, `claim openamp` for
-/// the OpenAMP account key.
+/// the OpenAMP account key, `claim staker` for the staking key.
 fn claim_purpose(named: Named) -> String {
 	match named {
 		Named::Onchain(c, i) => format!("claim {}/{}", c, i),
 		Named::OpenAmp => "claim openamp".to_string(),
+		Named::Staker => "claim staker".to_string(),
 	}
 }
 
@@ -117,6 +122,9 @@ fn parse_claim_purpose(p: &str) -> Option<Named> {
 	let rest = p.strip_prefix("claim ")?;
 	if rest == "openamp" {
 		return Some(Named::OpenAmp);
+	}
+	if rest == "staker" {
+		return Some(Named::Staker);
 	}
 	let (c, i) = rest.split_once('/')?;
 	Some(Named::Onchain(c.parse().ok()?, i.parse().ok()?))
@@ -152,6 +160,7 @@ impl Wallet {
 		match named {
 			Named::Onchain(c, i) => self.keys.onchain(c, i),
 			Named::OpenAmp => self.keys.openamp(),
+			Named::Staker => self.keys.staker(),
 		}
 	}
 
@@ -473,7 +482,9 @@ impl Wallet {
 	// The holder
 	// -----------------------------------------------------------------------
 
-	/// The keys a lookup names: the OpenAMP account key, then the on-chain
+	/// The keys a lookup names: the OpenAMP account key, the staking key (the
+	/// key a staker's sign-in names, to which a vesting sale pays its buyer's
+	/// lot), then the on-chain
 	/// receive keys, `scan` of them from the first, or every index handed out
 	/// and [`CLAIM_GAP`] more.
 	fn claim_keys(&self, scan: Option<u32>) -> Result<Vec<(Named, Keypair)>, Error> {
@@ -481,7 +492,7 @@ impl Wallet {
 			Some(n) => n,
 			None => self.store.indices(RECEIVE)? + CLAIM_GAP,
 		};
-		let mut keys = vec![(Named::OpenAmp, self.keys.openamp()?)];
+		let mut keys = vec![(Named::OpenAmp, self.keys.openamp()?), (Named::Staker, self.keys.staker()?)];
 		for i in 0..n {
 			keys.push((Named::Onchain(RECEIVE, i), self.keys.onchain(RECEIVE, i)?));
 		}
@@ -509,9 +520,10 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// The claims under the wallet's OpenAMP key and its on-chain receive
-	/// keys, as the operator shows them: each claim's distribution, the key it
-	/// was named under and its address (`null` for the OpenAMP key, with
+	/// The claims under the wallet's OpenAMP key, its staking key and its
+	/// on-chain receive keys, as the operator shows them: each claim's
+	/// distribution, the key it was named under and its address (`null` for
+	/// the OpenAMP and the staking key, with
 	/// `named_as` saying which key it is), its value and state (`pending` until its distribution is
 	/// released, `open`, `claimed`, `returned`), its deadline, and whether
 	/// the wallet holds it. Asks the operator, proving each key; signs
@@ -527,6 +539,7 @@ impl Wallet {
 			let (address, named_as) = match f.named {
 				Named::Onchain(chain, index) => (json!(self.chain.address(&self.keys.onchain_script(chain, index)?)?), json!("address")),
 				Named::OpenAmp => (Value::Null, json!("openamp")),
+				Named::Staker => (Value::Null, json!("staker")),
 			};
 			out.push(json!({
 				"distribution": c["distribution_id"], "index": c["index"], "key": c["key"], "address": address, "named_as": named_as,
