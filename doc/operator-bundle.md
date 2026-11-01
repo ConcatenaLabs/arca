@@ -515,6 +515,24 @@ or exit each coin before its exit deadline, three days before its batch
 expires: keep the operator running, and announce any end of service far
 ahead.
 
+**BTC past its expiry, on the Bitcoin ark.** A Bitcoin ark coin lives a fixed
+number of blocks (`vtxo_lifetime`), after which the watchman sweeps what is
+left of its batch back to your server's wallet; without covenants on Bitcoin
+that sweep is how the server gets its capital back, and it cannot be turned
+off. Wallets renew each coin before then: while they are open, and through a
+renewal they hand your server ahead of time, which it runs by itself shortly
+before the expiry. The policy every operator running this bundle keeps, and
+says so to its users: **an expired coin is taken back in a round when its
+holder returns.** The holder's wallet asks for the coin's refresh, your server
+includes it in a round as a new coin, less the refresh fee, however long the
+holder was away. Bark's server does this as it ships; your part is to keep its
+database (back it up as above) and never to refuse such a refresh. It is a
+promise, not a rule in script: a server that loses its database, or an
+operator who stops keeping it, keeps the expired coins. A holder who wants to
+depend on no promise takes the coin to the chain before it expires; the
+wallets do that by themselves when your server stops renewing a coin that is
+worth its exit.
+
 **Back up**, to offline media, apart from the machine: `operator.key`,
 `wallet.mnemonic` (in `/etc/arca-bundle/`, the `etc` volume with Docker),
 `captaind/mnemonic`, and each gateway's `hsm_secret` (`seqln/<network>/` and
