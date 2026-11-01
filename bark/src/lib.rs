@@ -380,6 +380,7 @@ pub extern crate lnurl as lnurllib;
 #[cfg(feature = "arca-core")]
 pub mod arca;
 pub mod actions;
+pub mod btc_tower;
 pub mod chain;
 pub mod exit;
 pub use bark_common::fs_perms;
