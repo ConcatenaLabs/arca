@@ -2452,7 +2452,12 @@ meanwhile.
   of round lands through its lineage, the checkpoint and reassignment
   published by the answers to stale exits, so its current holder's coin is an
   on-chain leaf of its own and nothing is left to answer. A claim leaf of a
-  distribution and an `htlc-1` leaf are left to their own paths. From three
+  distribution nobody took up is left to its lapse or return; a coin taken
+  up from one lands as any coin paid on out of round. An `htlc-1` coin is
+  brought on the chain once its outcome is the operator's: a payment
+  received past its timeout whose preimage never came, which the watcher
+  then refunds, or a payment sent that the operator paid, which it then
+  claims with the preimage. One still open, or its holder's, is left. From three
   days before the horizon the server takes no off-chain spend of the batch's
   coins, so nothing moves under a collection. A coin collected costs the
   operator its share of the unroll above it (434 vB for a node of three
@@ -3368,7 +3373,13 @@ goes out; the answering participations rebuilt alone first; a struck coin,
 and one paid on from it out of round, waiting and then running alone, its
 strike cleared once it answers; and a wallet that hands over its forfeits
 only after broadcast refused in words, its coin untouched, while an operator
-with a sweep takes it. `ARCA_TEST_NO_SWEEP=1` runs
+with a sweep takes it. The collection of the coins whose own paths finish
+them runs in the suites of those paths: an `htlc-1` receive never claimed,
+refunded in a block at the horizon (`lightning_receive.rs`); a paid payment
+whose sender never released its `htlc-1` coin, claimed in a block at the
+horizon (`lightning_pay.rs`); and a claim taken up out of round, landing
+under its holder's key while the claims nobody took up lapse
+(`distributions.rs`). `ARCA_TEST_NO_SWEEP=1` runs
 any suite against such an operator: the shared harness hands every held
 round's forfeits over for the tests' own participations before it goes out
 (a test of the sweep itself fails there by design).

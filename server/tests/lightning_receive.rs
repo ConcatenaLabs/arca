@@ -447,3 +447,92 @@ async fn a_receive_in_an_asset_whose_rate_is_stale_is_refused() {
 	}
 	let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The service horizon of the batches without a sweep below: five days.
+const HORIZON: u32 = 5 * 86_400;
+
+fn tune_no_sweep(c: &mut server::server::Config, y: AssetId) {
+	tune(c, y);
+	c.batches.no_sweep = true;
+	c.batches.holder_batches = Some(0);
+	c.batches.collect_after_seconds = Some(HORIZON);
+}
+
+/// arca#507. Two receives into a batch without a sweep: A's receiver takes
+/// its leaf and goes away, never claiming; B's claims it with the preimage
+/// into a leaf of its own, out of round, and goes away too. Past the
+/// horizon, the collection brings A's `htlc-1` leaf on the chain, whose
+/// outcome is the operator's (its timeout passed, no preimage came), and
+/// the refund takes it back to the operator's wallet in a block. B's coin,
+/// its own, lands under its key through its checkpoint and reassignment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receive_never_claimed_in_a_batch_without_a_sweep_comes_back_at_the_horizon() {
+	let Some(g) = gateway("a_receive_never_claimed_in_a_batch_without_a_sweep_comes_back_at_the_horizon", tune_no_sweep).await
+		else { return };
+	let x = g.r.x;
+	let (wa, wb) = (Receiving::new(x, 100_000), Receiving::new(x, 120_000));
+	let mut paying = vec![];
+	for w in [&wa, &wb] {
+		let r = w.ask(&g).ok();
+		paying.push(pay(&g.px, r["invoice"].as_str().unwrap()));
+		let (http, h) = (g.r.http.clone(), hex(&w.hash));
+		g.r.wait("the payment held", || http.post("lightning_receive_status", &json!({"payment_hash": h})).json["state"] == "accepted").await;
+	}
+	let built = g.r.server.rounds.run_round_of(x).await.unwrap().expect("a round");
+	g.r.produce().await;
+	g.r.bury().await;
+	round_final(&g.r, &built.tx.txid()).await;
+	let (held_a, _, round) = take_leaf(&g, &wa).await;
+	let (held_b, _, _) = take_leaf(&g, &wb).await;
+	// B claims into a leaf of its own, out of round.
+	let (body, kb, nb) = claim_body(&g, &wb, &held_b, &round, &wb.preimage);
+	let claimed = g.r.http.post("lightning_receive_claim", &body).ok();
+	let b_record = CoinRecord::from_bytes(&unhex(claimed["cosigned"]["outputs"][0]["record"].as_str()
+		.unwrap_or_else(|| claimed["outputs"][0]["record"].as_str().expect("the claimed leaf's record")))).unwrap();
+	let b_valid = b_record.validate(std::slice::from_ref(&round), &policy(&g), &xonly(&kb), &nb).unwrap();
+	let b_spk = g.r.server.store.leaf(&b_valid.id.0).await.unwrap().unwrap().script_pubkey;
+	let a_spk = g.r.server.store.leaf(&held_a.id.0).await.unwrap().unwrap().script_pubkey;
+	let row = g.r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(round.txid())).await.unwrap().unwrap();
+	let batch = g.r.server.store.batches(row.round_id).await.unwrap().remove(0);
+	let horizon = batch.collect_mtp.expect("a batch without a sweep");
+	let timeout = status(&g, &wa.hash)["timeout"].as_u64().unwrap() as u32;
+	println!("A's htlc-1 leaf {} (timeout {}), B's own coin {} paid on from its claim; horizon {}", held_a.id, timeout, b_valid.id, horizon);
+
+	// Before the horizon, nothing is collected.
+	g.r.server.watcher.pass().await.unwrap();
+	assert!(g.r.server.store.watcher_txs("unroll", &held_a.id.0).await.unwrap().is_empty());
+
+	let wallet0 = g.r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	advance_mtp(&g.r, horizon.max(timeout) + 3_600 - mtp(&g.r).to_consensus_u32()).await;
+	let mut refund = None;
+	for pass in 0..40 {
+		g.r.synced().await;
+		g.r.server.watcher.pass().await.unwrap();
+		common::flow::settle(&g.r).await;
+		if pass % 3 == 2 {
+			advance_mtp(&g.r, 3_600).await;
+		}
+		let r = g.r.server.store.watcher_txs("htlc_refund", &held_a.id.0).await.unwrap();
+		if let Some(t) = r.first() {
+			let txid = elements::Txid::from_raw_hash(elements::hashes::Hash::from_byte_array(t.txid));
+			if g.r.rt.client().confirmations(&txid).unwrap_or(0) >= 1 && !g.r.server.store.sightings_of(&b_spk).await.unwrap().is_empty() {
+				refund = Some((txid, t.detail.clone()));
+				break;
+			}
+		}
+	}
+	for w in common::flow::log(&g.r).await {
+		println!("  watcher: {} {}", w.kind, w.detail.chars().take(110).collect::<String>());
+	}
+	let (txid, detail) = refund.expect("A's leaf refunded in a block, B's coin on the chain");
+	let tx = g.r.rt.client().raw_transaction(&txid).unwrap();
+	let wallet1 = g.r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	println!("refund {} ({} vB) in a block: {}; operator wallet {} -> {} of X", txid, tx.vsize(), detail, wallet0, wallet1);
+	assert!(!g.r.server.store.sightings_of(&a_spk).await.unwrap().is_empty(), "A's leaf came on the chain");
+	let seen_b = g.r.server.store.sightings_of(&b_spk).await.unwrap();
+	println!("B's own coin on the chain at {:?}", seen_b.iter().map(|(t, v)| format!("{}:{}", hex(t), v)).collect::<Vec<_>>());
+	assert!(wallet1 > wallet0, "the operator's value in A's leaf came back");
+	for p in paying {
+		let _ = p.join();
+	}
+}

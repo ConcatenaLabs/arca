@@ -348,3 +348,107 @@ async fn pays_invoices_in_each_asset_from_leaves_in_it() {
 	assert!(claim.input[i].witness.script_witness.iter().any(|w| w[..] == pre[..]), "the claim reveals the preimage");
 	println!("the claim {} spends {} with the preimage", claim.txid(), at);
 }
+
+/// The service horizon of the batch without a sweep below: five days.
+const HORIZON: u32 = 5 * 86_400;
+
+fn tune_no_sweep(c: &mut server::server::Config, y: AssetId) {
+	tune(c, y);
+	c.batches.no_sweep = true;
+	c.batches.holder_batches = Some(0);
+	c.batches.collect_after_seconds = Some(HORIZON);
+}
+
+/// A coin of the payer's on a batch without a sweep: a board refreshed in a
+/// round held for its forfeit, handed over before broadcast, the round
+/// final, the new leaf taken with its preimage and unroll authorisations.
+async fn tree_coin(g: &mut Gateway, asset: AssetId) -> Coin {
+	use arca_covenant::sign::sign_digest;
+	let (board, btx) = credited_board(&mut g.r, &fresh(), asset).await;
+	let key = fresh();
+	let (w, nonce) = common::client::want_leaf(&key, asset, common::rounds::VALUE);
+	let (body, id) = common::client::participation_body(&[&board], &[w], &[], None, xonly(&g.r.s), g.r.chain);
+	assert_eq!(g.r.http.post("submit_participation", &body).ok()["state"], "pending");
+	let built = g.r.server.rounds.run_round_of(asset).await.unwrap().expect("the refresh round");
+	assert!(built.broadcast.starts_with("held"), "{}", built.broadcast);
+	common::rounds::round_final(&g.r, &built.tx.txid()).await;
+	let st = g.r.http.post("participation_status", &json!({"participation_id": hex(&id)})).ok();
+	let round = g.r.rt.client().raw_transaction(&built.tx.txid()).unwrap();
+	let (valid, record, _) = common::rounds::validate_new_leaf(&g.r, &id, 0, &key, &nonce);
+	assert!(!record.schedule.expires(), "a batch without a sweep");
+	let old = board.record.resolve(std::slice::from_ref(&btx), &g.r.policy()).unwrap();
+	let f = common::flow::forfeit_for(&old, &valid, &round, &st);
+	let at = common::rounds::created(&record);
+	let auths: Vec<(elements::secp256k1_zkp::schnorr::Signature, MedianTime)> = valid.branch.nodes.iter()
+		.map(|n| (sign_digest(&key, &n.unroll_authorisation(at).digest, &random32()), at)).collect();
+	let done = g.r.http.post("forfeit_leaves", &json!({"participation_id": hex(&id),
+		"forfeits": [{"leaf_id": board.id.to_string(), "signature": common::client::forfeit_sig(&f, &board.key)}],
+		"leaves": [{"leaf_id": valid.leaf_id.to_string(), "auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()),
+			"time": t.to_consensus_u32()})).collect::<Vec<_>>()}]})).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+	let preimage: [u8; 32] = unhex(done["preimage"].as_str().unwrap()).try_into().unwrap();
+	let held = Held { key, nonce, id: valid.leaf_id, record: CoinRecord::Leaf { record, preimage, auths } };
+	let bases = vec![round];
+	let valid = held.record.resolve(&bases, &g.r.policy()).unwrap();
+	Coin { held, valid, bases }
+}
+
+/// arca#507. A coin on a batch without a sweep pays an invoice; the payment
+/// is paid, and the payer goes away without releasing its `htlc-1` coin.
+/// Past the batch's horizon the collection follows the payer's leaf to the
+/// `htlc-1` coin it paid on out of round, brings it on the chain through its
+/// checkpoint and reassignment, and the operator claims it with the
+/// preimage, in a block: the operator gets back what it paid the invoice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paid_htlc_coin_on_a_batch_without_a_sweep_is_claimed_at_the_horizon() {
+	let Some(mut g) = gateway("a_paid_htlc_coin_on_a_batch_without_a_sweep_is_claimed_at_the_horizon", tune_no_sweep).await else { return };
+	let x = g.r.x;
+	let c = tree_coin(&mut g, x).await;
+	// The whole coin pays: no change beside the htlc-1 coin, which so lands
+	// on the chain only if the collection takes it there itself.
+	let kept = c.valid.value - MARGIN;
+	let amount = (0..kept).rev().find(|a| a + fee(*a) == kept - MARGIN).expect("an amount whose fee fills the coin");
+	let (inv, h) = invoice(&g.px, x, amount, "ns-paid");
+	let key = fresh();
+	let (mut leaf, nonce) = new_leaf(&key);
+	leaf.htlc = Some(terms(&g, h));
+	let mut body = transfer_body(&[(&c.held, c.valid.clone(), kept)], &[(x, kept - MARGIN, leaf)], xonly(&g.r.s), g.r.chain);
+	body["invoice"] = json!(inv);
+	let p = Payment { body, key, nonce };
+	let answer = g.r.http.post("lightning_send", &p.body).ok();
+	assert_eq!(answer["payment"]["state"], "paying");
+	let st = decided(&g, &h).await;
+	assert_eq!(st["state"], "paid", "{}", st);
+	let (held, valid) = htlc_coin(&g, &c, &p, &answer);
+	println!("the payer's tree coin {} paid {} over Lightning through htlc-1 coin {} of {}", c.held.id, amount, held.id, valid.value);
+	let row = g.r.server.store.round_by_txid(&elements::hashes::Hash::to_byte_array(c.bases[0].txid())).await.unwrap().unwrap();
+	let horizon = g.r.server.store.batches(row.round_id).await.unwrap().remove(0).collect_mtp.expect("a batch without a sweep");
+
+	// The payer releases nothing and goes away. Past the horizon:
+	let wallet0 = g.r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	advance_mtp(&g.r, horizon + 3_600 - mtp(&g.r).to_consensus_u32()).await;
+	let mut claimed = None;
+	for pass in 0..40 {
+		g.r.synced().await;
+		g.r.server.watcher.pass().await.unwrap();
+		common::flow::settle(&g.r).await;
+		if pass % 3 == 2 {
+			advance_mtp(&g.r, 3_600).await;
+		}
+		if let Some(t) = g.r.server.store.watcher_txs("htlc_claim", &held.id.0).await.unwrap().first() {
+			let txid = elements::Txid::from_raw_hash(elements::hashes::Hash::from_byte_array(t.txid));
+			if g.r.rt.client().confirmations(&txid).unwrap_or(0) >= 1 {
+				claimed = Some((txid, t.detail.clone()));
+				break;
+			}
+		}
+	}
+	for w in common::flow::log(&g.r).await {
+		println!("  watcher: {} {}", w.kind, w.detail.chars().take(110).collect::<String>());
+	}
+	let (txid, detail) = claimed.expect("the paid htlc-1 coin claimed in a block");
+	let tx = g.r.rt.client().raw_transaction(&txid).unwrap();
+	let wallet1 = g.r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
+	println!("claim {} ({} vB) in a block: {}; operator wallet {} -> {} of X", txid, tx.vsize(), detail, wallet0, wallet1);
+	assert!(wallet1 > wallet0, "the operator's value in the paid coin came back");
+}
