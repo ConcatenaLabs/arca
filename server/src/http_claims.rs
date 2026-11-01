@@ -40,10 +40,12 @@ pub fn claim_state(c: &ClaimRow) -> &'static str {
 }
 
 /// A claim leaf's state now: [`claim_state`], `lapsing` for an open claim-1
-/// leaf whose deadline has passed at `now`.
+/// leaf whose deadline has passed at `now`, `vesting` for an open vest-1
+/// leaf before its vest time.
 pub fn claim_state_at(c: &ClaimRow, now: u32) -> &'static str {
 	match claim_state(c) {
 		"open" if c.lapse.as_ref().is_some_and(|l| now >= l.deadline.to_consensus_u32()) => "lapsing",
+		"open" if c.lapse.as_ref().and_then(|l| l.vest).is_some_and(|v| now < v.to_consensus_u32()) => "vesting",
 		s => s,
 	}
 }
@@ -107,8 +109,9 @@ pub(super) async fn distribute(State(app): State<Arc<App>>, body: Result<Bytes, 
 			(Some(t), Some(a)) => Some(arca_covenant::DistributionLapse {
 				deadline: MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("deadline: {}", e)))?,
 				allowance: amount(a)?,
-				vest: None,
+				vest: req.vest.map(|v| MedianTime::from_consensus(v).map_err(|e| Refusal::malformed(format!("vest: {}", e)))).transpose()?,
 			}),
+			(None, None) if req.vest.is_some() => return Err(Refusal::malformed("a vest time comes with a deadline")),
 			(None, None) => None,
 			_ => return Err(Refusal::malformed("a deadline and a lapse allowance come together")),
 		},
@@ -161,6 +164,7 @@ pub(super) async fn distribution_status(State(app): State<Arc<App>>, body: Resul
 		deadline: take_up_deadline(at.as_ref().and_then(|(_, e)| *e), lapse.as_ref().map(|l| l.deadline.to_consensus_u32())),
 		lapse_deadline: lapse.as_ref().map(|l| l.deadline.to_consensus_u32()),
 		lapse_allowance: lapse.as_ref().map(|l| l.allowance.to_string()),
+		vest: lapse.as_ref().and_then(|l| l.vest).map(|v| v.to_consensus_u32()),
 		claims: d.claims.iter().map(|c| api::ClaimStatus {
 			index: c.idx,
 			key: hex(&c.named_key),
@@ -205,6 +209,7 @@ pub(super) async fn claims(State(app): State<Arc<App>>, ConnectInfo(peer): Conne
 			state: claim_state_at(&c, now).into(),
 			leaf_id: None, round: None, batch_vout: None, leaf_index: None, record: None, preimage: None, expiry: None, deadline: None,
 			lapse_deadline: c.lapse.as_ref().map(|l| l.deadline.to_consensus_u32()),
+			vest: c.lapse.as_ref().and_then(|l| l.vest).map(|v| v.to_consensus_u32()),
 		};
 		// Where the leaf is, its record and the preimage that opens its entry,
 		// once the distribution is released: until then the leaf is not

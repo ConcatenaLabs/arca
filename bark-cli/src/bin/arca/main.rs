@@ -441,9 +441,15 @@ enum Cmd {
 		#[arg(long)]
 		shown: Option<u64>,
 		/// How many days the holders have to take their claims up; what is
-		/// left after that goes back to `--return`.
+		/// left after that goes back to `--return`. Counted from `--vest`
+		/// where it is given.
 		#[arg(long)]
 		days: Option<u32>,
+		/// A vest time (a median time, Unix seconds): the claims are leaves
+		/// nothing moves before then, as a sale locks what it sells; each
+		/// holder takes its claim up from then until the deadline.
+		#[arg(long)]
+		vest: Option<u32>,
 	},
 	/// Every distribution this wallet made, as the operator shows it: each
 	/// claim's state, the deadline and what went back.
@@ -1567,7 +1573,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::BtcSwap(c) => btc_swap(&mut w, &datadir, c),
 		Cmd::Refusals => w.refusals(),
 		Cmd::Participations => w.participations(),
-		Cmd::Distribute { list, asset: a, return_address, quote, shown, days } => {
+		Cmd::Distribute { list, asset: a, return_address, quote, shown, days, vest } => {
 			let mut claims = vec![];
 			for (key, amount) in read_claims(&list)? {
 				claims.push((w.named(&key)?, amount));
@@ -1576,9 +1582,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 				w.distribute_quote(asset(&a)?, &claims)
 			} else {
 				let return_to = return_address.as_deref().map(|r| w.script_of(r)).transpose()?;
-				match days {
-					Some(d) => w.distribute_days(asset(&a)?, &claims, return_to, shown, d),
-					None => w.distribute(asset(&a)?, &claims, return_to, shown),
+				match (vest, days) {
+					(Some(v), d) => w.distribute_vesting(asset(&a)?, &claims, return_to, shown, v, d),
+					(None, Some(d)) => w.distribute_days(asset(&a)?, &claims, return_to, shown, d),
+					(None, None) => w.distribute(asset(&a)?, &claims, return_to, shown),
 				}
 			}
 		},

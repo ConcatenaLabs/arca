@@ -72,6 +72,9 @@ fn distribute_lapsing(r: &Running, coins: &[&Held], asset: AssetId, claims: &[Cl
 	if let Some(l) = lapse {
 		body["deadline"] = json!(l.deadline.to_consensus_u32());
 		body["lapse_allowance"] = json!(l.allowance.to_string());
+		if let Some(v) = l.vest {
+			body["vest"] = json!(v.to_consensus_u32());
+		}
 	}
 	(body, id)
 }
@@ -451,6 +454,11 @@ async fn a_distribution_is_refused_for_what_it_breaks() {
 	};
 	try_(&r, &good, &board_spk, &[], exit_delay(), "script_reused", "a return script that is an Arca script");
 	try_(&r, &good, &Script::new(), &[], exit_delay(), "malformed", "no return script");
+	// A vesting distribution, from an operator whose batches have a sweep.
+	let at = |d: u32| MedianTime::from_consensus(mtp(&r).to_consensus_u32() + d).unwrap();
+	let (body, _) = distribute_lapsing(&r, &[&b1], x, &good, &ret, &[], exit_delay(),
+		Some(DistributionLapse { deadline: at(20 * DAY), allowance: 20_000, vest: Some(at(5 * DAY)) }));
+	refused(r.http.post("distribute", &body), "out_of_bounds", "a vesting distribution where batches have a sweep");
 	try_(&r, &good, &Script::from(vec![0x6a, 0x01, 0x07]), &[], exit_delay(), "out_of_bounds", "a return script that is no standard address");
 	// An attestation by another key.
 	let (mut body, _) = distribute_body(&r, &[&b1], x, &good, &ret, &[], exit_delay());
@@ -480,4 +488,156 @@ async fn a_distribution_is_refused_for_what_it_breaks() {
 	refused(r.http.post("claim_leaf", &json!({"leaf_id": leaf.to_string(), "auths": []})), "not_live",
 		"authorisations for a claim leaf before its distribution is released");
 	refused(lookup(&r, &[]), "malformed", "a lookup naming no key");
+}
+
+/// A server building batches without a sweep, its wallet funded and final.
+async fn start_no_sweep() -> Running {
+	let mut r = Running::start_plain(|c, _| {
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x;
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.fund_wallet_in(x, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vesting_claims_move_only_after_their_vest_time() {
+	let mut r = start_no_sweep().await;
+	let x = r.x;
+	let payer = keypair("VS payer");
+	let (b1, tx1) = credited_board(&mut r, &payer, x).await;
+	let holders: Vec<Keypair> = (0..3).map(|i| keypair(&format!("VS holder {}", i))).collect();
+	let value = VALUE / 3;
+	let claims: Vec<Claim> = holders.iter().map(|h| Claim { named: xonly(h), nonce: random32(), value }).collect();
+	let fee = VALUE - 3 * value;
+	let ret = Script::from([vec![0x00, 0x14], vec![7u8; 20]].concat());
+	let now = mtp(&r).to_consensus_u32();
+	let at = |t: u32| MedianTime::from_consensus(t).unwrap();
+	let (vest, deadline) = (at(now + 2 * DAY), at(now + 10 * DAY));
+	let allowance = 20_000;
+	let lapse = DistributionLapse { deadline, allowance, vest: Some(vest) };
+	let try_lapse = |l: DistributionLapse| distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(), Some(l)).0;
+
+	// Refused: a vest time passed, a deadline less than a week after the
+	// vest time, a vest time at the deadline, a vest time without a deadline.
+	refused(r.http.post("distribute", &try_lapse(DistributionLapse { vest: Some(at(now - HOUR)), ..lapse })), "out_of_bounds",
+		"a vest time that has passed");
+	refused(r.http.post("distribute", &try_lapse(DistributionLapse { deadline: at(now + 8 * DAY), ..lapse })), "out_of_bounds",
+		"a deadline six days after the vest time");
+	refused(r.http.post("distribute", &try_lapse(DistributionLapse { vest: Some(deadline), ..lapse })), "malformed",
+		"a vest time at the deadline");
+	let mut body = try_lapse(lapse);
+	body.as_object_mut().unwrap().remove("deadline");
+	body.as_object_mut().unwrap().remove("lapse_allowance");
+	refused(r.http.post("distribute", &body), "malformed", "a vest time without a deadline");
+	let (body, id) = distribute_lapsing(&r, &[&b1], x, &claims, &ret, &[(x, fee)], exit_delay(), Some(lapse));
+	assert_eq!(r.http.post("distribute", &body).ok()["state"], "pending");
+
+	// An ordinary refresh in the same round: its leaf rests in another batch.
+	let (b2, tx2) = credited_board(&mut r, &keypair("VS refresher"), x).await;
+	let (w, _) = common::client::want_leaf(&keypair("VS refresher, new"), x, VALUE);
+	let (pbody, pid) = common::client::participation_body(&[&b2], &[w], &[], None, xonly(&r.s), r.chain);
+	assert_eq!(r.http.post("submit_participation", &pbody).ok()["state"], "pending");
+
+	// The round: two batch outputs, the vest-1 leaves alone in theirs.
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let st = status(&r, &id);
+	let txid = st["round"]["txid"].as_str().unwrap().to_string();
+	let vout = st["outputs"][0]["batch_vout"].as_u64().unwrap();
+	let pst = status(&r, &pid);
+	assert_ne!(pst["outputs"][0]["batch_vout"].as_u64().unwrap(), vout, "the refresh's leaf is in another batch");
+	let tree = rebuild(&r.http.post("tree", &json!({"txid": txid, "vout": vout})).ok());
+	assert_eq!(tree.leaves().len(), 3, "the vest batch holds the three claims only");
+	let round = r.rt.client().raw_transaction(&common::client::txid(&txid)).unwrap();
+	println!("the round: {} vB, {} outputs", round.vsize(), round.output.len());
+	let rec = tree.record(st["outputs"][0]["leaf_index"].as_u64().unwrap() as usize);
+	assert_eq!(rec.template, Template::Vest1, "a vesting distribution's claim leaves are vest-1");
+	assert_eq!(rec.claim, Some(arca_covenant::Lapse { deadline, allowance, return_script: ret.clone(), vest: Some(vest) }));
+	let new0 = rec.validate(&round, &accept_policy(&r), &claims[0].owner().unwrap(), &claims[0].nonce).unwrap();
+	let old = b1.record.resolve(std::slice::from_ref(&tx1), &r.policy()).unwrap();
+	let f = forfeit_for(&old, &new0, &round, &st);
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&id), "forfeits": [
+		{"leaf_id": b1.id.to_string(), "signature": forfeit_sig(&f, &b1.key)}], "leaves": []})).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+	let _ = tx2;
+	let ds = r.http.post("distribution_status", &json!({"distribution_id": hex(&id)})).ok();
+	assert_eq!(ds["vest"], json!(vest.to_consensus_u32()));
+	assert!(ds["claims"].as_array().unwrap().iter().all(|c| c["state"] == "vesting"), "{}", ds);
+
+	// Before V: holder 0 hands its authorisations over, and its take-up is
+	// refused.
+	let found = lookup(&r, &[&holders[0], &holders[1], &holders[2]]).ok();
+	let pick = |k: &Keypair| found["claims"].as_array().unwrap().iter().find(|c| c["key"] == json!(hex(&xonly(k).serialize()))).unwrap().clone();
+	let f0 = pick(&holders[0]);
+	assert_eq!(f0["vest"], json!(vest.to_consensus_u32()));
+	assert_eq!(f0["state"], "vesting");
+	let pre: [u8; 32] = unhex(f0["preimage"].as_str().unwrap()).try_into().unwrap();
+	let t = MedianTime::from_consensus(mtp(&r).to_consensus_u32() - HOUR).unwrap();
+	let (v0, rec0, round0) = checked(&r, &f0, &holders[0]);
+	let n0: [u8; 32] = unhex(f0["nonce"].as_str().unwrap()).try_into().unwrap();
+	let claim0 = claim_keypair(&holders[0], &n0).unwrap();
+	let a0 = auths(&v0, &claim0, t);
+	r.http.post("claim_leaf", &auths_body(&v0.leaf_id, &a0)).ok();
+	let held0 = Held { key: claim0, nonce: n0, id: v0.leaf_id, record: CoinRecord::Leaf { record: rec0, preimage: pre, auths: a0 } };
+	let c0 = held0.record.resolve(std::slice::from_ref(&round0), &r.policy()).unwrap();
+	let (to, _) = new_leaf(&keypair("VS holder 0, its own leaf"));
+	let kept = c0.value - 2_000;
+	refused(r.http.post("cosign_transfer", &transfer_body(&[(&held0, c0.clone(), kept)], &[(x, kept - 2_000, to)], xonly(&r.s), r.chain)),
+		"vesting", "a take-up of a vest-1 leaf before its vest time");
+
+	// After V: the same take-up is co-signed.
+	advance_mtp(&r, 2 * DAY + HOUR).await;
+	r.synced().await;
+	let c0 = held0.record.resolve(std::slice::from_ref(&round0), &r.policy()).unwrap();
+	let (to, _) = new_leaf(&keypair("VS holder 0, after V"));
+	let leaf0 = c0.leaf.clone();
+	let plan = arca_covenant::transfer::TransferPlan { inputs: vec![(c0.clone(), kept)],
+		outputs: vec![arca_covenant::ExplicitOutput::new(x, kept - 2_000, to.policy(xonly(&r.s), r.chain).script_pubkey())] };
+	let ok = r.http.post("cosign_transfer", &transfer_body(&[(&held0, c0, kept)], &[(x, kept - 2_000, to)], xonly(&r.s), r.chain)).ok();
+	// The operator's checkpoint signature is over the vest-1 message, K ‖ V.
+	let cp: [u8; 64] = unhex(ok["signatures"][0]["checkpoint"].as_str().unwrap()).try_into().unwrap();
+	let cp = elements::secp256k1_zkp::schnorr::Signature::from_slice(&cp).unwrap();
+	assert_eq!(leaf0.vest(), Some(vest));
+	assert!(arca_covenant::sign::verify_digest(&cp, &plan.checkpoint_message(0).unwrap().digest, &xonly(&r.s)),
+		"the operator signs the checkpoint over K || V");
+	println!("take-up after V: co-signed, transfer {}", ok["transfer_id"]);
+	let ds = r.http.post("distribution_status", &json!({"distribution_id": hex(&id)})).ok();
+	let states: Vec<&str> = ds["claims"].as_array().unwrap().iter().map(|c| c["state"].as_str().unwrap()).collect();
+	println!("after V: {:?}", states);
+	assert!(!states.contains(&"vesting"), "nothing is vesting after V");
+
+	// After D: the two claims nobody took up lapse to the payer.
+	advance_mtp(&r, 8 * DAY + HOUR).await;
+	r.synced().await;
+	let mut lapsed = None;
+	for pass in 0..40 {
+		r.server.watcher.pass().await.unwrap();
+		settle(&r).await;
+		if pass % 4 == 3 {
+			advance_mtp(&r, 12 * HOUR).await;
+		}
+		let ds = r.http.post("distribution_status", &json!({"distribution_id": hex(&id)})).ok();
+		if ds["claims"].as_array().unwrap().iter().filter(|c| c["state"] == "lapsed").count() == 2 {
+			lapsed = Some(ds);
+			break;
+		}
+	}
+	let ds = lapsed.expect("both unclaimed vest-1 leaves lapse");
+	for c in ds["claims"].as_array().unwrap() {
+		if let Some(t) = c["lapsed_in"].as_str() {
+			let tx = r.rt.client().raw_transaction(&common::client::txid(t)).unwrap();
+			let paid: u64 = tx.output.iter().filter(|o| o.script_pubkey == ret && o.asset.explicit() == Some(x))
+				.map(|o| o.value.explicit().unwrap()).sum();
+			assert!(paid >= value - allowance && paid <= value);
+			println!("lapse {}: {} vB, {} of X to the payer's script", t, tx.vsize(), paid);
+		}
+	}
 }

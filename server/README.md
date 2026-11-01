@@ -1011,6 +1011,12 @@ without one returns what nobody took up, and the payer relies on nobody for
 it. A distribution without a deadline pays `vtxo-1` claim leaves, which only
 a batch's sweep returns, from the operator's coins.
 
+A distribution whose deadline comes with a vest time `V` pays `vest-1`
+leaves: `claim-1` whose collaborative path and exit wait for `V`, in a batch
+of their own (one for each vest time) whose lowest nodes' RECLAIM waits for
+`V` too, so nothing moves an allocation before it vests, owner and operator
+together included. It serves a sale whose allocations vest.
+
 The payer names each holder by a 32-byte x-only key `A` (an on-chain address
 key, a taproot address's program, or any key the holder hands over) and
 draws a fresh nonce `n` for it. The holder's leaf is owned by the claim key
@@ -1046,7 +1052,11 @@ script, and the fee. The server takes it only when:
   up, `refresh_base` for each claim leaf, and `offboard_base` once, for the
   payment of the unclaimed leaves back to the payer;
 - a deadline and a lapse allowance come together (`malformed`); the deadline
-  is 7 to 400 days ahead (`out_of_bounds`); the allowance is below every
+  is 7 to 400 days ahead (`out_of_bounds`);
+- a vest time comes only with a deadline and before it (`malformed`), only
+  where the server builds batches without a sweep, after now and at most four
+  years ahead (`out_of_bounds`), and the deadline is then 7 to 400 days after
+  the vest time (`out_of_bounds`) rather than after now; the allowance is below every
   claim (`malformed`) and, where the node takes the asset for fees, at least
   the fee of a lapse at the node's floor (`fee`). The id commits to both.
 
@@ -1067,7 +1077,11 @@ take-up: the lapse deadline, or the leaf's exit deadline three days before
 its batch's first expiry when that comes first. From the lapse deadline on,
 the server takes no authorisations for the leaf (`claim_leaf` answers
 `lapsed`) and co-signs no spend of it in a transfer, a refresh or anything
-else (`lapsed`): it is the payer's again. The published tree carries every
+else (`lapsed`): it is the payer's again. A `vest-1` claim shows its `vest`
+time and is `vesting` until then: the server takes its authorisations, and
+co-signs no spend of it in a transfer, a refresh or anything else before `V`
+(`vesting`), so no coin rests on an allocation before it vests; its holder
+takes it up between `V` and the deadline. The published tree carries every
 leaf's owner key and owner nonce too, so a holder can also find a claim in
 any copy of a tree by testing its keys. To take a claim up, the holder hands
 over its unroll authorisations for the leaf, signed by the claim key
@@ -2486,7 +2500,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST take_order` | Accepts a take of an on-chain order (see Takes of on-chain orders), answered as `participation_status` answers |
 | `POST issuer_supply` | What the operator minted and burned of an issuer-operated asset (see Issuer-operated assets): every round's mint and every burn of the watcher's the active chain holds, each with its txid, kind, amount and finality, their sums and those of the final ones, the value live under its burn-only sweeps (`in_batches`) with each output it counts (`in_batches_outputs`: its outpoint and value, its batch's round and output, whether it is the `batch` output, a `node` or an `entry`, and a node's level and index or an entry's leaf index in the published tree), the units of coins given up in its batches without a sweep that are not yet collected (`forfeited_uncollected`, with each coin in `forfeited_uncollected_coins`), and the limiter's coin and state, or why it mints nothing now. Not authenticated: everything in it is on the chain |
-| `POST distribute` | Accepts a distribution (see Distributions: claim trees), with `deadline` and `lapse_allowance` for claims that lapse, answered as `participation_status` answers |
+| `POST distribute` | Accepts a distribution (see Distributions: claim trees), with `deadline` and `lapse_allowance` for claims that lapse, and `vest` for claims that vest, answered as `participation_status` answers |
 | `POST distribution_status` | A distribution by its id: its participation's state, round, the claim leaves' first expiry (none in a batch without a sweep) and take-up deadline, the lapse deadline and allowance, each claim's key, claim key, value, leaf and state, the lapse that paid it back, and each payment of unclaimed leaves back to the return script, with its state in the nursery |
 | `POST claims` | The claims under each of up to 64 keys, each proven under one challenge (the call `claims`, an empty request), newest first: each claim's distribution, nonce, claim key, asset, value, exit delay and state, and once its distribution is released its leaf, round, place in the tree, record, preimage, expiry and deadline |
 | `POST claim_leaf` | Takes a holder's unroll authorisations for a claim leaf, signed by its claim key, keeps the leaf's full record and credits the leaf, so its holder can spend it; a `claim-1` leaf past its deadline is refused `lapsed` (422), as is any co-signature of a spend of it |

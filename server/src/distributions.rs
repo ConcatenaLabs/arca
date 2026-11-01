@@ -53,6 +53,17 @@
 //! node no longer takes the asset for fees, when a coin of the operator's
 //! pays the lapse's fee.
 //!
+//! A distribution whose lapse also names a vest time `V` wants `vest-1`
+//! leaves, which no path moves before `V` ([`arca_covenant::claim`]). The
+//! server takes one only where its batches have no sweep
+//! ([`crate::params::Params::no_sweep`]), with `V` after now and at most
+//! [`MAX_VEST_AHEAD`] ahead, and the deadline [`MIN_LAPSE_WINDOW`] to
+//! [`MAX_LAPSE_WINDOW`] after `V`. Its leaves rest in a batch of their own
+//! for each vest time, and the server co-signs no spend of one before `V`
+//! (`vesting`, [`crate::coins::check`]), so no coin rests on a leaf that has
+//! not vested; a holder hands over its authorisations whenever it likes and
+//! takes its claim up between `V` and the deadline.
+//!
 //! The `vtxo-1` claim leaves of a distribution without a deadline, which no
 //! holder took up, are paid back to the payer's return script by the watcher
 //! once the sweep that took them is final ([`crate::watcher`]).
@@ -83,6 +94,10 @@ pub const MAX_CLAIMS: usize = 1024;
 /// The least time from a distribution's acceptance to its deadline: a week
 /// for its holders to take their claims up.
 pub const MIN_LAPSE_WINDOW: u32 = 7 * 86_400;
+
+/// The furthest ahead a vesting distribution's vest time may be: four
+/// years.
+pub const MAX_VEST_AHEAD: u32 = 4 * 365 * 86_400;
 
 /// The most time from a distribution's acceptance to its deadline.
 pub const MAX_LAPSE_WINDOW: u32 = 400 * 86_400;
@@ -172,9 +187,27 @@ impl Participations {
 		if let Some(l) = &d.lapse {
 			let t = l.deadline.to_consensus_u32();
 			let n = now.to_consensus_u32();
-			if t < n.saturating_add(MIN_LAPSE_WINDOW) || t > n.saturating_add(MAX_LAPSE_WINDOW) {
-				return Err(ParticipationError::OutOfBounds(format!("a deadline of {}; the operator takes one {} to {} days ahead, so the \
-					holders have their time to take their claims up", t, MIN_LAPSE_WINDOW / 86_400, MAX_LAPSE_WINDOW / 86_400)));
+			// A vesting distribution's holders take their claims up between
+			// the vest time and the deadline, so the window runs from V.
+			let from = match l.vest {
+				None => n,
+				Some(v) => {
+					let v = v.to_consensus_u32();
+					if !p.no_sweep {
+						return Err(ParticipationError::OutOfBounds("a vesting distribution: this operator's batches have a sweep, \
+							which would take a leaf back before it vests; vest-1 leaves rest only in batches without one".into()));
+					}
+					if v <= n || v > n.saturating_add(MAX_VEST_AHEAD) {
+						return Err(ParticipationError::OutOfBounds(format!("a vest time of {}; the operator takes one after now and at most \
+							{} days ahead", v, MAX_VEST_AHEAD / 86_400)));
+					}
+					v
+				},
+			};
+			if t < from.saturating_add(MIN_LAPSE_WINDOW) || t > from.saturating_add(MAX_LAPSE_WINDOW) {
+				return Err(ParticipationError::OutOfBounds(format!("a deadline of {}; the operator takes one {} to {} days after {}, so the \
+					holders have their time to take their claims up", t, MIN_LAPSE_WINDOW / 86_400, MAX_LAPSE_WINDOW / 86_400,
+					if l.vest.is_some() { "the vest time" } else { "now" })));
 			}
 			if let Some(floor) = self.floor(asset).await? {
 				let least = arca_covenant::claim::lapse_allowance(Some(floor), 1);
@@ -311,7 +344,11 @@ impl Participations {
 				asset: asset.into_inner().to_byte_array(),
 				value: c.value,
 				kind: WantedKind::Leaf {
-					template: if d.lapse.is_some() { Template::Claim1 } else { Template::Vtxo1 }.to_string(),
+					template: match &d.lapse {
+						Some(l) if l.vest.is_some() => Template::Vest1,
+						Some(_) => Template::Claim1,
+						None => Template::Vtxo1,
+					}.to_string(),
 					owner_key: owner.serialize(),
 					owner_nonce: c.nonce,
 					exit_delay_units: d.exit_delay.units(),

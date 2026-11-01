@@ -990,7 +990,7 @@ async fn answer(state: &State, line: &str) -> Response {
 				Err(e) => Response { error: Some(format!("the record could not be read: {}", e)), ..none },
 			}
 		},
-		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing, enclave, policy_sig, named, check } => {
+		Request::Rebind { owner, owner_sig, salt, asset_in, value_in, outputs, forfeit, known, landing, vest, enclave, policy_sig, named, check } => {
 			let parsed = (|| -> Result<_, String> {
 				let owner = XOnlyPublicKey::from_slice(&unhex(&owner)?).map_err(|e| format!("owner: {}", e))?;
 				let owner_sig = Signature::from_slice(&unhex(&owner_sig)?).map_err(|e| format!("owner_sig: {}", e))?;
@@ -1091,10 +1091,20 @@ async fn answer(state: &State, line: &str) -> Response {
 					return Response { code: code_of(&e), error: Some(e), ..none };
 				}
 			}
-			let k = match (&landing, &enclave) {
-				(Some(l), _) => chain.landing_prefix(&salt, l),
-				(None, Some(e)) => chain.enclave_prefix(&salt, &e.digest()),
-				(None, None) => chain.leaf_constant(&salt).to_vec(),
+			// A vest-1 coin's message carries its vest time after `K`, as its
+			// script does; no landing-1, enclave-1 or vtxo-2 coin vests.
+			if vest.is_some() && (landing.is_some() || enclave.is_some() || named.is_some()) {
+				return declined("a vest-1 coin is no landing-1, enclave-1 or vtxo-2 coin".into());
+			}
+			let k = match (&landing, &enclave, vest) {
+				(Some(l), ..) => chain.landing_prefix(&salt, l),
+				(None, Some(e), _) => chain.enclave_prefix(&salt, &e.digest()),
+				(None, None, Some(v)) => {
+					let mut b = chain.leaf_constant(&salt).to_vec();
+					b.extend(v.to_le_bytes());
+					b
+				},
+				(None, None, None) => chain.leaf_constant(&salt).to_vec(),
 			};
 			let built = match &named {
 				Some((index, inputs)) => {

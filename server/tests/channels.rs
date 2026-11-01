@@ -272,7 +272,7 @@ async fn a_state_the_signer_cannot_sign_now_waits_and_one_it_refuses_is_dropped(
 	let out = arca_covenant::ExplicitOutput::new(v.asset, v.value - 1_000, elements::Script::from(vec![0x51]));
 	let m = arca_covenant::message::rebind_message(&r.chain.leaf_constant(&a.policy.salt), v.asset, v.value, std::slice::from_ref(&out))
 		.unwrap();
-	signer.rebind(&a.policy.owner, &sign_digest(&a.key, &m.digest, &random32()), &a.policy.salt, None, v.asset, v.value,
+	signer.rebind(&a.policy.owner, &sign_digest(&a.key, &m.digest, &random32()), &a.policy.salt, server::signer::After::NONE, v.asset, v.value,
 		std::slice::from_ref(&out), None).await.unwrap();
 	let a2 = a1.pay(50_000, 0).unwrap();
 	for _ in 0..2 {

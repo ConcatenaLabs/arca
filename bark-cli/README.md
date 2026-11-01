@@ -1180,6 +1180,10 @@ gets a leaf (`claim-1`), owned by a key of its own that the wallet derives from
 the key named and a nonce it draws, so one address can be paid by any number
 of distributions and the address key itself signs nothing of the tree. The
 leaf lapses at the distribution's deadline, 30 days ahead or `--days N`.
+With `--vest T` (a median time, Unix seconds) the claims vest: each leaf is
+`vest-1`, which nothing moves before `T`, as a sale locks what it sells, and
+the deadline counts `--days` from `T`. The operator takes such a distribution
+only where its batches have no sweep.
 
 The coins given up hold exactly the claims and the operator's fee (its
 refresh fee of each coin given up, its fixed part per claim leaf, and its
@@ -1207,8 +1211,10 @@ under its own key, with the preimage that opens its entry. Then it signs the
 leaf's unroll authorisations with that key, hands them to the operator, keeps
 the leaf as a coin, and pays it out of round to a fresh leaf of its own. A
 wallet restored from its mnemonic finds its claims the same way. `arca
-claims` shows each claim's deadline; `arca claim` takes up only a claim at
-least an hour before it, and `sync` pays on, before the deadline, a claim
+claims` shows each claim's deadline, and for a claim that vests its date in
+words (`vests`, state `vesting`); `arca claim` leaves a vesting claim until
+that date, saying when, and takes up only a claim at least an hour before its
+deadline, and `sync` pays on, before the deadline, a claim
 the wallet holds but did not get to pay on. A claim not taken up by its
 deadline went back to its payer by the distribution's terms: `arca claims`
 shows it `lapsing` or `lapsed`, and a held claim coin left unpaid is marked

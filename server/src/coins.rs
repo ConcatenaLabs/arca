@@ -85,6 +85,11 @@ pub enum CoinError {
 	#[error("leaf {leaf} is a claim leaf whose distribution's deadline {deadline} has passed: it lapses to its payer, and the operator \
 		co-signs no take-up of it")]
 	Lapsed { leaf: LeafId, deadline: u32 },
+	/// A `vest-1` leaf before its vest time: no path moves it on the chain
+	/// before then ([`arca_covenant::claim`]), and the operator co-signs no
+	/// spend of it, so no coin rests on it before it vests.
+	#[error("leaf {leaf} vests at median time {vest}: nothing moves it before then")]
+	Vesting { leaf: LeafId, vest: u32 },
 	#[error(transparent)]
 	Store(#[from] StoreError),
 	#[error("{0}")]
@@ -291,6 +296,9 @@ pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[
 	if let Some(l) = record.lapse() {
 		if !repeat && policy.now.to_consensus_u32() >= l.deadline.to_consensus_u32() {
 			return Err(CoinError::Lapsed { leaf: *id, deadline: l.deadline.to_consensus_u32() });
+		}
+		if let Some(v) = l.vest.filter(|v| policy.now.to_consensus_u32() < v.to_consensus_u32()) {
+			return Err(CoinError::Vesting { leaf: *id, vest: v.to_consensus_u32() });
 		}
 	}
 	let horizon = match dates {

@@ -800,7 +800,22 @@ impl Rounds {
 		} else {
 			self.config.holder_batches.min(self.wallet.issuing_coins(None).await?.saturating_sub(assets.len() + reserved))
 		};
-		Ok(plan_batches(&leaves, room))
+		// vest-1 leaves rest in batches of their own, one for each vest
+		// time: their lowest nodes' RECLAIM waits for it
+		// ([`arca_covenant::tree::TreeError::VestBatch`]).
+		let vest_of = |(k, j): (usize, usize)| match &rows[k].outputs[j].kind {
+			WantedKind::Leaf { claim, .. } => claim.as_ref().and_then(|c| c.vest).map(|v| v.to_consensus_u32()),
+			_ => None,
+		};
+		let mut out = vec![];
+		for b in plan_batches(&leaves, room) {
+			let mut by: BTreeMap<Option<u32>, Vec<(usize, usize)>> = BTreeMap::new();
+			for l in b.leaves {
+				by.entry(vest_of(l)).or_default().push(l);
+			}
+			out.extend(by.into_values().map(|leaves| BatchPlan { asset: b.asset, leaves, own: b.own }));
+		}
+		Ok(out)
 	}
 
 	/// A batch's kind: a holder's own batch (`own`) is a tree, so that it can

@@ -412,7 +412,7 @@ async fn a_frozen_holder_cannot_move_or_escape() {
 	let msg = v2.leaf.collab_message(z, v2.value, std::slice::from_ref(&out)).unwrap();
 	let owner_sig = sign_digest(&alice2.held.key, &msg.digest, &[0; 32]);
 	let client = SignerClient::new(&r.signer.socket);
-	let e = client.rebind(&v2.leaf.owner, &owner_sig, &v2.leaf.salt, Some(alice.program()), z, v2.value, std::slice::from_ref(&out), None).await
+	let e = client.rebind(&v2.leaf.owner, &owner_sig, &v2.leaf.salt, server::signer::After::landing(alice.program()), z, v2.value, std::slice::from_ref(&out), None).await
 		.unwrap_err();
 	println!("REFUSED by the signer, on its own node: {}", e);
 	assert!(matches!(e, SignerError::Frozen(_)), "{}", e);
@@ -425,7 +425,7 @@ async fn a_frozen_holder_cannot_move_or_escape() {
 	let landing_msg = throwaway.collab_message(z, v2.value, std::slice::from_ref(&out)).unwrap();
 	let plain_msg = arca_covenant::message::rebind_message(&r.chain.leaf_constant(&salt), z, v2.value, std::slice::from_ref(&out)).unwrap();
 	assert_ne!(plain_msg.digest, landing_msg.digest);
-	let plain_sig = client.rebind(&v2.leaf.owner, &sign_digest(&alice2.held.key, &plain_msg.digest, &[0; 32]), &salt, None, z, v2.value,
+	let plain_sig = client.rebind(&v2.leaf.owner, &sign_digest(&alice2.held.key, &plain_msg.digest, &[0; 32]), &salt, server::signer::After::NONE, z, v2.value,
 		std::slice::from_ref(&out), None).await.unwrap();
 	assert!(arca_covenant::sign::verify_digest(&plain_sig, &plain_msg.digest, &xonly(&r.s)));
 	assert!(!arca_covenant::sign::verify_digest(&plain_sig, &landing_msg.digest, &xonly(&r.s)),
@@ -433,7 +433,7 @@ async fn a_frozen_holder_cannot_move_or_escape() {
 	println!("the signer, asked with no landing, signs the plain constant's message, which no landing-1 leaf's script checks");
 	// A signer that reads no node signs nothing for a landing-1 coin.
 	let lone = tokio::task::block_in_place(|| common::signer::SignerProcess::start(&keypair("a second operator"), genesis));
-	let e = SignerClient::new(&lone.socket).rebind(&v2.leaf.owner, &owner_sig, &v2.leaf.salt, Some(alice.program()), z, v2.value,
+	let e = SignerClient::new(&lone.socket).rebind(&v2.leaf.owner, &owner_sig, &v2.leaf.salt, server::signer::After::landing(alice.program()), z, v2.value,
 		std::slice::from_ref(&out), None).await.unwrap_err();
 	println!("REFUSED by a signer that reads no node: {}", e);
 	assert!(e.to_string().contains("reads freezes from no node"), "{}", e);

@@ -62,7 +62,7 @@ pub struct DistributionRow {
 }
 
 const CLAIM_COLUMNS: &str = "c.participation_id, c.idx, c.named_key, o.owner_key, o.owner_nonce, o.asset, o.value, o.exit_delay_units,
-	o.leaf_id, l.state::text, l.spent_by, (l.record IS NOT NULL AND l.record <> ''::bytea), p.state::text, c.returned_in, o.claim, c.lapsed_in";
+	o.leaf_id, l.state::text, l.spent_by, (l.record IS NOT NULL AND l.record <> ''::bytea), p.state::text, c.returned_in, o.claim, c.lapsed_in, o.vest";
 
 const CLAIM_FROM: &str = "distribution_claim c
 	JOIN participation_output o ON o.participation_id = c.participation_id AND o.idx = c.idx
@@ -88,7 +88,7 @@ fn claim_row(r: &tokio_postgres::Row) -> Result<ClaimRow, StoreError> {
 		authorised: r.get::<_, Option<bool>>(11).unwrap_or(false),
 		participation_state: ParticipationState::parse(&r.get::<_, String>(12))?,
 		returned_in: r.get::<_, Option<Vec<u8>>>(13).map(|v| array32(v, "return txid")).transpose()?,
-		lapse: r.get::<_, Option<Vec<u8>>>(14).map(|b| super::participations::claim_of(&b)).transpose()?,
+		lapse: r.get::<_, Option<Vec<u8>>>(14).map(|b| super::participations::claim_with_vest(&b, r.get(16))).transpose()?,
 		lapsed_in: r.get::<_, Option<Vec<u8>>>(15).map(|v| array32(v, "lapse txid")).transpose()?,
 	})
 }

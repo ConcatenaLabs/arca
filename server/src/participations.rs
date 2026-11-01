@@ -417,6 +417,7 @@ impl ParticipationError {
 			Coin(CoinError::InvalidCoin { .. }) | Coin(CoinError::PastBoardDate { .. }) => "invalid_coin",
 			Coin(CoinError::Channel(_)) => "template",
 			Coin(CoinError::Lapsed { .. }) => "lapsed",
+			Coin(CoinError::Vesting { .. }) => "vesting",
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",
 			BadAttestation(_) | BadKeyProof(_) => "bad_attestation",
 			Template(..) | HtlcInput(..) => "template",
