@@ -901,7 +901,7 @@ impl Rounds {
 
 	fn kind_of(&self, asset: &AssetId, specs: &[LeafSpec]) -> BatchKind {
 		let issuer = self.params.assets.get(asset).is_some_and(|a| a.issuer.is_some());
-		BatchKind::choose(specs, self.config.radix, self.config.accumulator_exit_rate_ppm, issuer)
+		BatchKind::choose(specs, self.config.radix, self.config.accumulator_exit_rate_ppm, issuer, self.config.no_sweep)
 	}
 
 	async fn now(&self) -> Result<MedianTime, RoundError> {

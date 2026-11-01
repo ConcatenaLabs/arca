@@ -1157,20 +1157,24 @@ pub fn read_spend(witness: &[Vec<u8>]) -> Option<SeenSpend> {
 
 /// The size of an exit whose fee comes from the slot's reserve, in vbytes, as
 /// measured on regtest (`covenant/tests/accumulator.rs`): the same at every
-/// slot and in every batch.
+/// slot and in every batch of `arca/accumulator-1`.
 pub const EXIT_VBYTES: u64 = 979;
+/// [`EXIT_VBYTES`] for `arca/accumulator-2`, the batch without a sweep, whose
+/// program also carries the release (`covenant/tests/accumulator_release.rs`).
+pub const EXIT2_VBYTES: u64 = 1_072;
 /// The size of a gated node's unroll in a tree, in vbytes: the mean of the
 /// five levels of a 1,024-leaf radix-4 tree measured beside it (615, 592,
 /// 571, 549 and 527).
 pub const NODE_VBYTES: u64 = 571;
 
 /// What `exits` exits from a batch of `n` leaves cost on the chain, in
-/// vbytes, as an accumulator and as a tree at `radix`: one exit each, against
-/// the node transactions they unroll. The leaves leaving are taken as
-/// scattered at random, so a level of `N` nodes has `N (1 − (1 − 1/N)^exits)`
-/// of them unrolled. Each leaf's entry and its own exit cost the same in both
-/// and are left out.
-pub fn exit_costs(n: usize, radix: usize, exits: f64) -> (f64, f64) {
+/// vbytes, as an accumulator and as a tree at `radix`: one exit each
+/// ([`EXIT_VBYTES`], or [`EXIT2_VBYTES`] for a batch without a sweep,
+/// `no_sweep`), against the node transactions they unroll. The leaves leaving
+/// are taken as scattered at random, so a level of `N` nodes has
+/// `N (1 − (1 − 1/N)^exits)` of them unrolled. Each leaf's entry and its own
+/// exit cost the same in both and are left out.
+pub fn exit_costs(n: usize, radix: usize, exits: f64, no_sweep: bool) -> (f64, f64) {
 	let mut tree = 0.0;
 	let mut width = n.max(1);
 	loop {
@@ -1181,20 +1185,21 @@ pub fn exit_costs(n: usize, radix: usize, exits: f64) -> (f64, f64) {
 			break;
 		}
 	}
-	(exits * EXIT_VBYTES as f64, tree)
+	(exits * if no_sweep { EXIT2_VBYTES } else { EXIT_VBYTES } as f64, tree)
 }
 
 /// Whether the operator should build a batch of `n` leaves as an accumulator
 /// rather than a tree at `radix`, when it expects `exits` of them to leave on
 /// the chain: when it fits (two to 1,024 leaves) and costs less to leave. At
 /// 1,024 leaves and radix 4 that is up to 77 exits (19 of 256, 4 of 64, one of
-/// 16); past that, or on a run, the tree wins, because its exits share nodes
-/// and run in parallel.
-pub fn prefer_accumulator(n: usize, radix: usize, exits: f64) -> bool {
+/// 16), and up to 61 for a batch without a sweep (`no_sweep`, 15 of 256, 3 of
+/// 64, one of 16), whose exit is larger; past that, or on a run, the tree
+/// wins, because its exits share nodes and run in parallel.
+pub fn prefer_accumulator(n: usize, radix: usize, exits: f64, no_sweep: bool) -> bool {
 	if !(2..=SLOTS).contains(&n) {
 		return false;
 	}
-	let (acc, tree) = exit_costs(n, radix, exits.max(1.0));
+	let (acc, tree) = exit_costs(n, radix, exits.max(1.0), no_sweep);
 	acc < tree
 }
 
@@ -1821,18 +1826,38 @@ mod tests {
 
 	#[test]
 	fn the_choice_breaks_even_at_78_exits_of_1024() {
-		assert!(prefer_accumulator(1024, 4, 1.0));
-		assert!(prefer_accumulator(1024, 4, 77.0));
-		assert!(!prefer_accumulator(1024, 4, 78.0));
-		assert!(prefer_accumulator(256, 4, 19.0));
-		assert!(!prefer_accumulator(256, 4, 20.0));
-		assert!(!prefer_accumulator(1024, 4, 1024.0));
+		assert!(prefer_accumulator(1024, 4, 1.0, false));
+		assert!(prefer_accumulator(1024, 4, 77.0, false));
+		assert!(!prefer_accumulator(1024, 4, 78.0, false));
+		assert!(prefer_accumulator(256, 4, 19.0, false));
+		assert!(!prefer_accumulator(256, 4, 20.0, false));
+		assert!(!prefer_accumulator(1024, 4, 1024.0, false));
 		// A batch whose tree is one node: the tree's one unroll is smaller.
-		assert!(!prefer_accumulator(4, 4, 1.0));
+		assert!(!prefer_accumulator(4, 4, 1.0, false));
 		// Two levels: one exit through the tree costs two nodes.
-		assert!(prefer_accumulator(16, 4, 1.0));
-		assert!(!prefer_accumulator(1025, 4, 1.0));
-		assert!(!prefer_accumulator(1, 4, 1.0));
+		assert!(prefer_accumulator(16, 4, 1.0, false));
+		assert!(!prefer_accumulator(1025, 4, 1.0, false));
+		assert!(!prefer_accumulator(1, 4, 1.0, false));
+	}
+
+	#[test]
+	fn without_a_sweep_the_choice_breaks_even_at_62_exits_of_1024() {
+		// An accumulator-2 exit is 1,072 vB against accumulator-1's 979.
+		assert!(prefer_accumulator(1024, 4, 1.0, true));
+		assert!(prefer_accumulator(1024, 4, 61.0, true));
+		assert!(!prefer_accumulator(1024, 4, 62.0, true));
+		assert!(prefer_accumulator(256, 4, 15.0, true));
+		assert!(!prefer_accumulator(256, 4, 16.0, true));
+		assert!(prefer_accumulator(64, 4, 3.0, true));
+		assert!(!prefer_accumulator(64, 4, 4.0, true));
+		assert!(prefer_accumulator(64, 4, 4.0, false));
+		assert!(prefer_accumulator(16, 4, 1.0, true));
+		assert!(!prefer_accumulator(4, 4, 1.0, true));
+		// Between the two break-evens the kinds of batch choose differently.
+		let (a1, t) = exit_costs(1024, 4, 70.0, false);
+		let (a2, t2) = exit_costs(1024, 4, 70.0, true);
+		assert_eq!(t, t2);
+		assert!(a1 < t && t < a2, "{} < {} < {}", a1, t, a2);
 	}
 
 	#[test]
