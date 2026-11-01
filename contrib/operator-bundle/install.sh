@@ -55,7 +55,7 @@ fi
 : "${ARCA_ASSETS:=}" "${ARCA_FEE_ASSETS:=}" "${ARCA_EXIT_DELAY_UNITS:=254 338}" "${ARCA_ROUND_INTERVAL:=60}" "${ARCA_SEND_TIMEOUT:=777600}"
 : "${DOMAIN:=}" "${CONTACT_NAME:=}" "${CONTACT_EMAIL:=}" "${REGISTRY_URL:=https://sequentiatestnet.com/registry}"
 : "${PEER_ARCA_URL:=}" "${PEER_HOST:=}" "${PEER_SEQLN_PORT:=19850}" "${PEER_BTC_LN_PORT:=19746}"
-: "${PEER_WATCHTOWER:=}" "${WATCHTOWER_PORT:=3537}"
+: "${PEER_WATCHTOWER:=}" "${WATCHTOWER_PORT:=3537}" "${BTC_WATCHTOWER_PORT:=3541}" "${BTC_TOWER_ARKS:=}"
 : "${CHANNEL_ATOMS:=2000000000}" "${CHANNEL_SAT:=1000000}" "${PEER_SEQLN_ID:=}" "${PEER_BTC_LN_ID:=}"
 : "${SEQ_RPC_PORT:=18884}" "${SEQ_P2P_PORT:=18885}" "${BTC_RPC_PORT:=48332}" "${BTC_P2P_PORT:=48333}" "${FEE_PROXY_PORT:=48342}"
 : "${PG_PORT:=5433}" "${ARCAD_PORT:=3535}" "${ARCAD_METRICS_PORT:=3536}" "${SEQLN_PORT:=9835}" "${CLN_PORT:=9935}"
@@ -105,7 +105,7 @@ U() { printf '%s-%s.service' "$NAME" "$1"; }
 [ "$SEQ_CHAIN" = test ] && : "${PRICE_FEED_URL:=http://sequentiatestnet.com/prices}"
 [ "${PRICE_FEED_URL:-}" = none ] && PRICE_FEED_URL=""
 : "${PRICE_FEED_URL:=}" "${ASSET_REGISTRY_INDEX:=http://sequentiatestnet.com/registry/index.minimal.json}"
-UNITS="bitcoind feeproxy sequentiad $( [ -n "$PRICE_FEED_URL" ] && echo priceserver ) arca-signer arcad seqln cln captaind watchmand${PEER_ARCA_URL:+ watchtower}"
+UNITS="bitcoind feeproxy sequentiad $( [ -n "$PRICE_FEED_URL" ] && echo priceserver ) arca-signer arcad seqln cln captaind watchmand${PEER_ARCA_URL:+ watchtower} btc-watchtower"
 # PostgreSQL names a cluster's unit postgresql@<version>-<cluster>, where a dash
 # in the cluster name would read as a path: the cluster takes underscores.
 PG_CLUSTER=${NAME//-/_}
@@ -623,10 +623,31 @@ tower_wallet() {
     || { printf '%s\n' "$err" | tail -3; return 1; }
 }
 
+# The watchtower for Bitcoin ark coins: holders' deposits (each coin with a
+# claim its holder signed), brought on chain a day before the coin's expiry
+# and claimed to the holder's address, the children paid from its own BTC. It
+# watches the arks named in BTC_TOWER_ARKS by server key (empty: any ark,
+# this bundle's own and the peer's), and reads the chain through the fee
+# proxy by the bundle's login, whose password it takes from an environment
+# file only its user reads.
+btc_tower_make() {
+  install -d -m 700 -o "$USER_" -g "$USER_" "$LIB/btc"
+  install -m 640 -o root -g "$USER_" /dev/null "$ETC/btc-watchtower.env.tmp"
+  printf 'ARCA_BITCOIND_PASSWORD=%s\n' "$(cat "$ETC/btc-rpc.password")" > "$ETC/btc-watchtower.env.tmp"
+  mv -f "$ETC/btc-watchtower.env.tmp" "$ETC/btc-watchtower.env"
+  [ -s "$LIB/btc/btc-watchtower/config.json" ] && return 0
+  local a=() k err
+  for k in $BTC_TOWER_ARKS; do a+=(--ark "$k"); done
+  err=$(ARCA_BITCOIND_PASSWORD="$(cat "$ETC/btc-rpc.password")" as_user "$BIN/arca" --datadir "$LIB/btc" btc-watchtower create --network "$BARK_NET" \
+    --bitcoind "http://127.0.0.1:$FEE_PROXY_PORT" --bitcoind-user "$NAME" "${a[@]}" 2>&1 >/dev/null </dev/null) \
+    || { printf '%s\n' "$err" | tail -3; return 1; }
+}
+
 caddyfile() {
   cat <<EOF
 # The bundle's public route, written by install.sh: the Arca operator under
 # /arca, the watchtower for the peer operator's users under /watchtower, the
+# watchtower for Bitcoin ark coins under /btc-watchtower, the
 # Bitcoin ark by its two gRPC services, and the registry's domain proof.
 # Caddy obtains the certificate itself.
 $DOMAIN {
@@ -639,6 +660,9 @@ $DOMAIN {
 	}
 	handle_path /watchtower/* {
 		reverse_proxy 127.0.0.1:$WATCHTOWER_PORT
+	}
+	handle_path /btc-watchtower/* {
+		reverse_proxy 127.0.0.1:$BTC_WATCHTOWER_PORT
 	}
 	@bitcoinark path /bark_server.ArkService/* /mailbox_server.MailboxService/*
 	handle @bitcoinark {
@@ -687,7 +711,7 @@ for u in $UNITS caddy; do
   if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cgroup.procs" ]; then mine+="$(tr '\n' ' ' < "/sys/fs/cgroup$cg/cgroup.procs")"; fi
 done
 for port in $SEQ_RPC_PORT $SEQ_P2P_PORT $BTC_RPC_PORT $BTC_P2P_PORT $FEE_PROXY_PORT $PG_PORT $ARCAD_PORT $ARCAD_METRICS_PORT \
-            $SEQLN_PORT $CLN_PORT $CLN_GRPC_PORT $HOLD_GRPC_PORT $CAPTAIND_PORT $CAPTAIND_ADMIN_PORT $CAPTAIND_INTEGRATION_PORT $WATCHTOWER_PORT; do
+            $SEQLN_PORT $CLN_PORT $CLN_GRPC_PORT $HOLD_GRPC_PORT $CAPTAIND_PORT $CAPTAIND_ADMIN_PORT $CAPTAIND_INTEGRATION_PORT $WATCHTOWER_PORT $BTC_WATCHTOWER_PORT; do
   l=$(ss -ltnpH "sport = :$port" 2>/dev/null || true)
   [ -n "$l" ] || continue
   pids=$(grep -o 'pid=[0-9]*' <<<"$l" | cut -d= -f2 | sort -u | tr '\n' ' ' || true)
@@ -995,6 +1019,9 @@ if [ -n "$PEER_ARCA_URL" ]; then
   unit watchtower "the watchtower for the peer operator's users" "$(U sequentiad)" \
     "$BIN/arca --datadir $LIB/watchtower watchtower serve --listen 127.0.0.1:$WATCHTOWER_PORT --interval 10" "$RUNDIR"
 fi
+unit btc-watchtower "the watchtower for Bitcoin ark coins" "$(U feeproxy)" \
+  "$BIN/arca --datadir $LIB/btc btc-watchtower serve --listen 127.0.0.1:$BTC_WATCHTOWER_PORT --interval 30" "EnvironmentFile=$ETC/btc-watchtower.env
+$RUNDIR"
 systemctl daemon-reload
 say "units:${uchanged:- none changed}"
 restart_if() {   # restart_if <word>: restarts its unit when its unit, binary or configuration changed, else starts it
@@ -1011,7 +1038,7 @@ step "the ports, kept from the kernel's ephemeral ports"
 f=/etc/sysctl.d/60-arca-bundles.conf
 have=""; [ -f "$f" ] && have=$(sed -n 's/^net.ipv4.ip_local_reserved_ports *= *//p' "$f" | tr ',' ' ')
 want=$(printf '%s\n' $have $SEQ_RPC_PORT $SEQ_P2P_PORT $BTC_RPC_PORT $BTC_P2P_PORT $FEE_PROXY_PORT $PG_PORT $ARCAD_PORT $ARCAD_METRICS_PORT \
-  $SEQLN_PORT $CLN_PORT $CLN_GRPC_PORT $HOLD_GRPC_PORT $CAPTAIND_PORT $CAPTAIND_ADMIN_PORT $CAPTAIND_INTEGRATION_PORT $WATCHTOWER_PORT | sort -n -u | paste -sd, -)
+  $SEQLN_PORT $CLN_PORT $CLN_GRPC_PORT $HOLD_GRPC_PORT $CAPTAIND_PORT $CAPTAIND_ADMIN_PORT $CAPTAIND_INTEGRATION_PORT $WATCHTOWER_PORT $BTC_WATCHTOWER_PORT | sort -n -u | paste -sd, -)
 printf '# Ports the Arca operator bundles on this machine listen on (install.sh).\nnet.ipv4.ip_local_reserved_ports = %s\n' "$want" > "$f.new"
 mv "$f.new" "$f"
 sysctl -q -w "net.ipv4.ip_local_reserved_ports=$want" || say "could not reserve the ports here (a container without that right): a busy machine may take one before its daemon"
@@ -1123,6 +1150,12 @@ if [ -n "$PEER_ARCA_URL" ]; then
   say "it holds $(curl -sf --max-time 5 "http://127.0.0.1:$WATCHTOWER_PORT/v1/info" | jq -r .deposits) deposits; fund it with a fee asset ($0 addresses)"
 fi
 
+step "the watchtower for Bitcoin ark coins"
+btc_tower_make || die "the Bitcoin ark watchtower could not be set up (above)"
+restart_if btc-watchtower arca
+WAIT_UNIT=$(U btc-watchtower) wait_for 120 "the Bitcoin ark watchtower answering" curl -sf --max-time 5 "http://127.0.0.1:$BTC_WATCHTOWER_PORT/v1/info"
+say "it holds $(curl -sf --max-time 5 "http://127.0.0.1:$BTC_WATCHTOWER_PORT/v1/info" | jq -r .deposits) deposits; fund it with BTC ($0 addresses)"
+
 if [ -n "$DOMAIN" ]; then
   step "the route: Caddy at https://$DOMAIN"
   install -d -m 755 "$LIB/www/.well-known"
@@ -1213,6 +1246,8 @@ status() {
     step "the watchtower for the users of $PEER_ARCA_URL"
     say "$(curl -sf --max-time 5 "http://127.0.0.1:$WATCHTOWER_PORT/v1/info" | jq -r '"\(.deposits) deposits, for operator \(.operator[0:16])…"' || echo 'not answering')"
   fi
+  step "the watchtower for Bitcoin ark coins"
+  say "$(curl -sf --max-time 5 "http://127.0.0.1:$BTC_WATCHTOWER_PORT/v1/info" | jq -r '"\(.deposits) deposits, \(.float_sat) sat of its own for fees, arks \(if (.arks | length) == 0 then "any" else (.arks | join(", ")) end)"' || echo 'not answering')"
   step "the Bitcoin ark"
   say "$(captaind_rpc wallet 2>/dev/null | jq -c '.rounds | {address, total_balance, trusted_balance}' || echo 'captaind is not answering')"
   step "gateways"
@@ -1235,6 +1270,10 @@ addresses() {
   if [ -s "$LIB/watchtower/arca.sqlite" ]; then
     say "watchtower: $(as_user "$BIN/arca" --datadir "$LIB/watchtower" address </dev/null 2>/dev/null | jq -r .address)"
     say "    the watchtower for the peer's users: an asset accepted for fees, for steps a coin's reserves cannot pay"
+  fi
+  if [ -s "$LIB/btc/btc-watchtower/config.json" ]; then
+    say "btc-watchtower: $(set -a; . "$ETC/btc-watchtower.env"; as_user "$BIN/arca" --datadir "$LIB/btc" btc-watchtower address </dev/null 2>/dev/null | jq -r .address)"
+    say "    the watchtower for Bitcoin ark coins: BTC for the fees of the coins it brings on chain, several coins so it can pay several at once"
   fi
 }
 

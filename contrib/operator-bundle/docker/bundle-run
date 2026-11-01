@@ -12,7 +12,7 @@
 set -Eeuo pipefail
 svc=${1:-}
 case $svc in
-  init|net|postgres|bitcoind|feeproxy|sequentiad|priceserver|seqln|cln|arca-signer|captaind|watchmand|arcad|watchtower|caddy) ;;
+  init|net|postgres|bitcoind|feeproxy|sequentiad|priceserver|seqln|cln|arca-signer|captaind|watchmand|arcad|watchtower|btc-watchtower|caddy) ;;
   *) exec /opt/arca-src/contrib/operator-bundle/install.sh "$@" ;;
 esac
 BUNDLE_LIB=1 . /opt/arca-src/contrib/operator-bundle/install.sh
@@ -148,6 +148,12 @@ watchtower)
   until_up "the Sequentia node" seq_cli getblockchaininfo
   until tower_wallet; do echo "watchtower: its wallet could not be made against $PEER_ARCA_URL; trying again in a minute"; sleep 60; done
   run_as "$BIN/arca" --datadir "$LIB/watchtower" watchtower serve --listen "127.0.0.1:$WATCHTOWER_PORT" --interval 10
+  ;;
+btc-watchtower)
+  until_up "the fee proxy" bash -c "exec 3<>/dev/tcp/127.0.0.1/$FEE_PROXY_PORT"
+  until btc_tower_make; do echo "btc-watchtower: it could not be set up; trying again in a minute"; sleep 60; done
+  set -a; . "$ETC/btc-watchtower.env"; set +a
+  run_as "$BIN/arca" --datadir "$LIB/btc" btc-watchtower serve --listen "127.0.0.1:$BTC_WATCHTOWER_PORT" --interval 30
   ;;
 caddy)
   [ -n "$DOMAIN" ] || { echo "caddy: no DOMAIN set, so no public route: nothing to serve"; exec sleep infinity; }

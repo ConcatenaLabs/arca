@@ -41,6 +41,7 @@ start; the Linux paths are the ones tested.
 | Bitcoin | `bitcoind` (Bitcoin Core) | testnet4, with a transaction index |
 | | fee proxy | The node's RPC with fee estimates from the live mempool, for Bark's server and the Bitcoin gateway (testnet4's own estimates often say a sat or two while its mempool queues at tens, or nothing at all, and a gateway with no estimate refuses every channel opened to it) |
 | | `captaind`, `watchmand` | Bark's server and watchman: the Bitcoin ark |
+| | Bitcoin ark watchtower (`arca btc-watchtower serve`) | Takes holders' deposits of Bitcoin ark coins (each with a claim its holder signed) and, a day before a coin's expiry, brings it on chain and claims it to its holder's own address, paying the fees from its own BTC |
 | | Core Lightning | The Bitcoin gateway, with Boltz's hold-invoice plugin |
 | Both | Caddy | The public route over TLS: the operator at `https://<your domain>/arca`, the Bitcoin ark at `https://<your domain>` |
 
@@ -61,6 +62,7 @@ gateways and Caddy:
 | 80, 443 | Caddy | anywhere: the certificate's challenge, and wallets |
 | 3535, 3545 | arcad, captaind | this machine; others through Caddy, over TLS |
 | 3537 | the watchtower | this machine; others through Caddy, at `/watchtower` |
+| 3541 | the Bitcoin ark watchtower | this machine; others through Caddy, at `/btc-watchtower` |
 | 18884, 48332 | the Sequentia and Bitcoin nodes' RPC | this machine |
 | the rest (`bundle.env.example`) | the fee proxy, PostgreSQL, metrics, the gateways' gRPC | this machine |
 
@@ -112,6 +114,8 @@ Every path reads the same settings, described line by line in
   watches for, and `PEER_WATCHTOWER` the watchtower that operator runs for
   this bundle's users, which arcad's `info` names to them (see
   [Watching each other's users](#watching-each-others-users)).
+- `BTC_TOWER_ARKS`: the Bitcoin arks, by server key, whose coins the bundle's
+  Bitcoin ark watchtower takes. Empty, any ark's.
 - `BUILD_JOBS`: 2 unless the machine has more than 8 GB of memory to spare.
 
 ## Path 1: Docker Compose
@@ -277,7 +281,7 @@ inside the distro, each prefixed with `wsl -d ArcaBundle -u root --`.
 
     $B addresses
 
-prints four addresses, each with what it is for:
+prints an address for each part to fund, with what it is for:
 
 - **operator-pools**: pay each served asset to it. Every round is funded from
   these coins, which stay in batches until they expire and are swept back,
@@ -293,6 +297,8 @@ prints four addresses, each with what it is for:
   channel (`connect` says `no channel size set`).
 - **cln**: testnet4 BTC for the Bitcoin gateway's channel, its anchor reserve
   (25,000 sat) and its fees.
+- **btc-watchtower**: testnet4 BTC for the fees of the coins the Bitcoin ark
+  watchtower brings on chain (see [Bitcoin ark coins](#bitcoin-ark-coins)).
 
 **Check:** `$B status` shows the ark's `trusted_balance`.
 
@@ -418,6 +424,55 @@ peer's. From anywhere,
 answers `"watchtower": true`, the operator key of sequentiatestnet.com and
 `"sealed": 1`. Tell the sequentiatestnet.com operator that URL: its wallets
 add it to the watchtowers they deposit with, and its info names it.
+
+### Bitcoin ark coins
+
+On a Bitcoin ark the operator may sweep the tree above a coin from the coin's
+expiry, and nothing in script stops an operator that does. Every transaction
+of a coin's way out is already signed, though, so anyone holding the coin's
+data can bring it on chain before then, choosing nothing but the fee. A
+wallet therefore deposits, with each Bitcoin ark watchtower it names, every
+coin worth rescuing (at least 20 times what bringing it on chain costs at the
+day's fast fee rate), together with a claim its holder signs once: the coin
+to the holder's own address, less a fixed rescue fee to the watchtower. A
+day (144 blocks) before a coin's expiry the watchtower broadcasts the coin's
+transactions level by level, paying each through its anchor from its own
+BTC, and once the coin's exit delay has passed it broadcasts the claim. It
+also acts at once when an earlier holder of a coin paid out of round takes
+that earlier coin home, which the coin must answer within its exit delay.
+A wallet that spends a coin withdraws its deposit; the coin's holder signs
+the withdrawal, and nobody else can make one.
+
+Each operator runs one for the other's users, so a holder who goes away needs
+one of two watchtowers run by different operators, and neither operator's
+honesty. The bundle's is `arca btc-watchtower`, made at install with its own
+phrase and served at `https://<DOMAIN>/btc-watchtower`. It takes the coins of
+every ark unless `BTC_TOWER_ARKS` names some. Its BTC pays the fees and the
+claims pay it back: fund it with a few separate coins (`$B addresses`, the
+line `btc-watchtower`), since each fee is paid from a confirmed coin and one
+coin pays one fee per block.
+
+**An installed bundle takes it on with an update** (`git pull` in the clone,
+then `$B install`, or `docker compose up -d --build`); a `bundle.env` written
+before needs no new line.
+
+**Check:** `$B status` shows, under "the watchtower for Bitcoin ark coins",
+its deposits, the BTC it holds for fees and the arks it watches. From
+anywhere,
+
+    curl -s https://<DOMAIN>/btc-watchtower/v1/info
+
+answers `"kind": "bitcoin-ark-watchtower"`, `"network": "testnet4"` and the
+payout address its rescue fees are paid to. Tell the sequentiatestnet.com
+operator that URL: its wallets add it to the Bitcoin ark watchtowers they
+deposit with.
+
+On its own machine, `arca --datadir /var/lib/arca-bundle/btc btc-watchtower
+deposits` lists every deposit with its state: `waiting`, `rescuing` (its
+transactions going on chain), `claiming` (waiting out the exit delay),
+`claimed`, or `taken` (the coin was spent another way: its holder had given it
+up and the operator answered with what the holder signed, which costs the
+watchtower the fees it paid and the holder nothing).
 
 ## Paying between the two operators
 
