@@ -8,7 +8,7 @@
 //! release of its old slot for the round of its new coin (`M`, that round's
 //! connector asset), and the operator takes the slots back in batches:
 //!
-//! 1. the records are format version 2 and a wallet that accepts only
+//! 1. the records are format version 4 and a wallet that accepts only
 //!    batches without a sweep takes them, while it refuses a batch with one;
 //! 2. a release of one slot, paying the operator exactly what the slot
 //!    weighed; an exit after it; a release of 14 slots of two rounds after
@@ -235,7 +235,7 @@ fn accumulator_release_on_regtest() {
 		AccumulatorError::Record(RecordError::SweepRefused), "the strict wallet refuses accumulator-1");
 	let swept_valid = swept.record(0).validate(&swept_round, &a.policy(&s), &xonly(&owners[0]), &swept_specs[0].owner_nonce)
 		.expect("the general policy takes accumulator-1");
-	// The no-sweep token in a version 1 record is refused: it is written as version 2 alone.
+	// The no-sweep token in a version 1 record is refused: it is written as version 4 alone.
 	let mut v1 = swept.record(0).to_bytes().unwrap();
 	let at = v1.windows(32).position(|w| w == arca_covenant::script::asset_bytes(sched.token)).unwrap();
 	v1[at..at + 32].copy_from_slice(&arca_covenant::script::asset_bytes(no_sweep_token()));

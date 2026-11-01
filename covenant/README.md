@@ -972,7 +972,8 @@ let rs = state.release_tx(&chain, batch_coin, (asset, held), &slots, &[(m_coin, 
 let tx = rs.finish(&sign_digest(&operator, &rs.digest(&chain), &aux));      // then the M atom's own witness
 ```
 
-Such a record is format version 2 (no token, notice, burn or expiry), and
+Such a record is format version 4 (no token, notice, burn or expiry; a tree
+leaf record is version 2 or 3, so the first byte tells the kinds apart), and
 `WalletPolicy::no_sweep` takes it while it refuses an `arca/accumulator-1`
 record. Measured on regtest (`covenant/tests/accumulator_release.rs`): an
 exit is 1,072 vB with its fee from the slot's reserve; a release of one slot
@@ -1274,7 +1275,7 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   entry, a checkpoint) refused in a block with `Witness program hash mismatch`.
 - `tests/accumulator_release.rs`: on an anchored regtest chain, an
   accumulator batch without a sweep (`arca/accumulator-2`): its records
-  (format version 2) and the wallet policy that takes them and refuses
+  (format version 4) and the wallet policy that takes them and refuses
   `arca/accumulator-1`; owners refreshing into a round that is rolled back and
   replaced, and into another; releases of one slot and of 14 slots of two
   rounds, each paying the operator exactly what the slots weighed, exits by an

@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use arca_covenant::encode::Encoding;
 use arca_covenant::spend::{margin_for, FeeSource};
 use arca_covenant::tree::{LeafSpec, ReserveRule, TreeParams};
-use arca_covenant::accumulator::ACCUMULATOR_RECORD_VERSION;
+use arca_covenant::accumulator::{ACCUMULATOR_RECORD_VERSION, ACCUMULATOR_RECORD_VERSION_NO_SWEEP};
 use arca_covenant::{connector_asset, AccumulatorRecord, Batch, BatchKind, Chain, ClockSchedule, CoinRecord, ExplicitOutput, Forfeit,
 	HtlcTerms, Landing, LeafId, LeafPolicy, LeafRecord, MedianTime, OffboardPolicy, OrderLeafTerms, Release, RelativeTime, SpendError,
 	Template, ValidAccumulatorLeaf, ValidLeaf, WalletPolicy};
@@ -305,7 +305,8 @@ impl NewRecord {
 	/// Reads [`NewRecord::to_bytes`], of either kind.
 	pub(crate) fn from_bytes(b: &[u8]) -> Result<NewRecord, String> {
 		match b.first() {
-			Some(&ACCUMULATOR_RECORD_VERSION) => AccumulatorRecord::from_bytes(b).map(NewRecord::Accumulator).map_err(|e| e.to_string()),
+			Some(&ACCUMULATOR_RECORD_VERSION) | Some(&ACCUMULATOR_RECORD_VERSION_NO_SWEEP) =>
+				AccumulatorRecord::from_bytes(b).map(NewRecord::Accumulator).map_err(|e| e.to_string()),
 			_ => LeafRecord::from_bytes(b).map(NewRecord::Tree).map_err(|e| e.to_string()),
 		}
 	}
@@ -2592,6 +2593,43 @@ pub(crate) const DECIDED: [&str; 2] = ["refunded", "claimed"];
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A record of a leaf the wallet takes, of each kind, read back by its
+	/// first byte: an accumulator record of a batch with a sweep (version 1)
+	/// and of one without (version 4), and a tree leaf record (version 2 or
+	/// 3), none taken for another kind.
+	#[test]
+	fn records_of_every_kind_are_read_back_as_their_kind() {
+		use arca_covenant::accumulator::{Accumulator, AccumulatorParams};
+		use arca_covenant::tree::{LeafSpec, ReserveRule, Tree, TreeParams};
+		let secp = elements::secp256k1_zkp::Secp256k1::new();
+		let key = |n: u8| elements::secp256k1_zkp::Keypair::from_seckey_slice(&secp, &[n; 32]).unwrap().x_only_public_key().0;
+		let chain = Chain::new(elements::BlockHash::from_byte_array([9; 32]));
+		let asset = AssetId::from_slice(&[3; 32]).unwrap();
+		let delay = RelativeTime::from_seconds_ceil(36 * 3600).unwrap();
+		let leaves: Vec<LeafSpec> = (0..4u8).map(|i| LeafSpec {
+			template: arca_covenant::Template::Vtxo1, owner: key(10 + i), value: 100_000, owner_nonce: [20 + i; 32],
+			operator_nonce: [30 + i; 32], exit_delay: delay, unlock_hash: [40 + i; 32], htlc: None, order: None, landing: None,
+			channel: None, claim: None,
+		}).collect();
+		let s = key(1);
+		let swept = ClockSchedule::new(AssetId::from_slice(&[5; 32]).unwrap(), s, delay, vec![MedianTime::from_consensus(1_800_000_000).unwrap()])
+			.unwrap();
+		let reserve = ReserveRule::Fixed { node: 1_000, entry: 1_000 };
+		for (schedule, version) in [(swept.clone(), 1u8), (ClockSchedule::never(s), 4u8)] {
+			let acc = Accumulator::build(AccumulatorParams { asset, chain, schedule, burn: false, reserve, min_leaf: 1 }, &leaves).unwrap();
+			let b = acc.record(1).to_bytes().unwrap();
+			assert_eq!(b[0], version);
+			assert!(matches!(NewRecord::from_bytes(&b), Ok(NewRecord::Accumulator(r)) if r == acc.record(1)), "accumulator, version {}", version);
+		}
+		for (schedule, version) in [(swept, 2u8), (ClockSchedule::never(s), 3u8)] {
+			let tree = Tree::build(TreeParams { asset, chain, schedule, burn: false, delegated_reclaim: false, radix: 4, reserve, min_leaf: 1 },
+				&leaves).unwrap();
+			let b = tree.record(1).to_bytes().unwrap();
+			assert_eq!(b[0], version);
+			assert!(matches!(NewRecord::from_bytes(&b), Ok(NewRecord::Tree(r)) if r == tree.record(1)), "tree, version {}", version);
+		}
+	}
 
 	#[test]
 	fn a_refresh_of_more_coins_than_one_participation_takes_is_split() {
