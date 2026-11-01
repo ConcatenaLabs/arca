@@ -1527,6 +1527,29 @@ participation. A participation that gives up no coin (a payment received
 over Lightning, a repayment of a swept coin) completes once the round is
 final, as before.
 
+No participant holds a held round back twice (this holds for fill rounds
+too):
+
+- After a drop, the participations that handed their forfeits over run
+  again at once, alone: while any of them can run, the next round of the
+  asset takes them and no newcomer. An answering participation so goes out
+  at most one window late for each participant that drops out beside it,
+  whoever joins meanwhile.
+- Each coin a voided participation gave up, and each batch leaf or board it
+  rests on (so a coin paid on from it out of round too), is struck. A
+  participation giving one up waits (`This waits until median time …`), the
+  window at first and doubling with each strike up to a day, and then runs
+  only in a round of its own, where it holds back nobody. A round that goes
+  out with it clears the strike. Its void reason says so.
+- A wallet that hands over its forfeits before broadcast says so on the
+  participation (`forfeits_before_broadcast`, which
+  `info.participations.forfeits_before_broadcast` says the operator reads).
+  One that does not, a wallet that would hand them over only once its round
+  is out, is refused when it submits a participation or a distribution
+  (`forfeits_after_broadcast`: update the wallet; nothing was taken), and
+  never joins a held round. A take is unaffected: every wallet hands a
+  take's forfeits over before broadcast.
+
 A coin resting on such a batch never expires, but the operator serves it
 only up to the batch's service horizon, `[batches] collect_after_seconds`
 (28 days by default) after its round's median time: like a board's service
@@ -2506,7 +2529,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight now (`in_flight_cap`, `in_flight`, absent when no cap is set; see Rounds), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline and whether the operator takes back a pending one (`withdraw`), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), and how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep) |
+| `GET info` | The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight now (`in_flight_cap`, `in_flight`, absent when no cap is set; see Rounds), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), and how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -3338,7 +3361,14 @@ window, the dropped round refused by the node and when forced into a block
 (`bad-txns-inputs-missingorspent`), the others' round built again and
 completed; and at the service horizon an absent holder's coin, and an absent
 receiver's coin paid out of round, landing on the chain as their own leaves,
-while a coin given up is forfeited and claimed. `ARCA_TEST_NO_SWEEP=1` runs
+while a coin given up is forfeited and claimed. `tests/held_strikes.rs` runs
+participants that drop out of held rounds: a hostile one rejoining with the
+same coin every cycle never shares a round again and every honest refresh
+goes out; the answering participations rebuilt alone first; a struck coin,
+and one paid on from it out of round, waiting and then running alone, its
+strike cleared once it answers; and a wallet that hands over its forfeits
+only after broadcast refused in words, its coin untouched, while an operator
+with a sweep takes it. `ARCA_TEST_NO_SWEEP=1` runs
 any suite against such an operator: the shared harness hands every held
 round's forfeits over for the tests' own participations before it goes out
 (a test of the sweep itself fails there by design).

@@ -103,7 +103,15 @@ impl Http {
 		Answer { status: r.status_code, json: serde_json::from_str(r.as_str().unwrap()).unwrap_or(Value::Null) }
 	}
 
+	/// Posts `body` to `call`. A participation or a distribution says that
+	/// its forfeits come before broadcast, as the tests hand them over
+	/// (`forfeits_before_broadcast`), unless its body says otherwise.
 	pub fn post(&self, call: &str, body: &Value) -> Answer {
+		if matches!(call, "submit_participation" | "distribute") && body.is_object() && body.get("forfeits_before_broadcast").is_none() {
+			let mut b = body.clone();
+			b["forfeits_before_broadcast"] = Value::Bool(true);
+			return self.post_bytes(call, b.to_string().into_bytes());
+		}
 		self.post_bytes(call, body.to_string().into_bytes())
 	}
 

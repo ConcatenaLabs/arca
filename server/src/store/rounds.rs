@@ -548,6 +548,43 @@ impl Store {
 		Ok(r.get(0))
 	}
 
+	/// Strikes each coin of `ids` ([`Rounds`]' held-round back-off): its
+	/// count goes up by one and it waits until `now` plus `base` doubled for
+	/// each strike before this one, at most `cap`. Returns the latest wait.
+	pub async fn strike_coins(&self, ids: &[[u8; 32]], now: u32, base: u32, cap: u32) -> Result<u32, StoreError> {
+		let conn = self.conn().await?;
+		let mut latest = 0u32;
+		for id in ids {
+			let r = conn.query_one(
+				"INSERT INTO held_strike (leaf_id, strikes, until_mtp) VALUES ($1, 1, $2::BIGINT + LEAST($3::BIGINT, $4::BIGINT))
+				 ON CONFLICT (leaf_id) DO UPDATE SET strikes = held_strike.strikes + 1,
+				   until_mtp = $2::BIGINT + LEAST($3::BIGINT * POWER(2, LEAST(held_strike.strikes, 30))::BIGINT, $4::BIGINT)
+				 RETURNING until_mtp",
+				&[&&id[..], &(now as i64), &(base as i64), &(cap as i64)]).await?;
+			let until: i64 = r.get(0);
+			latest = latest.max(u32::try_from(until).unwrap_or(u32::MAX));
+		}
+		Ok(latest)
+	}
+
+	/// The strike on any coin of `ids`: the most strikes, and the latest
+	/// median time they wait until. `None` when none is struck.
+	pub async fn strike_of(&self, ids: &[[u8; 32]]) -> Result<Option<(u32, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let r = conn.query_one("SELECT MAX(strikes), MAX(until_mtp) FROM held_strike WHERE leaf_id = ANY($1)", &[&ids]).await?;
+		let n: Option<i32> = r.get(0);
+		let until: Option<i64> = r.get(1);
+		Ok(n.zip(until).map(|(n, u)| (n.max(0) as u32, u32::try_from(u).unwrap_or(u32::MAX))))
+	}
+
+	/// Clears the strikes on `ids`: a round with them went out.
+	pub async fn clear_strikes(&self, ids: &[[u8; 32]]) -> Result<u64, StoreError> {
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		Ok(conn.execute("DELETE FROM held_strike WHERE leaf_id = ANY($1)", &[&ids]).await?)
+	}
+
 	/// The service horizon of the batch leaf `leaf_id` rests on, if that
 	/// batch has no sweep ([`BatchRow::collect_mtp`]).
 	pub async fn leaf_collect_mtp(&self, leaf_id: &[u8; 32]) -> Result<Option<u32>, StoreError> {

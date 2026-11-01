@@ -334,7 +334,10 @@ operator signs can take a coin from a holder who stays away. Elsewhere it
 does so with `[batches] no_sweep = true`. Turn it on only once every wallet
 your holders use reads such a batch's records (a wallet that does not refuses
 their leaves) and signs its forfeits against the round's transaction before
-the round is broadcast.
+the round is broadcast. A wallet that does says so on each participation; the
+server refuses a refresh, offboard or distribution from one that does not,
+telling its holder to update it, so an older wallet never holds a round
+back.
 
 What it changes for the operator:
 
@@ -344,8 +347,11 @@ What it changes for the operator:
   round being built (600 s unless set). One that does not is voided, its
   coins given back; the round is dropped, and a spend of one of its own
   coins kills it on the chain, so it can never confirm; the rest run again
-  in the next round. Expect a refresh to take one round interval plus the
-  window at worst.
+  at once in a round of their own, before any newcomer. The voided coins
+  then wait (the window, doubling with each repeat, up to a day) and run
+  only in a round of their own, so the same participant never holds anyone
+  back twice. Expect a refresh to take one round interval plus the window
+  for each participant that drops out beside it.
 - **No sweep brings capital back; RECLAIM, RECLAIM-D and collection do.** A
   lowest node every owner of which has refreshed and released comes back by
   RECLAIM as soon as it does (`[watcher] reclaim_early`); with

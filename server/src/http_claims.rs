@@ -116,7 +116,8 @@ pub(super) async fn distribute(State(app): State<Arc<App>>, body: Result<Bytes, 
 			_ => return Err(Refusal::malformed("a deadline and a lapse allowance come together")),
 		},
 	};
-	let status = app.participations.distribute(&DistributionRequest { distribution, attestations }).await?;
+	let status = app.participations.distribute(&DistributionRequest { distribution, attestations,
+		forfeits_before_broadcast: req.forfeits_before_broadcast }).await?;
 	Ok(Json(participation_status(&status)))
 }
 

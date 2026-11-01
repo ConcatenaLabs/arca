@@ -783,6 +783,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			exit_deadline_seconds: Params::PARTICIPATION_HORIZON,
 			forfeit_deadline_seconds: Params::FORFEIT_DEADLINE,
 			withdraw: true,
+			forfeits_before_broadcast: true,
 		},
 		boards: api::BoardsInfo {
 			lifetime_seconds: Params::BOARD_LIFETIME,
@@ -1202,7 +1203,8 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 	}
 	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 		.transpose()?;
-	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, key_proofs, fees, not_before }).await?;
+	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, key_proofs, fees, not_before,
+		forfeits_before_broadcast: req.forfeits_before_broadcast }).await?;
 	for (owner, (mailbox, proof)) in bindings {
 		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
 	}
@@ -1726,7 +1728,7 @@ async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<S
 /// One leaf as `leaf_data` serves it.
 /// The leaf ids of the round leaves and boards a coin record descends from:
 /// the coins at the bottom of its lineage, which rest on the chain.
-fn root_leaf_ids(rec: &arca_covenant::CoinRecord, out: &mut Vec<[u8; 32]>) {
+pub(crate) fn root_leaf_ids(rec: &arca_covenant::CoinRecord, out: &mut Vec<[u8; 32]>) {
 	match rec {
 		arca_covenant::CoinRecord::Leaf { record, .. } => {
 			if let Ok(id) = record.leaf_id() {
