@@ -49,6 +49,9 @@ pub const COMMANDS: &[&str] = &["exit_estimate", "exit_start", "exit_progress", 
 
 type Funding = Arc<tokio::sync::RwLock<OnchainWallet>>;
 
+/// The unused addresses past the last used one a sync of the funding wallet reads.
+const REVEAL_GAP: u32 = 20;
+
 /// The funding wallet of each open wallet, and those scanned since this
 /// program started.
 static FUNDING: Mutex<Option<HashMap<Fingerprint, Funding>>> = Mutex::new(None);
@@ -96,6 +99,14 @@ async fn sync_funding(wallet: &Wallet) -> anyhow::Result<Funding> {
 	let r = if first && (fresh || wallet.config().esplora_address.is_some()) {
 		w.initial_wallet_scan(wallet.chain(), None).await.map(|_| ())
 	} else {
+		// A sync reads only the addresses the wallet has revealed, and the holder's
+		// wallet gives out new ones: keep a window of unused ones revealed past the
+		// last used, as a scan's gap would.
+		use bark::onchain::bdk_wallet::KeychainKind;
+		for k in [KeychainKind::External, KeychainKind::Internal] {
+			let last = w.inner.spk_index().last_used_index(k).map(|i| i + 1).unwrap_or(0);
+			let _ = w.inner.reveal_addresses_to(k, last + REVEAL_GAP).count();
+		}
 		w.sync(wallet.chain()).await
 	};
 	if let Err(e) = r {
