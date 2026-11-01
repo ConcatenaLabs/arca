@@ -105,11 +105,23 @@ impl Http {
 
 	/// Posts `body` to `call`. A participation or a distribution says that
 	/// its forfeits come before broadcast, as the tests hand them over
-	/// (`forfeits_before_broadcast`), unless its body says otherwise.
+	/// (`forfeits_before_broadcast`), and a participation names every record
+	/// format the library reads (`record_formats`), as a current wallet does,
+	/// unless its body says otherwise (`"record_formats": []` names none, as an
+	/// older wallet).
 	pub fn post(&self, call: &str, body: &Value) -> Answer {
-		if matches!(call, "submit_participation" | "distribute") && body.is_object() && body.get("forfeits_before_broadcast").is_none() {
+		if matches!(call, "submit_participation" | "distribute") && body.is_object() {
 			let mut b = body.clone();
-			b["forfeits_before_broadcast"] = Value::Bool(true);
+			if b.get("forfeits_before_broadcast").is_none() {
+				b["forfeits_before_broadcast"] = Value::Bool(true);
+			}
+			match b.get("record_formats") {
+				None if call == "submit_participation" => b["record_formats"] = json!(arca_covenant::RECORD_FORMATS),
+				Some(Value::Array(a)) if a.is_empty() => {
+					b.as_object_mut().unwrap().remove("record_formats");
+				},
+				_ => {},
+			}
 			return self.post_bytes(call, b.to_string().into_bytes());
 		}
 		self.post_bytes(call, body.to_string().into_bytes())

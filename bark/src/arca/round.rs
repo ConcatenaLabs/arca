@@ -1246,11 +1246,23 @@ impl Wallet {
 		// that builds batches without a sweep refuses a participation that
 		// does not). An older operator refuses fields it does not know, so it
 		// is told only when it asks. Not part of the participation's id.
+		//
+		// It also names the leaf record formats it reads to an operator that
+		// asks (`info.participations.record_formats`), which then puts its
+		// new leaves only into batches whose records it reads: a wallet that
+		// names none is never given a slot of an accumulator batch without a
+		// sweep. Not part of the participation's id either.
 		let told;
-		let body = match info.as_ref().map(|i| i["participations"]["forfeits_before_broadcast"].as_bool() == Some(true)) {
-			Some(true) if call != "take_order" && body.is_object() => {
+		let reads = |key: &str| info.as_ref().is_some_and(|i| i["participations"][key].as_bool() == Some(true));
+		let body = match (reads("forfeits_before_broadcast"), reads("record_formats")) {
+			(before, formats) if (before || formats) && call != "take_order" && body.is_object() => {
 				let mut b = body.clone();
-				b["forfeits_before_broadcast"] = json!(true);
+				if before {
+					b["forfeits_before_broadcast"] = json!(true);
+				}
+				if formats && call == "submit_participation" {
+					b["record_formats"] = json!(arca_covenant::RECORD_FORMATS);
+				}
 				told = b;
 				&told
 			},

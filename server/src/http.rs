@@ -784,6 +784,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			forfeit_deadline_seconds: Params::FORFEIT_DEADLINE,
 			withdraw: true,
 			forfeits_before_broadcast: true,
+			record_formats: true,
 		},
 		boards: api::BoardsInfo {
 			lifetime_seconds: Params::BOARD_LIFETIME,
@@ -1203,8 +1204,11 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 	}
 	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))
 		.transpose()?;
+	if req.record_formats.len() > MAX_RECORD_FORMATS || req.record_formats.iter().any(|f| f.is_empty() || f.len() > 32) {
+		return Err(Refusal::malformed(format!("record_formats: at most {} names, each of 1 to 32 bytes", MAX_RECORD_FORMATS)));
+	}
 	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, key_proofs, fees, not_before,
-		forfeits_before_broadcast: req.forfeits_before_broadcast }).await?;
+		forfeits_before_broadcast: req.forfeits_before_broadcast, record_formats: req.record_formats.clone() }).await?;
 	for (owner, (mailbox, proof)) in bindings {
 		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
 	}
@@ -1637,6 +1641,10 @@ pub const LEAF_PAGE_BYTES: usize = 1 << 20;
 
 /// The most bindings one `bind_mailbox` takes.
 pub const MAX_BINDINGS: usize = 64;
+
+/// The most record format names a participation names
+/// (`SubmitParticipation::record_formats`).
+pub const MAX_RECORD_FORMATS: usize = 16;
 
 /// A txid in internal byte order, as RPCs print it.
 fn txid_hex(t: &[u8; 32]) -> String {

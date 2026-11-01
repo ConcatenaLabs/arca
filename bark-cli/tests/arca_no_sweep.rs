@@ -448,3 +448,119 @@ async fn a_coin_collected_at_the_horizon_is_shown_and_boarded_back() {
 	println!("E's balance: {} (its coin held {})", bal["arca"], e_value);
 	let _ = x;
 }
+
+/// Wallets that name the record formats they read refresh beside wallets
+/// built before wallets named them (each `arca` named in
+/// `ARCA_CLI_OLDER_BUILDS`, separated by `:`, when set), on an operator that
+/// builds accumulator batches without a sweep (`accumulator_exit_rate_ppm`).
+/// The five current wallets' leaves are slots of one accumulator batch (four
+/// leaves are cheaper as a tree, of one level); an older
+/// wallet's leaf rests in a tree in the same round, so it reads its record
+/// and hands over its forfeits as the others do, and the round goes out
+/// without waiting for anyone. An older wallet too old to hand its forfeits
+/// over before broadcast is refused in words, its coin live, as ever.
+#[tokio::test(flavor = "multi_thread")]
+async fn older_wallets_get_a_tree_beside_the_accumulator_slots() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+		c.batches.accumulator_exit_rate_ppm = Some(10_000);
+	}).await;
+	let x_id = r.x;
+	r.fund_server(x_id, 100_000_000).await;
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let current: Vec<Arca> = ["F1 fmt", "F2 fmt", "F3 fmt", "F4 fmt", "F5 fmt"].iter().map(|n| Arca::new(n)).collect();
+	let older: Vec<Arca> = std::env::var("ARCA_CLI_OLDER_BUILDS").ok().map(|v| v.split(':').filter(|p| !p.is_empty()).enumerate()
+		.map(|(i, p)| Arca::built_from(&format!("O{} fmt", i), std::path::Path::new(p))).collect()).unwrap_or_default();
+	if older.is_empty() {
+		println!("ARCA_CLI_OLDER_BUILDS is not set: current wallets alone");
+	}
+	let ws: Vec<&Arca> = current.iter().chain(older.iter()).collect();
+	for w in &ws {
+		w.ok(&create);
+	}
+	boarded(&mut r, &ws, x_id, 2_000_000).await;
+
+	// Everyone asks a refresh. An older wallet either joins or is refused.
+	let mut joined: Vec<&Arca> = current.iter().collect();
+	for w in &current {
+		let p = w.ok(&["participate"]);
+		assert!(p["participations"].as_array().unwrap().iter().all(|x| x["state"] == "pending"), "{}", p);
+	}
+	for o in &older {
+		let (ok, p) = o.run(&["participate"]);
+		let states: Vec<String> = p["participations"].as_array().map(|a| a.iter().map(|x| x["state"].to_string()).collect())
+			.unwrap_or_default();
+		println!("{} (older) participate: ok {}, states {:?}: {}", o.name, ok, states, p);
+		if ok && !states.is_empty() && states.iter().all(|s| s == "\"pending\"") {
+			joined.push(o);
+		} else {
+			let coins = o.ok(&["coins"]);
+			assert!(coins.as_array().unwrap().iter().any(|c| c["state"] == "live"), "{}: refused, its coin is its own: {}", o.name, coins);
+		}
+	}
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(built.len() == 1 && failed.is_empty(), "{} built, {} failed", built.len(), failed.len());
+	let txid = built[0].tx.txid();
+	assert!(built[0].broadcast.starts_with("held"), "{}", built[0].broadcast);
+	let row = r.server.store.round_by_txid(&txid.to_byte_array()).await.unwrap().unwrap();
+	let batches = r.server.store.batches(row.round_id).await.unwrap();
+	let kinds: Vec<String> = batches.iter().map(|b| format!("{} {}", b.vout, b.kind)).collect();
+	println!("round {}: {} participations, batches {:?}", txid, r.server.store.round_participations(row.round_id).await.unwrap().len(), kinds);
+	assert_eq!(batches.iter().filter(|b| b.kind == arca_covenant::BatchKind::Accumulator).count(), 1, "the current wallets' slots");
+	let in_tree = joined.len() - current.len();
+	assert_eq!(batches.iter().filter(|b| b.kind == arca_covenant::BatchKind::Tree).count(), usize::from(in_tree > 0),
+		"a tree for the older wallets' leaves, and only then");
+
+	// Every wallet that joined hands over its forfeits before broadcast.
+	for w in &joined {
+		let s = w.ok(&["sync"]);
+		let ps = s["participations"].as_array().unwrap();
+		println!("{} before broadcast: {}", w.name, ps.iter().map(|p| format!("{} {}", p["state"], p["note"])).collect::<Vec<_>>().join("; "));
+		assert!(ps.iter().all(|p| p["state"] == "forfeiting"), "{}: {}", w.name, s);
+	}
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(round_of(&r, &txid).await, RoundState::Broadcast, "out once every forfeit is in, held back by nobody");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&txid, RoundState::Final).await;
+	for w in &joined {
+		let s = w.ok(&["sync"]);
+		let ps = s["participations"].as_array().unwrap();
+		assert!(!ps.is_empty() && ps.iter().all(|p| p["state"] == "released"), "{}: {}", w.name, s);
+		let coins = w.ok(&["coins"]);
+		println!("{} after the round: {}", w.name, coins);
+		assert!(coins.as_array().unwrap().iter().any(|c| c["state"] == "live"), "{}: its new coin: {}", w.name, coins);
+	}
+
+	// A current wallet pays each older one out of round from its slot. An
+	// older wallet cannot read that coin's record and refuses it; once
+	// updated (the current build on the same wallet directory), it holds the
+	// coin, by `restore` when its `sync` does not read the refused message
+	// again (arca#550).
+	let x = x_id.to_string();
+	for o in &joined[current.len()..] {
+		let req = o.ok(&["receive"]);
+		let sent = current[0].ok(&["send", req["request"].as_str().unwrap(), "--amount", "300000", "--asset", &x]);
+		assert!(sent["change"].is_string(), "{}", sent);
+		let (ok, mb) = o.run(&["mailbox"]);
+		println!("{} (older) reads its mailbox: ok {}: {}", o.name, ok, mb);
+		let updated = Arca { name: format!("{} updated", o.name), dir: o.dir.clone(), patience: std::cell::Cell::new(o.patience.get()),
+			bin: std::path::PathBuf::from(env!("CARGO_BIN_EXE_arca")) };
+		let (ok, s) = updated.run(&["sync"]);
+		println!("{} sync: ok {}: {}", updated.name, ok, s);
+		let coins = updated.ok(&["coins"]);
+		println!("{} coins: {}", updated.name, coins);
+		if !coins.as_array().unwrap().iter().any(|c| c["value"] == "300000" && c["state"] == "live") {
+			let (ok, rs) = updated.run(&["restore"]);
+			println!("{} restore: ok {}: {}", updated.name, ok, rs);
+		}
+		let coins = updated.ok(&["coins"]);
+		println!("{} coins after: {}", updated.name, coins);
+		assert!(coins.as_array().unwrap().iter().any(|c| c["value"] == "300000" && c["state"] == "live"),
+			"{}: the coin paid to it out of a slot: {}", updated.name, coins);
+	}
+}

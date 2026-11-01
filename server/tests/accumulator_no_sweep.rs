@@ -23,6 +23,11 @@
 //!    forfeit claimed; a coin paid on out of round from a slot lands under
 //!    its holder's key through its checkpoint and reassignment.
 //!
+//! A third test refreshes beside wallets that name no record formats, as
+//! wallets built before they named them: their leaves rest in a tree in the
+//! same round, the others' in the accumulator batch, and the round goes out
+//! once every forfeit is in. A round of such wallets alone pays a tree.
+//!
 //! A second test loses the refresh round whose releases are stored and
 //! brings it back: while it is lost its releases are retired and the watcher
 //! tries none; once it is final again they are restored and released.
@@ -104,12 +109,22 @@ fn no_sweep_policy(r: &Running) -> WalletPolicy {
 /// the round goes out, as the held round needs, and again for the
 /// preimage), and, where `release` says so, releases its old slot.
 async fn refresh(r: &mut Running, tag: &str, coins: &[&Coin], release: &[bool]) -> Vec<Out> {
+	refresh_naming(r, tag, coins, release, &vec![true; coins.len()]).await
+}
+
+/// [`refresh`], each participation naming the record formats the library
+/// reads where `names` says so, as a current wallet does, and naming none
+/// otherwise, as a wallet built before it named them.
+async fn refresh_naming(r: &mut Running, tag: &str, coins: &[&Coin], release: &[bool], names: &[bool]) -> Vec<Out> {
 	let mut ids = vec![];
 	for (i, coin) in coins.iter().enumerate() {
 		let v = coin.valid(r);
 		let key = keypair(&format!("{} {}", tag, i));
 		let (w, nonce) = want_leaf(&key, v.asset, v.value);
-		let (body, id) = participation_body(&[&coin.held], &[w], &[], None, xonly(&r.s), r.chain);
+		let (mut body, id) = participation_body(&[&coin.held], &[w], &[], None, xonly(&r.s), r.chain);
+		if !names[i] {
+			body["record_formats"] = json!([]);
+		}
 		assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");
 		ids.push((id, nonce, key));
 	}
@@ -533,4 +548,59 @@ async fn a_lost_refresh_round_retires_its_slot_releases_and_its_return_restores_
 	let tx = tx_of(&rs[0]);
 	assert!(in_a_block(&r, &tx.txid()));
 	check_release(&r, &rs[0], &acc, acc.policy(), &slots_of(&[&coins[0], &coins[1]])).await;
+}
+
+/// Participations that name no record formats (a wallet built before it
+/// named them, which cannot read an `accumulator-4` record and would never
+/// hand over its forfeits for a slot) refresh beside ones that name them: the
+/// round pays the namers' accumulator batch and a tree of the others' leaves,
+/// every owner validates its leaf and hands over its forfeit, and the round
+/// goes out and is final. A round of such participations alone pays a tree.
+/// The operator says it reads the names, and refuses too many.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_naming_no_record_formats_gets_a_tree_beside_the_slots() {
+	let mut r = start().await;
+	let x = r.x;
+	let info = r.http.get("info").ok();
+	assert_eq!(info["participations"]["record_formats"], true, "{}", info["participations"]);
+	let mut boards = vec![];
+	for i in 0..8 {
+		let (held, tx) = credited_board(&mut r, &keypair(&format!("fmt board {}", i)), x).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+
+	// Too many names: refused, nothing taken.
+	let (w, _) = want_leaf(&keypair("fmt many"), x, boards[0].valid(&r).value);
+	let (mut body, _) = participation_body(&[&boards[0].held], &[w], &[], None, xonly(&r.s), r.chain);
+	body["record_formats"] = json!((0..17).map(|i| format!("leaf-{}", i)).collect::<Vec<_>>());
+	let a = r.http.post("submit_participation", &body);
+	assert_eq!(a.status, 400, "{}", a.json);
+	println!("17 names: refused {} {}", a.status, a.json);
+
+	// Five that name the formats, one that names none, in one round.
+	let names = [true, true, false, true, true, true];
+	let mixed = refresh_naming(&mut r, "fmt M", &boards[..6].iter().collect::<Vec<_>>(), &[false; 6], &names).await;
+	let round = mixed[0].round.clone();
+	assert!(mixed.iter().all(|o| o.round.txid() == round.txid()), "one round");
+	for (o, named) in mixed.iter().zip(names) {
+		let (kind, vout) = match &o.new {
+			New::Acc(v) => ("accumulator", v.batch_vout),
+			New::Tree(v) => ("tree", v.batch_vout),
+		};
+		println!("names formats {}: a leaf of the {} at output {}", named, kind, vout);
+		assert_eq!(named, matches!(o.new, New::Acc(_)), "a slot exactly for the participations that name accumulator-4");
+	}
+	let row = r.server.store.round_by_txid(&round.txid().to_byte_array()).await.unwrap().unwrap();
+	assert_eq!(row.state, RoundState::Final);
+	let kinds: Vec<String> = r.server.store.batches(row.round_id).await.unwrap().iter().map(|b| format!("{} {}", b.vout, b.kind)).collect();
+	println!("round {}: batches {:?}, final", round.txid(), kinds);
+	assert_eq!(kinds.len(), 2);
+
+	// Two that name none, alone: a tree.
+	let alone = refresh_naming(&mut r, "fmt A", &[&boards[6], &boards[7]], &[false; 2], &[false; 2]).await;
+	assert!(alone.iter().all(|o| matches!(o.new, New::Tree(_))));
+	let row = r.server.store.round_by_txid(&alone[0].round.txid().to_byte_array()).await.unwrap().unwrap();
+	let kinds: Vec<String> = r.server.store.batches(row.round_id).await.unwrap().iter().map(|b| format!("{} {}", b.vout, b.kind)).collect();
+	println!("round {} of two naming none: batches {:?}", alone[0].round.txid(), kinds);
+	assert_eq!(kinds.len(), 1);
 }

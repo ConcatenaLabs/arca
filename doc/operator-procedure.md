@@ -371,7 +371,13 @@ What it changes for the operator:
   without a sweep (`arca/accumulator-2`): the watcher releases each slot its
   owner released (up to 14 in one transaction, with an atom of each round's
   connector asset), and collects the rest at the service horizon as it does
-  a tree. A holder's own batch is always a tree.
+  a tree. A holder's own batch is always a tree, and so is the part of a
+  round for wallets that do not name `accumulator-4` among the record
+  formats they read (older wallets): they get a tree leaf in the same round,
+  never a slot. A wallet older than that format cannot read a coin paid to it
+  out of round from a slot either: turn the rate on once the
+  wallets your holders use read it, and check every client of the operator
+  on its own machine first (makers, agents, command lines).
 - **The bond's notice** must cover the horizon: `notice_units` at least the
   longer of 28 days and `collect_after_seconds`, plus the longest exit
   delay, plus a day.

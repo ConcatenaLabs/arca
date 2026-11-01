@@ -221,6 +221,11 @@ pub struct ParticipationRequest {
 	/// ([`ParticipationError::ForfeitsAfterBroadcast`]). Not covered by the
 	/// id.
 	pub forfeits_before_broadcast: bool,
+	/// The leaf record formats the wallet names as ones it reads
+	/// ([`arca_covenant::RECORD_FORMATS`]): its leaves go only into a batch
+	/// whose record it reads ([`arca_covenant::reads_format`]). Not covered
+	/// by the id.
+	pub record_formats: Vec<String>,
 }
 
 impl ParticipationRequest {
@@ -993,6 +998,7 @@ impl Participations {
 			fees: req.fees.iter().map(|(a, v)| (a.into_inner().to_byte_array(), *v)).collect(),
 			fill: None,
 			distribution: None,
+			record_formats: req.record_formats.clone(),
 		};
 		match self.store.insert_participation_seen(&new, &seen).await {
 			Ok(()) => {},
@@ -1168,6 +1174,9 @@ impl Participations {
 		let mut preimage = [0u8; 32];
 		rand::rngs::OsRng.fill_bytes(&mut preimage);
 		let new = NewParticipation {
+			// The holder's wallet named no format here: it is taken to read
+			// those every wallet reads.
+			record_formats: vec![],
 			id,
 			unlock_hash: sha256_bytes(&preimage),
 			preimage,

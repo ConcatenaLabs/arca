@@ -62,7 +62,14 @@ sweep, whose pruned forms also come from sequentia-contracts
 batch, built from the same parameters and leaves) and the operator's rule for
 choosing between them (`BatchKind::choose`: an accumulator batch when the
 share of leaves expected to leave on their own costs less from one output,
-never for a batch with a resting order or a channel, or a burn-only one).
+never for a batch with a resting order or a channel, or a burn-only one). It
+also names the leaf record formats, by kind and version byte: `leaf-2` and
+`leaf-3` (a tree's leaf, with a sweep and without), `accumulator-1` and
+`accumulator-4` (`BatchKind::record_format`). `RECORD_FORMATS` lists those this
+library reads, which a wallet built on it names in each participation;
+`FORMATS_EVERY_WALLET_READS` those an operator takes a participation naming
+none to read; `reads_format` tells whether a participation reads one. An
+operator puts a leaf only into a batch whose format its wallet reads.
 `record` holds the leaf record, `record_json` its JSON form (the `json`
 feature, on by default), `tree` the builder that turns the leaves of one asset
 into a batch, `unroll` the transactions that take a leaf on-chain, `board`
@@ -975,7 +982,9 @@ let tx = rs.finish(&sign_digest(&operator, &rs.digest(&chain), &aux));      // t
 Such a record is format version 4 (no token, notice, burn or expiry; a tree
 leaf record is version 2 or 3, so the first byte tells the kinds apart), and
 `WalletPolicy::no_sweep` takes it while it refuses an `arca/accumulator-1`
-record. Measured on regtest (`covenant/tests/accumulator_release.rs`): an
+record. A wallet built before this format cannot read it, so an operator
+gives a slot of such a batch only to a participation that names
+`accumulator-4` among its record formats (`reads_format`). Measured on regtest (`covenant/tests/accumulator_release.rs`): an
 exit is 1,072 vB with its fee from the slot's reserve; a release of one slot
 1,305 vB, of 14 slots 3,317 vB, and of the last nine slots, leaving no rest,
 2,320 vB, each with one or two atoms of `M` beside it.
