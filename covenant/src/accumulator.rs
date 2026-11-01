@@ -68,7 +68,7 @@
 //! until its owner, or the operator by EXIT to the owner's entry, takes it
 //! out.
 //!
-//! # The record's binary form, versions 1 and 2
+//! # The record's binary form, versions 1 and 4
 //!
 //! [`AccumulatorRecord`] is a leaf record whose path is a slot. Integers are
 //! little-endian; asset ids, the token and the genesis hash are in internal
@@ -90,7 +90,7 @@
 //! 10 ×  ([32] sibling, u64 its weight), from the slot up
 //! ```
 //!
-//! Version 2 is a batch without a sweep (`arca/accumulator-2`): no token,
+//! Version 4 is a batch without a sweep (`arca/accumulator-2`): no token,
 //! notice, burn or expiry, so after the operator key
 //!
 //! ```text
@@ -101,7 +101,8 @@
 //! ```
 //!
 //! Every field has one encoding, so a record has one binary form: the
-//! no-sweep token is written as version 2 alone. A reader refuses another
+//! no-sweep token is written as version 4 alone. A leaf record's versions
+//! are 2 and 3, so the first byte tells the two kinds of record apart. A reader refuses another
 //! version, an unknown template, trailing bytes and a record
 //! [`AccumulatorRecord::check`] refuses.
 
@@ -1655,8 +1656,10 @@ impl AccumulatorRecord {
 /// The format version of [`AccumulatorRecord`]'s binary form for a batch
 /// with a sweep.
 pub const ACCUMULATOR_RECORD_VERSION: u8 = 1;
-/// The format version of a batch without a sweep.
-pub const ACCUMULATOR_RECORD_VERSION_NO_SWEEP: u8 = 2;
+/// The format version of a batch without a sweep. Leaf records and
+/// accumulator records share one space of format versions (a leaf record is
+/// 2 or 3), so a reader that holds either tells them apart by the first byte.
+pub const ACCUMULATOR_RECORD_VERSION_NO_SWEEP: u8 = 4;
 
 impl AccumulatorRecord {
 	/// The binary form; see the [module documentation](self). Refuses a
@@ -1763,7 +1766,7 @@ impl AccumulatorRecord {
 			(ClockSchedule::never(operator), flags)
 		} else {
 			let token = r.asset()?;
-			// The no-sweep token is written as format version 2 alone.
+			// The no-sweep token is written as format version 4 alone.
 			if token == crate::clock::no_sweep_token() {
 				return Err(DecodeError::NoSweepToken.into());
 			}
