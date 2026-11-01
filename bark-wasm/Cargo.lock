@@ -74,10 +74,13 @@ version = "0.7.1"
 dependencies = [
  "async-trait",
  "bdk_bitcoind_rpc",
+ "bdk_wallet",
  "bitcoin",
  "bitcoind-async-client",
  "getrandom 0.2.17",
  "lazy_static",
+ "log",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

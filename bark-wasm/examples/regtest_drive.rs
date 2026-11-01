@@ -5,11 +5,13 @@
 //! closed, as a browser's is when its page is.
 //!
 //!     ARK=http://127.0.0.1:23145 BITCOIND=http://127.0.0.1:23142 \
-//!     COOKIE=$H/btc/regtest/.cookie MNEMONIC="…" \
+//!     COOKIE=$H/btc/regtest/.cookie MNEMONIC="…" [FEERATE=5] \
 //!     cargo run --features native --example regtest_drive -- DATADIR COMMAND [JSON]
 //!
-//! `sync` is the wallet's own sync (what its daemon runs while it is open);
-//! every other command is one of [arca_bark_wasm::command::COMMANDS].
+//! `sync` is the wallet's own sync (what its daemon runs while it is open),
+//! `funding_address` the first address of the phrase's BIP84 account (whose
+//! coins pay an exit's fees); every other command is one of
+//! [arca_bark_wasm::command::COMMANDS].
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -53,14 +55,23 @@ async fn main() -> anyhow::Result<()> {
 	config.server_address = env("ARK")?;
 	config.bitcoind_address = Some(env("BITCOIND")?);
 	config.bitcoind_cookiefile = Some(PathBuf::from(env("COOKIE")?));
+	// A regtest node has no fee estimates: the rate the wallet takes instead
+	// (sat/vB, `FEERATE`, 5 by default, the regtest ark's own fallback).
+	let rate = std::env::var("FEERATE").ok().and_then(|r| r.parse().ok()).unwrap_or(5);
+	config.fallback_fee_rate = Some(bark::ark::bitcoin::FeeRate::from_sat_per_vb_u32(rate));
 	let mut open = bark::OpenWalletArgs::default();
 	open.run_daemon = false;
 	open.datadir = Some(datadir);
+	arca_bark_wasm::exit::attach_funding(&mut open, net, &env("MNEMONIC")?).await?;
 	let wallet = bark::Wallet::open(net, seed, config, open).await?;
 
 	let out = if cmd == "sync" {
 		wallet.sync().await;
 		serde_json::json!({})
+	} else if cmd == "funding_address" {
+		// The phrase's first BIP84 address: the one a dual-chain wallet shows first.
+		let w = wallet.onchain().context("no funding wallet")?;
+		serde_json::json!({ "address": w.write().await.address().await?.to_string() })
 	} else {
 		arca_bark_wasm::run(&wallet, &cmd, &json).await?
 	};

@@ -7,6 +7,7 @@
 //! gRPC-web and its chain read from an Esplora server.
 
 pub mod command;
+pub mod exit;
 
 use std::sync::Arc;
 
@@ -31,6 +32,7 @@ pub async fn open(
 	let config = command::config(net, server, esplora);
 	let mut args = bark::OpenWalletArgs::default();
 	args.persister = persister;
+	exit::attach_funding(&mut args, net, mnemonic).await?;
 	bark::Wallet::open(net, seed, config, args).await
 }
 

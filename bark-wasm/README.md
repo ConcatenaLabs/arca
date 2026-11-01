@@ -48,6 +48,32 @@ server, and the next call schedules one for what replaced it. While a refresh
 is scheduled, `refresh` and the daemon leave that coin to the server, until six
 blocks past its height. A page calls it when it opens and after each sync.
 
+## Leaving the ark alone
+
+A coin's exit is already signed, so the wallet takes a coin to the chain
+without the server: it broadcasts every transaction from the round down to the
+coin, then, once the coin's exit delta has passed, claims it to the holder's
+own Bitcoin address (`m/84'/coin'/0'/0/0` unless another is named). Each of
+those transactions pays no fee itself and carries an anchor a child spends to
+pay it. The children are paid from the phrase's own BIP84 account, the coins a
+dual-chain wallet holds at its shared address: the wallet is opened with that
+account as its onchain wallet, so nothing else needs funding. A child spends
+only confirmed coins, so the address needs confirmed BTC for the whole walk,
+and the walk advances one level per block at best.
+
+An exit costs Bitcoin fees for every transaction above the coin. A coin is
+worth its exit when what reaches the address is more than 330 sat after every
+fee; `exit_estimate` prices each coin alone, and `exit_start` refuses one that
+is not worth it, in words.
+
+`exit_auto` is default mode's rule, the same in every wallet: when the server
+refused the wallet's last renewal (or the caller says it refused, with
+`ark_refused`) or cannot be reached now, it takes out every coin worth its exit
+within `margin` blocks of its expiry (144 by default, a day); otherwise it
+starts nothing. In every case it moves exits already under way on and claims
+what has finished. A page calls it after each sync; developer mode offers
+`exit_estimate` and `exit_start` as a button.
+
 ## Commands
 
 `BtcArk.open(network, mnemonic, server, esplora)`, then `run(command, json)`.
@@ -74,17 +100,29 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `catch_up` | | `recovered` (ids), `recovered_sat`, `spent_elsewhere` (ids), `failed` (ids), `complete` |
 | `history` | | the wallet's movements |
 | `coins` | | `tip`, each coin's `id`, `amount`, `expiry_height`, `refresh_height` (its scheduled refresh, or null), `state` |
+| `exit_estimate` | `vtxos`? (ids) | `tip`, `address` (where a claim goes), `fee_rate` (sat/vB), `funding_confirmed`, each coin's `id`, `amount`, `expiry_height`, `blocks_left`, `cost`, `worth`, `why_not`; `worth`: the worthwhile coins together, their `fees`, `claim_fee`, `cost`, `transactions`, `fundable` |
+| `exit_start` | `vtxos`? (ids; every worthwhile coin when absent) | `started` (ids), `amount`, `fees`, `claim_fee`, `cost`, `transactions`, `exits` |
+| `exit_progress` | `address`? | `exits` (each `id`, `state`, `claimable_height`, `error`), `claimed` (`txid`, `address`, `amount`, `coins`, or null), `pending`, `claimable_at` |
+| `exit_claim` | `address`? | `txid`, `address`, `amount`, `coins` |
+| `exit_status` | | `exits`: every exit, live or finished, with its `state` |
+| `exit_auto` | `address`?, `ark_refused`?, `margin`? | `action` (`none`, `started`, `cannot_start` with `reason`), `ark` (`answering`, `refused`, `unreachable`), `not_worth` (coins due but not worth their exit), `started`, `progress` |
+
+An exit's states are `starting`, `on_its_way`, `waiting_out_its_delay`,
+`claimable`, `claiming`, `claimed`, `spent_elsewhere` and `canceled`.
 
 `pay` refuses before anything moves when the fee would pass `max_fee_sats` or
 the server's longest lock would pass `max_delay`.
 
 A program that links the wallet natively runs the same commands: build with
 the `native` feature, open the wallet with `arca_bark_wasm::open` and call
-`arca_bark_wasm::run`. `examples/regtest_drive.rs` does so against the regtest
+`arca_bark_wasm::run`. A program that opens `bark::Wallet` itself calls
+`arca_bark_wasm::exit::attach_funding` on its `OpenWalletArgs` first, so its
+exits can pay their fees. `examples/regtest_drive.rs` does so against the regtest
 ark of `contrib/bitcoin-ark-regtest`, one command a run, the wallet closed
-between runs:
+between runs (`funding_address` answers the phrase's first BIP84 address, to
+fund an exit's fees from):
 
-    ARK=… BITCOIND=… COOKIE=… MNEMONIC="…" \
+    ARK=… BITCOIND=… COOKIE=… MNEMONIC="…" [FEERATE=5] \
     cargo run --features native --example regtest_drive -- DATADIR COMMAND [JSON]
 
 ## Build

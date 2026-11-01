@@ -291,6 +291,37 @@ impl OnchainWallet {
 
 		Ok(Self { inner: wallet, db })
 	}
+
+	/// The wallet of the seed's BIP84 account (`m/84'/coin'/0'`, receive and
+	/// change): native segwit coins, the account a wallet that shares one
+	/// address across Bitcoin and another chain already holds its BTC in.
+	/// Given to [crate::Wallet] as its onchain wallet, it pays an exit's fees
+	/// from those same coins, with no second on-chain wallet to fund.
+	///
+	/// Its first scan should be [OnchainWallet::initial_wallet_scan]: the
+	/// account's coins sit at addresses this wallet has not revealed.
+	pub async fn load_or_create_bip84(network: Network, seed: [u8; 64], db: Arc<dyn BarkPersister>) -> anyhow::Result<Self> {
+		let xpriv = bip32::Xpriv::new_master(network, &seed).expect("valid seed");
+		let desc = bdk_wallet::template::Bip84(xpriv, KeychainKind::External);
+		let change = bdk_wallet::template::Bip84(xpriv, KeychainKind::Internal);
+
+		let changeset = db.initialize_bdk_wallet().await.context("error reading bdk wallet state")?;
+		let wallet_opt = bdk_wallet::Wallet::load()
+			.descriptor(KeychainKind::External, Some(desc.clone()))
+			.descriptor(KeychainKind::Internal, Some(change.clone()))
+			.extract_keys()
+			.check_network(network)
+			.load_wallet_no_persist(changeset)?;
+
+		let wallet = match wallet_opt {
+			Some(wallet) => wallet,
+			None => bdk_wallet::Wallet::create(desc, change)
+				.network(network)
+				.create_wallet_no_persist()?,
+		};
+
+		Ok(Self { inner: wallet, db })
+	}
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
