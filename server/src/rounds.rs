@@ -884,17 +884,30 @@ impl Rounds {
 		// not read the record of an accumulator batch rest in a tree of their
 		// own beside it, in the same round: such a wallet could not check its
 		// slot, and so would never hand over its forfeits, and the round,
-		// held for them, would be lost for everyone in it.
+		// held for them, would be lost for everyone in it. Only where the
+		// batch could be an accumulator batch at all ([`Self::may_accumulate`]):
+		// otherwise it is a tree whoever reads what, and a second tree would
+		// cost an output, a root and its unroll path for nothing, and show on
+		// the chain whose leaves are whose.
 		let reads = |k: usize| self.reads_accumulator(rows[k]);
 		let mut out = vec![];
 		for b in plan_batches(&leaves, room) {
+			let split = !b.own && self.may_accumulate(&b.asset);
 			let mut by: BTreeMap<(bool, Option<u32>), Vec<(usize, usize)>> = BTreeMap::new();
 			for l in b.leaves {
-				by.entry((!b.own && !reads(l.0), vest_of(l))).or_default().push(l);
+				by.entry((split && !reads(l.0), vest_of(l))).or_default().push(l);
 			}
 			out.extend(by.into_iter().map(|((unread, _), leaves)| BatchPlan { asset: b.asset, leaves, own: b.own, tree: b.tree || unread }));
 		}
 		Ok(out)
+	}
+
+	/// Whether a shared batch of `asset` may be built as an accumulator
+	/// batch: only when the operator sets
+	/// [`RoundConfig::accumulator_exit_rate_ppm`], and never for an asset
+	/// with an issuer, whose batches are trees ([`BatchKind::choose`]).
+	pub fn may_accumulate(&self, asset: &AssetId) -> bool {
+		self.config.accumulator_exit_rate_ppm.is_some() && !self.params.assets.get(asset).is_some_and(|a| a.issuer.is_some())
 	}
 
 	/// Whether the wallet of `row` reads the record of a leaf of the
