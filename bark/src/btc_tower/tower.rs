@@ -21,6 +21,12 @@
 //! coins spending one output: only one can ever reach the chain) or is
 //! already spent on chain by another transaction.
 //!
+//! Its own coins' wallet starts at the tower's birthday (`birthday`, the
+//! first block within two hours of its phrase being made), never at
+//! genesis: nothing older can be its own. While a pass brings that wallet up
+//! to the chain, the tower keeps answering ([Tower::sync_float_of] holds
+//! only the wallet, not the tower).
+//!
 //! A pass reads every deposit's state from the chain again: a rescue a reorg
 //! undid goes back to `rescuing` or `claiming`, and a claim counts as final
 //! once it is [CLAIM_DEPTH] blocks deep.
@@ -63,6 +69,10 @@ pub const MAX_DEPOSIT_BYTES: usize = 256 * 1024;
 /// The blocks a claim must be buried under before the tower stops watching
 /// it: until then a reorg can undo it, and the tower broadcasts it again.
 pub const CLAIM_DEPTH: u32 = 6;
+
+/// How far before its phrase was made a tower's wallet starts looking: block
+/// times can run two hours from the clock.
+pub const BIRTHDAY_SLACK_SECS: u64 = 2 * 3600;
 
 /// The share of a margin's blocks a tower counts on to bring the deposits due
 /// in it on chain: one exit transaction per coin of its own per block, for
@@ -189,11 +199,52 @@ struct Store {
 	mempool_since: BTreeMap<String, BlockHeight>,
 }
 
+/// What the tower's own coins can pay, as of its wallet's last sync or
+/// payment: read by `info` and deposits without waiting on the wallet.
+#[derive(Debug, Clone, Default)]
+pub struct Figures {
+	/// Its coins: confirmed, and its own change on the way.
+	pub sat: Amount,
+	/// The value of each confirmed coin.
+	pub coins: Vec<u64>,
+	/// The height its wallet has read the chain to.
+	pub synced_to: BlockHeight,
+}
+
+fn figures_of(w: &OnchainWallet) -> Figures {
+	let b = w.balance();
+	Figures {
+		sat: b.confirmed + b.trusted_pending,
+		coins: w.list_unspent().iter().filter(|u| u.chain_position.is_confirmed()).map(|u| u.txout.value.to_sat()).collect(),
+		synced_to: w.inner.latest_checkpoint().height(),
+	}
+}
+
+/// The first height whose block is no older than `since` (unix seconds), by
+/// a search over the chain up to `tip`.
+async fn first_block_since(chain: &ChainSource, since: u64, tip: BlockHeight) -> anyhow::Result<BlockHeight> {
+	let time = |h: BlockHeight| async move {
+		let r = chain.block_ref(h).await?;
+		let b = chain.block(r.hash).await?.context("a block the node does not have")?;
+		anyhow::Ok(b.header.time as u64)
+	};
+	let (mut lo, mut hi) = (0, tip);
+	if time(hi).await? < since {
+		return Ok(tip);
+	}
+	while lo < hi {
+		let mid = lo + (hi - lo) / 2;
+		if time(mid).await? < since { lo = mid + 1 } else { hi = mid }
+	}
+	Ok(lo)
+}
+
 pub struct Tower {
 	dir: PathBuf,
 	cfg: TowerConfig,
 	chain: Arc<ChainSource>,
-	float: OnchainWallet,
+	float: Arc<tokio::sync::Mutex<OnchainWallet>>,
+	figures: Figures,
 	payout: Address,
 	store: Store,
 	paths: Paths,
@@ -248,13 +299,30 @@ impl Tower {
 			#[cfg(feature = "socks5-proxy")] None).await?);
 		let _ = chain.update_fee_rates(cfg.fallback_rate).await;
 		let fast = chain.fee_rates().await.fast;
+		// The wallet's birthday: nothing older than its phrase can be its own.
+		let bpath = dir.join("birthday");
+		let birthday = match std::fs::read_to_string(&bpath).ok().and_then(|s| s.trim().parse::<BlockHeight>().ok()) {
+			Some(h) => h,
+			None => {
+				let made = std::fs::metadata(&mpath).and_then(|m| m.modified()).ok()
+					.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+				let tip = chain.tip().await?;
+				let h = first_block_since(&chain, made.saturating_sub(BIRTHDAY_SLACK_SECS), tip).await?;
+				std::fs::write(&bpath, h.to_string()).context("writing the birthday")?;
+				h
+			},
+		};
+		if float.inner.latest_checkpoint().height() + 1 < birthday {
+			use bitcoin_ext::bdk::WalletExt;
+			let at = birthday - 1;
+			let r = chain.block_ref(at).await?;
+			info!("btc tower: its coins' wallet reads the chain from block {} (its birthday)", birthday);
+			float.inner.set_checkpoint(at, r.hash);
+		}
+		let figures = figures_of(&float);
 		let store = load_store(&dir.join("deposits.json"))?;
 		let paths = Paths::of(&store);
-		let mut t = Tower { dir: dir.to_path_buf(), cfg, chain, float, payout, store, paths, fast };
-		if let Err(e) = t.float.sync(&t.chain).await {
-			warn!("btc tower: the float did not sync: {:#}", e);
-		}
-		Ok(t)
+		Ok(Tower { dir: dir.to_path_buf(), cfg, chain, float: Arc::new(tokio::sync::Mutex::new(float)), figures, payout, store, paths, fast })
 	}
 
 	fn save(&self) -> anyhow::Result<()> {
@@ -272,7 +340,26 @@ impl Tower {
 
 	/// A fresh address of the tower's own account, to fund it.
 	pub async fn funding_address(&mut self) -> anyhow::Result<Address> {
-		self.float.address().await
+		self.float.lock().await.address().await
+	}
+
+	/// The wallet of the tower's own coins, to sync without holding the tower
+	/// ([Tower::sync_float_of]).
+	pub fn float(&self) -> Arc<tokio::sync::Mutex<OnchainWallet>> {
+		self.float.clone()
+	}
+
+	/// Brings the tower's wallet up to the chain, holding only the wallet,
+	/// and returns its figures for [Tower::set_figures].
+	pub async fn sync_float_of(float: &tokio::sync::Mutex<OnchainWallet>, chain: &ChainSource) -> anyhow::Result<Figures> {
+		let mut f = float.lock().await;
+		f.sync(chain).await?;
+		Ok(figures_of(&f))
+	}
+
+	/// Takes the figures of a sync made without holding the tower.
+	pub fn set_figures(&mut self, f: Figures) {
+		self.figures = f;
 	}
 
 	/// The rate the tower prices a rescue at today.
@@ -282,8 +369,7 @@ impl Tower {
 
 	/// The tower's own coins: those confirmed and its own change on the way.
 	fn float_sat(&self) -> Amount {
-		let b = self.float.balance();
-		b.confirmed + b.trusted_pending
+		self.figures.sat
 	}
 
 	/// What the deposits it holds may still cost it: each one's rescue fee,
@@ -295,8 +381,7 @@ impl Tower {
 	/// The confirmed coins of its own that can each pay a child at its rate.
 	fn float_coins(&self) -> usize {
 		let child = self.rate().to_sat_per_vb_ceil().saturating_mul(super::CHILD_VB) + 330;
-		self.float.list_unspent().iter()
-			.filter(|u| u.chain_position.is_confirmed() && u.txout.value.to_sat() >= child).count()
+		self.figures.coins.iter().filter(|v| **v >= child).count()
 	}
 
 	/// The exit transactions it can bring on chain within one margin.
@@ -325,6 +410,7 @@ impl Tower {
 			"short_sat": committed.checked_sub(float).unwrap_or(Amount::ZERO).to_sat(),
 			"float_coins": self.float_coins(),
 			"exits_per_margin": self.exits_per_margin(),
+			"float_synced_to": self.figures.synced_to,
 		})
 	}
 
@@ -477,11 +563,14 @@ impl Tower {
 			MakeCpfpFees::Rbf { current_package_fee, .. } => *current_package_fee,
 			_ => Amount::ZERO,
 		};
-		let child = self.float.make_signed_p2a_cpfp(tx, fees).await
+		let mut float = self.float.lock().await;
+		let child = float.make_signed_p2a_cpfp(tx, fees).await
 			.map_err(|e| BroadcastError::Other(format!("cannot pay a child: {}", e)))?;
 		self.chain.broadcast_package(&[tx, &child]).await?;
-		let fee = self.float.inner.calculate_fee(&child).unwrap_or(Amount::ZERO);
-		let _ = self.float.store_signed_p2a_cpfp(&child).await;
+		let fee = float.inner.calculate_fee(&child).unwrap_or(Amount::ZERO);
+		let _ = float.store_signed_p2a_cpfp(&child).await;
+		self.figures = figures_of(&float);
+		drop(float);
 		if let Some(d) = self.store.deposits.get_mut(k) {
 			d.paid = d.paid.saturating_add(fee.checked_sub(replaced).unwrap_or(Amount::ZERO).to_sat());
 		}
@@ -518,16 +607,27 @@ impl Tower {
 
 	/// One pass over every deposit still to act on. Returns what it did.
 	pub async fn pass(&mut self) -> anyhow::Result<Value> {
-		// Every pass reads the chain as it is now: the source's cached tip
-		// can lag by blocks, and a pass acts at exact heights.
+		let (tip, fast) = self.pass_begin().await?;
+		match Self::sync_float_of(&self.float, &self.chain).await {
+			Ok(f) => self.figures = f,
+			Err(e) => warn!("btc tower: the float did not sync: {:#}", e),
+		}
+		self.pass_deposits(tip, fast).await
+	}
+
+	/// A pass's first step: the chain's tip and fast rate, read as they are
+	/// now (the source's cached tip can lag by blocks, and a pass acts at
+	/// exact heights).
+	pub async fn pass_begin(&mut self) -> anyhow::Result<(BlockHeight, FeeRate)> {
 		self.chain.invalidate_caches().await;
 		let _ = self.chain.update_fee_rates(self.cfg.fallback_rate).await;
 		let fast = self.chain.fee_rates().await.fast;
 		self.fast = fast;
-		let tip = self.chain.tip().await?;
-		if let Err(e) = self.float.sync(&self.chain).await {
-			warn!("btc tower: the float did not sync: {:#}", e);
-		}
+		Ok((self.chain.tip().await?, fast))
+	}
+
+	/// A pass's last step, once the wallet is synced: every deposit acted on.
+	pub async fn pass_deposits(&mut self, tip: BlockHeight, fast: FeeRate) -> anyhow::Result<Value> {
 		let keys: Vec<String> = self.store.deposits.iter()
 			.filter(|(_, d)| d.watched(tip))
 			.map(|(k, _)| k.clone()).collect();
@@ -690,7 +790,7 @@ impl Tower {
 
 	/// The tower's own coins.
 	pub async fn balance(&self) -> Amount {
-		self.float.balance().total()
+		self.float.lock().await.balance().total()
 	}
 
 	/// Calls by name, as the HTTP service routes them.

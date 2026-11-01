@@ -1106,3 +1106,37 @@ async fn a_rescue_undone_by_a_reorg_is_broadcast_again() {
 	println!("  claimed and buried: {}", tower.deposits()[0]["note"]);
 	println!("DONE");
 }
+
+/// A tower's wallet reads the chain from its birthday, the first block within
+/// two hours of its phrase being made, never from genesis.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_towers_wallet_starts_at_its_birthday() {
+	let Some((node, base)) = start_node("birthday", 100) else { return };
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+	// 150 blocks of today, then 50 blocks ten days on
+	node.rpc.call::<Value>("setmocktime", &[json!(now + 10 * 24 * 3600)]).unwrap();
+	node.mine(50);
+	let dir = base.join("tower");
+	std::fs::create_dir_all(&dir).unwrap();
+	// a phrase made five days on: its birthday is the first block of the later 50
+	let m = base.join("tower/mnemonic");
+	std::fs::write(&m, phrase("bd-tower").to_string()).unwrap();
+	std::fs::File::options().write(true).open(&m).unwrap()
+		.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(now + 5 * 24 * 3600)).unwrap();
+	let mut tower = open_tower(&node, &dir, vec![]).await;
+	let birthday: u32 = std::fs::read_to_string(dir.join("birthday")).unwrap().trim().parse().unwrap();
+	let info = tower.info().await;
+	println!("  tip {}; the tower's birthday {}; its wallet starts at {}", node.tip(), birthday, info["float_synced_to"]);
+	assert_eq!(birthday, 151);
+	assert_eq!(info["float_synced_to"], json!(150));
+	fund_tower(&node, &mut tower, 2).await;
+	let info = tower.info().await;
+	println!("  after funding and a pass: synced to {}, {} sat in {} coins", info["float_synced_to"], info["float_sat"], info["float_coins"]);
+	assert_eq!(info["float_synced_to"], json!(node.tip()));
+	assert_eq!(info["float_sat"], json!(2_000_000));
+	// reopened, it keeps its birthday and its wallet's height
+	drop(tower);
+	let tower = open_tower(&node, &dir, vec![]).await;
+	assert_eq!(tower.info().await["float_synced_to"], json!(node.tip()));
+	println!("DONE");
+}

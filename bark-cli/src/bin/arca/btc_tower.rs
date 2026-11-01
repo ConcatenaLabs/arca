@@ -7,11 +7,13 @@
 //! chain source, the arks it watches, its least rate); a bitcoind password is
 //! never written there, but read from `ARCA_BITCOIND_PASSWORD` at each start.
 //! `serve` answers `GET /v1/info`, `POST /v1/deposit` and `POST /v1/withdraw`
-//! over HTTP, with the same server as `arca watchtower serve`, and passes over
-//! its deposits every `interval` seconds.
+//! over HTTP, with the same request handling as `arca watchtower serve`, and
+//! passes over its deposits every `interval` seconds; a request never waits
+//! on a pass's sync of the tower's wallet.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 use bark::arca::Error;
 use bark::btc_tower::tower::{Tower, TowerConfig};
@@ -154,25 +156,72 @@ pub fn run(datadir: &Path, cmd: BtcTowerCmd) -> Result<Value, Error> {
 	let mut t = rt.block_on(Tower::open(&d, cfg)).map_err(err)?;
 	match cmd {
 		BtcTowerCmd::Create { .. } => unreachable!(),
-		BtcTowerCmd::Serve { listen, interval } => super::tower::serve_with(&listen, interval, "arca btc-watchtower", |req| {
-			let r = match req {
-				Some((call, body)) => rt.block_on(t.call(call, body)),
-				None => rt.block_on(t.pass()),
-			};
-			match r {
-				Ok(v) => (200, v),
-				Err(e) => {
-					let m = format!("{:#}", e);
-					match m.strip_prefix("refused: ") {
-						Some(r) => (422, json!({"error": {"code": "refused", "message": r}})),
-						None => (503, json!({"error": {"code": "unavailable", "message": m}})),
-					}
-				},
-			}
-		}),
+		BtcTowerCmd::Serve { listen, interval } => serve(rt, t, &listen, interval),
 		BtcTowerCmd::Pass => rt.block_on(t.pass()).map_err(err),
 		BtcTowerCmd::Deposits => Ok(t.deposits()),
 		BtcTowerCmd::Info => Ok(rt.block_on(t.info())),
 		BtcTowerCmd::Address => Ok(json!({"address": rt.block_on(t.funding_address()).map_err(err)?.to_string()})),
+	}
+}
+
+fn answer(r: anyhow::Result<Value>) -> (u16, Value) {
+	match r {
+		Ok(v) => (200, v),
+		Err(e) => {
+			let m = format!("{:#}", e);
+			match m.strip_prefix("refused: ") {
+				Some(r) => (422, json!({"error": {"code": "refused", "message": r}})),
+				None => (503, json!({"error": {"code": "unavailable", "message": m}})),
+			}
+		},
+	}
+}
+
+/// Serves the tower until stopped. A request never waits on a pass's slow
+/// part: `info` is answered from what the tower last stated, and while a pass
+/// brings the tower's wallet up to the chain (its first sync can take long)
+/// it holds only that wallet, so deposits and withdrawals go on. Only a
+/// pass's walk over the deposits, and each call, hold the tower.
+fn serve(rt: tokio::runtime::Runtime, t: Tower, listen: &str, interval: u64) -> Result<Value, Error> {
+	use std::sync::{Arc, RwLock};
+	let name = "arca btc-watchtower";
+	let info = Arc::new(RwLock::new(rt.block_on(t.info())));
+	let float = t.float();
+	let chain = t.chain().clone();
+	let tower = Arc::new(tokio::sync::Mutex::new(t));
+	let handle = rt.handle().clone();
+	let (tw, inf) = (tower.clone(), info.clone());
+	super::tower::serve_each(listen, name, Arc::new(move |call: &str, body: &Value| {
+		if call == "info" {
+			return (200, inf.read().map(|v| v.clone()).unwrap_or(Value::Null));
+		}
+		handle.block_on(async {
+			let mut t = tw.lock().await;
+			let r = t.call(call, body).await;
+			if let Ok(mut i) = inf.write() { *i = t.info().await; }
+			answer(r)
+		})
+	}))?;
+	eprintln!("{}: a pass every {} s", name, interval);
+	loop {
+		let started = std::time::Instant::now();
+		let r: anyhow::Result<Value> = rt.block_on(async {
+			let (tip, fast) = tower.lock().await.pass_begin().await?;
+			let synced = Tower::sync_float_of(&float, &chain).await;
+			let mut t = tower.lock().await;
+			match synced {
+				Ok(f) => t.set_figures(f),
+				Err(e) => eprintln!("{}: its wallet did not sync: {:#}", name, e),
+			}
+			let v = t.pass_deposits(tip, fast).await;
+			if let Ok(mut i) = info.write() { *i = t.info().await; }
+			v
+		});
+		match r {
+			Ok(v) if v["acted"].as_array().is_some_and(|a| !a.is_empty()) => eprintln!("{}: {}", name, v),
+			Ok(_) => {},
+			Err(e) => eprintln!("{}: the pass stopped: {:#}", name, e),
+		}
+		std::thread::sleep(Duration::from_secs(interval.max(1)).saturating_sub(started.elapsed()));
 	}
 }
