@@ -2364,10 +2364,45 @@ impl Wallet {
 	///
 	/// Returns the refreshes scheduled by this call.
 	pub async fn schedule_refreshes(&self) -> anyhow::Result<Vec<ScheduledRefresh>> {
+		self.schedule_refreshes_except(&HashSet::new()).await
+	}
+
+	/// [Wallet::schedule_refreshes], leaving out the coins in `except`: those a Bitcoin ark
+	/// watchtower covers (`no_refresh` of [Wallet::btc_tower_plan]). A coin gets a tower or
+	/// a delegated refresh, never both, and a scheduled refresh cannot be cancelled.
+	pub async fn schedule_refreshes_except(
+		&self,
+		except: &HashSet<VtxoId>,
+	) -> anyhow::Result<Vec<ScheduledRefresh>> {
+		let mut ret = Vec::new();
+		for (height, vtxos) in self.refreshes_to_schedule(except).await? {
+			let ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
+			let amount = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
+			match self.refresh_vtxos_scheduled(vtxos, height).await {
+				Ok(Some(_)) => {
+					info!("Scheduled the refresh of {} VTXO(s) ({}) at height {}",
+						ids.len(), amount, height);
+					ret.push(ScheduledRefresh { height, vtxos: ids, amount });
+				},
+				Ok(None) => {},
+				Err(e) => warn!("Could not schedule the refresh of {:?} at height {}: {:#}",
+					ids, height, e),
+			}
+		}
+		Ok(ret)
+	}
+
+	/// The refreshes [Wallet::schedule_refreshes_except] would schedule: each height with
+	/// the coins it would refresh there, leaving out the coins in `except`, those with a
+	/// refresh pending already, and those it cannot schedule.
+	pub async fn refreshes_to_schedule(
+		&self,
+		except: &HashSet<VtxoId>,
+	) -> anyhow::Result<Vec<(BlockHeight, Vec<WalletVtxo>)>> {
 		let tip = self.inner.chain.tip().await?;
 		let margin = self.inner.config.vtxo_refresh_expiry_threshold
 			.max(SCHEDULED_REFRESH_MARGIN) as BlockHeight;
-		let mut busy = HashSet::new();
+		let mut busy = except.clone();
 		for round in self.pending_round_states().await? {
 			busy.extend(round.state().participation().inputs.iter().map(|v| v.id()));
 		}
@@ -2383,24 +2418,7 @@ impl Wallet {
 			}
 			by_expiry.entry(v.expiry_height()).or_default().push(v);
 		}
-
-		let mut ret = Vec::new();
-		for (expiry, vtxos) in by_expiry {
-			let height = expiry.saturating_sub(margin).max(tip);
-			let ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
-			let amount = vtxos.iter().map(|v| v.amount()).sum::<Amount>();
-			match self.refresh_vtxos_scheduled(vtxos, height).await {
-				Ok(Some(_)) => {
-					info!("Scheduled the refresh of {} VTXO(s) ({}) at height {}",
-						ids.len(), amount, height);
-					ret.push(ScheduledRefresh { height, vtxos: ids, amount });
-				},
-				Ok(None) => {},
-				Err(e) => warn!("Could not schedule the refresh of {:?} at height {}: {:#}",
-					ids, height, e),
-			}
-		}
-		Ok(ret)
+		Ok(by_expiry.into_iter().map(|(expiry, vtxos)| (expiry.saturating_sub(margin).max(tip), vtxos)).collect())
 	}
 
 	/// This will find all VTXOs that meets must-refresh criteria. Then, if there are some VTXOs to

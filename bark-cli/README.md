@@ -1273,10 +1273,27 @@ A day (144 blocks) before the coin's expiry the watchtower broadcasts the
 coin's transactions level by level, each with a child it pays through the
 transaction's anchor, and once the coin's exit delta has passed it broadcasts
 the claim the same way. It acts at once instead when an earlier holder of a
-coin paid out of round brings that earlier coin on chain. It refuses a
-deposit whose coin does not validate against its anchor on chain, whose
-claim is not signed by the coin's key or pays it less than a rescue costs at
-its least rate, or whose ark it does not watch.
+coin paid out of round brings that earlier coin on chain. At every pass it
+reads each deposit's state from the chain again, so a rescue a Bitcoin reorg
+undid is broadcast again, and it watches a claim until it is six blocks deep.
+
+It refuses a deposit
+- whose coin does not validate against its anchor on chain, or whose ark it
+  does not watch;
+- whose claim is not signed by the coin's key, or pays it less than a rescue
+  costs at its least rate, or more than a twentieth of the coin (a coin worth
+  less than 20 times its rescue is not worth rescuing);
+- whose way out spends an output differently from a coin it holds (only one
+  of two such coins can ever reach the chain), or is already spent on chain;
+- that its own BTC cannot pay for: the rescue fees of the deposits it holds
+  never exceed its coins;
+- that it could not bring on chain in time: each child spends one confirmed
+  coin of its own, so it pushes about one exit transaction per coin per
+  block, and the exit transactions of the coins due within one margin of each
+  other may not exceed its coins times half the margin.
+
+So fund it with BTC for the rescues it is to pay for (a rescue is about 1,400
+vB: about 42,000 sat at 30 sat/vB), split into several coins.
 
     arca btc-watchtower create --network testnet4 --bitcoind http://127.0.0.1:48332 \
         --bitcoind-user NAME [--ark SERVER_KEY …] [--min-rate 5]   # password from ARCA_BITCOIND_PASSWORD
@@ -1290,8 +1307,51 @@ It answers `GET /v1/info`, `POST /v1/deposit` (`{"vtxo", "claim"}`) and
 `SHA256(T ‖ T ‖ network magic ‖ claim txid)`, `T = SHA256("Arca/btc-tower-withdraw")`),
 under any path prefix. A deposit for a coin it already holds replaces that
 one. A withdrawal arriving after the rescue started is answered
-`"withdrawn": false`. Wallets make their deposits and withdrawals with
-`tower_plan` (`bark-wasm`).
+`"withdrawn": false`. Its `info` states its least rate (`min_rate_sat_vb`)
+and the rate it prices a rescue at today (`rate_sat_vb`, the higher of that
+and the chain's fast rate), and what its BTC can still pay for: `float_sat`,
+`committed_sat` (the rescue fees of the deposits it holds), `capacity_sat`,
+`short_sat` (above zero when spent coins leave it unable to pay for every
+deposit it holds), `float_coins` and `exits_per_margin`. Wallets make their
+deposits and withdrawals with `tower_plan` (`bark-wasm`), which judges a coin
+and prices its claim at one rate, and counts a coin covered only by a
+watchtower that took it and is not short.
+
+Its node login needs only these calls, and should be a login of its own that
+Bitcoin Core limits to them (`rpcauth` with `rpcwhitelist`, and
+`rpcwhitelistdefault=0` so other logins keep theirs): `getblockchaininfo`,
+`getnetworkinfo`, `getindexinfo`, `getblockcount`, `getbestblockhash`,
+`getblockhash`, `getblockheader`, `getblock`, `getrawtransaction`, `gettxout`,
+`getrawmempool`, `getmempoolentry`, `estimatesmartfee`, `sendrawtransaction`,
+`submitpackage`. The node needs `-txindex`.
+
+#### What a Bitcoin ark watchtower does not do
+
+- **It cannot make a holder pay.** Once a rescued coin's output is on chain
+  and its exit delay has passed, the holder's key alone can spend it, so a
+  holder can claim the coin itself, ahead of the watchtower's claim. The
+  watchtower then has paid every fee and is paid nothing. Each such coin
+  costs it about one rescue; enough of them empty its BTC, after which it
+  rescues no one until it is funded again.
+- **It cannot tell who deposits.** Anyone holding coins of an ark it watches
+  can deposit them. An operator with many coins of its own can fill a
+  watchtower's capacity with real coins, which keeps others' deposits out
+  until the watchtower is funded more.
+- **It learns every coin it holds.** A deposit is in the clear: the
+  watchtower sees the coin, its amount and the holder's claim address.
+- **The fee is fixed when the deposit is made.** If Bitcoin fees rise above
+  it by the time of the rescue, the watchtower still brings the coin on chain
+  and pays the difference.
+- **It rescues only coins worth it.** A coin worth less than 20 times its
+  rescue at the watchtower's rate is not taken, and stays on the ark's
+  delegated refresh and its operator's honesty.
+- **It keeps its deposits in one file** (`deposits.json`), rewritten at each
+  deposit, and a pass reads every deposit: a watchtower holding many
+  thousands of deposits answers and passes slowly.
+- **A coin has a watchtower or a delegated refresh, never both.** A
+  watchtower cannot tell a refreshed coin from an abandoned one, and the ark
+  cannot cancel a scheduled refresh, so wallets deposit only coins with no
+  refresh scheduled and schedule none for the coins they deposit.
 
 ### Watchtowers: a coin kept safe while the wallet is away
 

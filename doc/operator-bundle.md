@@ -432,25 +432,36 @@ expiry, and nothing in script stops an operator that does. Every transaction
 of a coin's way out is already signed, though, so anyone holding the coin's
 data can bring it on chain before then, choosing nothing but the fee. A
 wallet therefore deposits, with each Bitcoin ark watchtower it names, every
-coin worth rescuing (at least 20 times what bringing it on chain costs at the
-day's fast fee rate), together with a claim its holder signs once: the coin
-to the holder's own address, less a fixed rescue fee to the watchtower. A
+coin worth rescuing (at least 20 times what bringing it on chain costs, at the
+rate the watchtower charges for it), together with a claim its holder signs
+once: the coin to the holder's own address, less that rescue fee to the
+watchtower. A
 day (144 blocks) before a coin's expiry the watchtower broadcasts the coin's
 transactions level by level, paying each through its anchor from its own
 BTC, and once the coin's exit delay has passed it broadcasts the claim. It
 also acts at once when an earlier holder of a coin paid out of round takes
 that earlier coin home, which the coin must answer within its exit delay.
 A wallet that spends a coin withdraws its deposit; the coin's holder signs
-the withdrawal, and nobody else can make one.
+the withdrawal, and nobody else can make one. A coin whose exit the wallet
+has started keeps its deposit until that exit is claimed, so a wallet closed
+mid-exit leaves the rest to the watchtowers. A coin has a watchtower or the
+ark's delegated refresh, never both: a wallet deposits only coins with no
+refresh scheduled, and schedules none for the coins it deposits.
 
 Each operator runs one for the other's users, so a holder who goes away needs
 one of two watchtowers run by different operators, and neither operator's
 honesty. The bundle's is `arca btc-watchtower`, made at install with its own
 phrase and served at `https://<DOMAIN>/btc-watchtower`. It takes the coins of
 every ark unless `BTC_TOWER_ARKS` names some. Its BTC pays the fees and the
-claims pay it back: fund it with a few separate coins (`$B addresses`, the
-line `btc-watchtower`), since each fee is paid from a confirmed coin and one
-coin pays one fee per block.
+claims pay it back, and it takes only the deposits its BTC can pay for, so
+it covers about one coin per rescue's worth of BTC (about 42,000 sat at 30
+sat/vB). Fund it with several separate coins (`$B addresses`, the line
+`btc-watchtower`), since each fee is paid from a confirmed coin and one coin
+pays one fee per block: a watchtower of one coin refuses a round's worth of
+coins coming due together. Its `info` says what it can still pay for
+(`capacity_sat`) and what it can bring on chain in one margin
+(`exits_per_margin`). What a watchtower cannot do is listed in
+[the CLI's README](../bark-cli/README.md#what-a-bitcoin-ark-watchtower-does-not-do).
 
 **An installed bundle takes it on with an update** (`git pull` in the clone,
 then `$B install`, or `docker compose up -d --build`); a `bundle.env` written
@@ -462,8 +473,8 @@ anywhere,
 
     curl -s https://<DOMAIN>/btc-watchtower/v1/info
 
-answers `"kind": "bitcoin-ark-watchtower"`, `"network": "testnet4"` and the
-payout address its rescue fees are paid to. Tell the sequentiatestnet.com
+answers `"kind": "bitcoin-ark-watchtower"`, `"network": "testnet4"`, the
+payout address its rescue fees are paid to, and `capacity_sat`. Tell the sequentiatestnet.com
 operator that URL: its wallets add it to the Bitcoin ark watchtowers they
 deposit with.
 

@@ -5,6 +5,25 @@
 //! pays children with), its Bitcoin wallet (`float.sqlite`, the phrase's
 //! BIP84 account) and its deposits (`deposits.json`). Its rescue fees are
 //! paid to the account's first address, which its `info` names.
+//!
+//! It takes only what its own coins can pay for:
+//! - **value:** the rescue fees of the deposits it holds never exceed its
+//!   coins ([Tower::info]'s `capacity_sat`); a deposit beyond that is
+//!   refused, and `short_sat` says when spent coins left it unable to pay
+//!   for every deposit it holds;
+//! - **count:** each child spends one confirmed coin of its own, so it
+//!   brings about one exit transaction on chain per coin per block. The exit
+//!   transactions of the deposits whose expiries fall within one margin of
+//!   each other may not exceed its coins times half the margin
+//!   ([THROUGHPUT_SHARE]), the other half left for fees to rise.
+//!
+//! It refuses a coin whose path out conflicts with a coin it holds (two
+//! coins spending one output: only one can ever reach the chain) or is
+//! already spent on chain by another transaction.
+//!
+//! A pass reads every deposit's state from the chain again: a rescue a reorg
+//! undid goes back to `rescuing` or `claiming`, and a claim counts as final
+//! once it is [CLAIM_DEPTH] blocks deep.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,7 +48,7 @@ use bitcoin_ext::fee::P2A_SCRIPT;
 use crate::chain::{BroadcastError, ChainSource, ChainSourceSpec};
 use crate::onchain::{OnchainWallet, OnchainWalletTrait};
 use crate::persist::sqlite::SqliteClient;
-use super::{check_claim, check_withdrawal, rescue_cost, KIND, WORTH_FACTOR};
+use super::{check_claim, check_withdrawal, fee_is_worth, rescue_cost, KIND, WORTH_FACTOR};
 
 /// The blocks an exit or claim may sit in the mempool before the tower
 /// replaces its child with one paying more.
@@ -40,6 +59,15 @@ pub const MAX_DEPOSITS: usize = 100_000;
 
 /// The largest deposit a tower takes, in bytes of its JSON body.
 pub const MAX_DEPOSIT_BYTES: usize = 256 * 1024;
+
+/// The blocks a claim must be buried under before the tower stops watching
+/// it: until then a reorg can undo it, and the tower broadcasts it again.
+pub const CLAIM_DEPTH: u32 = 6;
+
+/// The share of a margin's blocks a tower counts on to bring the deposits due
+/// in it on chain: one exit transaction per coin of its own per block, for
+/// half the margin.
+pub const THROUGHPUT_SHARE: u32 = 2;
 
 /// How a tower is set up.
 #[derive(Debug, Clone)]
@@ -71,6 +99,85 @@ pub struct Deposit {
 	/// The txids this tower broadcast for the deposit, children included.
 	#[serde(default)]
 	pub broadcast: Vec<String>,
+	/// The height the claim was confirmed at, while it is not yet
+	/// [CLAIM_DEPTH] deep.
+	#[serde(default)]
+	pub claimed_at: Option<BlockHeight>,
+	/// What the tower has paid in children for it so far.
+	#[serde(default)]
+	pub paid: u64,
+}
+
+const LIVE: [&str; 3] = ["waiting", "rescuing", "claiming"];
+
+impl Deposit {
+	fn live(&self) -> bool {
+		LIVE.contains(&self.state.as_str())
+	}
+	/// Whether a pass still looks at it: live, or claimed and not yet buried.
+	fn watched(&self, tip: BlockHeight) -> bool {
+		self.live() || (self.state == "claimed"
+			&& self.claimed_at.map_or(true, |h| tip < h.saturating_add(CLAIM_DEPTH - 1)))
+	}
+}
+
+/// What the tower knows of the exit transactions of the coins it holds.
+#[derive(Default)]
+struct Paths {
+	/// The exit transactions of each live deposit's coin, by the claim's txid.
+	txs: std::collections::HashMap<String, (BlockHeight, Vec<Txid>)>,
+	/// For every output an exit transaction spends, the transaction.
+	spends: std::collections::HashMap<OutPoint, Txid>,
+}
+
+impl Paths {
+	fn of(store: &Store) -> Paths {
+		let mut p = Paths::default();
+		for (k, d) in store.deposits.iter().filter(|(_, d)| d.live()) {
+			if let Ok(v) = parse_vtxo(&d.vtxo) {
+				p.add(k, &v);
+			}
+		}
+		p
+	}
+	fn add(&mut self, k: &str, v: &Vtxo<Full>) {
+		let mut ids = vec![];
+		for t in v.transactions() {
+			let txid = t.tx.compute_txid();
+			for i in &t.tx.input {
+				self.spends.insert(i.previous_output, txid);
+			}
+			ids.push(txid);
+		}
+		self.txs.insert(k.to_string(), (v.expiry_height(), ids));
+	}
+	/// A transaction of a held coin's path that spends what one of `v`'s
+	/// does, differently.
+	fn conflict(&self, v: &Vtxo<Full>) -> Option<(OutPoint, Txid)> {
+		for t in v.transactions() {
+			let txid = t.tx.compute_txid();
+			for i in &t.tx.input {
+				if let Some(o) = self.spends.get(&i.previous_output) {
+					if *o != txid {
+						return Some((i.previous_output, *o));
+					}
+				}
+			}
+		}
+		None
+	}
+	/// The distinct exit transactions of the held coins expiring within
+	/// `margin` of `expiry`, with those of `v`.
+	fn due_with(&self, v: &Vtxo<Full>, margin: u32) -> usize {
+		let e = v.expiry_height();
+		let mut set: std::collections::HashSet<Txid> = v.transactions().map(|t| t.tx.compute_txid()).collect();
+		for (x, ids) in self.txs.values() {
+			if x.abs_diff(e) < margin {
+				set.extend(ids.iter().copied());
+			}
+		}
+		set.len()
+	}
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -89,6 +196,9 @@ pub struct Tower {
 	float: OnchainWallet,
 	payout: Address,
 	store: Store,
+	paths: Paths,
+	/// The chain's fast rate at the last pass.
+	fast: FeeRate,
 }
 
 fn load_store(path: &Path) -> anyhow::Result<Store> {
@@ -136,8 +246,15 @@ impl Tower {
 		let _ = float.inner.reveal_addresses_to(KeychainKind::External, 20).count();
 		let chain = Arc::new(ChainSource::new(cfg.chain.clone(), cfg.network, cfg.fallback_rate,
 			#[cfg(feature = "socks5-proxy")] None).await?);
+		let _ = chain.update_fee_rates(cfg.fallback_rate).await;
+		let fast = chain.fee_rates().await.fast;
 		let store = load_store(&dir.join("deposits.json"))?;
-		Ok(Tower { dir: dir.to_path_buf(), cfg, chain, float, payout, store })
+		let paths = Paths::of(&store);
+		let mut t = Tower { dir: dir.to_path_buf(), cfg, chain, float, payout, store, paths, fast };
+		if let Err(e) = t.float.sync(&t.chain).await {
+			warn!("btc tower: the float did not sync: {:#}", e);
+		}
+		Ok(t)
 	}
 
 	fn save(&self) -> anyhow::Result<()> {
@@ -158,19 +275,56 @@ impl Tower {
 		self.float.address().await
 	}
 
-	/// What a wallet reads before depositing.
+	/// The rate the tower prices a rescue at today.
+	pub fn rate(&self) -> FeeRate {
+		self.fast.max(self.cfg.min_rate)
+	}
+
+	/// The tower's own coins: those confirmed and its own change on the way.
+	fn float_sat(&self) -> Amount {
+		let b = self.float.balance();
+		b.confirmed + b.trusted_pending
+	}
+
+	/// What the deposits it holds may still cost it: each one's rescue fee,
+	/// less what it has paid for it already.
+	fn committed(&self) -> Amount {
+		Amount::from_sat(self.store.deposits.values().filter(|d| d.live()).map(|d| d.fee.saturating_sub(d.paid)).sum())
+	}
+
+	/// The confirmed coins of its own that can each pay a child at its rate.
+	fn float_coins(&self) -> usize {
+		let child = self.rate().to_sat_per_vb_ceil().saturating_mul(super::CHILD_VB) + 330;
+		self.float.list_unspent().iter()
+			.filter(|u| u.chain_position.is_confirmed() && u.txout.value.to_sat() >= child).count()
+	}
+
+	/// The exit transactions it can bring on chain within one margin.
+	fn exits_per_margin(&self) -> usize {
+		self.float_coins().saturating_mul((self.cfg.margin / THROUGHPUT_SHARE) as usize)
+	}
+
+	/// What a wallet reads before depositing: its terms, and what its own
+	/// coins can still pay for.
 	pub async fn info(&self) -> Value {
-		let live = self.store.deposits.values().filter(|d| ["waiting", "rescuing", "claiming"].contains(&d.state.as_str())).count();
+		let live = self.store.deposits.values().filter(|d| d.live()).count();
+		let (float, committed) = (self.float_sat(), self.committed());
 		json!({
 			"kind": KIND,
 			"network": self.cfg.network.to_string(),
 			"payout": self.payout.to_string(),
 			"min_rate_sat_vb": self.cfg.min_rate.to_sat_per_vb_ceil(),
+			"rate_sat_vb": self.rate().to_sat_per_vb_ceil(),
 			"margin": self.cfg.margin,
 			"worth_factor": WORTH_FACTOR,
 			"arks": self.cfg.arks.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
 			"deposits": live,
-			"float_sat": self.float.balance().total().to_sat(),
+			"float_sat": float.to_sat(),
+			"committed_sat": committed.to_sat(),
+			"capacity_sat": float.checked_sub(committed).unwrap_or(Amount::ZERO).to_sat(),
+			"short_sat": committed.checked_sub(float).unwrap_or(Amount::ZERO).to_sat(),
+			"float_coins": self.float_coins(),
+			"exits_per_margin": self.exits_per_margin(),
 		})
 	}
 
@@ -204,12 +358,42 @@ impl Tower {
 		let min_fee = rescue_cost(&vtxo, self.cfg.min_rate)?;
 		let paid = check_claim(&vtxo, &claim, &self.payout.script_pubkey(), min_fee)
 			.map_err(|e| anyhow!("refused: {}", e))?;
+		if !fee_is_worth(vtxo.amount(), paid) {
+			bail!("refused: the rescue fee {} is more than 1/{} of the coin ({}): it is not worth rescuing",
+				paid, WORTH_FACTOR, vtxo.amount());
+		}
 		let txid = claim.compute_txid().to_string();
 		let id = vtxo.id().to_string();
-		let before = self.store.deposits.len();
-		self.store.deposits.retain(|k, d| !(d.vtxo_id == id && *k != txid && d.state == "waiting"));
-		let replaced = before - self.store.deposits.len();
-		if !self.store.deposits.contains_key(&txid) {
+		if self.store.deposits.contains_key(&txid) {
+			return Ok(json!({"deposited": txid, "vtxo": id, "fee": paid.to_sat(), "replaced": 0,
+				"acts_at": vtxo.expiry_height().saturating_sub(self.cfg.margin)}));
+		}
+		// the deposits this one would replace: the same coin's, still waiting
+		let old: Vec<String> = self.store.deposits.iter()
+			.filter(|(k, d)| d.vtxo_id == id && **k != txid && d.state == "waiting")
+			.map(|(k, _)| k.clone()).collect();
+		// a deposit it replaces is of the same coin, so its way out is the same
+		if let Some((o, t)) = self.paths.conflict(&vtxo) {
+			bail!("refused: the coin's way out spends {} differently from a coin the tower holds ({}): only one of them can reach the chain", o, t);
+		}
+		self.check_unspent(&vtxo).await?;
+		let freed: u64 = old.iter().filter_map(|k| self.store.deposits.get(k)).map(|d| d.fee.saturating_sub(d.paid)).sum();
+		let cap = (self.float_sat() + Amount::from_sat(freed)).checked_sub(self.committed()).unwrap_or(Amount::ZERO);
+		if paid > cap {
+			bail!("refused: the tower's coins can pay for {} more and this rescue costs {}: it cannot take it", cap, paid);
+		}
+		let due = self.paths.due_with(&vtxo, self.cfg.margin);
+		let can = self.exits_per_margin();
+		if due > can {
+			bail!("refused: with this coin, {} exit transactions come due within {} blocks and the tower's {} coins bring about {} on chain in that time: it cannot take it",
+				due, self.cfg.margin, self.float_coins(), can);
+		}
+		let replaced = old.len();
+		for k in &old {
+			self.store.deposits.remove(k);
+			self.paths.txs.remove(k);
+		}
+		{
 			if self.store.deposits.len() >= MAX_DEPOSITS {
 				bail!("refused: the tower is full");
 			}
@@ -222,8 +406,11 @@ impl Tower {
 				state: "waiting".into(),
 				note: String::new(),
 				broadcast: vec![],
+				claimed_at: None,
+				paid: 0,
 			});
 		}
+		self.paths.add(&txid, &vtxo);
 		self.save()?;
 		Ok(json!({"deposited": txid, "vtxo": id, "fee": paid.to_sat(), "replaced": replaced, "acts_at": vtxo.expiry_height().saturating_sub(self.cfg.margin)}))
 	}
@@ -244,6 +431,7 @@ impl Tower {
 			return Ok(json!({"withdrawn": false, "reason": format!("the rescue has started ({})", d.state)}));
 		}
 		self.store.deposits.remove(&txid.to_string());
+		self.paths = Paths::of(&self.store);
 		self.save()?;
 		Ok(json!({"withdrawn": true}))
 	}
@@ -252,24 +440,57 @@ impl Tower {
 		self.chain.tx_status(txid).await
 	}
 
+	/// Refuses a coin whose way out is already spent on chain by another
+	/// transaction: the output under the first of its transactions not yet
+	/// confirmed, or the coin's own output once all are.
+	async fn check_unspent(&self, vtxo: &Vtxo<Full>) -> anyhow::Result<()> {
+		let txs: Vec<Transaction> = vtxo.transactions().map(|i| i.tx).collect();
+		for t in &txs {
+			if let TxStatus::Confirmed(_) = self.status(t.compute_txid()).await? {
+				continue;
+			}
+			for i in &t.input {
+				if let TxStatus::Confirmed(_) = self.status(i.previous_output.txid).await? {
+					if self.chain.outpoint_spent_confirmed(i.previous_output).await? {
+						bail!("refused: {} on the coin's way out is spent on chain by another transaction", i.previous_output);
+					}
+				}
+			}
+			return Ok(());
+		}
+		if self.chain.outpoint_spent_confirmed(vtxo.point()).await? {
+			bail!("refused: the coin's output {} is spent on chain", vtxo.point());
+		}
+		Ok(())
+	}
+
 	fn p2a_point(tx: &Transaction) -> Option<OutPoint> {
 		tx.output.iter().position(|o| o.script_pubkey == *P2A_SCRIPT)
 			.map(|i| OutPoint::new(tx.compute_txid(), i as u32))
 	}
 
 	/// Broadcasts `tx` with a child spending its anchor, paid at `fees` from
-	/// the tower's own confirmed coins. Returns the child's txid.
-	async fn push(&mut self, tx: &Transaction, fees: MakeCpfpFees) -> Result<Txid, BroadcastError> {
+	/// the tower's own confirmed coins, for the deposit `k`, which it counts
+	/// as paid (a replacement, only what it adds). Returns the child's txid.
+	async fn push(&mut self, k: &str, tx: &Transaction, fees: MakeCpfpFees) -> Result<Txid, BroadcastError> {
+		let replaced = match &fees {
+			MakeCpfpFees::Rbf { current_package_fee, .. } => *current_package_fee,
+			_ => Amount::ZERO,
+		};
 		let child = self.float.make_signed_p2a_cpfp(tx, fees).await
 			.map_err(|e| BroadcastError::Other(format!("cannot pay a child: {}", e)))?;
 		self.chain.broadcast_package(&[tx, &child]).await?;
+		let fee = self.float.inner.calculate_fee(&child).unwrap_or(Amount::ZERO);
 		let _ = self.float.store_signed_p2a_cpfp(&child).await;
+		if let Some(d) = self.store.deposits.get_mut(k) {
+			d.paid = d.paid.saturating_add(fee.checked_sub(replaced).unwrap_or(Amount::ZERO).to_sat());
+		}
 		Ok(child.compute_txid())
 	}
 
 	/// Replaces the child of `tx`, waiting in the mempool, with one paying
 	/// more: at least the fast rate and above the package now waiting.
-	async fn bump(&mut self, tx: &Transaction, fast: FeeRate) -> anyhow::Result<Option<Txid>> {
+	async fn bump(&mut self, k: &str, tx: &Transaction, fast: FeeRate) -> anyhow::Result<Option<Txid>> {
 		let Some(anchor) = Self::p2a_point(tx) else { return Ok(None) };
 		let tip = self.chain.tip().await?;
 		let spends = self.chain.txs_spending_inputs([anchor], tip).await?;
@@ -278,7 +499,7 @@ impl Tower {
 		let now = info.effective_fee_rate().unwrap_or(FeeRate::BROADCAST_MIN);
 		let rate = FeeRate::from_sat_per_kwu(now.to_sat_per_kwu().saturating_mul(2)).max(fast);
 		let fees = MakeCpfpFees::Rbf { min_effective_fee_rate: rate, current_package_fee: info.total_fee };
-		match self.push(tx, fees).await {
+		match self.push(k, tx, fees).await {
 			Ok(t) => Ok(Some(t)),
 			Err(e) => Err(anyhow!("{}", e)),
 		}
@@ -302,12 +523,13 @@ impl Tower {
 		self.chain.invalidate_caches().await;
 		let _ = self.chain.update_fee_rates(self.cfg.fallback_rate).await;
 		let fast = self.chain.fee_rates().await.fast;
+		self.fast = fast;
 		let tip = self.chain.tip().await?;
 		if let Err(e) = self.float.sync(&self.chain).await {
 			warn!("btc tower: the float did not sync: {:#}", e);
 		}
 		let keys: Vec<String> = self.store.deposits.iter()
-			.filter(|(_, d)| ["waiting", "rescuing", "claiming"].contains(&d.state.as_str()))
+			.filter(|(_, d)| d.watched(tip))
 			.map(|(k, _)| k.clone()).collect();
 		let mut acted = vec![];
 		for k in keys {
@@ -320,6 +542,7 @@ impl Tower {
 				},
 			}
 		}
+		self.paths = Paths::of(&self.store);
 		self.save()?;
 		Ok(json!({"tip": tip, "acted": acted}))
 	}
@@ -349,6 +572,26 @@ impl Tower {
 		}
 		let on = |s: &TxStatus| !matches!(s, TxStatus::NotFound);
 
+		// A reorg can undo what was confirmed, and the mempool can then drop
+		// it: read the state from the chain again.
+		if d.state == "claimed" {
+			match self.status(claim.compute_txid()).await? {
+				TxStatus::Confirmed(b) => {
+					if let Some(x) = self.store.deposits.get_mut(k) { x.claimed_at = Some(b.height); }
+					return Ok(None);
+				},
+				_ => {
+					warn!("btc tower: {}'s claim is no longer confirmed (a reorg): claiming again", d.vtxo_id);
+					if let Some(x) = self.store.deposits.get_mut(k) { x.claimed_at = None; }
+					self.note(k, Some("claiming"), "the claim was undone by a reorg".into(), &[]);
+				},
+			}
+		}
+		if self.store.deposits[k].state == "claiming" && st.iter().any(|s| !on(s)) {
+			warn!("btc tower: {}'s exit is no longer on chain (a reorg): rescuing again", d.vtxo_id);
+			self.note(k, Some("rescuing"), "the exit was undone by a reorg".into(), &[]);
+		}
+
 		if d.state == "waiting" {
 			let due = tip.saturating_add(self.cfg.margin) >= vtxo.expiry_height();
 			let lineage = vtxo.arkoor_levels().into_iter()
@@ -373,7 +616,7 @@ impl Tower {
 			let txid = txs[i].compute_txid();
 			if let TxStatus::Mempool = st[i] {
 				if self.stuck(txid, tip) {
-					if let Some(c) = self.bump(&txs[i], fast).await? {
+					if let Some(c) = self.bump(k, &txs[i], fast).await? {
 						self.store.mempool_since.insert(txid.to_string(), tip);
 						self.note(k, None, format!("level {} was stuck: its child replaced", i), &[c]);
 						return Ok(Some(json!({"vtxo": d.vtxo_id, "bumped": txid.to_string(), "level": i, "child": c.to_string()})));
@@ -384,7 +627,7 @@ impl Tower {
 			if i > 0 && !matches!(st[i - 1], TxStatus::Confirmed(_)) {
 				return Ok(None);
 			}
-			return match self.push(&txs[i], MakeCpfpFees::Effective(fast)).await {
+			return match self.push(k, &txs[i], MakeCpfpFees::Effective(fast)).await {
 				Ok(c) => {
 					self.store.mempool_since.insert(txid.to_string(), tip);
 					self.note(k, None, format!("level {} of {} broadcast", i, txs.len()), &[txid, c]);
@@ -404,12 +647,13 @@ impl Tower {
 			let ctxid = claim.compute_txid();
 			match self.status(ctxid).await? {
 				TxStatus::Confirmed(b) => {
+					if let Some(x) = self.store.deposits.get_mut(k) { x.claimed_at = Some(b.height); }
 					self.note(k, Some("claimed"), format!("claimed in block {}", b.height), &[]);
 					return Ok(Some(json!({"vtxo": d.vtxo_id, "claimed": ctxid.to_string(), "height": b.height})));
 				},
 				TxStatus::Mempool => {
 					if self.stuck(ctxid, tip) {
-						if let Some(c) = self.bump(&claim, fast).await? {
+						if let Some(c) = self.bump(k, &claim, fast).await? {
 							self.store.mempool_since.insert(ctxid.to_string(), tip);
 							self.note(k, None, "the claim was stuck: its child replaced".into(), &[c]);
 							return Ok(Some(json!({"vtxo": d.vtxo_id, "bumped": ctxid.to_string(), "child": c.to_string()})));
@@ -426,7 +670,7 @@ impl Tower {
 			if tip.saturating_add(1) < ready {
 				return Ok(None);
 			}
-			return match self.push(&claim, MakeCpfpFees::Effective(fast)).await {
+			return match self.push(k, &claim, MakeCpfpFees::Effective(fast)).await {
 				Ok(c) => {
 					self.store.mempool_since.insert(ctxid.to_string(), tip);
 					self.note(k, None, "the claim broadcast".into(), &[ctxid, c]);

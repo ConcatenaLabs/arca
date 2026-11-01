@@ -294,9 +294,16 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 		},
 		// Schedules with the server the refresh of every coin that has none yet, so the
 		// server renews it with the wallet closed; the wallet takes the new coin in at its
-		// next sync.
+		// next sync. `except` (coin ids): the coins a Bitcoin ark watchtower covers
+		// (`tower_plan`'s `no_refresh`), which get no refresh.
 		"schedule_refreshes" => {
-			let s = wallet.schedule_refreshes().await;
+			let mut except = std::collections::HashSet::new();
+			for v in args.get("except").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+				let id: bark::ark::VtxoId = v.as_str().unwrap_or("").parse()
+					.map_err(|_| anyhow!("except: {} is not a coin id", v))?;
+				except.insert(id);
+			}
+			let s = wallet.schedule_refreshes_except(&except).await;
 			crate::exit::note_server(wallet, s.is_err());
 			let s = s?;
 			Ok(json!({

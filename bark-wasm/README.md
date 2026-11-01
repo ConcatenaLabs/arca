@@ -46,7 +46,9 @@ next sync, after the old coin's expiry too. Coins sharing an expiry go in one
 refresh, for one base fee. A coin spent before its refresh runs drops it on the
 server, and the next call schedules one for what replaced it. While a refresh
 is scheduled, `refresh` and the daemon leave that coin to the server, until six
-blocks past its height. A page calls it when it opens and after each sync.
+blocks past its height. A page calls it when it opens and after each sync,
+after `tower_plan`, with `except` set to that plan's `no_refresh`: a coin a
+Bitcoin ark watchtower covers gets no delegated refresh (see below).
 
 ## Leaving the ark alone
 
@@ -79,18 +81,47 @@ what has finished. A page calls it after each sync; developer mode offers
 A holder who goes away past a coin's expiry would otherwise rely on the
 operator not to sweep it. `tower_plan` answers what to send the Bitcoin ark
 watchtowers the program names (each one's `GET /v1/info`, read by the
-program): for every coin worth rescuing (at least 20 times its rescue cost at
-the day's fast rate), a deposit for each watchtower that watches the coin's
-ark and does not hold it yet, its claim (signed now by the coin's key) paying
-the phrase's first BIP84 address, less the rescue fee; a withdrawal for each
-deposit the program lists whose coin the wallet no longer holds in the ark;
-and, for developer mode, which coins are covered and by whom (`covered`) and
-which are too small (`not_worth`). `refresh_due` lists the coins within 288
-blocks (two days) of expiry, which the program refreshes while the wallet is
-open, so a holder who opened it recently is never rescued. The program posts
-each `body` to `<tower>/v1/deposit` or `<tower>/v1/withdraw` and keeps the
-`tower`, `vtxo` and `claim_txid` of each deposit a tower took, to pass back as
-`deposited`. Default mode shows none of this.
+program):
+
+- `deposit`: for every coin worth rescuing, a deposit for each watchtower that
+  watches the coin's ark, does not hold it yet, and whose own BTC can still pay
+  for its rescue. Its claim (signed now by the coin's key) pays the phrase's
+  first BIP84 address, less the rescue fee. One rate decides both whether the
+  coin is worth it (at least 20 times its rescue cost) and that fee: the
+  highest of the day's fast rate, the watchtower's least rate and the rate it
+  charges today. Each deposit names it (`rate_sat_vb`, `rescue_fee`).
+- `withdraw`: a withdrawal for each deposit the program lists whose coin the
+  wallet no longer holds: spent in the ark, or its own exit claimed. A coin
+  whose exit the wallet has started keeps its deposits until then, so a
+  wallet closed mid-exit leaves the rest of the exit to its watchtowers.
+- `covered`: the coins a watchtower has accepted and can pay for, and by which
+  watchtowers. A watchtower whose `info` says it is short of BTC for the
+  deposits it holds covers nothing. `uncovered` lists every other coin worth
+  rescuing, each with why (no watchtower watches its ark, none can pay for it,
+  its deposits are not accepted yet, its refresh is scheduled with the ark);
+  `not_worth` the coins too small at every watchtower's rate, with that rate.
+- `refresh_due`: the coins within 288 blocks (two days) of expiry, which the
+  program refreshes while the wallet is open, so a holder who opened it
+  recently is never rescued; `rescuing`: the covered coins a watchtower may
+  already be bringing on chain (past `expiry − margin`), which the program
+  leaves to it.
+- `no_refresh`: the coins covered or just planned for a deposit. The program
+  passes them to `schedule_refreshes` as `except`.
+
+A coin gets a watchtower or a delegated refresh, never both. A watchtower
+cannot tell a refreshed coin from an abandoned one, so it would bring the old
+coin on chain, at the holder's cost, while the refreshed one waits in the ark;
+and the server cannot cancel a scheduled refresh. So a coin that already has a
+refresh scheduled is left to it (no deposit, and its deposits withdrawn), and a
+covered coin gets none.
+
+The program posts each `body` to `<tower>/v1/deposit` or `<tower>/v1/withdraw`
+and keeps the `tower`, `vtxo` and `claim_txid` of each deposit a tower took, to
+pass back as `deposited`. Default mode shows none of this; developer mode shows
+`covered`, `uncovered` and `not_worth`, with the rate.
+
+What a watchtower does not do is written in
+[the CLI's README](../bark-cli/README.md#what-a-bitcoin-ark-watchtower-does-not-do).
 
 ## Commands
 
@@ -113,7 +144,7 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `receive_fee` | `sats` | `fee`, `net` |
 | `offboard`, `offboard_fee` | `address` (Bitcoin), `sats` or `all` | `txid` / `fee` |
 | `refresh` | | `refreshed` (coins whose refresh is scheduled are left to the server) |
-| `schedule_refreshes` | | `scheduled`: each refresh scheduled now, its `height`, `vtxos` (ids) and `amount` |
+| `schedule_refreshes` | `except`? (coin ids: `tower_plan`'s `no_refresh`) | `scheduled`: each refresh scheduled now, its `height`, `vtxos` (ids) and `amount` |
 | `sync` | | |
 | `catch_up` | | `recovered` (ids), `recovered_sat`, `spent_elsewhere` (ids), `failed` (ids), `complete` |
 | `history` | | the wallet's movements |
@@ -123,7 +154,7 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `exit_progress` | `address`? | `exits` (each `id`, `state`, `claimable_height`, `error`), `claimed` (`txid`, `address`, `amount`, `coins`, or null), `pending`, `claimable_at` |
 | `exit_claim` | `address`? | `txid`, `address`, `amount`, `coins` |
 | `exit_status` | | `exits`: every exit, live or finished, with its `state` |
-| `tower_plan` | `towers` (each `url`, `info`), `deposited`? (each `tower`, `vtxo`, `claim_txid`), `fast_rate`? (sat/vB) | `deposit` and `withdraw` (each `tower`, `vtxo`, `claim_txid`, `body`), `covered` (each `vtxo`, `amount`, `expiry_height`, `rescued_from`, `towers`), `not_worth` (each `vtxo`, `amount`, `rescue_cost`), `refresh_due`, `skipped` (with `reason`), `holder_address`, `fast_rate`, `tip` |
+| `tower_plan` | `towers` (each `url`, `info`), `deposited`? (each `tower`, `vtxo`, `claim_txid`), `fast_rate`? (sat/vB) | `deposit` (each `tower`, `vtxo`, `claim_txid`, `rate_sat_vb`, `rescue_fee`, `body`) and `withdraw` (each `tower`, `vtxo`, `claim_txid`, `body`), `covered` (each `vtxo`, `amount`, `expiry_height`, `rescued_from`, `towers`, `exiting`), `uncovered` (each `vtxo`, `amount`, `reason`), `not_worth` (each `vtxo`, `amount`, `rate_sat_vb`, `rescue_cost`), `refresh_due`, `rescuing`, `no_refresh` (coin ids), `skipped` (with `reason`), `holder_address`, `fast_rate`, `tip` |
 | `exit_auto` | `address`?, `ark_refused`?, `margin`? | `action` (`none`, `started`, `cannot_start` with `reason`, the coins' `amount` and, when the address holds too little for the fees, `needed` and `available`), `ark` (`answering`, `refused`, `unreachable`), `not_worth` (coins due but not worth their exit), `started`, `progress` |
 
 An exit's states are `starting`, `on_its_way`, `waiting_out_its_delay`,
