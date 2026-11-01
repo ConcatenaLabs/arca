@@ -944,7 +944,10 @@ expired), or never takes it. A withdrawn participation is void (its
 a participation already void answers its status. A take, a distribution, an
 offline-refresh plan's step (cancel the plan instead), and a participation
 that was in a round that went out of the chain (which may still return
-with it) are not withdrawn (`not_withdrawable`). `info` says the operator
+with it) are not withdrawn (`not_withdrawable`). A participation run again
+after a held round dropped unbroadcast (see Batches without a sweep) is
+withdrawn once that round can never return: it was never handed to the
+node, and a transaction spending one of its own coins is final. `info` says the operator
 takes withdrawals (`participations.withdraw`).
 
 ### Takes of on-chain orders

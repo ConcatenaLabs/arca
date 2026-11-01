@@ -9,6 +9,9 @@
 //!   strike) and then run only in a round of their own. A coin paid on out of
 //!   round from a struck coin is struck with it. A round that goes out with
 //!   them clears the strike.
+//! - A participation run again after a dropped held round is withdrawn by
+//!   its owner once that round is dead (its kill spend final), and not
+//!   before.
 //! - A wallet that hands over its forfeits only after broadcast is refused
 //!   when it submits, in words, by an operator building batches without a
 //!   sweep, and still taken by one with a sweep.
@@ -288,4 +291,77 @@ async fn a_wallet_that_forfeits_after_broadcast_is_refused_in_words_and_loses_no
 	let ans = s.http.post("submit_participation", &body);
 	println!("the same, to an operator with a sweep: {} {}", ans.status, ans.json["state"]);
 	assert_eq!(ans.ok()["state"], "pending");
+}
+
+/// arca#514 (RV8's reproduction). A participation run again after its held
+/// round was dropped unbroadcast, for another participant's missing
+/// forfeit, is withdrawn by its owner once that round can never return (its
+/// kill spend final): its coin is live again and pays out of round. Before
+/// the kill spend is final the round could still confirm, and the
+/// withdrawal is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_participation_run_again_after_a_dropped_held_round_is_withdrawn_once_that_round_is_dead() {
+	use arca_covenant::sign::sign_digest;
+	let mut r = start().await;
+	let (x, s) = (r.x, xonly(&r.s));
+	let (ka, kb) = (keypair("W A board"), keypair("W B board"));
+	let (a, atx) = credited_board(&mut r, &ka, x).await;
+	let (b, _) = credited_board(&mut r, &kb, x).await;
+	let ida = submit(&r, &a, &keypair("W A new"), VALUE);
+	let idb = submit(&r, &b, &keypair("W B new"), VALUE);
+	let d = server::participations::withdraw_digest(&r.chain, &s, &ida);
+	let wa = serde_json::json!({"participation_id": common::client::hex(&ida),
+		"signatures": [common::client::hex(sign_digest(&ka, &d, &common::client::random32()).as_ref())]});
+	let built = r.server.rounds.run_round().await.unwrap().expect("a held round");
+	let txid = built.tx.txid();
+	let held = r.http.post("withdraw_participation", &wa);
+	assert_eq!(held.refusal().0, "in_round", "{}", held.json);
+	answer(&r, &ida).await;
+	r.server.rounds.pass().await.unwrap();
+	window_passes(&r).await;
+	assert_eq!(state_of(&r, &txid).await, RoundState::Lost);
+	assert_eq!(status(&r, &idb)["state"], "void");
+	let pa = r.server.store.participation(&ida).await.unwrap().unwrap();
+	assert_eq!((pa.attempt, pa.state), (1, server::store::ParticipationState::Pending));
+
+	// The kill spend is not final yet: the round could still confirm.
+	let early = r.http.post("withdraw_participation", &wa);
+	let (code, why) = early.refusal();
+	println!("A withdraws before the dropped round is dead: {} {}: {}", early.status, code, why);
+	assert_eq!((early.status, code.as_str()), (409, "not_withdrawable"));
+
+	// The kill spend final: the dropped round, forced into a block, is refused.
+	for _ in 0..3 {
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		r.server.rounds.pass().await.unwrap();
+	}
+	let row = r.server.store.round_by_txid(&txid.to_byte_array()).await.unwrap().unwrap();
+	let tx: elements::Transaction = elements::encode::deserialize(&row.tx).unwrap();
+	let h0 = r.rt.client().block_count().unwrap();
+	let e = r.rt.client().generate_block("raw(51)", &[&tx]).expect_err("the dropped round must not confirm").to_string();
+	println!("the dropped round {} forced into a block: {}", txid, e);
+	assert!(e.contains("bad-txns-inputs-missingorspent"), "{}", e);
+	assert_eq!(r.rt.client().block_count().unwrap(), h0);
+
+	// The operator cannot fund the re-run now: it waits, and A takes it back.
+	let hold = Txid::from_byte_array([0xab; 32]);
+	let coins = r.server.wallet.coins_in_chain(x).await.unwrap();
+	let free: Vec<_> = coins.iter().filter(|c| c.spent_by.is_none()).collect();
+	r.server.wallet.take(&free, &hold).await.unwrap();
+	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "the re-run waits for funds");
+	println!("A's re-run waits: {}", reason(&status(&r, &ida), "waiting"));
+	let done = r.http.post("withdraw_participation", &wa).ok();
+	println!("A withdraws once the dropped round is dead: {} returned {}", done["state"], done["inputs"][0]["returned"]);
+	assert_eq!((done["state"].as_str(), done["inputs"][0]["returned"].as_bool()), (Some("void"), Some(true)), "{}", done);
+	assert_eq!(r.server.store.leaf(&a.id.0).await.unwrap().unwrap().state, server::store::LeafState::Live);
+	// Its coin pays out of round.
+	let valid = a.record.resolve(std::slice::from_ref(&atx), &r.policy()).unwrap();
+	let (leaf, _) = new_leaf(&keypair("W A payee"));
+	let paid = r.http.post("cosign_transfer", &transfer_body(&[(&a, valid, VALUE - 2_000)], &[(x, VALUE - 4_000, leaf)], s, r.chain));
+	println!("A pays out of round: {}", paid.status);
+	assert_eq!(paid.status, 200, "{}", paid.json);
+	r.server.wallet.release(&hold).await.unwrap();
+	assert!(r.server.rounds.run_round().await.unwrap().is_none(), "nothing of A's runs again");
 }

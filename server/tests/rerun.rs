@@ -188,6 +188,13 @@ async fn a_coin_whose_forfeit_for_a_lost_round_was_published_is_never_run_again(
 	let sb = status(&r, &pb);
 	println!("G1 B after R is lost: {} attempt {}", sb["state"], sb["attempt"]);
 	assert_eq!((sb["state"].as_str(), sb["attempt"].as_u64()), (Some("pending"), Some(1)));
+	// R was broadcast and may still return: B's owner cannot take it back.
+	let d = server::participations::withdraw_digest(&r.chain, &xonly(&r.s), &pb);
+	let w = r.http.post("withdraw_participation", &json!({"participation_id": hex(&pb),
+		"signatures": [hex(sign_digest(&cb.held.key, &d, &random32()).as_ref())]}));
+	let (code, why) = w.refusal();
+	println!("G1 B's withdrawal after R, broadcast, is lost: {} {}: {}", w.status, code, why);
+	assert_eq!((w.status, code.as_str()), (409, "not_withdrawable"));
 
 	// The server's copy of A's forfeit for R is given up and never broadcast
 	// again: not on a pass, and not by the watcher.
