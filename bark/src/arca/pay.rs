@@ -1048,7 +1048,11 @@ impl Wallet {
 	}
 
 	fn accept_coin_as(&mut self, bytes: &[u8], claimed: &str, source: &str, home: bool) -> Result<Value, Error> {
-		let record = CoinRecord::from_bytes(bytes).map_err(|e| Error::Refused(format!("the record does not decode: {}", e)))?;
+		let record = CoinRecord::from_bytes(bytes).map_err(|e| if e.is_unknown_format() {
+			Error::Unread(e.to_string())
+		} else {
+			Error::Refused(format!("the record does not decode: {}", e))
+		})?;
 		let (owner, nonce) = owner_of(&record);
 		let row = match self.store.nonce(&nonce)? {
 			Some(row) => row,
@@ -1642,6 +1646,7 @@ impl Wallet {
 				self.store.set_cursor(&k, c.max(start))?;
 			}
 		}
+		self.reread_mailbox(home.is_some(), &mut accepted, &mut waiting, &mut notes)?;
 		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
 		// A coin paid out of round while the operator's bond does not stand,
 		// or does not cover it, is the wallet's still: sync refreshes it at
@@ -1678,6 +1683,117 @@ impl Wallet {
 				nothing more, so the wallet takes every coin it is sent on the chain at once", at, why));
 		}
 		Ok(out)
+	}
+
+	/// Reads every mailbox of the wallet again from its start, once for each
+	/// set of record formats the wallet reads ([`arca_covenant::RECORD_FORMATS`]):
+	/// a coin an earlier build refused, its record of a format that build
+	/// did not read, lies behind the cursor, which never moves back, and is
+	/// taken now. The re-read keeps a cursor of its own for each key and
+	/// stops at the message the wallet had read to when it began; it reads
+	/// at most [`REREAD_PAGES`] pages in a sync and goes on at the next, so a
+	/// sync stays as short as ever and the wallet stays usable throughout.
+	/// It passes over notices and every coin the wallet holds or held, takes
+	/// each other coin as the read does, keeps one it cannot take yet for a
+	/// retry, and records no refusal again. A wallet whose cursors are all at
+	/// the start has nothing behind them, and is done at once.
+	fn reread_mailbox(&mut self, home: bool, accepted: &mut Vec<Value>, waiting: &mut Vec<Value>, notes: &mut Vec<String>)
+		-> Result<(), Error>
+	{
+		let formats = arca_covenant::RECORD_FORMATS.join(" ");
+		let mut state: Value = self.store.meta(MAILBOX_REREAD)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or(Value::Null);
+		let mut keys = vec![self.keys.mailbox()?];
+		for n in self.store.nonces()? {
+			if n.purpose == "receive" {
+				keys.push(self.keys.leaf(&n.nonce)?);
+			}
+		}
+		if state["formats"] != formats.as_str() {
+			let mut left = serde_json::Map::new();
+			for key in &keys {
+				let k = key.x_only_public_key().0.serialize();
+				let until = self.store.cursor(&k)?;
+				if until > 0 {
+					left.insert(hex(&k), json!({"after": 0, "until": until}));
+				}
+			}
+			state = json!({"formats": formats, "keys": left, "found": 0});
+			self.store.set_meta(MAILBOX_REREAD, &state.to_string())?;
+		}
+		if state["keys"].as_object().is_none_or(|k| k.is_empty()) {
+			return Ok(());
+		}
+		let mut pages = 0;
+		let mut found = state["found"].as_u64().unwrap_or(0);
+		for key in keys {
+			let k = hex(&key.x_only_public_key().0.serialize());
+			let Some(at) = state["keys"].get(&k).cloned() else { continue };
+			let mut after = at["after"].as_i64().unwrap_or(0);
+			let until = at["until"].as_i64().unwrap_or(0);
+			let mut done = false;
+			while !done && pages < REREAD_PAGES {
+				pages += 1;
+				let v = self.server.mailbox_read(&key, &self.genesis, after, 100)?;
+				let msgs = v["messages"].as_array().cloned().unwrap_or_default();
+				done = msgs.is_empty();
+				for m in &msgs {
+					let cursor: i64 = m["cursor"].as_str().unwrap_or("0").parse().unwrap_or(0);
+					// Past where the wallet had read when the re-read began, or
+					// a server serving again what it served: the re-read of
+					// this key is over (the read itself takes what follows).
+					if cursor > until || cursor <= after {
+						done = true;
+						break;
+					}
+					after = cursor;
+					let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
+					if m["kind"].as_str().is_some_and(|k| k != "coin") || self.store.coin(&leaf)?.is_some() {
+						continue;
+					}
+					let bytes = unhex(m["record"].as_str().unwrap_or("")).unwrap_or_default();
+					let head = (!m["signer_record"].is_null()).then(|| m["signer_record"].to_string());
+					if let (Err(why), false) = (self.held_outside(&m["signer_record"]), home) {
+						self.store.keep_for_retry(&leaf, &bytes, &why, head.as_deref())?;
+						waiting.push(json!({"leaf_id": leaf, "reason": why}));
+						continue;
+					}
+					match self.accept_coin_as(&bytes, &leaf, "mailbox", home) {
+						Ok(v) => {
+							self.pending_ended(&leaf)?;
+							if let Err(e) = self.keep_coin_head(&leaf, &m["signer_record"]) {
+								self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
+							}
+							if v["already_held"].is_null() {
+								found += 1;
+								accepted.push(v);
+							}
+						},
+						Err(e) if passing(&e) => {
+							self.store.keep_for_retry(&leaf, &bytes, &e.to_string(), head.as_deref())?;
+							waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
+						},
+						// Refused when it was first read, and refused again.
+						Err(_) => {},
+					}
+				}
+				done = done || after >= until;
+				state["found"] = json!(found);
+				if done {
+					state["keys"].as_object_mut().expect("an object").remove(&k);
+				} else {
+					state["keys"][&k] = json!({"after": after, "until": until});
+				}
+				self.store.set_meta(MAILBOX_REREAD, &state.to_string())?;
+			}
+		}
+		if state["keys"].as_object().is_some_and(|k| !k.is_empty()) {
+			notes.push("the wallet is reading its mailbox again from the start, once, for coins an earlier version could not read: the \
+				next sync reads on".into());
+		} else if found > 0 {
+			notes.push(format!("the wallet read its mailbox again from the start, once, and took {} coin(s) an earlier version could not \
+				read", found));
+		}
+		Ok(())
 	}
 
 	// -----------------------------------------------------------------------
@@ -2152,8 +2268,17 @@ impl Wallet {
 /// Whether a coin refused with `e` may be accepted later: what it rests on
 /// is not on the chain now, or the node, the server or the store did not
 /// answer.
+/// The store's record of [`Wallet::reread_mailbox`]: the record formats it
+/// read for, and for each key still to read, its own cursor and where it
+/// stops.
+const MAILBOX_REREAD: &str = "mailbox_reread";
+
+/// The most pages of the mailboxes [`Wallet::reread_mailbox`] reads in one
+/// sync.
+const REREAD_PAGES: usize = 10;
+
 fn passing(e: &Error) -> bool {
-	matches!(e, Error::Missing(_) | Error::Node(_) | Error::Unreachable(_) | Error::Store(_) | Error::Io(_))
+	matches!(e, Error::Missing(_) | Error::Unread(_) | Error::Node(_) | Error::Unreachable(_) | Error::Store(_) | Error::Io(_))
 }
 
 fn to_out_owner(o: &Out) -> String {

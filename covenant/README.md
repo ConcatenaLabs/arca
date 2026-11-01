@@ -69,7 +69,10 @@ also names the leaf record formats, by kind and version byte: `leaf-2` and
 library reads, which a wallet built on it names in each participation;
 `FORMATS_EVERY_WALLET_READS` those an operator takes a participation naming
 none to read; `reads_format` tells whether a participation reads one. An
-operator puts a leaf only into a batch whose format its wallet reads.
+operator puts a leaf only into a batch whose format its wallet reads. A
+record of a format, template or template version this library does not know
+fails to decode with an error for which `TransferError::is_unknown_format` is
+true, so a wallet can keep it for a later build rather than refuse it.
 `record` holds the leaf record, `record_json` its JSON form (the `json`
 feature, on by default), `tree` the builder that turns the leaves of one asset
 into a batch, `unroll` the transactions that take a leaf on-chain, `board`

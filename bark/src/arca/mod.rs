@@ -161,6 +161,11 @@ pub enum Error {
 	/// a rollback: it may be again.
 	#[error("not on the chain now: {0}")]
 	Missing(String),
+	/// A record of a format this build does not read (a later build may):
+	/// a coin in it is kept, its bytes with it, and taken by the build that
+	/// reads it.
+	#[error("a record this wallet does not read: {0}: a later version of the wallet takes it")]
+	Unread(String),
 	#[error("the node: {0}")]
 	Node(String),
 	#[error("the store: {0}")]
@@ -182,6 +187,7 @@ impl Error {
 			Error::Server { .. } => "server_refused",
 			Error::Unreachable(_) => "unreachable",
 			Error::Missing(_) => "missing",
+			Error::Unread(_) => "unread",
 			Error::Node(_) => "node",
 			Error::Store(_) => "store",
 			Error::Keys(_) => "keys",

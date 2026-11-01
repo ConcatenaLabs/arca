@@ -377,9 +377,11 @@ What it changes for the operator:
   round for wallets that do not name `accumulator-4` among the record
   formats they read (older wallets): they get a tree leaf in the same round,
   never a slot. A wallet older than that format cannot read a coin paid to it
-  out of round from a slot either: turn the rate on once the
-  wallets your holders use read it, and check every client of the operator
-  on its own machine first (makers, agents, command lines).
+  out of round from a slot either, and does not show it until it is updated:
+  an updated wallet reads its mailbox again once on its first sync and shows
+  it then. Turn the rate on once the wallets your holders use read it, and
+  check every client of the operator on its own machine first (makers,
+  agents, command lines).
 - **The bond's notice** must cover the horizon: `notice_units` at least the
   longer of 28 days and `collect_after_seconds`, plus the longest exit
   delay, plus a day.

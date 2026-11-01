@@ -538,9 +538,10 @@ async fn older_wallets_get_a_tree_beside_the_accumulator_slots() {
 
 	// A current wallet pays each older one out of round from its slot. An
 	// older wallet cannot read that coin's record and refuses it; once
-	// updated (the current build on the same wallet directory), it holds the
-	// coin, by `restore` when its `sync` does not read the refused message
-	// again (arca#550).
+	// updated (the current build on the same wallet directory), its first
+	// `sync` reads the mailbox again from the start, once, and it holds the
+	// coin, with no `restore` (arca#550). The re-read passes over every
+	// coin it holds already, and a second sync reads nothing again.
 	let x = x_id.to_string();
 	for o in &joined[current.len()..] {
 		let req = o.ok(&["receive"]);
@@ -550,17 +551,17 @@ async fn older_wallets_get_a_tree_beside_the_accumulator_slots() {
 		println!("{} (older) reads its mailbox: ok {}: {}", o.name, ok, mb);
 		let updated = Arca { name: format!("{} updated", o.name), dir: o.dir.clone(), patience: std::cell::Cell::new(o.patience.get()),
 			bin: std::path::PathBuf::from(env!("CARGO_BIN_EXE_arca")) };
-		let (ok, s) = updated.run(&["sync"]);
-		println!("{} sync: ok {}: {}", updated.name, ok, s);
+		let before = updated.ok(&["balance"]);
+		println!("{} balance before its first sync: {}", updated.name, before["arca"]);
+		let s = updated.ok(&["sync"]);
+		println!("{} first sync: mailbox {}", updated.name, s["mailbox"]);
 		let coins = updated.ok(&["coins"]);
-		println!("{} coins: {}", updated.name, coins);
-		if !coins.as_array().unwrap().iter().any(|c| c["value"] == "300000" && c["state"] == "live") {
-			let (ok, rs) = updated.run(&["restore"]);
-			println!("{} restore: ok {}: {}", updated.name, ok, rs);
-		}
-		let coins = updated.ok(&["coins"]);
-		println!("{} coins after: {}", updated.name, coins);
+		println!("{} coins after its first sync: {}", updated.name, coins);
 		assert!(coins.as_array().unwrap().iter().any(|c| c["value"] == "300000" && c["state"] == "live"),
-			"{}: the coin paid to it out of a slot: {}", updated.name, coins);
+			"{}: the coin paid to it out of a slot, after its first sync: {}", updated.name, coins);
+		assert!(s["mailbox"]["accepted"].as_array().unwrap().iter().any(|a| a["value"] == "300000"), "{}", s["mailbox"]);
+		let again = updated.ok(&["sync"]);
+		println!("{} second sync: mailbox {}", updated.name, again["mailbox"]);
+		assert!(again["mailbox"]["accepted"].as_array().unwrap().is_empty(), "read again once only: {}", again["mailbox"]);
 	}
 }
