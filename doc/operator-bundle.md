@@ -108,8 +108,11 @@ Every path reads the same settings, described line by line in
   Without a domain the operator answers only on this machine.
 - `BACKUP_DIR` (native path): where the database's write-ahead log is
   archived. Put it on other storage than the machine's disk.
-- `PEER_*`, `CHANNEL_ATOMS`, `CHANNEL_SAT`: the peer bundle the gateways open
-  channels to, and their sizes. The defaults name sequentiatestnet.com.
+- `PEER_*`, `CHANNEL_USD`, `CHANNEL_ATOMS`, `CHANNEL_SAT`: the peer bundle the
+  gateways open channels to, and their sizes. `CHANNEL_USD` gives every asset's
+  channel the same worth at the node's rate (1000: 1,000 of a dollar coin, a
+  quarter of an ounce of a gold token); `CHANNEL_ATOMS` pairs override it per
+  asset. The defaults name sequentiatestnet.com.
   `PEER_ARCA_URL` is also the operator whose users the bundle's watchtower
   watches for, and `PEER_WATCHTOWER` the watchtower that operator runs for
   this bundle's users, which arcad's `info` names to them (see
@@ -291,10 +294,12 @@ prints an address for each part to fund, with what it is for:
   receive into the ark is paid out of that pool, and with none ready it is
   failed back.
 - **seqln**: each asset the gateway's channels are opened in: a channel's size
-  (`CHANNEL_ATOMS`) and a little more of the same asset, since each channel is
-  opened with its fee in its own asset. Given as `<asset id>:<atoms>` pairs,
-  `CHANNEL_ATOMS` needs a pair for every served asset: one without gets no
-  channel (`connect` says `no channel size set`).
+  and a little more of the same asset, since each channel is opened with its
+  fee in its own asset. `addresses` lists each asset's channel size in atoms:
+  `CHANNEL_USD` at the node's rate, or a `CHANNEL_ATOMS` pair where one names
+  the asset. An asset the node has no rate for gets no channel under
+  `CHANNEL_USD`; without `CHANNEL_USD`, `CHANNEL_ATOMS` given as pairs needs a
+  pair for every served asset (`connect` says `no channel size set`).
 - **cln**: testnet4 BTC for the Bitcoin gateway's channel, its anchor reserve
   (25,000 sat) and its fees.
 - **btc-watchtower**: testnet4 BTC for the fees of the coins the Bitcoin ark

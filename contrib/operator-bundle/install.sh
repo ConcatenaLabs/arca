@@ -57,6 +57,10 @@ fi
 : "${PEER_ARCA_URL:=}" "${PEER_HOST:=}" "${PEER_SEQLN_PORT:=19850}" "${PEER_BTC_LN_PORT:=19746}"
 : "${PEER_WATCHTOWER:=}" "${WATCHTOWER_PORT:=3537}" "${BTC_WATCHTOWER_PORT:=3541}" "${BTC_TOWER_ARKS:=}"
 : "${CHANNEL_ATOMS:=2000000000}" "${CHANNEL_SAT:=1000000}" "${PEER_SEQLN_ID:=}" "${PEER_BTC_LN_ID:=}"
+# A channel's size as a value in the reference currency (the node's rates):
+# the same worth in every asset, whatever its price. Empty: CHANNEL_ATOMS.
+: "${CHANNEL_USD:=}"
+[ -z "$CHANNEL_USD" ] || [[ $CHANNEL_USD =~ ^[0-9]+([.][0-9]+)?$ ]] || die "CHANNEL_USD is an amount in the reference currency, such as 1000"
 : "${SEQ_RPC_PORT:=18884}" "${SEQ_P2P_PORT:=18885}" "${BTC_RPC_PORT:=48332}" "${BTC_P2P_PORT:=48333}" "${FEE_PROXY_PORT:=48342}"
 : "${PG_PORT:=5433}" "${ARCAD_PORT:=3535}" "${ARCAD_METRICS_PORT:=3536}" "${SEQLN_PORT:=9835}" "${CLN_PORT:=9935}"
 : "${CLN_GRPC_PORT:=9937}" "${HOLD_GRPC_PORT:=9938}" "${CAPTAIND_PORT:=3545}" "${CAPTAIND_ADMIN_PORT:=3546}" "${CAPTAIND_INTEGRATION_PORT:=3547}"
@@ -156,9 +160,19 @@ for a in $ARCA_ASSETS; do
   case ${rs:-none} in node|none) ;; *) die "ARCA_ASSETS: $a: the rate source is node or none";; esac
   ASSET_IDS+=("$id"); MIN_LEAF[$id]=$ml; RATE[$id]=${rs:-none}
 done
-channel_atoms() {   # the channel size for asset $1
+channel_atoms() {   # the channel size for asset $1, in atoms; $2: the node's rates (node_rates)
   local x
-  for x in $CHANNEL_ATOMS; do case $x in "$1":*) echo "${x#*:}"; return;; *:*) ;; *) echo "$x"; return;; esac; done
+  # An <asset id>:<atoms> pair names that asset's size outright.
+  for x in $CHANNEL_ATOMS; do case $x in "$1":*) echo "${x#*:}"; return;; esac; done
+  # Else CHANNEL_USD at the node's rate: a rate is the value of 1e8 atoms in
+  # the reference currency, times 1e8 (100000000 for a dollar coin of eight
+  # decimals), so the atoms are the value times 1e16 over the rate. No rate: 0.
+  if [ -n "$CHANNEL_USD" ]; then
+    jq -r --arg a "$1" --argjson v "$CHANNEL_USD" \
+      '(.[$a] // 0) as $r | if $r > 0 then ($v * 1e16 / $r | floor | tostring) else "0" end' <<<"${2:-$(node_rates)}"
+    return
+  fi
+  for x in $CHANNEL_ATOMS; do case $x in *:*) ;; *) echo "$x"; return;; esac; done
   echo 0
 }
 
@@ -1265,6 +1279,8 @@ addresses() {
   say "    the Bitcoin ark's round wallet: BTC its rounds are built from"
   say "seqln: $(seqln newaddr | jq -r '.bech32 // .p2tr')"
   say "    the SeqLN gateway: each asset its channels are opened in, and a fee asset"
+  local rates id; rates=$(node_rates)
+  for id in "${ASSET_IDS[@]}"; do say "      ${id:0:12}…: a channel of $(channel_atoms "$id" "$rates") atoms$( [ -n "$CHANNEL_USD" ] && printf ' (%s at the node'"'"'s rate)' "$CHANNEL_USD")"; done
   say "cln: $(cln newaddr p2tr | jq -r '.p2tr // .bech32')"
   say "    the Bitcoin gateway: BTC for its channel and its fees"
   if [ -s "$LIB/watchtower/arca.sqlite" ]; then
@@ -1283,6 +1299,7 @@ connect() {
   pi=$(curl -sf --max-time 20 "$PEER_ARCA_URL/v1/info") || die "the peer's info does not answer at $PEER_ARCA_URL/v1/info"
   [ "$(jq -r .genesis_hash <<<"$pi")" = "$(seq_cli getblockhash 0)" ] || die "the peer runs another chain than this node"
   step "SeqLN: a channel to the peer's node in each served asset it serves too"
+  local rates; rates=$(node_rates)
   for id in "${ASSET_IDS[@]}"; do
     pid=$(jq -r --arg a "$id" '.assets[] | select(.asset == $a) | .lightning.node // empty' <<<"$pi")
     # A leg names its node only while up, which takes a channel in the asset:
@@ -1292,12 +1309,13 @@ connect() {
     seqln connect "$pid" "$PEER_HOST" "$PEER_SEQLN_PORT" >/dev/null
     have=$(seqln listpeerchannels "$pid" | jq --arg a "$id" '[.channels[] | select((.channel_asset // .asset) == $a and (.state | test("CLOSING|ONCHAIN|CLOSED") | not))] | length')
     if [ "$have" -gt 0 ]; then say "${id:0:12}…: a channel is open already"; continue; fi
-    amt=$(channel_atoms "$id"); [ "$amt" -gt 0 ] || { say "${id:0:12}…: no channel size set"; continue; }
-    jq -e --arg a "$id" 'has($a)' <<<"$(node_rates)" >/dev/null \
+    amt=$(channel_atoms "$id" "$rates")
+    [ "$amt" -gt 0 ] || { say "${id:0:12}…: no channel size set$( [ -n "$CHANNEL_USD" ] && printf ', or no rate for it at the node')"; continue; }
+    jq -e --arg a "$id" 'has($a)' <<<"$rates" >/dev/null \
       || die "${id:0:12}…: this node takes no fee in it, and a channel in an asset is opened with a fee in that asset: run the price server (PRICE_FEED_URL) or set its rate (sequentia-cli setfeeexchangerates)"
     r=$(seqln -k fundchannel id="$pid" amount="$amt" asset="$id" push_msat="$((amt / 2 * 1000))" announce=false 2>&1) \
       || die "${id:0:12}…: SeqLN did not open the channel: $(jq -r '.message // empty' <<<"$r" 2>/dev/null || true) ${r:0:300}"
-    say "${id:0:12}…: opened $amt atoms, half pushed: $(jq -r .txid <<<"$r")"
+    say "${id:0:12}…: opened $amt atoms$( [ -n "$CHANNEL_USD" ] && printf ' (%s at the node'"'"'s rate)' "$CHANNEL_USD"), half pushed: $(jq -r .txid <<<"$r")"
   done
   step "Core Lightning: a channel to the peer's Bitcoin gateway"
   bid=$(jq -r '.lightning.bitcoin.node.node // empty' <<<"$pi"); [ -n "$bid" ] || bid=$PEER_BTC_LN_ID
