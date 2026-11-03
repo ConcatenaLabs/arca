@@ -7,7 +7,9 @@
 //! that very quote, the operator's round pays the offboard output, `sync`
 //! hands over the forfeit once the round is final, and the operator's watcher
 //! unlocks the output into the address: its output 0 pays exactly 300,000 X
-//! there, and `arca offboards` says it is paid and final. Refused beside it,
+//! there, and `arca offboards` says it is paid and final. The change comes
+//! back as a leaf of the round: the wallet takes the operator's release whole,
+//! passing over the offboard's output, which sits in no batch. Refused beside it,
 //! the coins staying the wallet's: a fee in another asset, more than the
 //! wallet holds, a quote that is no longer the offboard's, and the operator's
 //! refusal of an offboard paying one of the wallet's own leaf scripts, which
@@ -166,6 +168,26 @@ async fn an_offboard_pays_an_address_on_the_chain_and_a_refused_one_gives_the_co
 	}
 	println!("buried: {}", o);
 	assert_eq!(o["final"], true, "{}", o);
+	// The change, a leaf of the round, is the wallet's: the release is taken
+	// whole. Asking a tree for the offboard's output, in no batch, was refused
+	// ("invalid type: null, expected u32"), and the coin given up stayed
+	// counted beside its change, which was never taken.
+	let mut change = vec![];
+	for _ in 0..5 {
+		let s = a.ok(&["sync"]);
+		let refused: Vec<&Value> = s["participations"].as_array().map(|p| p.iter().filter(|p| p.get("refused").is_some()).collect()).unwrap_or_default();
+		assert!(refused.is_empty(), "the release refused: {:?}", refused);
+		change = live_of(&a, x);
+		if change.len() == 1 && change[0]["leaf_id"] != coins[0]["leaf_id"] {
+			break;
+		}
+		r.produce().await;
+		r.synced().await;
+	}
+	println!("the change: {:?}", change);
+	assert_eq!(change.len(), 1, "{}", a.ok(&["coins"]));
+	assert_ne!(change[0]["leaf_id"], coins[0]["leaf_id"], "the coin given up is not the wallet's any more");
+	assert!(a.ok(&["coins"]).as_array().unwrap().iter().all(|c| c["state"] != "forfeited"), "{}", a.ok(&["coins"]));
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
