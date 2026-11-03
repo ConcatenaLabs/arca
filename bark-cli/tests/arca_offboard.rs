@@ -7,7 +7,9 @@
 //! that very quote, the operator's round pays the offboard output, `sync`
 //! hands over the forfeit once the round is final, and the operator's watcher
 //! unlocks the output into the address: its output 0 pays exactly 300,000 X
-//! there, and `arca offboards` says it is paid and final. Refused beside it,
+//! there, and `arca offboards` says it is paid and final. The change comes
+//! back as a leaf of the round: the wallet takes the operator's release whole,
+//! passing over the offboard's output, which sits in no batch. Refused beside it,
 //! the coins staying the wallet's: a fee in another asset, more than the
 //! wallet holds, a quote that is no longer the offboard's, and the operator's
 //! refusal of an offboard paying one of the wallet's own leaf scripts, which
@@ -166,6 +168,93 @@ async fn an_offboard_pays_an_address_on_the_chain_and_a_refused_one_gives_the_co
 	}
 	println!("buried: {}", o);
 	assert_eq!(o["final"], true, "{}", o);
+	// The change, a leaf of the round, is the wallet's: the release is taken
+	// whole. Asking a tree for the offboard's output, in no batch, was refused
+	// ("invalid type: null, expected u32"), and the coin given up stayed
+	// counted beside its change, which was never taken.
+	let mut change = vec![];
+	for _ in 0..5 {
+		let s = a.ok(&["sync"]);
+		let refused: Vec<&Value> = s["participations"].as_array().map(|p| p.iter().filter(|p| p.get("refused").is_some()).collect()).unwrap_or_default();
+		assert!(refused.is_empty(), "the release refused: {:?}", refused);
+		change = live_of(&a, x);
+		if change.len() == 1 && change[0]["leaf_id"] != coins[0]["leaf_id"] {
+			break;
+		}
+		r.produce().await;
+		r.synced().await;
+	}
+	println!("the change: {:?}", change);
+	assert_eq!(change.len(), 1, "{}", a.ok(&["coins"]));
+	assert_ne!(change[0]["leaf_id"], coins[0]["leaf_id"], "the coin given up is not the wallet's any more");
+	assert!(a.ok(&["coins"]).as_array().unwrap().iter().all(|c| c["state"] != "forfeited"), "{}", a.ok(&["coins"]));
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A participation the server released while the wallet was away, as the
+/// live operator released an offboard with change: at the forfeit step the
+/// keeper is down, so the server records the forfeit without the operator's
+/// half and the participation stands `forfeiting`; the keeper back, the
+/// server completes the forfeit and releases the participation. The wallet's
+/// next sync takes the release (`take_released`), rebuilding the round's new
+/// leaves to find their preimage, and an offboard with change is taken whole
+/// there too: the offboard's output, which sits in no batch, is passed over,
+/// the change is the wallet's leaf and the coin given up is gone. Asking a
+/// tree for the offboard's output (`"vout": null`) was refused on every sync
+/// ("invalid type: null, expected u32"), and the coin given up stayed counted
+/// beside its change, which was never taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offboard_with_change_released_while_the_wallet_was_away_is_taken_whole() {
+	let mut r = Running::start_kept(1, None).await;
+	let x = r.x;
+	let a = leaves_only(&mut r, "OBC", x, 600_000).await;
+	let b = Arca::new("OBD");
+	b.ok(&create_args(&r.url(), &r.node_url()));
+	let address = b.ok(&["address"])["address"].as_str().unwrap().to_string();
+	let given = live_of(&a, x);
+	assert_eq!(given.len(), 1);
+	let (xs, amount) = (x.to_string(), "300000");
+	let q = a.ok(&["offboard", "--asset", &xs, "--amount", amount, "--address", &address, "--quote"]);
+	let asked = a.ok(&["offboard", "--asset", &xs, "--amount", amount, "--address", &address, "--shown", &q.to_string()]);
+	let pid = asked["offboard"].as_str().unwrap().to_string();
+	let id: [u8; 32] = unhex(&pid).try_into().unwrap();
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(built.len() == 1 && failed.is_empty(), "{} built, {} failed", built.len(), failed.len());
+	assert_eq!(built[0].offboards, 1);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	// The forfeit goes in with the keeper down: held back, the participation `forfeiting`.
+	r.keepers[0].halt();
+	let s = a.ok(&["sync"]);
+	println!("the sync with the keeper down: {}", s["participations"]);
+	assert_eq!(r.server.store.unsigned_forfeits().await.unwrap().len(), 1, "the forfeit is recorded, held back");
+	r.keepers[0].resume();
+	r.server.forfeits.fill_unsigned().await.unwrap();
+	r.server.rounds.pass().await.unwrap();
+	let st = r.server.store.participation(&id).await.unwrap().unwrap().state;
+	println!("the keeper back: at the server {:?}", st);
+	assert_eq!(st, server::store::ParticipationState::Released);
+	let mut change = vec![];
+	for _ in 0..5 {
+		let s = a.ok(&["sync"]);
+		println!("a sync once released: {}", s["participations"]);
+		let refused: Vec<&Value> = s["participations"].as_array().map(|p| p.iter().filter(|p| p.get("refused").is_some()).collect()).unwrap_or_default();
+		assert!(refused.is_empty(), "the release refused: {:?}", refused);
+		change = live_of(&a, x);
+		if change.len() == 1 && change[0]["leaf_id"] != given[0]["leaf_id"] {
+			break;
+		}
+		r.produce().await;
+		r.synced().await;
+	}
+	println!("the change: {:?}", change);
+	assert_eq!(change.len(), 1, "{}", a.ok(&["coins"]));
+	assert_ne!(change[0]["leaf_id"], given[0]["leaf_id"], "the coin given up is not the wallet's any more");
+	assert!(a.ok(&["coins"]).as_array().unwrap().iter().all(|c| c["state"] != "forfeited"), "{}", a.ok(&["coins"]));
 	for w in [&a, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}

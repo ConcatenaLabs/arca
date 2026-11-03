@@ -1917,7 +1917,10 @@ impl Wallet {
 		let Some(unlock) = unlock else { return Ok(None) };
 		let mut preimage = None;
 		for o in st["outputs"].as_array().cloned().unwrap_or_default() {
-			let tree = self.server.post("tree", &json!({"txid": round, "vout": o["batch_vout"]}))?;
+			// An offboard pays the chain and sits in no batch: no tree of its
+			// carries the preimage, and asking for one with no vout is refused.
+			let Some(vout) = o["batch_vout"].as_u64() else { continue };
+			let tree = self.server.post("tree", &json!({"txid": round, "vout": vout}))?;
 			if tree["round_txid"].as_str() != Some(round.as_str()) {
 				return Err(Error::Refused("the server published the tree of another round".into()));
 			}
