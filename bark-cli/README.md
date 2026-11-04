@@ -488,7 +488,11 @@ and a board whose registration never reached the server, are not recovered.
   before anything is signed, and a refresh the operator refuses, voids or
   lets expire is asked for again six hours after `sync` last asked for it, a
   quarter of the day-long window, while the coin is still in it (the
-  schedule wakes for it then, and not sooner). A participation whose coin is on
+  schedule wakes for it then, and not sooner). A coin that alone keeps its
+  lowest node's fronted value from coming back (the other coins on it given
+  up and released, as the operator answers `holding_back`) is asked for at
+  once, its window or not: on a batch without a sweep nothing else would ask,
+  and its refresh gives the operator its capital back. A participation whose coin is on
   its way home on the chain is not handed over again; once the operator
   releases it, the wallet takes the new leaves with the preimage the server
   publishes. From `home_from`, `sync` takes on the chain every

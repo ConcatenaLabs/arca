@@ -1782,6 +1782,27 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// The wallet's live coins on a batch leaf that alone keep their lowest
+	/// node's fronted value from coming back, as the operator answers
+	/// (`holding_back`): refreshed at once ([`Self::refresh_due`]), each opens
+	/// nothing under the operator's in-flight cap and gives the operator its
+	/// capital back. None when the operator does not answer, or does not
+	/// know the call: the next sync asks again.
+	pub(crate) fn holding_back(&self) -> Result<Vec<String>, Error> {
+		let coins: Vec<String> = self.store.coins_in("live")?.into_iter().filter(|c| c.kind == "batch").map(|c| c.leaf_id).collect();
+		let mut out = vec![];
+		// The operator's bound on one call (`holding_back`).
+		for chunk in coins.chunks(64) {
+			let Ok(a) = self.server.post("holding_back", &json!({"leaf_ids": chunk})) else { return Ok(out) };
+			for l in a["leaves"].as_array().into_iter().flatten() {
+				if let Some(id) = l["leaf_id"].as_str().filter(|id| chunk.iter().any(|c| c == id)) {
+					out.push(id.to_string());
+				}
+			}
+		}
+		Ok(out)
+	}
+
 	/// D57: asks for the refresh of every live coin in its refresh window,
 	/// from [`REFRESH_FROM`] to [`HOME_FROM`] before its exit date, one
 	/// participation for each, as `participate` makes it: the refresh is
@@ -1791,7 +1812,9 @@ impl Wallet {
 	/// asked for again six hours ([`REFUSED_AGAIN`]) after it was last asked
 	/// for, while it is still in its refresh window.
 	/// From a day before its exit date, a coin not refreshed goes home
-	/// ([`Self::home`]).
+	/// ([`Self::home`]). A coin the bond does not cover, or one that alone
+	/// keeps its node's fronted value from coming back
+	/// ([`Self::holding_back`]), is asked for at once, its window or not.
 	pub(crate) fn refresh_due(&mut self) -> Result<Vec<Value>, Error> {
 		let now = self.now()?.to_consensus_u32();
 		let refused = self.refused_refreshes()?;
@@ -1802,8 +1825,12 @@ impl Wallet {
 		let planned: Vec<String> = self.plan_currents()?.into_iter().map(|(_, c, _)| c).collect();
 		// A coin resting on an out-of-round lineage the operator's bond does
 		// not cover is refreshed at once, its window or not: a coin that has
-		// been through a round has no such lineage left.
-		let uncovered = self.uncovered()?;
+		// been through a round has no such lineage left. So is a coin that
+		// alone keeps its node's fronted value from coming back: on a batch
+		// without a sweep nothing else ever asks for its refresh, and the
+		// operator's capital stays out until the batch's horizon.
+		let mut uncovered = self.uncovered()?;
+		uncovered.extend(self.holding_back()?);
 		for c in self.store.coins_in("live")? {
 			if planned.contains(&c.leaf_id) {
 				continue;

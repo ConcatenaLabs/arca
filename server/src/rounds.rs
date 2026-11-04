@@ -2322,6 +2322,65 @@ impl Rounds {
 		Ok(out)
 	}
 
+	/// Of `leaf_ids` (coins each resting on a batch leaf), the ones that keep
+	/// their lowest node's fronted value from coming back, and nothing else
+	/// does: the node holds coins already given up and released (or moved
+	/// with a delegation), it can come back ([`crate::delegations::can_complete`]),
+	/// and every slot of it without its consent is among `leaf_ids`. Each with
+	/// what the node's other slots hold. The holder brings that value back by
+	/// refreshing those coins: such a refresh opens nothing under the in-flight
+	/// cap ([`Self::within_cap`]), and once its round is final and the coins
+	/// released, the watcher reclaims the node.
+	pub async fn holding_back(&self, leaf_ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], u64)>, StoreError> {
+		let asked: HashSet<[u8; 32]> = leaf_ids.iter().copied().collect();
+		let mut nodes: BTreeMap<[u8; 32], Option<u64>> = BTreeMap::new();
+		let mut out = vec![];
+		for id in leaf_ids {
+			let Some(bl) = self.store.batch_leaf(id).await? else { continue };
+			let Some(h) = lowest_of(&bl.record) else { continue };
+			if !nodes.contains_key(&h) {
+				let back = self.held_back_by(&bl, h, &asked).await?;
+				nodes.insert(h, back);
+			}
+			if let Some(Some(back)) = nodes.get(&h) {
+				out.push((*id, *back));
+			}
+		}
+		Ok(out)
+	}
+
+	/// What node `h` of `bl`'s batch holds beyond its slots in `asked`, when
+	/// those are all it waits on ([`Self::holding_back`]).
+	async fn held_back_by(&self, bl: &crate::store::BatchLeafRow, h: [u8; 32], asked: &HashSet<[u8; 32]>) -> Result<Option<u64>, StoreError> {
+		let Some(round) = self.store.round(bl.round_id).await? else { return Ok(None) };
+		if !matches!(round.state, RoundState::Broadcast | RoundState::Final) {
+			return Ok(None);
+		}
+		let Some((batch, leaves)) = self.store.batch(&round.txid, bl.vout).await? else { return Ok(None) };
+		let slots: Vec<&crate::store::BatchLeafRow> = leaves.iter().filter(|l| lowest_of(&l.record) == Some(h)).collect();
+		let ids: Vec<[u8; 32]> = slots.iter().map(|l| l.leaf_id).collect();
+		if !crate::delegations::can_complete(&self.store, &ids, h).await? {
+			return Ok(None);
+		}
+		let mut left = arca_covenant::node::RECLAIM_STEPS;
+		let (mut back, mut lacks_asked, mut lacks_other) = (0u64, false, false);
+		for l in slots {
+			let consent = match elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&l.owner_key) {
+				Ok(key) => crate::delegations::consent(&self.store, l.leaf_id, key, h, left).await?,
+				Err(_) => None,
+			};
+			match consent {
+				Some(c) if batch.delegated_reclaim || c.direct() => {
+					left = left.saturating_sub(c.steps());
+					back = back.saturating_add(l.value);
+				},
+				_ if asked.contains(&l.leaf_id) => lacks_asked = true,
+				_ => lacks_other = true,
+			}
+		}
+		Ok((back > 0 && lacks_asked && !lacks_other).then_some(back))
+	}
+
 	/// Records why `row` waits.
 	async fn wait_for(&self, row: &ParticipationRow, why: &str) -> Result<(), RoundError> {
 		if row.waiting.as_deref() != Some(why) {

@@ -1367,6 +1367,23 @@ async fn participation_status_call(State(app): State<Arc<App>>, body: Result<Byt
 	Ok(Json(participation_status(&app.participations.status(&id).await?)))
 }
 
+/// `POST /v1/holding_back`: of the coins asked after, the ones that alone
+/// keep their lowest node's fronted value from coming back
+/// ([`Rounds::holding_back`]). A read, bounded like the others.
+async fn holding_back(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::HoldingBack>, Refusal>
+{
+	let req: api::HoldingBackRequest = parse(body, app.max_request)?;
+	app.reads.refusal("a read of coins holding back a node", app.source(peer.ip(), &headers))?;
+	if req.leaf_ids.len() > api::HOLDING_BACK_ASKED {
+		return Err(Refusal::malformed(format!("at most {} coins are asked after at once", api::HOLDING_BACK_ASKED)));
+	}
+	let ids = req.leaf_ids.iter().map(|l| unhex32(l)).collect::<Result<Vec<_>, _>>().map_err(Refusal::malformed)?;
+	let leaves = app.rounds.holding_back(&ids).await?.into_iter()
+		.map(|(l, back)| api::HoldingBackLeaf { leaf_id: hex(&l), back: back.to_string() }).collect();
+	Ok(Json(api::HoldingBack { leaves }))
+}
+
 /// `POST /v1/withdraw_participation`: the owners of the coins a pending
 /// participation gives up take it back before a round takes it
 /// ([`part::Participations::withdraw`]).
@@ -1946,6 +1963,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/lightning_preimage", post(lightning_preimage))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
+		.route("/v1/holding_back", post(holding_back))
 		.route("/v1/withdraw_participation", post(withdraw_participation))
 		.route("/v1/transfer_status", post(transfer_status))
 		.route("/v1/take_order", post(take_order))

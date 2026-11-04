@@ -457,3 +457,69 @@ async fn a_resting_order_filled_in_the_tree_delegates_its_first_coin_only() {
 	println!("after every holder refreshed: transferred X {}, Y {}", fx, fy);
 	assert!(fx > 0 && fy > 0, "both nodes stay counted until their expiry");
 }
+
+/// A coin left at rest beside released ones keeps its node's fronted value
+/// out until collection (arca#584). A and B refresh into one lowest node; A
+/// refreshes again and releases, so the node holds A's coin in flight and
+/// waits on B's alone. B's next sync asks the operator which of its coins
+/// hold a node back (`holding_back`), and asks for that coin's refresh at
+/// once, its window or not; once that round is final and B releases, the
+/// watcher reclaims the node. Before A's release, no sync asks for any
+/// refresh: nothing was held back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_that_alone_holds_its_node_back_is_refreshed_by_the_next_sync() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x.to_string();
+	let x_id = r.x;
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (a, b) = (Arca::new("HA"), Arca::new("HB"));
+	for w in [&a, &b] {
+		w.ok(&create);
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x_id, 5_000_000);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("both boards credited", || {
+		a.ok(&["boards"])[0]["server"]["state"] == "credited" && b.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	// Round 1: A's and B's leaves under one lowest node with RECLAIM-D.
+	refresh_all(&r, &[&a, &b]).await;
+	let s = b.ok(&["sync"]);
+	println!("B's sync before A refreshes: refresh {}", s["refresh"]);
+	assert!(s["refresh"].as_array().is_none_or(|a| a.is_empty()), "nothing is held back yet: {}", s["refresh"]);
+
+	// Round 2: A alone refreshes and releases.
+	refresh_all(&r, &[&a]).await;
+	let s = b.ok(&["sync"]);
+	println!("B's sync once A released: refresh {}", s["refresh"]);
+	let asked = s["refresh"].as_array().cloned().unwrap_or_default();
+	assert_eq!(asked.len(), 1, "{}", s["refresh"]);
+	assert_eq!(asked[0]["state"], "pending", "{}", asked[0]);
+
+	// Round 3: B's refresh; B releases, and the node comes back.
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	for t in &built {
+		r.round_state(&t.tx.txid(), RoundState::Final).await;
+	}
+	let s = b.ok(&["sync"]);
+	assert!(s["participations"].as_array().unwrap().iter().any(|p| p["state"] == "released"), "{}", s["participations"]);
+	let ks = reclaims(&r).await;
+	println!("{} reclaim(s): {:?}", ks.len(), ks.iter().map(|k| &k.detail).collect::<Vec<_>>());
+	assert!(!ks.is_empty(), "the node is reclaimed");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

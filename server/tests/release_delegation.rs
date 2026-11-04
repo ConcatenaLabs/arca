@@ -1656,3 +1656,63 @@ async fn two_holders_of_a_nodes_last_coins_bring_it_back() {
 	assert_eq!(reclaims, 1, "node A is reclaimed");
 	assert_eq!(after, 2 * VALUE, "only the two fresh coins stay in flight");
 }
+
+/// The leaf ids `holding_back` names of `coins`, with what each node pays back.
+fn holding_back(r: &Running, coins: &[&Coin]) -> Vec<(String, String)> {
+	let ids: Vec<String> = coins.iter().map(|c| hex(&c.held.id.0)).collect();
+	let a = r.http.post("holding_back", &json!({"leaf_ids": ids})).ok();
+	a["leaves"].as_array().unwrap().iter().map(|l| (l["leaf_id"].as_str().unwrap().to_string(), l["back"].as_str().unwrap().to_string()))
+		.collect()
+}
+
+/// A coin left at rest beside released ones keeps its node's fronted value
+/// out until collection (arca#584): the operator names it, for its holder to
+/// refresh. Node A holds U0, U1 and U2; U0 refreshed and released, so A holds
+/// U0's coin in flight. Asked after U1 alone, the operator names nothing (A
+/// waits on U2 too); asked after U1 and U2 (one holder of both), it names
+/// both, A paying back U0's coin. Refreshed alone, each opens nothing under
+/// a cap already full, and once both are released A is reclaimed. A fresh
+/// coin on a node holding nothing in flight is never named.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_operator_names_the_coins_that_alone_hold_a_node_back() {
+	let cap = VALUE / 2;
+	let (mut r, c) = first_leaves(Some(cap), &["HB U0", "HB U1", "HB U2"]).await;
+	let x = r.x;
+	let wk = [keypair("HB W board")];
+	let ws = boards(&mut r, &wk, x).await;
+	assert!(holding_back(&r, &[&c[0], &c[1], &c[2]]).is_empty(), "nothing is in flight yet");
+	let k0 = keypair("HB U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	let kw = keypair("HB W 1");
+	let (idw, nw) = submit(&r, &[&ws[0]], &[kw]);
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	let fresh = complete(&r, &idw, &[&ws[0]], &[kw], &nw, true).await.remove(0);
+	assert_eq!(n(&pool(&r, x), "in_flight"), VALUE, "node A holds U0's coin in flight, over a cap of {}", cap);
+
+	let one = holding_back(&r, &[&c[1]]);
+	println!("asked after U1: {:?}", one);
+	assert!(one.is_empty(), "A waits on U2 as well");
+	let both = holding_back(&r, &[&c[1], &c[2], &fresh]);
+	println!("asked after U1, U2 and a fresh coin: {:?}", both);
+	assert_eq!(both, vec![(hex(&c[1].held.id.0), VALUE.to_string()), (hex(&c[2].held.id.0), VALUE.to_string())]);
+
+	let keys = [keypair("HB U1 2"), keypair("HB U2 2")];
+	let mut parts = vec![];
+	for (coin, k) in [&c[1], &c[2]].into_iter().zip(&keys) {
+		parts.push(submit(&r, &[coin], &[*k]));
+	}
+	let built = r.server.rounds.run_round().await.unwrap().expect("both refreshes run under the full cap");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	for ((coin, k), (id, nn)) in [&c[1], &c[2]].into_iter().zip(&keys).zip(&parts) {
+		assert_ne!(status(&r, id)["state"], "pending", "{}", status(&r, id));
+		complete(&r, id, &[coin], &[*k], nn, true).await;
+	}
+	r.synced().await;
+	let reclaims = passes(&r).await.len();
+	println!("{} reclaim(s); in flight {}", reclaims, n(&pool(&r, x), "in_flight"));
+	assert_eq!(reclaims, 1, "node A is reclaimed");
+	assert!(holding_back(&r, &[&c[1], &c[2]]).is_empty(), "nothing is held back any more");
+}

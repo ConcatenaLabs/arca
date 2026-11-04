@@ -2044,6 +2044,32 @@ pub struct WithdrawParticipation {
 	pub signatures: Vec<String>,
 }
 
+/// `POST /v1/holding_back`: of a wallet's coins, each on a batch leaf
+/// ([`HOLDING_BACK_ASKED`] at most), the ones that alone keep their lowest
+/// node's fronted value from coming back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldingBackRequest {
+	pub leaf_ids: Vec<String>,
+}
+
+/// The most coins one `holding_back` call asks after.
+pub const HOLDING_BACK_ASKED: usize = 64;
+
+/// The answer to `POST /v1/holding_back`: each coin asked after that, once
+/// refreshed and released with the others asked after on its node, brings
+/// the node back, with what the node's other slots hold (`back`, atoms).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldingBack {
+	pub leaves: Vec<HoldingBackLeaf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldingBackLeaf {
+	pub leaf_id: String,
+	pub back: String,
+}
+
 /// `POST /v1/participation_status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
