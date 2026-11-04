@@ -168,8 +168,10 @@ to an older state:
   pins them, and refuses to start against a signer that names another set,
   naming both: that signer runs on another record than the operator's, made
   anew or with its first line edited. While the server runs it reads the
-  signer's keepers again at `info` and once a minute: a signer that names
-  another set since (swapped under the running server) stops it serving,
+  signer's keepers again at `info` (in the background, at most every 2 s,
+  so within one answer of the signer after the call) and once a minute: a
+  signer that names another set since (swapped under the running server)
+  stops it serving,
   every call answered `signer_replaced` (503) with both sets named, and the
   reason in its log; `info` never shows another set, so no wallet made then
   pins one.

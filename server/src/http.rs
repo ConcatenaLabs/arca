@@ -662,6 +662,11 @@ async fn record_head(app: &Arc<App>) -> Option<api::RecordHead> {
 }
 
 async fn read_record_head(app: &App) -> Option<crate::signer::SignedHead> {
+	// The keepers the record names, as the signer reads them from it,
+	// against the set the server pinned: another set stops the server. Asked
+	// first, so a swapped signer is found one signer round trip after the
+	// `info` that asked.
+	keepers_replaced(app.cosigner.signer(), &app.keepers, &app.replaced).await;
 	// The latest entry handed out, by this server or another on the same
 	// database, is known from here on without a read.
 	if let Err(e) = app.store.signer_head().await {
@@ -674,9 +679,6 @@ async fn read_record_head(app: &App) -> Option<crate::signer::SignedHead> {
 			None
 		},
 	};
-	// The keepers the record names, as the signer reads them from it,
-	// against the set the server pinned: another set stops the server.
-	keepers_replaced(app.cosigner.signer(), &app.keepers, &app.replaced).await;
 	head
 }
 
