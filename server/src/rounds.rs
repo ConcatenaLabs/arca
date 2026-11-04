@@ -380,6 +380,18 @@ fn lowest_of(record: &[u8]) -> Option<[u8; 32]> {
 	arca_covenant::LeafRecord::from_bytes(record).ok().and_then(|r| r.branch().ok()).and_then(|b| b.nodes.last().map(|n| n.children_hash()))
 }
 
+/// A lowest node holding fronted value, as [`Rounds::within_cap`] reads it.
+struct OpenNode {
+	/// Its batch's asset.
+	asset: AssetId,
+	/// Whether its batch has RECLAIM-D.
+	delegated: bool,
+	/// What its leaves hold, which a reclaim of it pays back.
+	value: u64,
+	/// Each slot's batch leaf and owner key, in owner order.
+	slots: Vec<([u8; 32], [u8; 32])>,
+}
+
 /// How close to its first expiry a coin given up must be for its refresh to
 /// run whatever the in-flight cap ([`Rounds::within_cap`]): six days, a day
 /// beyond the five before expiry from which a wallet asks for a refresh by
@@ -1919,13 +1931,20 @@ impl Rounds {
 	/// coin within [`CAP_EXEMPT`] of its first expiry is never held by the
 	/// cap: its holder would otherwise take it on the chain. Nor is an
 	/// offboard (a holder moving coins out of the Ark), which the float the
-	/// cap keeps is for, though what it gives up counts in flight. Nor is one whose
-	/// coins rest only on lowest nodes that already hold fronted value and
-	/// can still come back ([`crate::delegations::can_complete`]): it opens
-	/// nothing new, and those nodes come back only once it runs, so holding it
-	/// would keep the cap full for ever. One larger than a cap above 0 runs
-	/// once nothing of the asset is in flight. Coins on accumulator batches
-	/// count like any others, and never complete a node.
+	/// cap keeps is for, though what it gives up counts in flight. What
+	/// counts against the cap is what a participation opens beyond what it
+	/// brings back. A coin resting only on lowest nodes that already hold
+	/// fronted value and can still come back
+	/// ([`crate::delegations::can_complete`]) opens nothing new: those nodes
+	/// come back only once it runs, so holding it would keep the cap full for
+	/// ever. A lowest node every slot of which has its consent but those the
+	/// participation gives up is brought back by it: once its round is final
+	/// and its owners release, the watcher reclaims the node's whole value. So
+	/// a wallet refreshing a coin that completes a node together with fresh
+	/// coins runs while the node pays back at least what the fresh coins
+	/// open. One larger than a cap above 0 runs once nothing of the asset is
+	/// in flight. Coins on accumulator batches count like any others, and
+	/// never complete a node.
 	async fn within_cap(&self, chosen: Vec<ParticipationRow>, now: MedianTime) -> Result<Vec<ParticipationRow>, RoundError> {
 		let caps: BTreeMap<AssetId, u64> = self.params.assets.ids().into_iter()
 			.filter_map(|a| self.params.in_flight_cap(&a).map(|c| (a, c))).collect();
@@ -1948,27 +1967,53 @@ impl Rounds {
 				batches.insert((round_id, vout));
 			}
 		}
-		let mut slots: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
+		// Each open node's slots in owner order, its asset, its value and
+		// whether its batch has RECLAIM-D.
+		let mut nodes: BTreeMap<[u8; 32], OpenNode> = BTreeMap::new();
 		for (round_id, vout) in batches {
 			let Some(round) = self.store.round(round_id).await? else { continue };
-			let Some((_, leaves)) = self.store.batch(&round.txid, vout).await? else { continue };
+			let Some((batch, leaves)) = self.store.batch(&round.txid, vout).await? else { continue };
 			for l in leaves {
 				if let Some(h) = lowest_of(&l.record).filter(|h| open.contains(h)) {
-					slots.entry(h).or_default().push(l.leaf_id);
+					let n = nodes.entry(h).or_insert_with(|| OpenNode {
+						asset: AssetId::from_byte_array(batch.asset), delegated: batch.delegated_reclaim, value: 0, slots: vec![],
+					});
+					n.value = n.value.saturating_add(l.value);
+					n.slots.push((l.leaf_id, l.owner_key));
 				}
 			}
 		}
 		let mut completable: HashSet<[u8; 32]> = HashSet::new();
-		for (h, ids) in &slots {
-			if crate::delegations::can_complete(&self.store, ids, *h).await? {
-				completable.insert(*h);
+		// Of each node that can come back, the slots without their consent
+		// yet: once they are given up and released, the watcher reclaims it.
+		let mut missing: BTreeMap<[u8; 32], Vec<[u8; 32]>> = BTreeMap::new();
+		for (h, n) in &nodes {
+			let ids: Vec<[u8; 32]> = n.slots.iter().map(|s| s.0).collect();
+			if !crate::delegations::can_complete(&self.store, &ids, *h).await? {
+				continue;
+			}
+			completable.insert(*h);
+			let mut left = arca_covenant::node::RECLAIM_STEPS;
+			let mut lacks = vec![];
+			for (leaf, key) in &n.slots {
+				let Ok(key) = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(key) else { lacks.push(*leaf); continue };
+				match crate::delegations::consent(&self.store, *leaf, key, *h, left).await? {
+					// Without RECLAIM-D a node comes back by its owners' own
+					// releases only.
+					Some(c) if n.delegated || c.direct() => left = left.saturating_sub(c.steps()),
+					_ => lacks.push(*leaf),
+				}
+			}
+			if !lacks.is_empty() {
+				missing.insert(*h, lacks);
 			}
 		}
 		let mut out = Vec::with_capacity(chosen.len());
 		for row in chosen {
 			let mut adds: BTreeMap<AssetId, u64> = BTreeMap::new();
+			let mut opens: BTreeMap<AssetId, u64> = BTreeMap::new();
+			let mut given: HashSet<[u8; 32]> = HashSet::new();
 			let mut near = false;
-			let mut completes = true;
 			for i in row.inputs.iter().filter(|i| !i.returned) {
 				let asset = AssetId::from_byte_array(i.asset);
 				if !caps.contains_key(&asset) {
@@ -1978,23 +2023,40 @@ impl Rounds {
 				let Ok(record) = CoinRecord::from_bytes(&l.record) else { continue };
 				let Some(expiry) = crate::cosign::first_expiry(&record) else { continue };
 				near |= expiry < now.to_consensus_u32().saturating_add(CAP_EXEMPT);
-				completes &= lowest_nodes(&record).is_some_and(|ns| !ns.is_empty() && ns.iter().all(|h| completable.contains(h)));
+				// A coin resting only on lowest nodes that hold fronted value
+				// and can come back opens nothing new.
+				let completes = lowest_nodes(&record).is_some_and(|ns| !ns.is_empty() && ns.iter().all(|h| completable.contains(h)));
+				if !completes {
+					*opens.entry(asset).or_default() += i.value;
+				}
 				*adds.entry(asset).or_default() += i.value;
+				given.insert(i.leaf_id);
 			}
-			let completes = completes && !adds.is_empty();
+			// What it brings back: every node it gives up the last coins of
+			// that have not consented yet, reclaimed once its round is final
+			// and its owners release.
+			let mut returns: BTreeMap<AssetId, u64> = BTreeMap::new();
+			for (h, lacks) in &missing {
+				if lacks.iter().all(|l| given.contains(l)) {
+					let n = &nodes[h];
+					*returns.entry(n.asset).or_default() += n.value;
+				}
+			}
 			// A holder moving coins out of the Ark (an offboard: a stake, a
 			// withdrawal) is never held by the cap: the cap holds refreshes
 			// back so that the pool keeps what such moves need, and holding
 			// them too would leave that float unused. What it gives up still
 			// counts in flight.
 			let leaves_the_ark = row.outputs.iter().any(|o| matches!(o.kind, WantedKind::Offboard { .. }));
-			// One refresh larger than a cap above 0 runs when nothing else is
-			// in flight, or it would wait for ever.
-			let over = adds.iter().find(|(a, v)| {
+			// What it opens beyond what it brings back is what counts against
+			// the cap. One refresh larger than a cap above 0 runs when nothing
+			// else is in flight, or it would wait for ever.
+			let over = adds.keys().find(|a| {
 				let f = flight.get(*a).copied().unwrap_or(0);
-				f.saturating_add(**v) > caps[*a] && !(f == 0 && caps[*a] > 0)
-			}).map(|(a, _)| *a);
-			if let Some(a) = over.filter(|_| !near && !completes && !leaves_the_ark) {
+				let net = opens.get(*a).copied().unwrap_or(0).saturating_sub(returns.get(*a).copied().unwrap_or(0));
+				net > 0 && f.saturating_add(net) > caps[*a] && !(f == 0 && caps[*a] > 0)
+			}).copied();
+			if let Some(a) = over.filter(|_| !near && !leaves_the_ark) {
 				let why = format!("This refresh waits for a later round: the operator is refreshing as much of this asset as it takes on \
 					at once, and takes more as earlier refreshes come back. Nothing is lost meanwhile. (Asset {}: {} of a cap of {} \
 					in flight.)", a, flight.get(&a).copied().unwrap_or(0), caps[&a]);

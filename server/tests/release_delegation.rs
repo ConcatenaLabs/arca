@@ -18,7 +18,10 @@
 //! 3. The in-flight cap: a refresh beyond an asset's cap waits, in plain
 //!    words, and an asset with a cap of 0 and an empty pool holds up none of
 //!    the round's other assets. A refresh with no release on a node one of
-//!    whose coins was paid on is held by the cap too (arca#450).
+//!    whose coins was paid on is held by the cap too (arca#450). A refresh
+//!    that gives up the last coin of a node beside fresh coins runs while the
+//!    node pays back at least what the fresh coins open, and waits when they
+//!    open more.
 //! 4. A resting order filled in the tree (arca#419): the taker's coin
 //!    delegates with the fill, the maker's order coin afterwards from a coin
 //!    the fill made. A maker whose order is filled whole every round keeps
@@ -626,6 +629,74 @@ async fn a_node_that_cannot_come_back_does_not_take_refreshes_past_the_cap() {
 	}
 	assert!(most <= cap, "nothing runs past the cap on a node that cannot come back: {} in flight", most);
 	assert_eq!(pending.len(), 3, "the refreshes beyond the cap wait");
+}
+
+/// A holder over the cap refreshes, in one participation, the last coin of a
+/// node that holds fronted value beside fresh coins resting on a node that
+/// holds none (the testnet's leaf maker, 2026-11-04: one refresh of 16 coins,
+/// three of them the last of their nodes, waited for days, and those nodes
+/// with it). U0 and U1 share node A; U0 refreshed and released, so A holds
+/// U0's coin in flight and waits for U1. The fresh coins rest beside U0's new
+/// leaf. With `extra` 0 the participation opens one coin and brings back
+/// A's two: it runs, A is reclaimed, and what is in flight comes down to the
+/// one fresh coin. With `extra` 2 it opens three, more than A pays back, and
+/// waits under the cap.
+async fn completing_beside_fresh(extra: usize) -> (Running, Value, u64, usize) {
+	let cap = VALUE * 3 / 2;
+	let (mut r, c) = first_leaves(Some(cap), &["CF U0", "CF U1"]).await;
+	let x = r.x;
+	let wk: Vec<Keypair> = (0..=extra).map(|j| keypair(&format!("CF W{} board", j))).collect();
+	let ws = boards(&mut r, &wk, x).await;
+	let k0 = keypair("CF U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	let mut wparts = vec![];
+	for (j, w) in ws.iter().enumerate() {
+		let k = keypair(&format!("CF W{} 1", j));
+		wparts.push((submit(&r, &[w], &[k]), k));
+	}
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	let mut fresh = vec![];
+	for (((id, nn), k), w) in wparts.iter().zip(&ws) {
+		fresh.push(complete(&r, id, &[w], &[*k], nn, true).await.remove(0));
+	}
+	let p = pool(&r, x);
+	println!("before: in flight {} of a cap of {}", n(&p, "in_flight"), cap);
+	assert_eq!(n(&p, "in_flight"), VALUE, "node A holds U0's coin in flight");
+
+	let mut coins: Vec<&Coin> = vec![&c[1]];
+	coins.extend(fresh.iter());
+	let keys: Vec<Keypair> = (0..coins.len()).map(|j| keypair(&format!("CF P {}", j))).collect();
+	let (id, nn) = submit(&r, &coins, &keys);
+	let built = r.server.rounds.run_round().await.unwrap();
+	let st = status(&r, &id);
+	println!("the refresh of U1 and {} fresh coin(s): {} {}", fresh.len(), st["state"], st["waiting"]);
+	let Some(built) = built else { return (r, st, cap, 0) };
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	complete(&r, &id, &coins, &keys, &nn, true).await;
+	let reclaims = passes(&r).await.len();
+	(r, st, cap, reclaims)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_that_brings_a_node_back_runs_beside_fresh_coins() {
+	let (r, st, cap, reclaims) = completing_beside_fresh(0).await;
+	assert_eq!(st["state"], "issued", "it brings back more than it opens: {}", st);
+	let p = pool(&r, r.x);
+	println!("after: {} reclaim(s); in flight {} of a cap of {}", reclaims, n(&p, "in_flight"), cap);
+	assert_eq!(reclaims, 1, "node A is reclaimed");
+	assert_eq!(n(&p, "in_flight"), VALUE, "only the fresh coin is in flight");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_opening_more_than_it_brings_back_waits() {
+	let (r, st, cap, _) = completing_beside_fresh(2).await;
+	assert_eq!(st["state"], "pending", "it opens three coins and brings back two: {}", st);
+	assert!(st["waiting"].as_str().unwrap().starts_with("This refresh waits for a later round"), "{}", st);
+	let p = pool(&r, r.x);
+	assert!(n(&p, "in_flight") <= cap, "nothing ran past the cap: {}", n(&p, "in_flight"));
 }
 
 /// The cap holds refreshes back so that the pool keeps what holders moving
