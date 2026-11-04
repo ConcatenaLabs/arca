@@ -1695,22 +1695,41 @@ already hold fronted value and can still come back (every coin on them still
 held, given up in a refresh whose release is recorded or whose participation
 has not completed, or moved with a delegation, within RECLAIM-D's 32 steps)
 opens nothing new, and without its refresh those nodes never come back. A
-lowest node every slot of which has its consent but those the participation
-gives up is brought back by it: once its round is final and its owners
-release, the watcher reclaims the node's whole value. So a participation that
-refreshes the last coin of such a node together with fresh coins runs while
-the node pays back at least what the fresh coins open, and waits when they
-open more. Two kinds of refresh run whatever the cap too: one with a coin
-within six days of its first expiry (a wallet asks for a refresh by itself
-from five days before, and takes the coin on the chain from four), so the cap
-never sends a coin home; and one larger than a cap above 0 while nothing of
-the asset is in flight. A refresh on a node that can come back only at its batch's
-expiry (a coin on it moved without a delegation, or refreshed or offboarded
-with no release) is held by the cap like any
-other, and a coin on an accumulator batch, which has no lowest node, counts
-in flight and never completes one: a slot of one without a sweep comes back
-by its own release, once its owner gives it up. A cap of `"0"` fronts nothing, for
-an asset whose pool is empty.
+lowest node every slot of which has its consent but those given up by the
+participation and by the ones taken before it in the same round is brought
+back: once the round is final and its owners release, the watcher reclaims
+the node. What that pays back beyond the coins given up to complete it is
+what its other slots hold in flight, and that is what the participation is
+credited with: the coins that complete it opened nothing, so they are not
+credited a second time. So a participation that refreshes the last coin of
+such a node together with fresh coins runs while the node's other slots pay
+back at least what the fresh coins open, and waits when they open more; its
+holder can always refresh the node's coins on their own, which opens
+nothing. Its status then says how far it would take what is in flight (`...
+1000000 of a cap of 1500000 in flight; this refresh would take it to
+2000000.`).
+
+A node can lack the coins of several holders. A participation that does not
+fit alone is judged again together with the ones already waiting that give
+up other last coins of the same nodes, and they all run when together they
+fit. And when everything of an asset in flight rests on nodes that come back
+only once several of the waiting participations run, waiting frees nothing:
+the first of them runs whatever the cap, once a round for each asset, and the
+others are judged again beside it, so the node comes back. Value on a node
+that lacks a coin nobody offers holds the cap as before.
+
+Two kinds of refresh run whatever the cap too: one with a coin within six
+days of its first expiry, or, on a board or a batch without a sweep, of its
+service horizon (a wallet asks for a refresh by itself from five days before,
+and the operator takes such a coin in a refresh only until three days before
+its horizon), so the cap never sends a coin home; and one larger than a cap
+above 0 while nothing of the asset is in flight. A refresh on a node that can
+come back only at its batch's expiry or horizon (a coin on it moved without a
+delegation, or refreshed or offboarded with no release) is held by the cap
+like any other, and a coin on an accumulator batch, which has no lowest node,
+counts in flight and never completes one: a slot of one without a sweep comes
+back by its own release, once its owner gives it up. A cap of `"0"` fronts
+nothing, for an asset whose pool is empty.
 
 The participations are taken against what the operator's wallet can spend of the asset now: what
 the round pays on their behalf (the batch output, leaves and reserves as the
@@ -3894,7 +3913,11 @@ RECLAIM-D (the control) it grows by the maker's leaves every round. Under an
 in-flight cap a second refresh waits in plain words, and runs a round later
 once it completes a node the first opened; a refresh of a node's last coin
 beside a fresh coin runs and the node is reclaimed, and beside three fresh
-coins, more than the node pays back, it waits; on a node one of whose coins was
+coins, more than the node pays back, it waits; beside two fresh coins it waits
+too, the node's own last coin not credited twice, with and without another
+node's coin in flight; two holders each refreshing one of a node's last two
+coins beside a fresh coin, all in flight being that node's, both run and the
+node is reclaimed; on a node one of whose coins was
 paid on without a delegation the refreshes past the cap keep waiting; an asset
 with a cap of 0 and an empty pool waits and holds up no other asset's round.
 A transfer refused for good after it was recorded with a delegation is

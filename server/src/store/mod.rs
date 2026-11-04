@@ -80,7 +80,7 @@ pub use delegations::{DelegationRow, HolderReleaseRow, SpentBy};
 pub use distributions::{ClaimRow, DistributionRow, NewDistribution, ReturnRow};
 pub use lightning::{NewReceive, ReceiveRow, ReceiveState, SendRow, SendState};
 pub use mailbox::MailboxMessage;
-pub use pool::PoolFlow;
+pub use pool::{InFlightSlot, PoolFlow};
 pub use plans::{NewPlan, NewPlanStep, PlanRow, PlanState, PlanStepRow, StepState};
 pub use reserving::{ServedBatch, ServedBoard, ServedForfeit, ServedLeaf, ServedMadeBy, ServedTransferSpend};
 pub use nursery::{NurseryRow, NurseryState};
