@@ -611,7 +611,11 @@ async fn a_wallet_that_syncs_less_often_than_the_window_keeps_its_round_by_handi
 	assert_eq!(held[0]["state"], "forfeiting", "{}", h);
 	let again = m2.ok(&["hand-over-forfeits"]);
 	println!("M2 again while the round is held: {}", again["held"]);
-	assert!(again["held"][0]["note"].as_str().unwrap_or("").starts_with("the forfeits are in before the round is broadcast"), "{}", again);
+	// Nothing is signed again: the round still held reads as handed over,
+	// or the server's runner has broadcast it already and nothing is held.
+	let held_again = again["held"].as_array().unwrap();
+	assert!(held_again.is_empty() || held_again[0]["note"].as_str().unwrap_or("").starts_with("the forfeits are in before the round is \
+		broadcast"), "{}", again);
 	r.server.rounds.pass().await.unwrap();
 	assert_eq!(round_of(&r, &kept).await, RoundState::Broadcast, "every forfeit is in: the round goes out");
 	let after = m2.ok(&["hand-over-forfeits"]);
