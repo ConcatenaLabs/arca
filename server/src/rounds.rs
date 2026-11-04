@@ -266,7 +266,7 @@ use std::time::Duration;
 use elements::encode::{deserialize, serialize};
 use elements::hashes::Hash;
 use elements::{AssetId, OutPoint, Transaction, Txid};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
 
 use arca_covenant::encode::Encoding;
 use arca_covenant::spend::FeeSource;
@@ -622,6 +622,8 @@ pub struct Rounds {
 	going_out: Mutex<()>,
 	/// What [`Rounds::fundable_now`] last answered, and when.
 	fundable_seen: Mutex<Option<(std::time::Instant, BTreeMap<AssetId, u64>)>>,
+	/// What [`Rounds::in_flight_now`] last read, and when.
+	in_flight_seen: Mutex<Option<(std::time::Instant, BTreeMap<[u8; 32], u64>)>>,
 	/// Each participation's holder, once read ([`Rounds::holder_of`]).
 	holders: Mutex<std::collections::HashMap<[u8; 32], Option<[u8; 32]>>>,
 }
@@ -738,7 +740,7 @@ impl Rounds {
 		signer: SignerClient, config: RoundConfig) -> Arc<Rounds>
 	{
 		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
-			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), holders: Mutex::new(Default::default()) })
+			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), in_flight_seen: Mutex::new(None), holders: Mutex::new(Default::default()) })
 	}
 
 	/// The finality service this operator follows the chain with.
@@ -790,6 +792,21 @@ impl Rounds {
 		}
 		*seen = Some((std::time::Instant::now(), out.clone()));
 		Ok(out)
+	}
+
+	/// What is in flight of each asset ([`Store::in_flight`]), read again at
+	/// most every [`FUNDABLE_FOR`]: `info` publishes it, and on a long history
+	/// the statement takes a second or more, too long to run for every reader.
+	pub async fn in_flight_now(&self) -> Result<BTreeMap<[u8; 32], u64>, RoundError> {
+		let mut seen = self.in_flight_seen.lock().await;
+		if let Some((at, m)) = seen.as_ref() {
+			if at.elapsed() < FUNDABLE_FOR {
+				return Ok(m.clone());
+			}
+		}
+		let m = self.store.in_flight().await?;
+		*seen = Some((std::time::Instant::now(), m.clone()));
+		Ok(m)
 	}
 
 	/// What the operator minted and burned of the issuer-operated `asset`,
@@ -3619,11 +3636,20 @@ impl Rounds {
 			let mut tick = interval.map(tokio::time::interval);
 			loop {
 				let r = tokio::select! {
-					e = rx.recv() => match e {
-						Ok(ChainEvent::Synced { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => me.pass().await,
-						Ok(e @ ChainEvent::Disconnected { .. }) => me.on_chain_event(&e).await,
-						Ok(_) => Ok(()),
-						Err(broadcast::error::RecvError::Closed) => return,
+					d = crate::chain::drain(&mut rx) => {
+						let mut r = Ok(());
+						for e in d.events.iter().filter(|e| matches!(e, ChainEvent::Disconnected { .. })) {
+							if let Err(e) = me.on_chain_event(e).await {
+								log::warn!("rounds: {}", e);
+							}
+						}
+						if d.synced || d.lagged > 0 {
+							r = me.pass().await;
+						}
+						if d.closed {
+							return;
+						}
+						r
 					},
 					_ = async { match tick.as_mut() { Some(t) => { t.tick().await; }, None => std::future::pending::<()>().await } } => {
 						match me.run_rounds().await {

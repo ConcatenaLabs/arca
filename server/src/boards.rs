@@ -31,7 +31,6 @@ use std::time::Duration;
 use elements::encode::serialize;
 use elements::hashes::Hash;
 use elements::{Transaction, Txid};
-use tokio::sync::broadcast;
 
 use arca_covenant::{BoardRecord, CoinRecord, LeafId, MedianTime, RecordError};
 
@@ -312,14 +311,19 @@ impl Boards {
 		let mut rx = self.finality.subscribe();
 		tokio::spawn(async move {
 			loop {
-				let r = match rx.recv().await {
-					Ok(ChainEvent::Synced { .. }) => me.pass().await,
-					Ok(e) => me.on_chain_event(&e).await,
-					Err(broadcast::error::RecvError::Lagged(_)) => me.pass().await,
-					Err(broadcast::error::RecvError::Closed) => return,
-				};
-				if let Err(e) = r {
-					log::warn!("boards: {}", e);
+				let d = crate::chain::drain(&mut rx).await;
+				for e in &d.events {
+					if let Err(e) = me.on_chain_event(e).await {
+						log::warn!("boards: {}", e);
+					}
+				}
+				if d.synced || d.lagged > 0 {
+					if let Err(e) = me.pass().await {
+						log::warn!("boards: {}", e);
+					}
+				}
+				if d.closed {
+					return;
 				}
 			}
 		})

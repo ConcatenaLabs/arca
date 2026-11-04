@@ -133,7 +133,7 @@ use elements::encode::{deserialize, serialize};
 use elements::hashes::Hash;
 use elements::secp256k1_zkp::schnorr::Signature;
 use elements::{AssetId, OutPoint, Script, Transaction, Txid};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::Mutex;
 
 use arca_covenant::encode::Encoding;
 use arca_covenant::node::{connector_index, reclaim_items};
@@ -147,7 +147,7 @@ use arca_covenant::{
 };
 use sequentia_ext::AssetAmount;
 
-use crate::chain::{ChainEvent, FinalityService};
+use crate::chain::FinalityService;
 use crate::coins;
 use crate::fees;
 use crate::nursery::Nursery;
@@ -420,24 +420,22 @@ impl Watcher {
 			let mut last_whole = Instant::now() - me.config.recovery_interval;
 			let mut block = false;
 			loop {
-				let r = match rx.recv().await {
-					Ok(ChainEvent::Connected { .. }) | Ok(ChainEvent::Disconnected { .. }) => {
-						block = true;
-						Ok(())
-					},
-					Ok(ChainEvent::Synced { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => {
-						if block || last_whole.elapsed() >= me.config.recovery_interval {
-							block = false;
-							last_whole = Instant::now();
-							me.pass().await
-						} else {
-							me.urgent().await
-						}
-					},
-					Err(broadcast::error::RecvError::Closed) => return,
-				};
-				if let Err(e) = r {
-					log::warn!("watcher: {}", e);
+				let d = crate::chain::drain(&mut rx).await;
+				block |= !d.events.is_empty();
+				if d.synced || d.lagged > 0 {
+					let r = if block || last_whole.elapsed() >= me.config.recovery_interval {
+						block = false;
+						last_whole = Instant::now();
+						me.pass().await
+					} else {
+						me.urgent().await
+					};
+					if let Err(e) = r {
+						log::warn!("watcher: {}", e);
+					}
+				}
+				if d.closed {
+					return;
 				}
 			}
 		})
