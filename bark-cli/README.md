@@ -1012,7 +1012,12 @@ back after its delay) or `not_made` (the participation ended without a round,
 or the operator refused it: the coins are the wallet's again). The operator
 refuses an offboard paying one of its own Arca scripts (`script_reused`), and
 each of its refusals is final: the wallet puts the coins back and posts nothing
-again.
+again. The same offboard asked again (the same asset, amount and address, or
+the same coins to the same address) goes on with the first while the wallet
+has not finished it: one the operator never answered is posted again as it
+stood, one the operator holds is answered as under way (`already`), its coins
+given up to it again, and `sync` completes it. Only one the operator does not
+hold is made anew, as a participation of its own.
 
     arca offboard --asset X --amount 300000 --address ADDR --quote   # fee, coins, change
     arca offboard … --shown '<the quote>'                            # paid in the next round

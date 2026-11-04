@@ -25,7 +25,7 @@ use elements::{AssetId, OutPoint, Script, Txid};
 use serde_json::{json, Value};
 
 use arca_covenant::spend::FeeSource;
-use arca_covenant::{ExplicitOutput, LeafId, OffboardPolicy, RelativeTime, Template};
+use arca_covenant::{ExplicitOutput, LeafId, MedianTime, OffboardPolicy, RelativeTime, Template};
 
 use super::chain::{hex, unhex, unhex32};
 use super::client::{key_proof_digest, participation_id, Wanted};
@@ -167,6 +167,21 @@ impl Wallet {
 		}
 		self.witnessed_now()?;
 		let info = self.server_info()?;
+		// The same offboard asked again (same asset, amount and address)
+		// while the first is still the wallet's to finish: it goes on.
+		let list: Vec<Value> = self.store.meta(OFFBOARDS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let parts = self.store.participations()?;
+		for e in list.iter().rev() {
+			let same = e["asset"] == json!(asset.to_string()) && e["amount"] == json!(amount.to_string())
+				&& e["script"] == json!(hex(script.as_bytes())) && e["at"].is_null();
+			let pid = e["offboard"].as_str().unwrap_or("");
+			let open = parts.iter().any(|p| p.0 == pid && matches!(p.4.as_str(), "submitting" | "pending" | "issued" | "forfeiting"));
+			if same && open {
+				if let Some(v) = self.offboard_under_way(pid)? {
+					return Ok(v);
+				}
+			}
+		}
 		let (quote, plan) = self.offboard_plan(&info, asset, amount, script, max_fee_ppm)?;
 		if let Some(s) = shown {
 			for k in ["fee", "gives"] {
@@ -188,7 +203,28 @@ impl Wallet {
 		}
 		let fees = vec![(asset, plan.fee)];
 		let ids: Vec<LeafId> = plan.coins.iter().map(|c| c.coin.id).collect();
-		let id = participation_id(&self.genesis, &self.operator, &ids, &wanted, &fees, None);
+		let given: Vec<String> = plan.coins.iter().map(|c| c.row.leaf_id.clone()).collect();
+		// The same coins, address and amount make the same participation as
+		// an earlier offboard. One the operator still holds is that offboard,
+		// under way: it goes on, its coins given up again. One the operator
+		// does not hold (refused, void, never received) is over: this one is
+		// made apart from it by a date it may run from, now.
+		let mut not_before = None;
+		loop {
+			let id = participation_id(&self.genesis, &self.operator, &ids, &wanted, &fees, not_before);
+			let pid = hex(&id);
+			if !self.store.participations()?.iter().any(|p| p.0 == pid) {
+				break;
+			}
+			if not_before.is_none() {
+				if let Some(v) = self.offboard_under_way(&pid)? {
+					return Ok(v);
+				}
+			}
+			let t = not_before.map_or(self.now()?.to_consensus_u32(), |t: MedianTime| t.to_consensus_u32() + 1);
+			not_before = Some(MedianTime::from_consensus(t).map_err(|e| Error::Refused(e.to_string()))?);
+		}
+		let id = participation_id(&self.genesis, &self.operator, &ids, &wanted, &fees, not_before);
 		let mut inputs = vec![];
 		for c in &plan.coins {
 			let k = self.coin_key(&c.row.owner_nonce)?;
@@ -206,10 +242,12 @@ impl Wallet {
 			}
 			outputs.push(j);
 		}
-		let body = json!({"inputs": inputs, "outputs": outputs,
+		let mut body = json!({"inputs": inputs, "outputs": outputs,
 			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()});
+		if let Some(t) = not_before {
+			body["not_before"] = json!(t.to_consensus_u32());
+		}
 		let pid = hex(&id);
-		let given: Vec<String> = plan.coins.iter().map(|c| c.row.leaf_id.clone()).collect();
 		let entry = json!({"offboard": pid, "asset": asset.to_string(), "amount": amount.to_string(), "script": hex(script.as_bytes())});
 		self.store.atomically(|s| {
 			s.put_participation(&pid, &body.to_string(), &serde_json::to_string(&given).expect("strings"),
@@ -230,6 +268,57 @@ impl Wallet {
 			"change": plan.change.to_string(), "round_within_seconds": within,
 			"note": self.spelling.say("asked: once the operator's round pays the offboard and is final, {sync} hands over the forfeits; \
 				the operator then pays the address on the chain. {offboards} says where it stands")}))
+	}
+
+	/// The offboard the wallet recorded as participation `pid`, gone on with
+	/// when the operator holds it or takes it now: one the operator never
+	/// answered is posted again as it stands (the operator takes a
+	/// participation it holds already as that one, answering where it
+	/// stands); another is asked after. Its coins are given up to it again
+	/// and the wallet's record follows the operator's, and it is answered as
+	/// under way. `None` when the operator neither holds nor takes it: it is
+	/// over, its coins the wallet's.
+	fn offboard_under_way(&mut self, pid: &str) -> Result<Option<Value>, Error> {
+		let Some((_, body, given, _, state, _, _)) = self.store.participations()?.into_iter().find(|p| p.0 == pid) else { return Ok(None) };
+		let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+		let st = if state == "submitting" {
+			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+			match self.submit_participation_body(pid, &body, &given) {
+				Ok(a) => a,
+				// Refused: its coins are the wallet's again.
+				Err(Error::Server { .. }) => return Ok(None),
+				Err(e) => return Err(e),
+			}
+		} else {
+			match self.server.post("participation_status", &json!({"participation_id": pid})) {
+				Ok(st) => st,
+				Err(Error::Server { code, .. }) if code == "unknown_participation" => return Ok(None),
+				Err(e) => return Err(e),
+			}
+		};
+		let now = st["state"].as_str().unwrap_or("").to_string();
+		if !matches!(now.as_str(), "pending" | "issued" | "forfeiting" | "released") {
+			return Ok(None);
+		}
+		let local = match now.as_str() {
+			// The wallet hands over its forfeits and takes the release on
+			// its next sync, from the record of an issued participation.
+			"forfeiting" | "released" => "issued",
+			s => s,
+		};
+		self.store.atomically(|s| {
+			s.set_participation(pid, local, None, None)?;
+			for l in &given {
+				s.set_coin_state(l, "given", &format!("offboard {}", pid))?;
+			}
+			Ok(())
+		})?;
+		let list: Vec<Value> = self.store.meta(OFFBOARDS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let e = list.iter().find(|e| e["offboard"] == json!(pid)).cloned().unwrap_or(Value::Null);
+		Ok(Some(json!({"offboard": pid, "state": now, "asset": e["asset"], "amount": e["amount"], "script": e["script"],
+			"gives": given, "already": true,
+			"note": self.spelling.say("this payment is already under way: the operator holds it, and {sync} completes it. \
+				{offboards} says where it stands")})))
 	}
 
 	/// Moves each offboard on as far as `sync` takes it: once its

@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 
 use arca_covenant::CoinRecord;
 use common::cli::Arca;
+use common::proxy::Proxy;
 use common::running::Running;
 use server::server::AssetSection;
 use server::store::RoundState;
@@ -45,7 +46,13 @@ fn script(v: &Value) -> Script {
 
 /// A wallet whose only holding of `asset` is one coin boarded whole.
 async fn leaves_only(r: &mut Running, name: &str, asset: AssetId, paid: u64) -> Arca {
-	let (url, node) = (r.url(), r.node_url());
+	let url = r.url();
+	leaves_only_at(r, name, asset, paid, &url).await
+}
+
+/// [`leaves_only`], the wallet talking to the operator at `url`.
+async fn leaves_only_at(r: &mut Running, name: &str, asset: AssetId, paid: u64, url: &str) -> Arca {
+	let (url, node) = (url.to_string(), r.node_url());
 	let w = Arca::new(name);
 	w.ok(&create_args(&url, &node));
 	r.pay_to(script(&w.ok(&["address"])), asset, paid);
@@ -256,6 +263,137 @@ async fn an_offboard_with_change_released_while_the_wallet_was_away_is_taken_who
 	assert_ne!(change[0]["leaf_id"], given[0]["leaf_id"], "the coin given up is not the wallet's any more");
 	assert!(a.ok(&["coins"]).as_array().unwrap().iter().all(|c| c["state"] != "forfeited"), "{}", a.ok(&["coins"]));
 	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// The amount of an offboard of every coin of `asset` to `to` (`--address`
+/// or `--script` and its value): no change.
+fn whole(w: &Arca, asset: AssetId, to: [&str; 2]) -> String {
+	let held: u64 = live_of(w, asset).iter().map(|c| c["value"].as_str().map_or_else(|| c["value"].as_u64().unwrap(), |v| v.parse().unwrap())).sum();
+	let mut amount = held - held / 50;
+	for _ in 0..6 {
+		let q = w.ok(&["offboard", "--asset", &asset.to_string(), "--amount", &amount.to_string(), to[0], to[1], "--quote"]);
+		let change: u64 = q["change"].as_str().unwrap().parse().unwrap();
+		if change == 0 {
+			return amount.to_string();
+		}
+		amount += change;
+	}
+	panic!("no offboard of every coin of {} found", asset);
+}
+
+/// The same coins, address and amount make the same participation as an
+/// earlier offboard. Asked again, the wallet goes on with the one it has not
+/// finished, and makes a new one beside one the operator refused: it never
+/// fails on its own record of the first ("the store: UNIQUE constraint
+/// failed: participation.id", arca#590), and never leaves the coins "still
+/// arriving".
+///
+/// First the wallet's own board script, which the operator refuses for good
+/// (`script_reused`): asked again, the operator refuses it again in its own
+/// words. Then, each paying every coin of a wallet to an address:
+/// - W1's offboard gets no answer (the operator slow past the wallet's
+///   timeout, the call never reaching it: the live testnet's EURX payment):
+///   its coin waits, given up; asked again, the offboard is posted again as
+///   it stood and is under way;
+/// - W2's answer is turned into a refusal on its way back while the operator
+///   takes it (an answer misread): its coin is live again in its own eyes;
+///   asked again, it is the offboard under way, its coin given up again.
+/// One round pays both, and each wallet's next syncs show it paid.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offboard_asked_again_goes_on_with_the_first() {
+	let mut r = Running::start_with(|c, x, _| c.assets[0] = AssetSection::new(x, 1_000)).await;
+	let x = r.x;
+	let xs = x.to_string();
+	let proxy = Proxy::start(&r.url());
+	let purl = proxy.url.clone();
+	let w1 = leaves_only_at(&mut r, "OBW1", x, 600_000, &purl).await;
+	let w2 = leaves_only_at(&mut r, "OBW2", x, 600_000, &purl).await;
+
+	let coins = live_of(&w2, x);
+	let rec = w2.ok(&["record", coins[0]["leaf_id"].as_str().unwrap()]);
+	let own = match CoinRecord::from_bytes(&unhex(rec["record"].as_str().unwrap())).unwrap() {
+		CoinRecord::Board(bd) => bd.output().script_pubkey,
+		other => panic!("a boarded coin, not {:?}", other),
+	};
+	let own_hex: String = own.as_bytes().iter().map(|x| format!("{:02x}", x)).collect();
+	let amount = whole(&w2, x, ["--script", &own_hex]);
+	for attempt in 0..2 {
+		let (ok, v) = w2.run(&["offboard", "--asset", &xs, "--amount", &amount, "--script", &own_hex]);
+		println!("to the wallet's own board script, attempt {}: ok={} {}", attempt, ok, v["error"]);
+		assert!(!ok);
+		assert_eq!(v["error"]["code"].as_str(), Some("script_reused"), "{}", v);
+		assert_eq!(live_of(&w2, x).len(), 1, "the coin is the wallet's again");
+	}
+
+	let b = Arca::new("OBW3");
+	b.ok(&create_args(&r.url(), &r.node_url()));
+	let to = b.ok(&["address"]);
+	let (address, spk) = (to["address"].as_str().unwrap().to_string(), script(&to));
+
+	// W1: no answer.
+	let a1 = whole(&w1, x, ["--address", &address]);
+	proxy.hold("/v1/submit_participation");
+	let t = std::time::Instant::now();
+	let (ok, v) = w1.run(&["offboard", "--asset", &xs, "--amount", &a1, "--address", &address]);
+	proxy.release("/v1/submit_participation");
+	println!("W1's offboard, unanswered: ok={} after {:.0} s: {}", ok, t.elapsed().as_secs_f64(), v["error"]);
+	assert!(!ok);
+	assert!(live_of(&w1, x).is_empty(), "the coin waits, given up to the offboard");
+	assert_eq!(w1.ok(&["offboards"])[0]["state"], "waiting");
+	let again = w1.ok(&["offboard", "--asset", &xs, "--amount", &a1, "--address", &address]);
+	println!("W1 asks again: {}", again);
+	assert_eq!((again["already"].as_bool(), again["state"].as_str()), (Some(true), Some("pending")), "{}", again);
+	let id1 = again["offboard"].as_str().unwrap().to_string();
+
+	// W2: its answer misread as a refusal.
+	let a2 = whole(&w2, x, ["--address", &address]);
+	proxy.rewrite(Some(std::sync::Arc::new(|path: &str, _: &Value, status: u16, answer: &mut Value| {
+		(path.ends_with("submit_participation") && status == 200).then(|| {
+			*answer = json!({"error": {"code": "declined", "message": "the answer was misread on its way back"}});
+			409
+		})
+	})));
+	let (ok, v) = w2.run(&["offboard", "--asset", &xs, "--amount", &a2, "--address", &address]);
+	proxy.rewrite(None);
+	println!("W2's offboard, its answer misread: ok={} {}", ok, v["error"]);
+	assert!(!ok);
+	assert_eq!(live_of(&w2, x).len(), 1, "the wallet holds the coin live again");
+	let again = w2.ok(&["offboard", "--asset", &xs, "--amount", &a2, "--address", &address]);
+	println!("W2 asks again: {}", again);
+	assert_eq!((again["already"].as_bool(), again["state"].as_str()), (Some(true), Some("pending")), "{}", again);
+	assert!(live_of(&w2, x).is_empty(), "the coin is given up to the offboard again");
+	let id2 = again["offboard"].as_str().unwrap().to_string();
+
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built[0].offboards, 2, "one round pays both");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	for (w, id, amount) in [(&w1, &id1, &a1), (&w2, &id2, &a2)] {
+		let mut paid = Value::Null;
+		for _ in 0..30 {
+			w.ok(&["sync"]);
+			r.produce().await;
+			r.synced().await;
+			if let Some(o) = w.ok(&["offboards"]).as_array().unwrap().iter().find(|o| o["offboard"] == json!(id) && o["state"] == "paid") {
+				paid = o.clone();
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+		}
+		println!("{}'s offboard: {}", w.name, paid);
+		assert_eq!(paid["state"], "paid", "{}", w.ok(&["offboards"]));
+		let txid: Txid = paid["txid"].as_str().unwrap().parse().unwrap();
+		let tx = r.rt.client().raw_transaction(&txid).unwrap();
+		let i = tx.output.iter().position(|o| o.script_pubkey == spk && o.value.explicit() == Some(amount.parse::<u64>().unwrap()));
+		assert!(i.is_some(), "the address is paid {}: {:?}", amount, tx.output);
+		assert!(w.ok(&["coins"]).as_array().unwrap().iter().all(|c| c["asset"] != json!(xs) || c["state"] != "given"),
+			"nothing left given up: {}", w.ok(&["coins"]));
+	}
+	for w in [&w1, &w2, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
