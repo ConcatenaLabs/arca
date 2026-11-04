@@ -72,6 +72,22 @@ fn info_x(r: &Running) -> Value {
 	info["assets"].as_array().unwrap().iter().find(|a| a["asset"] == r.x.to_string()).cloned().unwrap()
 }
 
+/// X as `info` shows it once `done` holds of it: `info` answers from what it
+/// last read and reads what is owed again in the background every few
+/// seconds (`server::http::OWED_FOR`), so it shows a change within one
+/// period and a read.
+async fn info_x_once<F: Fn(&Value) -> bool>(r: &Running, what: &str, done: F) -> Value {
+	let start = std::time::Instant::now();
+	loop {
+		let ix = info_x(r);
+		if done(&ix) {
+			return ix;
+		}
+		assert!(start.elapsed() < std::time::Duration::from_secs(30), "info shows {} within 30 s: {}", what, ix);
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+	}
+}
+
 /// A claim of coin `coin`, signed by `signer`, wanting `leaf` (its key proven
 /// by `leaf_key`); and the repayment participation's id.
 fn claim_body(r: &Running, coin: &LeafId, signer: &Keypair, leaf: &OutputRequest, leaf_key: &Keypair) -> (Value, [u8; 32]) {
@@ -182,11 +198,10 @@ async fn a_swept_coin_is_owed_withdrawn_by_a_reorg_and_repaid_once() {
 		assert_eq!(e["sweep_txid"], json!(sweep_txid.to_string()));
 	}
 	let total = (vb - late_fee(vb)) + (vc - late_fee(vc));
-	let ix = info_x(&r);
-	println!("info for X: owed {}, fundable {}", ix["owed"], ix["fundable"]);
-	assert_eq!(ix["owed"], json!({"total": total.to_string(), "coins": 2}));
 	let pool: u64 = r.server.rounds.fundable_now().await.unwrap()[&x];
-	assert_eq!(ix["fundable"], json!((pool - total).to_string()), "the fundable figure leaves what is owed out of the pool, {}", pool);
+	let ix = info_x_once(&r, "the two coins owed", |ix| ix["owed"] == json!({"total": total.to_string(), "coins": 2})
+		&& ix["fundable"] == json!((pool - total).to_string())).await;
+	println!("info for X: owed {}, fundable {} (the pool {})", ix["owed"], ix["fundable"], pool);
 
 	// Bitcoin reorganises the sweep's parent block away: the sweep leaves the
 	// chain, its entries are withdrawn, the coins are back in their batch.
@@ -207,7 +222,7 @@ async fn a_swept_coin_is_owed_withdrawn_by_a_reorg_and_repaid_once() {
 	}
 	let owed = lookup(&r, &[&b1, &c]).ok();
 	assert!(owed["owed"].as_array().unwrap().iter().all(|e| e["state"] == "withdrawn"), "{}", owed);
-	assert!(info_x(&r).get("owed").is_none(), "info owes nothing while the sweep is not final");
+	info_x_once(&r, "nothing owed while the sweep is not final", |ix| ix.get("owed").is_none()).await;
 	assert_eq!(r.server.store.leaf(&lb.held.id.0).await.unwrap().unwrap().state, server::store::LeafState::Live, "B's coin is live");
 	let (w, _) = want_leaf(&keypair("O C, early"), x, vc - late_fee(vc));
 	let (body, _) = claim_body(&r, &lc, &c, &w, &keypair("O C, early"));
@@ -223,7 +238,7 @@ async fn a_swept_coin_is_owed_withdrawn_by_a_reorg_and_repaid_once() {
 	assert!(r.rt.client().confirmations(&sweep_txid).unwrap() >= 1, "the same sweep is back in the chain");
 	let owed = lookup(&r, &[&b1, &c]).ok();
 	assert!(owed["owed"].as_array().unwrap().iter().all(|e| e["state"] == "owed"), "{}", owed);
-	assert_eq!(info_x(&r)["owed"], json!({"total": total.to_string(), "coins": 2}));
+	info_x_once(&r, "the two coins owed again", |ix| ix["owed"] == json!({"total": total.to_string(), "coins": 2})).await;
 
 	// Claims: by another key, for another amount, then C's own.
 	let c2 = keypair("O C, repaid");
@@ -263,7 +278,7 @@ async fn a_swept_coin_is_owed_withdrawn_by_a_reorg_and_repaid_once() {
 	let owed = lookup(&r, &[&b1, &c]).ok();
 	assert_eq!(entry_state(&owed, &lc), "repaid");
 	assert_eq!(entry_state(&owed, &lb.held.id), "owed");
-	assert_eq!(info_x(&r)["owed"], json!({"total": (vb - late_fee(vb)).to_string(), "coins": 1}), "only B's coin is owed now");
+	info_x_once(&r, "only B's coin owed", |ix| ix["owed"] == json!({"total": (vb - late_fee(vb)).to_string(), "coins": 1})).await;
 	refused(r.http.post("owed_claim", &again), "owed_claimed", "a claim of C's coin once repaid");
 	let _ = status(&r, &pid);
 }
