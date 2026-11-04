@@ -68,7 +68,7 @@ R mine $((exp - tip - 10))
 d coins | jq -c '{tip, coins: [.coins[] | {amount, expiry_height, state}]}'
 
 echo "=== a refresh: the coin above the largest leaves, one refresh that fits ==="
-r1=$(d refresh)
+r1=$(timeout 600 "$DRIVE" "$W" refresh) || fail "the first refresh did not finish"
 echo "$r1"
 [ "$(jq '.offboarded | length' <<< "$r1")" = 1 ] || fail "the oversized coin did not leave"
 txid=$(jq -r '.offboarded[0].txid // empty' <<< "$r1")
@@ -80,11 +80,11 @@ awk -v p="$paid" 'BEGIN { exit !(p > 0.29 && p < 0.3) }' || fail "the offboard p
 R mine 1
 
 echo "=== the next refresh takes the other ==="
-r2=$(d refresh)
+r2=$(timeout 600 "$DRIVE" "$W" refresh) || fail "the second refresh did not finish"
 echo "$r2"
 [ "$(jq .refreshed <<< "$r2")" = 1 ] || fail "the second refresh took $(jq .refreshed <<< "$r2") coins, not one"
 R mine 1
-r3=$(d refresh)
+r3=$(timeout 600 "$DRIVE" "$W" refresh) || fail "the third refresh did not finish"
 echo "$r3"
 [ "$(jq .refreshed <<< "$r3")" = 0 ] || fail "a third refresh found more"
 c=$(spendable)
