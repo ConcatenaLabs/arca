@@ -279,6 +279,7 @@ min_leaf = "1000"
 # notice_units = 5232
 # outpoint = "<txid>:<vout>"
 # notice = "<txid>:<vout>"
+# instant_budget_fraction = 0.1   # optional: the share of the bond suggested to counterparties
 
 # Takes of on-chain orders (take_order): no order is taken, or filled in a
 # round, whose maker can refund it within order_margin_seconds, an order

@@ -150,6 +150,15 @@ enum Cmd {
 	/// The operator's equivocation bond as this wallet checks it on its own
 	/// node, and what the wallet holds out of round against it.
 	Bond,
+	/// Sets the wallet's instant budget: the share of the operator's bond,
+	/// at this node's rates, that it holds out of round at most (a maker's,
+	/// a swap service's or an LSP's); past it a payment out of round is
+	/// refused until the next round. The lower of this and the share the
+	/// operator suggests is taken.
+	InstantBudget {
+		/// A share of the bond such as 0.1, or off.
+		share: String,
+	},
 	/// Every message the operator key signed that the wallet's coins rest
 	/// on, as evidence lines (`{"lines": […]}`): what the wallet hands a
 	/// watcher.
@@ -1402,6 +1411,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::LeafTemplate { template } => w.leaf_template(template.as_deref()),
 		Cmd::Bond => w.bond(),
 		Cmd::BondEvidence => w.bond_evidence().map(|lines| json!({"lines": lines})),
+		Cmd::InstantBudget { share } => w.set_instant_budget_text(&share),
 		Cmd::WatchBond { evidence, fee_asset } => {
 			// A file is what `bond-evidence` printed, or one line a line.
 			let mut lines = vec![];

@@ -44,7 +44,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
-	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
+	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
 	fee_asset?}, channel_code {address?}, leaf_template {template?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
 	address | script, fee_asset?, max_fee_ppm?, shown?}, offboards";
@@ -206,6 +206,14 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"leaf_template" => w.leaf_template(a["template"].as_str()),
 		"bond" => w.bond(),
 		"bond_evidence" => w.bond_evidence().map(|l| json!({"lines": l})),
+		"instant_budget" => {
+			let share = match &a["share"] {
+				Value::String(t) => t.clone(),
+				Value::Number(n) => n.to_string(),
+				_ => return Err(Error::Parse("the share is missing: a share of the bond such as \"0.1\", or \"off\"".into())),
+			};
+			w.set_instant_budget_text(&share)
+		},
 		"watch_bond" => {
 			let lines = a["evidence"].as_array().cloned().unwrap_or_default();
 			let fee = a["fee_asset"].as_str().map(asset).transpose()?;

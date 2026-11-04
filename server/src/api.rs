@@ -248,6 +248,14 @@ pub struct BondInfo {
 	/// Whether the coin that stands is final: certified, its anchor buried.
 	#[serde(rename = "final")]
 	pub final_: bool,
+	/// The share of the bond's value, in millionths, the operator suggests
+	/// a counterparty take on out of round at once (`[bond]
+	/// instant_budget_fraction`); absent when it suggests none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub instant_budget_ppm: Option<u32>,
+	/// That share of `reference_value`, in atoms of the reference unit.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub instant_budget: Option<String>,
 	/// What the state rests on.
 	pub why: String,
 }

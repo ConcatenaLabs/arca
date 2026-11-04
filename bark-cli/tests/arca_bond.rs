@@ -70,7 +70,7 @@ async fn post(r: &mut Running, policy: &BondPolicy, w: &elements::secp256k1_zkp:
 	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
 	let op = OutPoint::new(tx.txid(), vout);
 	r.config.bond = Some(BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice_units(),
-		outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None });
+		outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None });
 	r.restart_server().await;
 	r.synced().await;
 	op
@@ -269,7 +269,7 @@ async fn a_bond_in_notice_takes_no_payment_out_of_round() {
 		let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_file).unwrap();
 		std::io::Write::write_all(&mut f, hex(&w.secret_bytes()).as_bytes()).unwrap();
 	}
-	let noticed = server::server::bond_notice(&r.config, &key_file).await.unwrap();
+	let noticed = server::server::bond_notice(&r.config, &key_file, None).await.unwrap();
 	println!("the notice: {}", noticed);
 	r.produce().await;
 	r.bury().await;
@@ -290,4 +290,160 @@ async fn a_bond_in_notice_takes_no_payment_out_of_round() {
 	b.refused(&["receive", "--asset", &x, "--amount", "600000"], "bond is noticed");
 	b.refused(&["swap", "offer", "--give-asset", &x, "--give", "300000", "--want-asset", &r.y.to_string(), "--want", "400000"],
 		"bond is noticed");
+}
+
+/// Pays `amount` of `asset` to the bond's script, buried; the configuration
+/// is left as it is.
+async fn pay_bond(r: &mut Running, policy: &BondPolicy, asset: AssetId, amount: u64) -> OutPoint {
+	let tx = r.pay_to(policy.script_pubkey(), asset, amount);
+	r.produce().await;
+	r.bury().await;
+	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
+	OutPoint::new(tx.txid(), vout)
+}
+
+/// What `arca bond` says of the instant budget, as numbers.
+fn budget_of(v: &Value) -> (u64, u64, u64, u64) {
+	let b = &v["instant_budget"];
+	let n = |k: &str| b[k].as_str().unwrap_or_else(|| panic!("instant_budget.{}: {}", k, v)).parse::<u64>().unwrap();
+	(b["ppm"].as_u64().unwrap(), n("bond_value"), n("value"), n("room"))
+}
+
+/// The bond counts at its value at the wallet's node's rate, whatever its
+/// asset: a bond in X (listed at one reference unit an atom, a stable
+/// asset) at its atoms, a bond in Y (listed at a quarter) at a quarter of
+/// them. A counterparty's instant budget, a share of that value, bounds what
+/// it holds out of round at once, for a receive request and for a swap it
+/// offers; the per-wallet refusal follows the same value; a lower price of
+/// the bond's asset lowers both at once; the operator's suggested share,
+/// when lower, is the one taken. The bond moves from X to Y with the
+/// operator bonded throughout: the Y coin posted to the same script, the
+/// configuration pointed at it, then the X coin given its notice by name.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instant_budget_follows_the_bonds_market_value() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	common::node::list_fee_asset(&r.rt, r.y, 25_000_000);
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("budget A");
+	let b = Arca::new("budget B");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1",
+		"--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, r.x, 10_000_000);
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit A's board", || a.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	a.ok(&["sync"]);
+
+	// --- A bond of 5,000,000 X: X at one reference unit an atom ---
+	let w = keypair("budget W");
+	let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
+	let policy = BondPolicy::new(chain, keypair("operator").x_only_public_key().0, w.x_only_public_key().0,
+		RelativeTime::from_units(notice_units()).unwrap()).unwrap();
+	let x_bond = post(&mut r, &policy, &w).await;
+	b.refused(&["instant-budget", "1.5"], "at most 1");
+	b.ok(&["instant-budget", "0.1"]);
+	let bb = b.ok(&["bond"]);
+	assert_eq!(budget_of(&bb), (100_000, BOND, BOND / 10, BOND / 10), "X counts at its atoms: {}", bb["instant_budget"]);
+	b.refused(&["receive", "--asset", &x, "--amount", "600000"], "past its instant budget of 500000");
+	let req = b.ok(&["receive", "--asset", &x, "--amount", "400000"]);
+	a.ok(&["send", req["request"].as_str().unwrap(), "--amount", "400000", "--asset", &x]);
+	let mb = b.ok(&["mailbox"]);
+	assert_eq!(mb["accepted"][0]["value"], "400000", "{}", mb);
+	let bb = b.ok(&["bond"]);
+	assert_eq!(budget_of(&bb).3, 100_000, "500,000 less the 400,000 held out of round: {}", bb["instant_budget"]);
+
+	// --- The bond moves to 40,000,000 Y, with the operator bonded throughout ---
+	let ya = r.y;
+	let y_bond = pay_bond(&mut r, &policy, ya, 40_000_000).await;
+	assert_eq!(b.ok(&["bond"])["coin"], format!("{}:{}", x_bond.txid, x_bond.vout), "the X coin stands while Y is posted");
+	r.config.bond.as_mut().unwrap().outpoint = Some(format!("{}:{}", y_bond.txid, y_bond.vout));
+	r.restart_server().await;
+	r.synced().await;
+	let bb = b.ok(&["bond"]);
+	println!("B's check of the Y bond: {}", bb);
+	assert_eq!((bb["state"].as_str(), bb["asset"].as_str()), (Some("bonded"), Some(y.as_str())));
+	// Y at a quarter of a reference unit: 40,000,000 Y are worth 10,000,000.
+	assert_eq!(budget_of(&bb), (100_000, 10_000_000, 1_000_000, 600_000), "{}", bb["instant_budget"]);
+	// The room in each priced asset's own atoms: 600,000 of X, 2,400,000 of Y.
+	assert_eq!(bb["instant_budget"]["room_atoms"][&x], "600000", "{}", bb["instant_budget"]);
+	assert_eq!(bb["instant_budget"]["room_atoms"][&y], "2400000", "{}", bb["instant_budget"]);
+
+	// The per-wallet refusal, at the same value, with no budget set.
+	b.ok(&["instant-budget", "off"]);
+	assert!(b.ok(&["bond"])["instant_budget"].is_null());
+	b.refused(&["receive", "--asset", &x, "--amount", "10500000"], "more than the bond's 10000000");
+	let req = b.ok(&["receive", "--asset", &x, "--amount", "9000000"]);
+	b.ok(&["forget-request", req["details"]["owner"].as_str().unwrap()]);
+
+	// The budget, for a receive request and for a swap offered as a maker.
+	b.ok(&["instant-budget", "0.1"]);
+	b.refused(&["receive", "--asset", &x, "--amount", "700000"], "past its instant budget of 1000000");
+	let req = b.ok(&["receive", "--asset", &x, "--amount", "500000"]);
+	b.ok(&["forget-request", req["details"]["owner"].as_str().unwrap()]);
+	b.refused(&["swap", "offer", "--give-asset", &x, "--give", "300000", "--want-asset", &y, "--want", "4000000"],
+		"after the next round");
+	let offer = b.ok(&["swap", "offer", "--give-asset", &x, "--give", "300000", "--want-asset", &y, "--want", "2000000"]);
+	b.ok(&["swap", "cancel", offer["swap"].as_str().unwrap()]);
+
+	// --- Y's price falls to 0.15: the budget falls with it, at once ---
+	common::node::list_fee_asset(&r.rt, r.y, 15_000_000);
+	let bb = b.ok(&["bond"]);
+	assert_eq!(budget_of(&bb), (100_000, 6_000_000, 600_000, 200_000), "{}", bb["instant_budget"]);
+	b.refused(&["receive", "--asset", &x, "--amount", "500000"], "past its instant budget of 600000");
+	b.refused(&["receive", "--asset", &x, "--amount", "6000000"], "more than the bond's 6000000");
+
+	// --- The operator suggests a twentieth: the lower share is taken ---
+	r.config.bond.as_mut().unwrap().instant_budget_fraction = Some(0.05);
+	r.restart_server().await;
+	r.synced().await;
+	let info = b.ok(&["info"])["server_info"].clone();
+	println!("info.bond with a suggested share: {}", info["bond"]);
+	assert_eq!(info["bond"]["instant_budget_ppm"], 50_000);
+	match info["bond"]["reference_value"].as_str() {
+		Some(v) => assert_eq!(info["bond"]["instant_budget"], (v.parse::<u64>().unwrap() / 20).to_string(), "a twentieth, at the operator's rate"),
+		None => assert!(info["bond"]["instant_budget"].is_null(), "no rate of the operator's, no figure: {}", info["bond"]),
+	}
+	let bb = b.ok(&["bond"]);
+	assert_eq!(budget_of(&bb), (50_000, 6_000_000, 300_000, 0), "{}", bb["instant_budget"]);
+	assert_eq!(bb["instant_budget"]["own_ppm"], 100_000);
+	b.refused(&["receive", "--asset", &x, "--amount", "1000"], "past its instant budget of 300000");
+	// Past its budget, B asks for the refresh of what it holds at once.
+	let sync = b.ok(&["sync"]);
+	println!("B's sync past its budget: {}", sync);
+
+	// --- The X coin retired: its notice, by name, leaves the Y bond standing ---
+	r.fund_server(r.x, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let key_file = b.dir.join("bond-w.key");
+	{
+		use std::os::unix::fs::OpenOptionsExt;
+		let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_file).unwrap();
+		std::io::Write::write_all(&mut f, hex(&w.secret_bytes()).as_bytes()).unwrap();
+	}
+	let old = format!("{}:{}", x_bond.txid, x_bond.vout);
+	let noticed = server::server::bond_notice(&r.config, &key_file, Some(&old)).await.unwrap();
+	println!("the notice of the retired X coin: {}", noticed);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let notice_tx: Transaction = r.rt.client().raw_transaction(&elements::Txid::from_str(noticed["txid"].as_str().unwrap()).unwrap()).unwrap();
+	assert!(notice_tx.input.iter().any(|i| i.previous_output == x_bond), "the notice spends the X coin");
+	let bb = b.ok(&["bond"]);
+	assert_eq!((bb["state"].as_str(), bb["coin"].as_str()), (Some("bonded"), Some(format!("{}:{}", y_bond.txid, y_bond.vout).as_str())),
+		"the Y bond stands: {}", bb);
+	let e = server::server::bond_notice(&r.config, &key_file, Some(&old)).await.unwrap_err();
+	assert!(e.to_string().contains("not bonded"), "{}", e);
+	let to = a.ok(&["address"])["address"].as_str().unwrap().to_string();
+	let e = server::server::bond_withdraw(&r.config, &key_file, &to, Some((&old, noticed["notice"].as_str().unwrap()))).await.unwrap_err();
+	println!("the retired coin's withdrawal before its delay: {}", e);
+	assert!(e.to_string().contains("non-BIP68-final"), "{}", e);
 }
