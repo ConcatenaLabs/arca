@@ -111,6 +111,26 @@ fn receive_state(st: LightningReceiveState) -> Value {
 	}
 }
 
+/// The boards the phrase's own Bitcoin account funded that no wallet of the
+/// phrase registered, found on the chain and taken in
+/// ([bark::Wallet::recover_boards]): each one's `funding` (outpoint),
+/// `amount`, `vtxo` and `outcome`; or `{"error"}`. Part of `catch_up`.
+pub async fn boards_on_chain(wallet: &Wallet) -> Value {
+	let txs = match crate::exit::funding_transactions(wallet).await {
+		Ok(txs) => txs,
+		Err(e) => return json!({ "error": format!("{:#}", e) }),
+	};
+	match wallet.recover_boards(txs).await {
+		Ok(found) => json!(found.iter().map(|b| json!({
+			"funding": b.funding.to_string(),
+			"amount": sat(b.amount),
+			"vtxo": b.vtxo.map(|v| v.to_string()),
+			"outcome": b.outcome,
+		})).collect::<Vec<_>>()),
+		Err(e) => json!({ "error": format!("{:#}", e) }),
+	}
+}
+
 /// Runs one command on an open wallet.
 pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Value> {
 	match cmd {
@@ -325,15 +345,19 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 		},
 		// What other wallets of the phrase did since this store was made: coins
 		// they made or received, from the server's recovery mailbox, and coins of
-		// this store they spent.
+		// this store they spent; then the boards the phrase's own Bitcoin coins
+		// funded that no wallet of the phrase registered (one whose store was
+		// lost before its board's confirmations), found on the chain.
 		"catch_up" => {
 			let r = wallet.catch_up_from_server().await?;
+			let boards = boards_on_chain(wallet).await;
 			Ok(json!({
 				"recovered": r.recovery.recovered().ids().map(|i| i.to_string()).collect::<Vec<_>>(),
 				"recovered_sat": sat(r.recovery.recovered().total_amount()),
 				"spent_elsewhere": r.spent_elsewhere.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
 				"failed": r.recovery.failed().ids().map(|i| i.to_string()).collect::<Vec<_>>(),
 				"complete": r.recovery.is_complete(),
+				"boards": boards,
 			}))
 		},
 		"history" => Ok(serde_json::to_value(wallet.history().await?)?),

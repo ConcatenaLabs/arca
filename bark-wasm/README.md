@@ -13,8 +13,14 @@ so the phrase restores it anywhere Bark runs (the Arca client's Bitcoin side
 is the same wallet). A wallet made anew from a phrase that held coins in the
 ark takes back what the server's recovery mailbox kept for it. A store made
 before, on a second device, learns what the phrase's other wallets did since
-with `catch_up`: the coins they made or received (a board once its wallet has
-registered it), and which of its own coins they spent.
+with `catch_up`: the coins they made or received, and which of its own coins
+they spent. A board is posted to the recovery mailbox only once the wallet that
+made it registers it, after its funding's confirmations; one whose wallet was
+lost before that is found on the chain instead: `catch_up` reads the
+transactions the phrase's own Bitcoin account paid from, rebuilds each board
+script the phrase's keys could have made with the server's current coin
+lifetime, and takes in every unspent board it matches, cosigned again by the
+server and registered as the lost wallet would have.
 
 Boarding takes the funding from whoever holds the coins: `board_address`
 answers the address under a fresh key of the wallet's, the holder builds the
@@ -158,7 +164,7 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `refresh` | | `refreshed` (coins whose refresh is scheduled are left to the server) |
 | `schedule_refreshes` | `except`? (coin ids: `tower_plan`'s `no_refresh`) | `scheduled`: each refresh scheduled now, its `height`, `vtxos` (ids) and `amount` |
 | `sync` | | |
-| `catch_up` | | `recovered` (ids), `recovered_sat`, `spent_elsewhere` (ids), `failed` (ids), `complete` |
+| `catch_up` | | `recovered` (ids), `recovered_sat`, `spent_elsewhere` (ids), `failed` (ids), `complete`, `boards`: each board found on the chain, its `funding` (outpoint), `amount`, `vtxo` and `outcome` (`adopted`, `recovered`, `spent`, `expired`, or why not), or an `error` |
 | `history` | | the wallet's movements |
 | `coins` | | `tip`, each coin's `id`, `amount`, `expiry_height`, `refresh_height` (its scheduled refresh, or null), `state` |
 | `exit_estimate` | `vtxos`? (ids) | `tip`, `address` (where a claim goes), `fee_rate` (sat/vB), `funding_confirmed`, each coin's `id`, `amount`, `expiry_height`, `blocks_left`, `cost`, `worth`, `why_not`; `worth`: the worthwhile coins together, their `fees`, `claim_fee`, `cost`, `transactions`, `fundable` |
