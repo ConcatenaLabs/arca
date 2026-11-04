@@ -703,7 +703,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	let owed_of = |a: &AssetId| owed.as_ref().and_then(|o| o.get(&a.into_inner().to_byte_array()).copied());
 	let p = &app.params;
 	let in_flight = if p.assets.ids().iter().any(|a| p.in_flight_cap(a).is_some()) {
-		app.store.in_flight().await.map_err(|e| log::warn!("what is in flight: {}", e)).ok()
+		app.rounds.in_flight_now().await.map_err(|e| log::warn!("what is in flight: {}", e)).ok()
 	} else {
 		None
 	};

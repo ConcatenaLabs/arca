@@ -140,6 +140,59 @@ pub enum ChainEvent {
 	Synced { height: u64, hash: BlockHash },
 }
 
+/// What a follower of [`FinalityService::subscribe`] takes in at once
+/// ([`drain`]): the event it waited for and every one queued behind it.
+#[derive(Debug, Default)]
+pub struct Drained {
+	/// The connections and disconnections, in order.
+	pub events: Vec<ChainEvent>,
+	/// Whether a pass of the service ended among them.
+	pub synced: bool,
+	/// How many events the receiver missed for falling behind.
+	pub lagged: u64,
+	/// Whether the service is gone.
+	pub closed: bool,
+}
+
+impl Drained {
+	fn take(&mut self, e: ChainEvent) {
+		match e {
+			ChainEvent::Synced { .. } => self.synced = true,
+			e => self.events.push(e),
+		}
+	}
+}
+
+/// Waits for the service's next event and takes every one queued behind it,
+/// so that one pass of a follower serves every pass of the service that
+/// ended meanwhile. The service ends a pass every poll interval; a follower
+/// that ran one pass per event would, once its passes take longer, fall
+/// further behind with each, run them back to back for ever and miss events
+/// once its queue is full.
+pub async fn drain(rx: &mut broadcast::Receiver<ChainEvent>) -> Drained {
+	let mut d = Drained::default();
+	match rx.recv().await {
+		Ok(e) => d.take(e),
+		Err(broadcast::error::RecvError::Lagged(n)) => d.lagged += n,
+		Err(broadcast::error::RecvError::Closed) => {
+			d.closed = true;
+			return d;
+		},
+	}
+	loop {
+		match rx.try_recv() {
+			Ok(e) => d.take(e),
+			Err(broadcast::error::TryRecvError::Lagged(n)) => d.lagged += n,
+			Err(broadcast::error::TryRecvError::Empty) => break,
+			Err(broadcast::error::TryRecvError::Closed) => {
+				d.closed = true;
+				break;
+			},
+		}
+	}
+	d
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FinalityError {
 	#[error(transparent)]
@@ -256,6 +309,12 @@ impl FinalityService {
 		let mut p = self.progress.lock().map(|p| p.clone()).unwrap_or_default();
 		p.anchor_ok = self.anchor_ok.load(Ordering::SeqCst);
 		p
+	}
+
+	/// Whether the node last reported its tip's anchor as ok: while it does
+	/// not, nothing is final.
+	pub fn anchor_ok(&self) -> bool {
+		self.anchor_ok.load(Ordering::SeqCst)
 	}
 
 	/// Changes to the active chain from now on.
@@ -523,5 +582,40 @@ impl FinalityService {
 		} else {
 			Ok(Finality::Settled { height: block.height, block: hash, depth })
 		}
+	}
+}
+
+#[cfg(test)]
+mod drain_tests {
+	use super::*;
+
+	fn synced(h: u64) -> ChainEvent {
+		ChainEvent::Synced { height: h, hash: BlockHash::all_zeros() }
+	}
+
+	/// Everything queued is taken in one go: one pass serves every pass of
+	/// the service that ended meanwhile, and a slow follower stops missing
+	/// events once it reads this way.
+	#[tokio::test]
+	async fn takes_everything_queued() {
+		let (tx, mut rx) = broadcast::channel(8);
+		for h in 0..5 {
+			tx.send(synced(h)).unwrap();
+		}
+		tx.send(ChainEvent::Connected { height: 5, hash: BlockHash::all_zeros() }).unwrap();
+		tx.send(synced(5)).unwrap();
+		let d = drain(&mut rx).await;
+		assert!(d.synced && d.lagged == 0 && !d.closed);
+		assert_eq!(d.events.len(), 1, "the connection, in order");
+		assert!(rx.try_recv().is_err(), "nothing left queued");
+		// Twelve into a queue of eight: four missed, said once.
+		for h in 0..12 {
+			tx.send(synced(h)).unwrap();
+		}
+		let d = drain(&mut rx).await;
+		assert_eq!(d.lagged, 4);
+		assert!(d.synced);
+		drop(tx);
+		assert!(drain(&mut rx).await.closed);
 	}
 }

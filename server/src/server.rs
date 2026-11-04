@@ -1887,10 +1887,12 @@ impl Server {
 			let mut rx = finality.subscribe();
 			tokio::spawn(async move {
 				loop {
-					match rx.recv().await {
-						Ok(crate::chain::ChainEvent::Synced { .. }) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
-						Ok(_) => continue,
-						Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+					let d = crate::chain::drain(&mut rx).await;
+					if d.closed {
+						return;
+					}
+					if !d.synced && d.lagged == 0 {
+						continue;
 					}
 					let assets: Vec<AssetId> = params.assets.ids().into_iter().filter(|a| params.supervised(a).is_some()).collect();
 					if let Err(e) = crate::supervision::observe(&store, &finality, &assets).await {
