@@ -162,6 +162,9 @@ async fn info_answers_at_once_while_the_node_stalls_and_its_tables_are_held() {
 	let (a2, b2) = (keypair("info at once A, refreshed"), keypair("info at once B, refreshed"));
 	let refreshed = refresh(&mut r, &[(&ca, &a2), (&cb, &b2)]).await;
 	println!("a round refreshed {} boards under the stalls in {:.1} s", refreshed.len(), t.elapsed().as_secs_f64());
+	// The round hands its heads out at its end: the reads go on a little
+	// longer, past the head's period, to see them.
+	tokio::time::sleep(Duration::from_secs(3)).await;
 	round_done.store(true, Ordering::SeqCst);
 	let reads = reads.await.unwrap();
 	stop.store(true, Ordering::SeqCst);

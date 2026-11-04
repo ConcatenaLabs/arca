@@ -4763,14 +4763,25 @@ async fn arcad_refuses_a_signer_whose_record_names_other_keepers() {
 	println!("PK the signer on it, without a keeper: {}", r.signer.log().lines().last().unwrap_or(""));
 
 	// The running server stops serving, with the reason, once it reads the
-	// swapped signer's keepers (at `info`, and once a minute): it never
-	// shows the edited record's set.
+	// swapped signer's keepers (at `info`, in the background, and once a
+	// minute): it never shows the edited record's set.
 	tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 	let first = info_of(&r);
 	println!("PK the running server's info, the signer swapped: keepers {} | error {}", first["keepers"], first["error"]);
 	assert!(first["keepers"] == pinned || first["error"]["code"] == "signer_replaced", "{}", first);
-	let then = info_of(&r);
-	println!("PK the running server, asked again: {}", then);
+	// The read that `info` started answers within one round trip of the
+	// signer's; every answer meanwhile still names the pinned set.
+	let asked = std::time::Instant::now();
+	let then = loop {
+		let v = info_of(&r);
+		if v["error"]["code"] == "signer_replaced" {
+			break v;
+		}
+		assert_eq!(v["keepers"], pinned, "{}", v);
+		assert!(asked.elapsed() < std::time::Duration::from_secs(5), "the running server still serves: {}", v);
+		std::thread::sleep(std::time::Duration::from_millis(20));
+	};
+	println!("PK the running server, asked again: {} ({} ms after the first)", then, asked.elapsed().as_millis());
 	assert_eq!(then["error"]["code"], "signer_replaced", "{}", then);
 	assert!(then["error"]["message"].as_str().unwrap().contains("another record"), "{}", then);
 	let (ok, v) = a.run(&["sync"]);
