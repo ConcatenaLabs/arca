@@ -256,6 +256,18 @@ type Conn<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
 #[derive(Clone)]
 pub struct Store {
 	pool: Pool<PostgresConnectionManager<NoTls>>,
+	/// The latest head of the signer's record this process gave the
+	/// database or read from it ([`Store::signer_head_latest`]).
+	head_seen: std::sync::Arc<std::sync::Mutex<Option<HeadSeen>>>,
+}
+
+/// A head of the signer's record: its entry, running hash, and the signer's
+/// signature over them when the signer gave one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadSeen {
+	pub entry: u64,
+	pub hash: [u8; 32],
+	pub signature: Option<[u8; 64]>,
 }
 
 impl Store {
@@ -270,7 +282,7 @@ impl Store {
 			.connection_timeout(Duration::from_secs(10))
 			.build(manager)
 			.await?;
-		let store = Store { pool };
+		let store = Store { pool, head_seen: Default::default() };
 		store.migrate().await?;
 		Ok(store)
 	}
@@ -345,10 +357,40 @@ impl Store {
 	pub async fn signer_head(&self) -> Result<Option<(u64, [u8; 32])>, StoreError> {
 		let conn = self.conn().await?;
 		let row = conn.query_opt("SELECT entry, hash FROM signer_head", &[]).await?;
-		row.map(|r| {
+		let head: Option<(u64, [u8; 32])> = row.map(|r| -> Result<_, StoreError> {
 			let n: i64 = r.get(0);
 			Ok((u64::try_from(n).map_err(|_| StoreError::Corrupt(format!("entry {}", n)))?, array32(r.get(1), "hash")?))
-		}).transpose()
+		}).transpose()?;
+		if let Some((n, hash)) = head {
+			self.saw_signer_head(n, &hash, None);
+		}
+		Ok(head)
+	}
+
+	/// The latest head of the signer's record this process gave the
+	/// database ([`Store::set_signer_head_signed`]) or read from it
+	/// ([`Store::signer_head`], [`Store::signer_head_signed`]), held in
+	/// memory and kept as the database keeps it: a later entry replaces it,
+	/// the same one adds a signature it lacked. What `info` must not show a
+	/// head older than, known without a read; `None` before either.
+	pub fn signer_head_latest(&self) -> Option<HeadSeen> {
+		self.head_seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	/// The entry of [`Store::signer_head_latest`]; 0 before any.
+	pub fn signer_head_seen(&self) -> u64 {
+		self.signer_head_latest().map_or(0, |h| h.entry)
+	}
+
+	fn saw_signer_head(&self, entry: u64, hash: &[u8; 32], signature: Option<[u8; 64]>) {
+		let mut seen = self.head_seen.lock().unwrap_or_else(|e| e.into_inner());
+		let replace = match seen.as_ref() {
+			None => true,
+			Some(h) => h.entry < entry || (h.entry == entry && h.hash == *hash && h.signature.is_none() && signature.is_some()),
+		};
+		if replace {
+			*seen = Some(HeadSeen { entry, hash: *hash, signature });
+		}
 	}
 
 	/// Remembers entry `entry` of the signer's record, with its running
@@ -374,6 +416,11 @@ impl Store {
 			   OR (signer_head.entry = EXCLUDED.entry AND signer_head.hash = EXCLUDED.hash AND signer_head.signature IS NULL)",
 			&[&n, &&hash[..], &sig],
 		).await?;
+		self.saw_signer_head(entry, hash, signature.map(|s| {
+			let mut b = [0u8; 64];
+			b.copy_from_slice(s.as_ref());
+			b
+		}));
 		Ok(())
 	}
 
@@ -382,12 +429,16 @@ impl Store {
 	pub async fn signer_head_signed(&self) -> Result<Option<(u64, [u8; 32], Option<[u8; 64]>)>, StoreError> {
 		let conn = self.conn().await?;
 		let row = conn.query_opt("SELECT entry, hash, signature FROM signer_head", &[]).await?;
-		row.map(|r| {
+		let head: Option<(u64, [u8; 32], Option<[u8; 64]>)> = row.map(|r| -> Result<_, StoreError> {
 			let n: i64 = r.get(0);
 			let sig: Option<Vec<u8>> = r.get(2);
 			Ok((u64::try_from(n).map_err(|_| StoreError::Corrupt(format!("entry {}", n)))?, array32(r.get(1), "hash")?,
 				sig.map(|s| s.try_into().map_err(|_| StoreError::Corrupt("a signature of another length".into()))).transpose()?))
-		}).transpose()
+		}).transpose()?;
+		if let Some((n, hash, sig)) = head {
+			self.saw_signer_head(n, &hash, sig);
+		}
+		Ok(head)
 	}
 
 	/// Keeps the keepers' acknowledgements `acks` of head `entry`, `hash` of

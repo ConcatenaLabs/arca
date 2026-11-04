@@ -350,6 +350,10 @@ pub struct Watcher {
 	/// on a later pass, hands out no new script each time.
 	pay_to: Mutex<Option<Script>>,
 	status: std::sync::Mutex<FeeStatus>,
+	/// The forfeited coins resting on boards whose lineage waits, each with
+	/// the median time it waits until ([`Self::recover_board_transfers`]):
+	/// not walked again, nor logged, before then.
+	lineage_waits: std::sync::Mutex<HashMap<[u8; 32], u32>>,
 }
 
 impl Watcher {
@@ -361,6 +365,7 @@ impl Watcher {
 			store, finality, params, wallet, nursery, signer, rounds, config,
 			running: Mutex::new(()), trees: Mutex::new(HashMap::new()), accumulators: Mutex::new(HashMap::new()), pay_to: Mutex::new(None),
 			status: std::sync::Mutex::new(FeeStatus::default()),
+			lineage_waits: std::sync::Mutex::new(HashMap::new()),
 		})
 	}
 
@@ -1672,6 +1677,14 @@ impl Watcher {
 	/// before the latest service expiry among those coins, a date each of
 	/// their holders knew ([`Params::BOARD_LIFETIME`]). Before then only an
 	/// exit puts it on the chain, and the answers to stale exits take it on.
+	///
+	/// A lineage that waits is walked again only once its date has come:
+	/// the walk is a read per coin and transfer of the lineage, run on every
+	/// pass, and the date is weeks away. Nothing is published early for it:
+	/// the walk runs again at that date, before anything is published, and
+	/// counts every coin resting on the lineage then. A holder who spends a
+	/// coin meanwhile may bring the true date forward; the lineage then waits
+	/// for the date it was given, no longer than if that holder had kept it.
 	async fn recover_board_transfers(&self, now: MedianTime) -> Result<(), WatcherError> {
 		/// Whether every base of the coin is a board.
 		fn boards_alone(r: &CoinRecord) -> bool {
@@ -1681,7 +1694,17 @@ impl Watcher {
 				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().all(boards_alone),
 			}
 		}
-		for (leaf_id, record) in self.store.forfeited_transfer_coins().await? {
+		let coins = self.store.forfeited_transfer_coins().await?;
+		let waits: HashMap<[u8; 32], u32> = {
+			let mut w = self.lineage_waits.lock().unwrap_or_else(|e| e.into_inner());
+			let listed: HashSet<[u8; 32]> = coins.iter().map(|(l, _)| *l).collect();
+			w.retain(|l, until| listed.contains(l) && now.to_consensus_u32() < *until);
+			w.clone()
+		};
+		for (leaf_id, record) in coins {
+			if waits.contains_key(&leaf_id) {
+				continue;
+			}
 			if !CoinRecord::from_bytes(&record).is_ok_and(|r| boards_alone(&r)) {
 				continue;
 			}
@@ -1706,6 +1729,7 @@ impl Watcher {
 					if now.to_consensus_u32() < until {
 						log::info!("watcher: the lineage of coin {} waits until median time {}: another holder's coin rests on it",
 							hex(&leaf_id), until);
+						self.lineage_waits.lock().unwrap_or_else(|e| e.into_inner()).insert(leaf_id, until);
 						return Ok(());
 					}
 				}
