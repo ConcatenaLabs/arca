@@ -1522,3 +1522,137 @@ async fn the_order_resting_again_cannot_release_the_orders_node_by_a_second_fill
 async fn the_order_resting_again_cannot_release_the_orders_node_by_a_cancel() {
 	rest_moves_on(true).await;
 }
+
+/// The last coin of node A (U0 refreshed and released, so A holds U0's coin
+/// in flight) beside `fresh` fresh coins, the cap at 1.5 coins. With `other`,
+/// a coin of another node Z (Z0, refreshed and released while Z1 rests) is in
+/// flight too, which comes back without the refresh of U1, and the cap is a
+/// coin higher. Returns the participation's status, the cap, what is in
+/// flight after the round and after the reclaims, and the reclaims.
+async fn last_coin_beside(fresh: usize, other: bool, tag: &str) -> (Value, u64, u64, u64, usize) {
+	let cap = VALUE * 3 / 2 + if other { VALUE } else { 0 };
+	let (mut r, c) = first_leaves(Some(cap), &[&format!("{} U0", tag), &format!("{} U1", tag)]).await;
+	let x = r.x;
+	let mut z = vec![];
+	if other {
+		let zk: Vec<Keypair> = (0..2).map(|j| keypair(&format!("{} Z{} board", tag, j))).collect();
+		let zs = boards(&mut r, &zk, x).await;
+		let mut parts = vec![];
+		for (j, b) in zs.iter().enumerate() {
+			let k = keypair(&format!("{} Z{} 1", tag, j));
+			parts.push((submit(&r, &[b], &[k]), k));
+		}
+		round(&r).await;
+		for (((id, nn), k), b) in parts.iter().zip(&zs) {
+			z.push(complete(&r, id, &[b], &[*k], nn, false).await.remove(0));
+		}
+	}
+	let wk: Vec<Keypair> = (0..fresh).map(|j| keypair(&format!("{} W{} board", tag, j))).collect();
+	let ws = boards(&mut r, &wk, x).await;
+	let k0 = keypair(&format!("{} U0 2", tag));
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	let kz = keypair(&format!("{} Z0 2", tag));
+	let zpart = other.then(|| submit(&r, &[&z[0]], &[kz]));
+	let mut wparts = vec![];
+	for (j, w) in ws.iter().enumerate() {
+		let k = keypair(&format!("{} W{} 1", tag, j));
+		wparts.push((submit(&r, &[w], &[k]), k));
+	}
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	if let Some((id, nn)) = &zpart {
+		complete(&r, id, &[&z[0]], &[kz], nn, true).await;
+	}
+	let mut coins = vec![c[1].clone()];
+	for (((id, nn), k), w) in wparts.iter().zip(&ws) {
+		coins.push(complete(&r, id, &[w], &[*k], nn, true).await.remove(0));
+	}
+	let before = n(&pool(&r, x), "in_flight");
+	assert_eq!(before, VALUE * if other { 2 } else { 1 }, "node A holds U0's coin in flight, and Z Z0's");
+	let refs: Vec<&Coin> = coins.iter().collect();
+	let keys: Vec<Keypair> = (0..coins.len()).map(|j| keypair(&format!("{} P {}", tag, j))).collect();
+	let (id, nn) = submit(&r, &refs, &keys);
+	let built = r.server.rounds.run_round().await.unwrap();
+	let st = status(&r, &id);
+	println!("U1 beside {} fresh coin(s), {} in flight: {} {}", fresh, before, st["state"], st["waiting"]);
+	let Some(built) = built else { return (st, cap, before, before, 0) };
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	complete(&r, &id, &refs, &keys, &nn, true).await;
+	r.synced().await;
+	let peak = n(&pool(&r, x), "in_flight");
+	let reclaims = passes(&r).await.len();
+	let after = n(&pool(&r, x), "in_flight");
+	println!("after the round {}, {} reclaim(s), after the reclaim {}; cap {}", peak, reclaims, after, cap);
+	(st, cap, peak, after, reclaims)
+}
+
+/// The coin that completes a node opens nothing, so the node is credited
+/// only with what its other slots hold in flight, not with that coin again:
+/// U1 beside two fresh coins opens two and brings back one (U0's), and
+/// waits. Counted twice it ran, and left in flight a coin above the cap once
+/// A was reclaimed. With `other`, a coin of another node is in flight too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nodes_last_coin_is_not_counted_twice() {
+	for (other, tag) in [(false, "N2"), (true, "N3")] {
+		let (st, cap, _, after, _) = last_coin_beside(2, other, tag).await;
+		assert_eq!(st["state"], "pending", "it opens two coins and brings back one: {}", st);
+		let why = st["waiting"].as_str().unwrap();
+		let f = if other { 2 * VALUE } else { VALUE };
+		assert!(why.starts_with("This refresh waits for a later round"), "{}", why);
+		assert!(why.contains(&format!("{} of a cap of {} in flight; this refresh would take it to {}", f, cap, f + VALUE)), "{}", why);
+		assert!(after <= cap, "nothing ran past the cap: {}", after);
+	}
+}
+
+/// Node A holds U0, U1 and U2; U0 refreshed and released, so A holds U0's
+/// coin in flight. P holds U1 and Q holds U2, and each refreshes its coin
+/// beside a fresh one. Neither alone brings A back, and together they open
+/// two coins against A's one, more than the cap leaves. But all that is in
+/// flight is A's, which comes back only through them: waiting frees
+/// nothing. So P runs whatever the cap, Q beside it brings A back, and A is
+/// reclaimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_holders_of_a_nodes_last_coins_bring_it_back() {
+	let cap = VALUE * 3 / 2;
+	let (mut r, c) = first_leaves(Some(cap), &["TH U0", "TH U1", "TH U2"]).await;
+	let x = r.x;
+	let wk: Vec<Keypair> = (0..2).map(|j| keypair(&format!("TH W{} board", j))).collect();
+	let ws = boards(&mut r, &wk, x).await;
+	let k0 = keypair("TH U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	let mut wparts = vec![];
+	for (j, w) in ws.iter().enumerate() {
+		let k = keypair(&format!("TH W{} 1", j));
+		wparts.push((submit(&r, &[w], &[k]), k));
+	}
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	let mut fresh = vec![];
+	for (((id, nn), k), w) in wparts.iter().zip(&ws) {
+		fresh.push(complete(&r, id, &[w], &[*k], nn, true).await.remove(0));
+	}
+	assert_eq!(n(&pool(&r, x), "in_flight"), VALUE, "node A holds U0's coin in flight");
+	let kp = [keypair("TH P 0"), keypair("TH P 1")];
+	let kq = [keypair("TH Q 0"), keypair("TH Q 1")];
+	let (idp, np) = submit(&r, &[&c[1], &fresh[0]], &kp);
+	let (idq, nq) = submit(&r, &[&c[2], &fresh[1]], &kq);
+	let built = r.server.rounds.run_round().await.unwrap().expect("a round is built");
+	let (sp, sq) = (status(&r, &idp), status(&r, &idq));
+	println!("P {} / Q {}", sp["state"], sq["state"]);
+	assert_ne!(sp["state"], "pending", "P runs: {}", sp);
+	assert_ne!(sq["state"], "pending", "Q runs: {}", sq);
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	complete(&r, &idp, &[&c[1], &fresh[0]], &kp, &np, true).await;
+	complete(&r, &idq, &[&c[2], &fresh[1]], &kq, &nq, true).await;
+	r.synced().await;
+	let peak = n(&pool(&r, x), "in_flight");
+	let reclaims = passes(&r).await.len();
+	let after = n(&pool(&r, x), "in_flight");
+	println!("in flight after the round {}, {} reclaim(s), after the reclaim {}; cap {}", peak, reclaims, after, cap);
+	assert_eq!(reclaims, 1, "node A is reclaimed");
+	assert_eq!(after, 2 * VALUE, "only the two fresh coins stay in flight");
+}

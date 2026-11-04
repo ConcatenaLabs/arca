@@ -333,3 +333,53 @@ async fn at_the_horizon_absent_holders_coins_land_on_the_chain_as_their_own() {
 	let st = status(&r, &second[0].id);
 	println!("A's refresh: {}", st["state"]);
 }
+
+/// A coin of a batch without a sweep never expires, so the date the cap
+/// measures its exemption from is its service horizon: a refresh within six
+/// days of it runs whatever the cap, as one within six days of its first
+/// expiry does, so the cap never sends a coin home. Boards A and B refresh
+/// in round 1; A again, beside C's board, in round 2, so A's coin of round 1
+/// is in flight, above a cap of half a coin. C's coin of round 2 rests on a
+/// node holding nothing in flight, so its refresh opens a coin: with a
+/// horizon of `horizon` seconds it runs when that is under six days, and
+/// waits under the cap when it is twenty. Returns its state.
+async fn refresh_near_the_horizon(horizon: u32, tag: &str) -> String {
+	use common::flow::{refresh, Coin};
+	let mut r = Running::start_with(|c, _| {
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+		c.batches.collect_after_seconds = Some(horizon);
+		c.assets[0].in_flight_cap = Some((VALUE / 2).to_string());
+	}).await;
+	let x = r.x;
+	for _ in 0..3 {
+		r.fund_wallet_in(x, 50_000_000).await;
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut boards = vec![];
+	for n in ["A", "B", "C"] {
+		let k = keypair(&format!("{} {} board", tag, n));
+		let (held, tx) = credited_board(&mut r, &k, x).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let (ka, kb) = (keypair(&format!("{} A", tag)), keypair(&format!("{} B", tag)));
+	let first = refresh(&mut r, &[(&boards[0], &ka), (&boards[1], &kb)]).await;
+	let (ka2, kc) = (keypair(&format!("{} A again", tag)), keypair(&format!("{} C", tag)));
+	let second = refresh(&mut r, &[(&first[0].new, &ka2), (&boards[2], &kc)]).await;
+	let flight: u64 = r.http.get("chain").json["pool"][x.to_string()]["in_flight"].as_str().unwrap_or("0").parse().unwrap();
+	println!("horizon {} s: in flight {} of a cap of {}", horizon, flight, VALUE / 2);
+	assert_eq!(flight, VALUE, "A's coin of round 1 is in flight");
+	let (id, _) = submit(&r, &second[1].new.held, &keypair(&format!("{} C again", tag)));
+	r.server.rounds.run_round().await.unwrap();
+	let st = status(&r, &id);
+	println!("C's refresh with a horizon of {} s: {} {}", horizon, st["state"], st["waiting"]);
+	st["state"].as_str().unwrap().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_within_six_days_of_its_horizon_runs_whatever_the_cap() {
+	assert_ne!(refresh_near_the_horizon(5 * 86_400, "HZ5").await, "pending", "five days from its horizon it is not held");
+	assert_eq!(refresh_near_the_horizon(20 * 86_400, "HZ20").await, "pending", "twenty days from it, the cap holds it");
+}

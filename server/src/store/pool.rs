@@ -86,9 +86,25 @@ const IN_FLIGHT_WITH: &str = "
 /// many of its batch leaves still hold value.
 const IN_FLIGHT: &str = "SELECT g.asset, sum(g.value)::BIGINT FROM given g WHERE g.leaf_id IN (SELECT root FROM held) GROUP BY 1";
 
-/// The batch leaves that hold value in flight: each one's id, batch and
+/// The batch leaves that hold value in flight: each with the coin given up
+/// whose value it holds (its id, asset and value), its own id, batch and
 /// leaf record.
-const IN_FLIGHT_SLOTS: &str = "SELECT DISTINCT leaf_id, round_id, vout, record FROM held";
+const IN_FLIGHT_SLOTS: &str = "SELECT DISTINCT h.root, g.asset, g.value, h.leaf_id, h.round_id, h.vout, h.record
+	FROM held h JOIN given g ON g.leaf_id = h.root";
+
+/// A batch leaf holding value in flight ([`Store::in_flight_slots`]).
+#[derive(Clone, Debug)]
+pub struct InFlightSlot {
+	/// The coin given up whose value it holds, and that coin's asset and value.
+	pub given: [u8; 32],
+	pub asset: [u8; 32],
+	pub value: u64,
+	/// The batch leaf, its batch (round and output) and its leaf record.
+	pub leaf_id: [u8; 32],
+	pub round_id: i64,
+	pub vout: u32,
+	pub record: Vec<u8>,
+}
 
 impl Store {
 	/// Each asset's pool flow, by asset: see [`PoolFlow`]. One read-only
@@ -204,12 +220,21 @@ impl Store {
 
 	/// The batch leaves whose value is in flight: each given up, or paid on
 	/// and some coin it became given up, in a round broadcast or final, its
-	/// batch neither reclaimed there nor swept. By leaf id, with its batch
-	/// (round and output) and its leaf record. A tree's lowest nodes above
-	/// them are the ones that hold fronted value.
-	pub async fn in_flight_slots(&self) -> Result<Vec<([u8; 32], i64, u32, Vec<u8>)>, StoreError> {
+	/// batch neither reclaimed there nor swept. Each with the coin given up
+	/// whose value it holds: a coin resting on several such leaves comes
+	/// back once every one of them has. A tree's lowest nodes above them are
+	/// the ones that hold fronted value.
+	pub async fn in_flight_slots(&self) -> Result<Vec<InFlightSlot>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(&format!("{} {}", IN_FLIGHT_WITH, IN_FLIGHT_SLOTS), &[]).await?;
-		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, r.get(1), r.get::<_, i32>(2) as u32, r.get(3)))).collect()
+		rows.iter().map(|r| Ok(InFlightSlot {
+			given: array32(r.get(0), "coin id")?,
+			asset: array32(r.get(1), "asset")?,
+			value: r.get::<_, i64>(2).max(0) as u64,
+			leaf_id: array32(r.get(3), "leaf id")?,
+			round_id: r.get(4),
+			vout: r.get::<_, i32>(5) as u32,
+			record: r.get(6),
+		})).collect()
 	}
 }
