@@ -93,3 +93,15 @@ impl Arca {
 		msg
 	}
 }
+
+/// Whether `sync`'s answer `s` handed over the forfeits of every
+/// participation it moved: each reads `forfeiting` among its
+/// `participations`, or is among those `held` handed over first, whose round
+/// a server's runner may have broadcast by the time the later step looked.
+#[allow(dead_code)]
+pub fn handed_over(s: &serde_json::Value) -> bool {
+	let held: Vec<&serde_json::Value> = s["held"].as_array().map(|h| h.iter().filter(|p| p["state"] == "forfeiting").collect())
+		.unwrap_or_default();
+	let ps = s["participations"].as_array().cloned().unwrap_or_default();
+	!ps.is_empty() && ps.iter().all(|p| p["state"] == "forfeiting" || held.iter().any(|h| h["participation"] == p["participation"]))
+}

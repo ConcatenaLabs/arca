@@ -15,6 +15,10 @@
 //! - A participation run again after a dropped held round is withdrawn by
 //!   its owner once that round is dead (its kill spend final), and not
 //!   before.
+//! - A participation that gives up no coin (a Lightning receive's leaf, a
+//!   repayment) has no forfeit to hand over: it runs in a round of its own,
+//!   which goes out at the next pass while a holder's refresh beside it is
+//!   still held, and stands when that refresh's round is dropped.
 //! - A wallet that hands over its forfeits only after broadcast is refused
 //!   when it submits, in words, by an operator building batches without a
 //!   sweep, and still taken by one with a sweep.
@@ -565,4 +569,73 @@ async fn one_holder_with_three_coins_holds_an_honest_refresh_back_one_window_per
 	answer(&r, &idn.unwrap()).await;
 	r.server.rounds.pass().await.unwrap();
 	assert_eq!(state_of(&r, &next.tx.txid()).await, RoundState::Broadcast, "N's refresh goes out");
+}
+
+/// A participation that gives up no coin and wants one leaf of `value` under
+/// `key`, which the operator's pool funds, recorded as the server records a
+/// Lightning receive's (`lightning::receive`): its id.
+async fn given_nothing(r: &Running, key: &Keypair, value: u64) -> [u8; 32] {
+	use server::store::{NewParticipation, ParticipationOutput, WantedKind};
+	let id = common::client::random32();
+	let preimage = common::client::random32();
+	let p = NewParticipation {
+		id, unlock_hash: arca_covenant::script::sha256(&preimage), preimage, not_before: None, refund_delay_units: 1,
+		inputs: vec![], fees: vec![], fill: None, distribution: None, record_formats: vec![],
+		outputs: vec![ParticipationOutput {
+			asset: r.x.into_inner().to_byte_array(), value,
+			kind: WantedKind::Leaf {
+				template: arca_covenant::Template::Vtxo1.to_string(), owner_key: xonly(key).serialize(),
+				owner_nonce: common::client::random32(), exit_delay_units: common::client::exit_delay().units(),
+				operator_nonce: [0; 32], htlc: None, order: None, landing: None, channel: None, claim: None,
+			},
+			leaf_id: None,
+		}],
+	};
+	r.server.store.insert_participation(&p).await.unwrap();
+	id
+}
+
+/// A holder's refresh A and a participation F that gives up nothing wait
+/// together. F runs in a round of its own, which goes out at the next pass
+/// while A's is held for A's forfeits; A never hands them over, its round is
+/// dropped, and F's round stands and is made final.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_participation_that_gives_up_nothing_never_waits_on_a_holders_forfeits() {
+	let mut r = start().await;
+	let x = r.x;
+	let ka = keypair("A board");
+	let (a, _) = credited_board(&mut r, &ka, x).await;
+	let ida = submit(&r, &a, &keypair("A new"), VALUE);
+	let idf = given_nothing(&r, &keypair("F new"), VALUE).await;
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed.iter().map(|f| f.1.to_string()).collect::<Vec<_>>());
+	let mut free = None;
+	let mut held = None;
+	for b in &built {
+		let ids = members(&r, &b.tx.txid()).await;
+		println!("round {}: {} participation(s), A in it: {}, F in it: {}; {}", b.tx.txid(), ids.len(), ids.contains(&ida),
+			ids.contains(&idf), b.broadcast);
+		if ids.contains(&idf) {
+			assert_eq!(ids, vec![idf], "F runs alone, beside no holder");
+			free = Some(b.tx.txid());
+		} else if ids.contains(&ida) {
+			held = Some(b.tx.txid());
+		}
+	}
+	let (free, held) = (free.expect("F's round"), held.expect("A's round"));
+	r.server.rounds.pass().await.unwrap();
+	println!("after one pass: F's round {:?}, A's round {:?}", state_of(&r, &free).await, state_of(&r, &held).await);
+	assert_eq!(state_of(&r, &free).await, RoundState::Broadcast, "F's round has no forfeit to wait for");
+	assert_eq!(state_of(&r, &held).await, RoundState::Built, "A's round waits for A's forfeits");
+	window_passes(&r).await;
+	assert_eq!(state_of(&r, &held).await, RoundState::Lost, "A never answered: its round is dropped");
+	assert_eq!(status(&r, &ida)["state"], "void");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	let st = status(&r, &idf);
+	println!("F once A's round was dropped: round {:?}, participation {}", state_of(&r, &free).await, st["state"]);
+	assert_eq!(state_of(&r, &free).await, RoundState::Final);
+	assert_eq!(st["state"], "issued", "{}", st);
 }

@@ -27,7 +27,7 @@ use super::{Config, Error, Wallet};
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
-	participations, settle_quote {asset, value, expiry}, sync, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
+	participations, settle_quote {asset, value, expiry}, sync, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
 	refresh_received {max_fee_ppm?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
@@ -161,12 +161,14 @@ fn reads_only(command: &str) -> bool {
 
 /// What `arca` runs before a command: the witness (unless the command stays
 /// on this machine and the node), then the re-check (unless the command is
-/// itself `recheck`, `sync` or `schedule`). With `coins_only` (the argument
+/// itself `recheck`, `sync`, `hand_over_forfeits` or `schedule`). With `coins_only` (the argument
 /// `"recheck": "coins"`), the re-check is the part that concerns the coins
 /// ([`Wallet::recheck_coins`]): a program that answers others from the
 /// wallet asks for it on its answer path, and runs `sync` on a timer.
 fn start(w: &mut Wallet, command: &str, coins_only: bool) -> Value {
+	// `hand_over_forfeits` witnesses itself, as it signs.
 	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "speed_up" | "schedule"
+		| "hand_over_forfeits"
 		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards");
 	// A command that reads only, of the operator or an offer, skips the
 	// witness: it guards the coins the wallet takes and the spends it signs
@@ -181,7 +183,7 @@ fn start(w: &mut Wallet, command: &str, coins_only: bool) -> Value {
 				no coin and signs no spend through the operator until a witness succeeds", e)}}),
 		};
 	}
-	if !matches!(command, "recheck" | "sync" | "schedule") {
+	if !matches!(command, "recheck" | "sync" | "schedule" | "hand_over_forfeits") {
 		// Every coin's bases once a tip; the lineage watch, which a spend in
 		// the mempool calls for, before every command.
 		if let Ok(Some(tip)) = w.tip_rechecked() {
@@ -290,6 +292,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.settle_quote(asset(req_str(&a["asset"], "the asset")?)?, value, expiry)
 		},
 		"sync" => w.sync(),
+		"hand_over_forfeits" => w.hand_over_forfeits(),
 		"schedule" => w.sync_schedule(),
 		"recheck" => w.recheck(),
 		"exit" => {

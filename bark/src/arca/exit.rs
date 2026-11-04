@@ -1568,6 +1568,13 @@ impl Wallet {
 		let talk = witnessed && !gone;
 		let waiting = || json!({"note": "the witness of the operator's signer's record did not succeed: the wallet takes no coin and \
 			signs no spend through the operator until one does"});
+		// The forfeits of every round the operator holds for them, first: a
+		// held round is dropped when they do not come within its window, and
+		// nothing after this needs them.
+		let held = if talk { self.progress_held().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
+			else { Value::Array(vec![]) };
+		steps.lap(self, "held");
+		self.exits_meanwhile();
 		let boards = if talk { self.retry_boards()? } else { vec![] };
 		steps.lap(self, "boards");
 		self.exits_meanwhile();
@@ -1710,6 +1717,9 @@ impl Wallet {
 		out["cost_by_step"] = steps.done();
 		if refresh.as_array().is_none_or(|r| !r.is_empty()) {
 			out["refresh"] = refresh;
+		}
+		if held.as_array().is_none_or(|h| !h.is_empty()) {
+			out["held"] = held;
 		}
 		if lightning.as_array().is_none_or(|l| !l.is_empty()) {
 			out["lightning"] = lightning;
