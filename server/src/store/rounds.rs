@@ -790,6 +790,19 @@ impl Store {
 		r.as_ref().map(batch_leaf_row).transpose()
 	}
 
+	/// Of the coins `ids`, the ones that are batch leaves themselves, in the
+	/// order asked.
+	pub async fn batch_leaves_among(&self, ids: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let asked: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query("SELECT leaf_id FROM batch_leaf WHERE leaf_id = ANY($1::bytea[])", &[&asked]).await?;
+		let found: std::collections::HashSet<[u8; 32]> = rows.iter().map(|r| array32(r.get(0), "coin id")).collect::<Result<_, _>>()?;
+		Ok(ids.iter().copied().filter(|i| found.contains(i)).collect())
+	}
+
 	/// The batch leaves each coin of `ids` rests on: itself when it is one,
 	/// else each batch leaf up its lineage of reassignments (a payment out of
 	/// round, a swap), eight steps at most as in flight is counted. Each with

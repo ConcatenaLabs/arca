@@ -669,3 +669,86 @@ async fn a_named_coin_is_refreshed_for_no_fee() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// A holder named for two coins of one node refreshes them together, for no
+/// fee (arca#612). A boards once and B twice; B refreshes each board in a
+/// participation of its own, so the round puts A's coin and B's two side by
+/// side under one lowest node. The operator charges 5,000 ppm for a refresh;
+/// A refreshes and releases, paying it. B's sync then asks for both of its
+/// coins in one participation and pays nothing: the operator names both,
+/// and waives the fee only for the two together, since the node comes back
+/// only once both are refreshed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holders_two_named_coins_are_refreshed_together_for_no_fee() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x.to_string();
+	let x_id = r.x;
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (a, b) = (Arca::new("NTA"), Arca::new("NTB"));
+	for w in [&a, &b] {
+		w.ok(&create);
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x_id, 5_000_000);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &x, "1000000"]);
+	// B's second board spends the first one's change, once it is in a block.
+	r.produce().await;
+	b.ok(&["board", &x, "1000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("every board credited", || {
+		let credited = |w: &Arca| w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited");
+		credited(&a) && credited(&b) && b.ok(&["boards"]).as_array().unwrap().len() == 2
+	}).await;
+	// Round 1: A's coin and B's two under one lowest node.
+	a.ok(&["participate"]);
+	for c in live(&b, &x) {
+		let p = b.ok(&["participate", "--leaf", c["leaf_id"].as_str().unwrap()]);
+		assert!(p["participations"].as_array().unwrap().iter().all(|x| x["state"] == "pending"), "{}", p);
+	}
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(built.len() == 1 && failed.is_empty(), "{} built, {} failed", built.len(), failed.len());
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	let mine = live(&b, &x);
+	assert_eq!(mine.len(), 2, "B holds two coins of the round: {:?}", mine);
+
+	let mut config = r.server.config();
+	config.fees.refresh_ppm = 5_000;
+	r.server.reload(&config).await.unwrap();
+	let p = a.ok(&["participate", "--max-fee-ppm", "10000"]);
+	println!("A's own refresh: {}", p["participations"]);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	for t in &built {
+		r.round_state(&t.tx.txid(), RoundState::Final).await;
+	}
+	a.ok(&["sync"]);
+	let s = b.ok(&["sync"]);
+	println!("B's sync once A released: refresh {}", s["refresh"]);
+	let asked = s["refresh"].as_array().cloned().unwrap_or_default();
+	assert_eq!(asked.len(), 2, "{}", s["refresh"]);
+	for e in &asked {
+		assert_eq!(e["state"], "pending", "{}", e);
+		let fees = e["fees"].as_array().cloned().unwrap_or_default();
+		assert!(fees.iter().all(|f| f["amount"] == "0"), "the named refresh pays nothing: {:?}", fees);
+	}
+	assert_eq!(asked[0]["participation"], asked[1]["participation"], "both in one participation: {}", s["refresh"]);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

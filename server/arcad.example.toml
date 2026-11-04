@@ -32,7 +32,8 @@ max_request_bytes = 65536
 challenge_ttl_seconds = 120
 
 # Whether `holding_back` also answers a request that proves no key, as
-# wallets on a leaf library older than the proof ask it. Such an answer tells
+# wallets on a leaf library older than the proof ask it: only about coins
+# that are batch leaves themselves, never a payment's coins. Such an answer tells
 # anyone which holders of a lowest node have refreshed, so it stays off
 # unless the operator's own wallets and services are still on such a
 # library. Changed only by a restart.

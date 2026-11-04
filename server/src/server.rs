@@ -58,10 +58,11 @@ pub struct Config {
 	/// How long a challenge is good for, in seconds.
 	#[serde(default = "default_challenge_ttl")]
 	pub challenge_ttl_seconds: u64,
-	/// Whether `holding_back` also answers a request that proves no key,
-	/// about any coin it names, as wallets on a leaf library older than the
-	/// proof ask it. Off by default: such an answer tells anyone which
-	/// holders of a node have refreshed. An operator turns it on only while
+	/// Whether `holding_back` also answers a request that proves no key, as
+	/// wallets on a leaf library older than the proof ask it: about the coins
+	/// it names that are batch leaves themselves, never a payment's coins
+	/// (whose lineage would tell whose coins share a node). Off by default:
+	/// such an answer tells anyone which holders of a node have refreshed. An operator turns it on only while
 	/// its own wallets and services are still on such a library.
 	#[serde(default)]
 	pub holding_back_unauthenticated: bool,
