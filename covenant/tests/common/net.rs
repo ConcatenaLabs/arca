@@ -55,13 +55,20 @@ pub fn op_true_spk() -> Script {
 
 impl Net {
 	pub fn start() -> Net {
+		Net::start_with(&[])
+	}
+
+	/// [`Net::start`], the node started with `extra` arguments beside `-par=1`.
+	pub fn start_with(extra: &[&str]) -> Net {
 		// One directory per chain: tests in one binary run in parallel.
 		static CHAINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 		let n = CHAINS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("covenant-regtest-{}-{}", std::process::id(), n));
 		// Scripts are checked inline, so a block refused for a script failure
 		// names it, and each negative case asserts why its block was refused.
-		let rt = Regtest::from_env(&dir, &["-par=1"]);
+		let mut args = vec!["-par=1"];
+		args.extend_from_slice(extra);
+		let rt = Regtest::from_env(&dir, &args);
 		let c = rt.client();
 		let genesis = c.genesis_hash().unwrap();
 		let info: Value = c.call("getsidechaininfo", &[]).unwrap();
