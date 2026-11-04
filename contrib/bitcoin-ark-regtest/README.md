@@ -33,6 +33,9 @@ builds them; follow it to build them by hand.
     regtest.sh btc …       # bitcoin-cli on the regtest node
     regtest.sh gw … / peer …   # lightning-cli on the gateway or the peer
     regtest.sh admin …     # captaind's admin RPC
+    regtest.sh limits MAX MIN [OFF]   # captaind restarted with its largest coin and
+                                      # board MAX sats, least board MIN, largest offboard
+                                      # and arkoor OFF
     regtest.sh down        # stops every process `up` started, by the PIDs in $H/pids
 
 The ark's settings are short so a test runs in minutes: rounds every 10
@@ -52,3 +55,16 @@ and the server's test environment:
     ARCA_TEST_BITCOIN_ARK=/path/to/a/script/that/sets/the/variables/and/runs/regtest.sh \
     ARCA_BARK_EXEC=/path/to/bark ARCA_BARKD_EXEC=/path/to/barkd \
     cargo test -p arca-cli --test arca_bitcoin_ark -- --nocapture
+
+`limits-drive.sh` runs the Bitcoin ark wallet's own library (bark-wasm's command
+set, through its `regtest_drive` example) on that ark while its operator lowers
+the limits under coins made before: from coins of up to 1 BTC to Second's
+mainnet figures (largest coin 10,000,000 sat, least board 50,000 sat). The
+wallet reads the new figures, is refused boards outside them, offboards a coin
+above the new largest to its own address instead of refreshing it, and
+refreshes the rest in refreshes that each fit:
+
+    H=… REGTEST=/path/to/a/script/that/runs/regtest.sh \
+    DRIVE=bark-wasm/target/debug/examples/regtest_drive \
+    contrib/bitcoin-ark-regtest/limits-drive.sh
+

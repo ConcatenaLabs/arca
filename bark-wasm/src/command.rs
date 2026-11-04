@@ -280,17 +280,22 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 			Ok(json!({ "fee": sat(e.fee), "gross": sat(e.gross_amount) }))
 		},
 		// Refreshes the coins that are due, in the server's next round. A coin whose refresh
-		// is scheduled is left to the server.
+		// is scheduled is left to the server. A refresh makes one coin, so what one call
+		// refreshes fits under the server's largest coin, and the rest is refreshed at the
+		// next call ([bark::Wallet::get_vtxos_to_refresh]). A coin due that is alone above
+		// the largest (made before the server lowered it) cannot be refreshed: it leaves the
+		// ark to the holder's own address first (`offboarded`, [crate::exit::offboard_oversized]).
 		"refresh" => {
+			let offboarded = crate::exit::offboard_oversized(wallet).await?;
 			let due = wallet.get_vtxos_to_refresh().await?;
 			if due.is_empty() {
-				return Ok(json!({ "refreshed": 0 }));
+				return Ok(json!({ "refreshed": 0, "offboarded": offboarded }));
 			}
 			let n = due.len();
 			let r = wallet.refresh_vtxos(due).await;
 			crate::exit::note_server(wallet, r.is_err());
 			r?;
-			Ok(json!({ "refreshed": n }))
+			Ok(json!({ "refreshed": n, "offboarded": offboarded }))
 		},
 		// Schedules with the server the refresh of every coin that has none yet, so the
 		// server renews it with the wallet closed; the wallet takes the new coin in at its

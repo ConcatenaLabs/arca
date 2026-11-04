@@ -8,6 +8,8 @@
 # and `down` stops exactly those.
 #
 #   regtest.sh up | down | info | mine N | miner-start SECS | miner-stop
+#   regtest.sh limits MAX_VTXO MIN_BOARD [MAX_OFFBOARD]   (sats; restarts captaind;
+#                                       MAX_OFFBOARD sets the arkoor limit too)
 #   regtest.sh btc ARGS… | gw ARGS… | peer ARGS… | admin ARGS…
 #
 # Environment (the binaries are not built here; see README.md):
@@ -134,6 +136,29 @@ info() {
   printf '{"ark": "http://127.0.0.1:%s", "bitcoind": "http://127.0.0.1:%s", "cookie": "%s"}\n' "$ARK_PORT" "$BTC_RPC" "$H/btc/regtest/.cookie"
 }
 
+# Restarts captaind with the largest coin and board at $1 sats, the least board at $2,
+# and the largest offboard and arkoor at $3 when given: an ark whose operator changes its limits
+# while coins made under the old ones are still out.
+limits() {
+  local max=${1:?MAX_VTXO} min=${2:?MIN_BOARD} off=${3:-} pid
+  pid=$(awk '$1=="captaind"{p=$2} END{print p}' $H/pids)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    for _ in $(seq 60); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  fi
+  sed -i -e "s/^max_vtxo_amount = .*/max_vtxo_amount = \"$max sat\"/" \
+    -e "s/^max_board_amount = .*/max_board_amount = \"$max sat\"/" \
+    -e "s/^min_board_amount = .*/min_board_amount = \"$min sat\"/" $H/captaind.toml
+  # Bark refuses an offboard limit above its arkoor limit (a send on chain splits its
+  # inputs with an arkoor first), so the two move together.
+  [ -z "$off" ] || sed -i -e "s/^max_offboard_amount = .*/max_offboard_amount = \"$off sat\"/" \
+    -e "s/^max_arkoor_amount = .*/max_arkoor_amount = \"$off sat\"/" $H/captaind.toml
+  CAPTAIND_LOG=info $CAPTAIND --config $H/captaind.toml start >> $H/log/captaind.log 2>&1 &
+  rec captaind $!
+  wait_for 120 admin wallet || { tail -n 20 $H/log/captaind.log >&2; return 1; }
+  grep -E '^(max_vtxo|max_board|min_board|max_offboard|max_arkoor)_amount' $H/captaind.toml
+}
+
 miner_start() {   # a block every $1 seconds, while it runs
   ( while true; do mine 1 || true; sleep "$1"; done ) > /dev/null 2>&1 &
   echo $! > $H/miner.pid
@@ -144,6 +169,7 @@ miner_stop() { if [ -f $H/miner.pid ]; then kill "$(cat $H/miner.pid)" 2>/dev/nu
 cmd=${1:-}; shift || true
 case "$cmd" in
   up) up ;; down) down ;; info) info ;; mine) mine "$1" ;; miner-start) miner_start "$1" ;; miner-stop) miner_stop ;;
+  limits) limits "$@" ;;
   btc) btc "$@" ;; gw) gw "$@" ;; peer) peer "$@" ;; admin) admin "$@" ;;
-  *) echo "usage: regtest.sh up|down|info|mine N|miner-start S|miner-stop|btc|gw|peer|admin" >&2; exit 1 ;;
+  *) echo "usage: regtest.sh up|down|info|mine N|miner-start S|miner-stop|limits MAX MIN [OFF]|btc|gw|peer|admin" >&2; exit 1 ;;
 esac

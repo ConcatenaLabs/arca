@@ -326,6 +326,42 @@ async fn address_arg(wallet: &Wallet, net: Network, args: &Value) -> anyhow::Res
 	}
 }
 
+/// Takes out of the ark, to the holder's own first Bitcoin address, every coin due for a
+/// refresh that the server cannot refresh: one alone above the server's largest coin
+/// ([Wallet::oversized_vtxos_due]), made before the server lowered it. A refresh of it
+/// is refused, and left alone it would expire; so it leaves cooperatively, with the
+/// server, one coin per offboard, the server's offboard fee taken from the coin. The BTC
+/// is at the address after a Bitcoin block, in the wallet's one BTC figure, and a wallet
+/// that boards by itself boards it again in coins the server takes.
+///
+/// -> one entry per coin: `{ vtxo, amount, txid }` when it left, `{ vtxo, amount, error }`
+/// when the server refused it (it is tried again at the next call).
+pub async fn offboard_oversized(wallet: &Wallet) -> anyhow::Result<Vec<Value>> {
+	let over = wallet.oversized_vtxos_due().await?;
+	if over.is_empty() {
+		return Ok(vec![]);
+	}
+	let net = wallet.properties().await?.network;
+	let address = address_arg(wallet, net, &json!({})).await?;
+	let mut out = Vec::with_capacity(over.len());
+	for v in over {
+		let (id, amount) = (v.id(), v.amount());
+		match wallet.offboard_vtxos([id], address.clone()).await {
+			Ok(txid) => {
+				log::info!("{} ({}) is above the server's largest coin: offboarded to {} in {}",
+					id, amount, address, txid);
+				out.push(json!({ "vtxo": id.to_string(), "amount": sat(amount), "txid": txid.to_string() }));
+			},
+			Err(e) => {
+				log::warn!("{} ({}) is above the server's largest coin; its offboard was refused: {:#}",
+					id, amount, e);
+				out.push(json!({ "vtxo": id.to_string(), "amount": sat(amount), "error": format!("{:#}", e) }));
+			},
+		}
+	}
+	Ok(out)
+}
+
 /// Runs one exit command.
 pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Value> {
 	let net = wallet.properties().await?.network;

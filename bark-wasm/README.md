@@ -43,12 +43,24 @@ delegated refresh scheduled for 72 blocks before the coin's expiry (Bark's
 refresh threshold, if that is more): the server runs it in its first round from
 that height, with the page closed, and the wallet takes the new coin in at its
 next sync, after the old coin's expiry too. Coins sharing an expiry go in one
-refresh, for one base fee. A coin spent before its refresh runs drops it on the
+refresh, for one base fee, as long as they fit in one coin of the server's: a
+refresh makes one coin, and the server refuses a coin above its largest
+(`max_vtxo_amount`, which `info` shows as `max_vtxo_sat`), so coins that hold
+more in all are split into refreshes that each fit. A coin spent before its refresh runs drops it on the
 server, and the next call schedules one for what replaced it. While a refresh
 is scheduled, `refresh` and the daemon leave that coin to the server, until six
 blocks past its height. A page calls it when it opens and after each sync,
 after `tower_plan`, with `except` set to that plan's `no_refresh`: a coin a
 Bitcoin ark watchtower covers gets no delegated refresh (see below).
+
+`refresh` takes the same care: one call refreshes the coins due that fit in one
+coin of the server's, soonest expiry first, and the next call the rest. A coin
+alone above the server's largest, made before the server lowered it, cannot be
+refreshed at all: `refresh` first offboards it, with the server, to the
+holder's own Bitcoin address (`m/84'/coin'/0'/0/0`), its offboard fee taken from
+the coin, and lists it under `offboarded`. The BTC is at that address after a
+Bitcoin block, and a wallet that boards by itself boards it again in coins the
+server takes.
 
 ## Leaving the ark alone
 
