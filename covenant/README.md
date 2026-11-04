@@ -928,7 +928,10 @@ the same.
 
 Exits are serial: each spends the batch output and re-creates it, so the
 mempool takes 25 exits of one batch from one unconfirmed chain, and a block
-takes them together. An exit is 979 vB with its
+takes them together. A wallet broadcasts its entry right behind its exit, and
+the entry counts against the same chain, so when every holder leaves at once a
+block takes about 13 exits and their entries: 1,024 holders are out in 79
+blocks, where a tree's are out in 6 (`covenant/tests/mass_exit.rs`). An exit is 979 vB with its
 fee from the slot's reserve, against 2,854 vB for the five node transactions of
 a 1,024-leaf tree; the entry's unlock (234 vB) and the leaf's exit follow in
 both (`covenant/tests/accumulator.rs`).
@@ -1285,6 +1288,20 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   claim and a dormant owner's entry opened into its own leaf, which only that
   owner takes home; and each removed sweep (batch output, lowest nodes, an
   entry, a checkpoint) refused in a block with `Witness program hash mismatch`.
+- `tests/mass_exit.rs`: on an anchored regtest chain whose blocks hold at
+  most the testnet's 89,999 vB of transactions, every holder of a full
+  1,024-leaf batch without a sweep leaves at once, the operator doing nothing
+  after its round: each holder brings its leaf on the chain from its record
+  (a tree's nodes unrolled level by level, or an accumulator's exits one after
+  another) and claims it after its exit delay, trying again a block later when
+  the mempool's chain limits refuse a step. It prints, block by block, the
+  vbytes by kind and level, the blocks each stage takes, the fees by asset and
+  how long the last holder waits. A tree's leaves are all on the chain in 6
+  blocks (637,172 vB with the claims, 7.08 blocks' worth); an accumulator's in
+  79, its exits held to about 13 a block by the chain limit (1,553,299 vB).
+  With no sweep, the last holder's wait is the exit delay and those blocks.
+  The two tests take about ten minutes, so CI skips them: run them with
+  `cargo test -p arca-covenant --test mass_exit -- --ignored --nocapture`.
 - `tests/accumulator_release.rs`: on an anchored regtest chain, an
   accumulator batch without a sweep (`arca/accumulator-2`): its records
   (format version 4) and the wallet policy that takes them and refuses
