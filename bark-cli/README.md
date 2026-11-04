@@ -106,13 +106,18 @@ received over Lightning under a request that named no mailbox key, each binding
 signed by the coin's own key.
 
 `create --mnemonic` restores a wallet from its mnemonic, and `restore` runs
-the restore again (it takes only what the wallet does not hold). A restore
-retires the old device: stop the wallet the mnemonic was restored from, and
-never run it beside the restored one. Two live stores of one mnemonic draw
-their own nonces and refuse each other's coins: a leaf one claims under a
-nonce the other never drew is refused there ("a coin for owner nonce …,
-which this wallet never drew"), and the other's own claim of it is refused
-as a double spend. A restore that stops at an error keeps what it took
+the restore again (it takes only what the wallet does not hold). Stores of
+one mnemonic kept side by side (a phone and a browser) follow each other:
+`sync` catches up, at most once every ten minutes (`caught_up` in its
+answer), with what the server serves to the mailbox key, as a restore reads
+it. It takes every coin the store does not hold, checked as a restore checks
+it, and gives up every coin it holds as live that another store gave up in a
+transfer the operator co-signed or in a participation the operator released,
+on the owner's own signatures (`given_elsewhere`), so every store shows the
+same coins after its next catch-up, and shows what it held until then. Each
+store still draws its own nonces, and its mailbox read refuses a coin paid
+under a nonce it never drew ("a coin for owner nonce …, which this wallet
+never drew"), which its catch-up takes instead. A restore that stops at an error keeps what it took
 before it and says so; `restore` takes the rest once the cause is gone. A
 take whose round is held for its takes' forfeits is restored from the round
 the take's status serves, as `sync` reads it, and its forfeits handed over

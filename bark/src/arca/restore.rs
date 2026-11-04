@@ -38,10 +38,12 @@
 //! such a request could last ([`super::wallet::REQUEST_HOLDS`] from the
 //! restore), since a payment to one is read only by `sync`.
 //!
-//! A restore retires the device it restores from: two live stores of one
-//! mnemonic draw their own owner nonces, and each refuses a coin made under
-//! a nonce it never drew, so a leaf one of them claims is refused by the
-//! other, whose own claim of it is then a double spend. A restore that stops
+//! Two live stores of one mnemonic draw their own owner nonces, and each
+//! one's mailbox read refuses a coin made under a nonce it never drew; each
+//! follows the other by catching up ([`Wallet::catch_up`], from `sync`),
+//! which reads what the server serves as a restore does: it takes what the
+//! store does not hold, and gives up what the other store gave up on the
+//! owner's own signatures, so both show the same coins. A restore that stops
 //! at an error keeps what it took before it, and a later restore takes the
 //! rest. A take whose round is held for its takes' forfeits, unbroadcast, is
 //! restored from the round its status serves (its txid the round's), as
@@ -100,6 +102,21 @@ struct Taken {
 	coin: ValidCoin,
 }
 
+/// What [`Wallet::take_served`] took and found.
+struct TakenServed {
+	restored: Vec<Value>,
+	not_recovered: Vec<Value>,
+	notes: Vec<Value>,
+	given_elsewhere: Vec<Value>,
+}
+
+/// Where the wallet keeps the median time it last caught up with what the
+/// server serves to its mailbox key ([`Wallet::catch_up`]).
+pub(crate) const CAUGHT_UP: &str = "caught_up";
+
+/// How often `sync` catches up, at most (median-time seconds).
+pub(crate) const CATCH_UP_EVERY: u32 = 600;
+
 impl Wallet {
 	/// Restores the wallet from what its mnemonic names: every leaf the server
 	/// serves to its mailbox key, each checked as the module documentation
@@ -108,165 +125,10 @@ impl Wallet {
 	/// restores nothing, while the operator's keeper set is not acknowledged.
 	pub fn restore(&mut self) -> Result<Value, Error> {
 		let info = self.server_info()?;
-		let mailbox = self.keys.mailbox()?;
-		let mut entries: Vec<Value> = vec![];
-		let mut served_receives: Vec<Value> = vec![];
-		let mut after = 0i64;
-		let mut read_note: Option<String> = None;
-		let mut pages = 0;
-		loop {
-			if pages >= LEAF_DATA_PAGES {
-				read_note = Some(format!("the server names more than {} pages of leaves: the restore reads no further, and takes what it read",
-					LEAF_DATA_PAGES));
-				break;
-			}
-			pages += 1;
-			let page = self.server.leaf_data(&mailbox, &self.genesis, after, LEAF_PAGE)?;
-			if after == 0 {
-				served_receives = page["receives"].as_array().cloned().unwrap_or_default();
-			}
-			let leaves = page["leaves"].as_array().cloned().unwrap_or_default();
-			if leaves.is_empty() {
-				break;
-			}
-			// Every leaf of a page lies past the cursor asked, and the next
-			// cursor past every one: a page that serves again what was read,
-			// or names a next that does not advance past it, ends the read.
-			let cursors: Vec<i64> = leaves.iter().filter_map(|l| l["cursor"].as_str().and_then(|c| c.parse::<i64>().ok())).collect();
-			if cursors.iter().any(|c| *c <= after) {
-				read_note = Some(format!("the server serves leaves at or before the cursor asked ({}) again: the restore reads no further, \
-					and takes what it read", after));
-				break;
-			}
-			entries.extend(leaves);
-			let last = cursors.iter().copied().max().unwrap_or(after);
-			match page["next"].as_str().and_then(|n| n.parse::<i64>().ok()) {
-				Some(n) if n > after && n >= last => after = n,
-				Some(n) => {
-					read_note = Some(format!("the server names a next page at cursor {}, not past the page it served (to {}): the restore reads \
-						no further, and takes what it read", n, last));
-					break;
-				},
-				None => break,
-			}
-		}
-		self.keepers_acknowledged(&info, &entries)?;
-		self.no_foreign_acks(&info, &entries)?;
+		let (entries, served_receives, read_note) = self.read_served()?;
+		let TakenServed { mut restored, not_recovered, notes, given_elsewhere: _ } =
+			self.take_served(&info, &entries, &served_receives, false)?;
 		let now = self.now()?;
-		let mut not_recovered: Vec<Value> = vec![];
-		let mut restored: Vec<Value> = vec![];
-		let mut taken: BTreeMap<String, Taken> = BTreeMap::new();
-		let mut trees: BTreeMap<(String, u32), (Value, Batch)> = BTreeMap::new();
-
-		// Every coin served with a record, checked; the same leaf served twice
-		// is looked at once, its first copy.
-		let mut seen = BTreeSet::new();
-		for e in &entries {
-			let id = e["leaf_id"].as_str().unwrap_or("").to_string();
-			if !seen.insert(id.clone()) {
-				not_recovered.push(missed(&id, "the server serves this leaf twice: the wallet looked at its first copy alone"));
-				continue;
-			}
-			if self.store.coin(&id)?.is_some() {
-				continue;
-			}
-			match self.restore_coin(e, &mut trees, now) {
-				Ok(Some((row_state, coin))) => {
-					restored.push(json!({"leaf_id": id, "kind": e["kind"], "asset": coin.asset.to_string(), "value": coin.value.to_string(),
-						"state": row_state}));
-					taken.insert(id, Taken { entry: e.clone(), coin });
-				},
-				Ok(None) => {},
-				Err(why) => {
-					self.store.refused(&format!("restore of coin {}", id), &why)?;
-					not_recovered.push(missed(&id, why));
-				},
-			}
-		}
-
-		// The coins a coin taken spends, by the transfer that made it: a
-		// received leaf is spent by its claim only once the wallet holds a coin
-		// the claim made, checked.
-		let mut spent_by_held: BTreeMap<String, String> = BTreeMap::new();
-		for t in taken.values() {
-			if let ValidOrigin::Transfer { inputs, .. } = &t.coin.origin {
-				let tid = t.entry["made_by"]["transfer_id"].as_str().unwrap_or("").to_string();
-				for i in inputs {
-					spent_by_held.insert(i.coin.id.to_string(), tid.clone());
-				}
-			}
-		}
-
-		// How each was given up, on its owner's own signatures.
-		let mut notes: Vec<Value> = vec![];
-		for (id, t) in &taken {
-			notes.extend(self.restore_given(id, &t.entry, &t.coin, now, &spent_by_held)?);
-		}
-
-		// A leaf the lost wallet took home: its own output on the chain, found
-		// and followed as an exit would (its claim, a forfeit or a checkpoint
-		// that took it, or the exit to go on), never held live.
-		for (id, t) in &taken {
-			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
-				if let Some(n) = self.restore_on_chain(id, &t.coin)? {
-					notes.push(n);
-				}
-			}
-		}
-
-		// A leaf that went over Lightning and is not given up on its owner's
-		// signature: as the payment stands. A received leaf whose claim the
-		// server recorded and has not co-signed (`sending`) is held as
-		// handed over too, with its home date (D68): the transfer the lost
-		// wallet posted is not the restored wallet's to post again, and the
-		// leaf comes home by its claim unless the operator co-signs one.
-		for (id, t) in &taken {
-			let Some(h) = t.coin.leaf.htlc else { continue };
-			let receive = h.direction == arca_covenant::HtlcDirection::Receive;
-			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending") || (receive && c.state == "sending")) {
-				notes.push(self.restore_htlc(id, &t.coin, h, &info, now)?);
-			}
-		}
-
-		// D70: the payments into the tree asked under the mailbox key and not
-		// yet claimed, whose leaf is not held yet (held, wanted in a round, or
-		// made and not yet released): each rebuilt from what the server serves,
-		// checked against the mnemonic, and taken up by `sync`.
-		for r in &served_receives {
-			match self.restore_receive(r, &info) {
-				Ok(Some(n)) => notes.push(n),
-				Ok(None) => {},
-				Err(why) => {
-					let hash = r["payment_hash"].as_str().unwrap_or("").to_string();
-					self.store.refused(&format!("restore of the payment received under hash {}", hash), &why)?;
-					not_recovered.push(json!({"payment_hash": hash, "why": why}));
-				},
-			}
-		}
-
-		// What the wallet's own records say, whatever the server says of the
-		// coins they rest on: every coin a held coin's record spends was
-		// spent by the transfer that made it, which the operator co-signed.
-		for t in taken.values() {
-			let ValidOrigin::Transfer { inputs, .. } = &t.coin.origin else { continue };
-			let tid = t.entry["made_by"]["transfer_id"].as_str().unwrap_or("").to_string();
-			for i in inputs {
-				let Some(c) = self.store.coin(&i.coin.id.to_string())? else { continue };
-				if c.state == "spent" {
-					continue;
-				}
-				let why = format!("the server serves coin {} as {}, an old copy: the record of coin {}, which the operator co-signed, shows it \
-					spent by transfer {}", c.leaf_id, if c.state == "live" { "unspent" } else { &c.state }, t.coin.id, tid);
-				self.store.set_coin_spent(&c.leaf_id, &format!("transfer {}", tid))?;
-				self.store.refused(&format!("restore of coin {}", c.leaf_id), &why)?;
-				notes.push(json!({"leaf_id": c.leaf_id, "note": why}));
-			}
-		}
-
-		// Participations in their forfeit step: the new leaves validated as
-		// before their forfeits were signed; and the new leaves of released
-		// ones that the server does not serve, from the published tree.
-		notes.extend(self.restore_participations(&mut trees, now, &mut restored, &mut not_recovered)?);
 
 		// The mailbox, from its start: a coin held is held, one paid to a key
 		// of the mnemonic and never read is taken.
@@ -317,6 +179,8 @@ impl Wallet {
 		// checked against the mnemonic; `sync` takes up each step whose round
 		// is final.
 		let plans = self.restore_plans().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		// A restore has just read everything a catch-up would.
+		self.store.set_meta(CAUGHT_UP, &now.to_consensus_u32().to_string())?;
 		let sync = self.sync()?;
 		let mut out = json!({
 			"served": entries.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes, "mailbox": mailbox_read,
@@ -521,6 +385,292 @@ impl Wallet {
 			let _ = self.witness_record(&e["batch"]["signer_record"], false);
 		}
 		Ok(Some((state.to_string(), coin)))
+	}
+
+	/// Every leaf the server serves to the mailbox key, a page at a time, and
+	/// the payments into the tree asked under it (D70); with a note when the
+	/// read stopped short.
+	fn read_served(&self) -> Result<(Vec<Value>, Vec<Value>, Option<String>), Error> {
+		let mailbox = self.keys.mailbox()?;
+		let mut entries: Vec<Value> = vec![];
+		let mut served_receives: Vec<Value> = vec![];
+		let mut after = 0i64;
+		let mut read_note: Option<String> = None;
+		let mut pages = 0;
+		loop {
+			if pages >= LEAF_DATA_PAGES {
+				read_note = Some(format!("the server names more than {} pages of leaves: the restore reads no further, and takes what it read",
+					LEAF_DATA_PAGES));
+				break;
+			}
+			pages += 1;
+			let page = self.server.leaf_data(&mailbox, &self.genesis, after, LEAF_PAGE)?;
+			if after == 0 {
+				served_receives = page["receives"].as_array().cloned().unwrap_or_default();
+			}
+			let leaves = page["leaves"].as_array().cloned().unwrap_or_default();
+			if leaves.is_empty() {
+				break;
+			}
+			// Every leaf of a page lies past the cursor asked, and the next
+			// cursor past every one: a page that serves again what was read,
+			// or names a next that does not advance past it, ends the read.
+			let cursors: Vec<i64> = leaves.iter().filter_map(|l| l["cursor"].as_str().and_then(|c| c.parse::<i64>().ok())).collect();
+			if cursors.iter().any(|c| *c <= after) {
+				read_note = Some(format!("the server serves leaves at or before the cursor asked ({}) again: the restore reads no further, \
+					and takes what it read", after));
+				break;
+			}
+			entries.extend(leaves);
+			let last = cursors.iter().copied().max().unwrap_or(after);
+			match page["next"].as_str().and_then(|n| n.parse::<i64>().ok()) {
+				Some(n) if n > after && n >= last => after = n,
+				Some(n) => {
+					read_note = Some(format!("the server names a next page at cursor {}, not past the page it served (to {}): the restore reads \
+						no further, and takes what it read", n, last));
+					break;
+				},
+				None => break,
+			}
+		}
+		Ok((entries, served_receives, read_note))
+	}
+
+	/// The coin passes of a restore over what the server serves: each coin
+	/// the store does not hold, checked and taken; how each was given up, on
+	/// its owner's own signatures; what the wallet's own records say of the
+	/// coins they spend; and the participations in their forfeit step.
+	///
+	/// `catching_up` ([`Self::catch_up`]): a store that holds coins already,
+	/// another store of the mnemonic live beside it. A coin it holds as live
+	/// or pending that the server serves as given up in a transfer the
+	/// operator co-signed, or in a participation the operator released and
+	/// this store never made, is given up as the restore gives
+	/// it up (`given_elsewhere`); and a coin it could not take is said, not
+	/// recorded as refused again, since it is looked at again next time.
+	fn take_served(&mut self, info: &Value, entries: &[Value], served_receives: &[Value], catching_up: bool) -> Result<TakenServed, Error> {
+		self.keepers_acknowledged(info, entries)?;
+		self.no_foreign_acks(info, entries)?;
+		let now = self.now()?;
+		let mut not_recovered: Vec<Value> = vec![];
+		let mut restored: Vec<Value> = vec![];
+		let mut taken: BTreeMap<String, Taken> = BTreeMap::new();
+		let mut trees: BTreeMap<(String, u32), (Value, Batch)> = BTreeMap::new();
+
+		// Every coin served with a record, checked; the same leaf served twice
+		// is looked at once, its first copy.
+		let mut seen = BTreeSet::new();
+		// Coins this store holds that another store of the mnemonic gave up.
+		let mut elsewhere: BTreeMap<String, Taken> = BTreeMap::new();
+		for e in entries {
+			let id = e["leaf_id"].as_str().unwrap_or("").to_string();
+			if !seen.insert(id.clone()) {
+				not_recovered.push(missed(&id, "the server serves this leaf twice: the wallet looked at its first copy alone"));
+				continue;
+			}
+			if let Some(c) = self.store.coin(&id)? {
+				if catching_up && matches!(c.state.as_str(), "live" | "pending") && self.given_elsewhere(e)? {
+					if let Some(coin) = self.held_valid(&c, now) {
+						elsewhere.insert(id, Taken { entry: e.clone(), coin });
+					}
+				}
+				continue;
+			}
+			match self.restore_coin(e, &mut trees, now) {
+				Ok(Some((row_state, coin))) => {
+					restored.push(json!({"leaf_id": id, "kind": e["kind"], "asset": coin.asset.to_string(), "value": coin.value.to_string(),
+						"state": row_state}));
+					taken.insert(id, Taken { entry: e.clone(), coin });
+				},
+				Ok(None) => {},
+				Err(why) => {
+					if !catching_up {
+						self.store.refused(&format!("restore of coin {}", id), &why)?;
+					}
+					not_recovered.push(missed(&id, why));
+				},
+			}
+		}
+
+		// The coins a coin taken spends, by the transfer that made it: a
+		// received leaf is spent by its claim only once the wallet holds a coin
+		// the claim made, checked.
+		let mut spent_by_held: BTreeMap<String, String> = BTreeMap::new();
+		for t in taken.values() {
+			if let ValidOrigin::Transfer { inputs, .. } = &t.coin.origin {
+				let tid = t.entry["made_by"]["transfer_id"].as_str().unwrap_or("").to_string();
+				for i in inputs {
+					spent_by_held.insert(i.coin.id.to_string(), tid.clone());
+				}
+			}
+		}
+
+		// How each was given up, on its owner's own signatures.
+		let mut notes: Vec<Value> = vec![];
+		for (id, t) in &taken {
+			notes.extend(self.restore_given(id, &t.entry, &t.coin, now, &spent_by_held)?);
+		}
+		let mut given_elsewhere: Vec<Value> = vec![];
+		for (id, t) in &elsewhere {
+			notes.extend(self.restore_given(id, &t.entry, &t.coin, now, &spent_by_held)?);
+			if let Some(c) = self.store.coin(id)? {
+				if c.state != "live" {
+					given_elsewhere.push(json!({"leaf_id": id, "asset": t.coin.asset.to_string(), "value": t.coin.value.to_string(),
+						"state": c.state}));
+				}
+			}
+		}
+
+		// A leaf the lost wallet took home: its own output on the chain, found
+		// and followed as an exit would (its claim, a forfeit or a checkpoint
+		// that took it, or the exit to go on), never held live.
+		for (id, t) in &taken {
+			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				if let Some(n) = self.restore_on_chain(id, &t.coin)? {
+					notes.push(n);
+				}
+			}
+		}
+
+		// A leaf that went over Lightning and is not given up on its owner's
+		// signature: as the payment stands. A received leaf whose claim the
+		// server recorded and has not co-signed (`sending`) is held as
+		// handed over too, with its home date (D68): the transfer the lost
+		// wallet posted is not the restored wallet's to post again, and the
+		// leaf comes home by its claim unless the operator co-signs one.
+		for (id, t) in &taken {
+			let Some(h) = t.coin.leaf.htlc else { continue };
+			let receive = h.direction == arca_covenant::HtlcDirection::Receive;
+			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending") || (receive && c.state == "sending")) {
+				notes.push(self.restore_htlc(id, &t.coin, h, &info, now)?);
+			}
+		}
+
+		// D70: the payments into the tree asked under the mailbox key and not
+		// yet claimed, whose leaf is not held yet (held, wanted in a round, or
+		// made and not yet released): each rebuilt from what the server serves,
+		// checked against the mnemonic, and taken up by `sync`.
+		for r in served_receives {
+			match self.restore_receive(r, &info) {
+				Ok(Some(n)) => notes.push(n),
+				Ok(None) => {},
+				Err(why) => {
+					let hash = r["payment_hash"].as_str().unwrap_or("").to_string();
+					if !catching_up {
+						self.store.refused(&format!("restore of the payment received under hash {}", hash), &why)?;
+					}
+					not_recovered.push(json!({"payment_hash": hash, "why": why}));
+				},
+			}
+		}
+
+		// What the wallet's own records say, whatever the server says of the
+		// coins they rest on: every coin a held coin's record spends was
+		// spent by the transfer that made it, which the operator co-signed.
+		for t in taken.values() {
+			let ValidOrigin::Transfer { inputs, .. } = &t.coin.origin else { continue };
+			let tid = t.entry["made_by"]["transfer_id"].as_str().unwrap_or("").to_string();
+			for i in inputs {
+				let Some(c) = self.store.coin(&i.coin.id.to_string())? else { continue };
+				if c.state == "spent" {
+					continue;
+				}
+				let why = format!("the server serves coin {} as {}, an old copy: the record of coin {}, which the operator co-signed, shows it \
+					spent by transfer {}", c.leaf_id, if c.state == "live" { "unspent" } else { &c.state }, t.coin.id, tid);
+				self.store.set_coin_spent(&c.leaf_id, &format!("transfer {}", tid))?;
+				if catching_up {
+					// Held here, given up by another store of the mnemonic.
+					given_elsewhere.push(json!({"leaf_id": c.leaf_id, "asset": c.asset, "value": c.value.to_string(), "state": "spent"}));
+				} else {
+					self.store.refused(&format!("restore of coin {}", c.leaf_id), &why)?;
+				}
+				notes.push(json!({"leaf_id": c.leaf_id, "note": why}));
+			}
+		}
+
+		// Participations in their forfeit step: the new leaves validated as
+		// before their forfeits were signed; and the new leaves of released
+		// ones that the server does not serve, from the published tree.
+		notes.extend(self.restore_participations(&mut trees, now, &mut restored, &mut not_recovered)?);
+		Ok(TakenServed { restored, not_recovered, notes, given_elsewhere })
+	}
+
+	/// Whether every output `wanted` names is an offboard and round `rtx` is
+	/// final in the chain: a released participation that wanted no leaf has
+	/// no preimage to wait for, its offboard output being the round's,
+	/// unlocked into the address by the operator or, past its grace, by the
+	/// wallet that made it.
+	fn offboards_final(&self, wanted: &Value, rtx: &str) -> Result<bool, Error> {
+		let Some(ws) = wanted.as_array().filter(|a| !a.is_empty()) else { return Ok(false) };
+		if !ws.iter().all(|w| w.get("offboard").is_some_and(|o| o.is_object())) {
+			return Ok(false);
+		}
+		let Ok(t) = Txid::from_str(rtx) else { return Ok(false) };
+		Ok(self.chain.finality(&t)?.is_final())
+	}
+
+	/// Whether the server serves coin `e` as given up in a way that is final
+	/// and not this store's own: a transfer the operator co-signed, or a
+	/// participation the operator released that this store never made.
+	/// Checked on the owner's signatures by [`Self::restore_given`].
+	fn given_elsewhere(&self, e: &Value) -> Result<bool, Error> {
+		let mut mine: Option<BTreeSet<String>> = None;
+		for g in e["given"].as_array().cloned().unwrap_or_default() {
+			if g["transfer"]["state"] == "signed" {
+				return Ok(true);
+			}
+			let p = &g["participation"];
+			if p["state"] == "released" {
+				if mine.is_none() {
+					mine = Some(self.store.participations()?.into_iter().map(|q| q.0).collect());
+				}
+				if !mine.as_ref().is_some_and(|m| m.contains(p["participation_id"].as_str().unwrap_or(""))) {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
+	}
+
+	/// A coin the store holds, checked as held, if it still checks.
+	fn held_valid(&self, c: &super::store::CoinRow, now: MedianTime) -> Option<ValidCoin> {
+		let record = Self::record_of(c).ok()?;
+		let bases = self.accepted_bases(&record).ok()?;
+		self.resolve(&record, &bases, &self.followed_policy(c.expiry, now)).ok()
+	}
+
+	/// What other stores of the mnemonic did since this one last looked, from
+	/// what the server serves to the mailbox key, checked as a restore checks
+	/// it: every coin this store does not hold, taken; and every coin it holds
+	/// that another store gave up, on the owner's own signatures, given up
+	/// here too (`given_elsewhere`), so every store of the mnemonic shows the
+	/// same coins. `sync` runs it at most once every ten minutes; the coins
+	/// held stay as they are while it runs.
+	pub fn catch_up(&mut self) -> Result<Value, Error> {
+		let info = self.server_info()?;
+		let (entries, served_receives, read_note) = self.read_served()?;
+		let TakenServed { mut restored, not_recovered, notes, given_elsewhere } =
+			self.take_served(&info, &entries, &served_receives, true)?;
+		let now = self.now()?;
+		self.store.set_meta(CAUGHT_UP, &now.to_consensus_u32().to_string())?;
+		for v in restored.iter_mut() {
+			if let Some(c) = self.store.coin(v["leaf_id"].as_str().unwrap_or(""))? {
+				v["state"] = json!(c.state);
+			}
+		}
+		let mut out = json!({"served": entries.len(), "restored": restored, "given_elsewhere": given_elsewhere,
+			"not_taken": not_recovered, "notes": notes});
+		if let Some(n) = read_note {
+			out["note"] = json!(n);
+		}
+		Ok(out)
+	}
+
+	/// Whether `sync` catches up now ([`CATCH_UP_EVERY`]).
+	pub(crate) fn catch_up_due(&self) -> Result<bool, Error> {
+		let now = self.now()?.to_consensus_u32();
+		let last: Option<u32> = self.store.meta(CAUGHT_UP)?.and_then(|v| v.parse().ok());
+		Ok(last.map_or(true, |l| now.saturating_sub(l) >= CATCH_UP_EVERY || now < l))
 	}
 
 	/// The transactions the server names for coin `e` (`bases`: the batch
@@ -1071,7 +1221,7 @@ impl Wallet {
 		not_recovered: &mut Vec<Value>) -> Result<Vec<Value>, Error>
 	{
 		let mut notes = vec![];
-		for (pid, body, _, wanted, state, _, round) in self.store.participations()? {
+		for (pid, body, given_json, wanted, state, _, round) in self.store.participations()? {
 			let restored_here = serde_json::from_str::<Value>(&body).is_ok_and(|b| b["restored"] == json!(true));
 			if !restored_here || state != "forfeiting" {
 				continue;
@@ -1195,6 +1345,22 @@ impl Wallet {
 						}
 					}
 					notes.push(json!({"participation": pid, "state": "released", "round": rtx}));
+				},
+				// A participation that wanted only offboards has no new leaf
+				// to give a preimage: released, its round final in the chain,
+				// the coins it gave up are spent, as the wallet that made it
+				// finds them.
+				None if released && news.is_empty() && self.offboards_final(&wanted, &rtx)? => {
+					let given: Vec<String> = serde_json::from_str(&given_json).map_err(|e| Error::Store(e.to_string()))?;
+					self.store.atomically(|s| {
+						for l in &given {
+							s.set_coin_spent(l, &format!("participation {}", pid))?;
+							s.set_forfeit_state(l, &rtx, "settled", "")?;
+						}
+						s.set_participation(&pid, "released", None, Some(&rtx))
+					})?;
+					notes.push(json!({"participation": pid, "state": "released", "round": rtx, "note": "it wanted offboards alone, and its \
+						round is final in the chain: the coins given up for it are spent"}));
 				},
 				None => {
 					for id in &withheld {
