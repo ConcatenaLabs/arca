@@ -129,6 +129,11 @@ CMake package config (`libboost-dev` on Debian and Ubuntu). On a machine without
 it, a directory holding a `lib/cmake/Boost-<version>/BoostConfig.cmake` that
 defines `Boost::headers`, named in `CMAKE_PREFIX_PATH`, is enough.
 
+`arca-server` and everything that depends on it (the `arca-cli` scenario tests
+among them) build `arca-server-rpc`, which compiles its protobuf definitions and
+needs `protoc`: on the `PATH` (`protobuf-compiler` on Debian and Ubuntu), or named
+by `PROTOC`.
+
 `arca-consensus` is the verifier for Sequentia transactions: it links the node's
 consensus library from the checkout named by `SEQUENTIA_DIR`, and its agreement
 test runs the node named by `SEQUENTIAD_EXEC` (`consensus/README.md`). A unit test
