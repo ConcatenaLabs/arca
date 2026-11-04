@@ -55,10 +55,10 @@ echo "$i"
 
 echo "=== boards outside them are refused ==="
 if out=$(d board_funding '{"sats":"40000"}' 2>&1); then fail "a board of 40,000 sat was taken: $out"; fi
-echo "$out" | grep -q "does not meet minimum" || fail "a board below the least, refused for another reason: $out"
+echo "$out" | grep -qE "less than minimum board amount|does not meet minimum" || fail "a board below the least, refused for another reason: $out"
 echo "below the least: $(echo "$out" | grep -o 'board amount.*' | head -1)"
 if out=$(d board_funding '{"sats":"20000000"}' 2>&1); then fail "a board of 20,000,000 sat was taken: $out"; fi
-echo "$out" | grep -q "exceeds maximum" || fail "a board above the largest, refused for another reason: $out"
+echo "$out" | grep -qE "(exceeds|more than|greater than) (the )?maximum" || fail "a board above the largest, refused for another reason: $out"
 echo "above the largest: $(echo "$out" | grep -o 'board amount.*' | head -1)"
 
 echo "=== the coins come due ==="
