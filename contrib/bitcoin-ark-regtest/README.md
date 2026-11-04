@@ -68,3 +68,11 @@ refreshes the rest in refreshes that each fit:
     DRIVE=bark-wasm/target/debug/examples/regtest_drive \
     contrib/bitcoin-ark-regtest/limits-drive.sh
 
+`board-recovery.sh` runs the same library on that ark in the same way: a
+wallet boards, its store is deleted before the board is registered, and a
+store made from the phrase alone must find the board on the chain, take it in
+once and hold what a third store holds:
+
+    ARK_SH=/path/to/a/script/that/runs/regtest.sh \
+    DRIVE=bark-wasm/target/debug/examples/regtest_drive \
+    contrib/bitcoin-ark-regtest/board-recovery.sh

@@ -412,6 +412,7 @@ mod psbtext;
 mod utils;
 
 pub use self::arkoor::{ArkoorCreateResult, ArkoorAddressError};
+pub use self::board::{FoundBoard, BOARD_SEARCH_BLOCKS, BOARD_SEARCH_KEYS};
 pub use self::payment_request::{
 	AvailablePaymentMethod, PaymentInitOutput, PaymentMethodParsingError, PaymentRequest,
 };

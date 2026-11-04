@@ -123,6 +123,17 @@ pub async fn sync_funding(wallet: &Wallet) -> anyhow::Result<Funding> {
 	Ok(f)
 }
 
+/// The transactions the phrase's BIP84 account paid from, brought up to the
+/// chain first: what funds a dual-chain wallet's boards.
+pub async fn funding_transactions(wallet: &Wallet) -> anyhow::Result<Vec<bitcoin::Transaction>> {
+	let f = sync_funding(wallet).await?;
+	let w = f.read().await;
+	Ok(w.inner.transactions()
+		.filter(|t| w.inner.sent_and_received(t.tx_node.tx.as_ref()).0 > Amount::ZERO)
+		.map(|t| t.tx_node.tx.as_ref().clone())
+		.collect())
+}
+
 /// Notes whether the server last refused this wallet: `refresh` and
 /// `schedule_refreshes` call it with their outcome.
 pub fn note_server(wallet: &Wallet, refused: bool) {

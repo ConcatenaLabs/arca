@@ -7,6 +7,7 @@ on:
       - 'bark/**'
       - 'bark-cli/**'
       - 'bark-wasm/**'
+      - 'lib/**'
       - 'contrib/bitcoin-ark-regtest/**'
       - '.github/workflows/bitcoin-ark.yml'
   pull_request:
@@ -14,6 +15,7 @@ on:
       - 'bark/**'
       - 'bark-cli/**'
       - 'bark-wasm/**'
+      - 'lib/**'
       - 'contrib/bitcoin-ark-regtest/**'
       - '.github/workflows/bitcoin-ark.yml'
   workflow_dispatch:
@@ -116,6 +118,11 @@ jobs:
           H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh \
             DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
             contrib/bitcoin-ark-regtest/limits-drive.sh
+
+      - name: A board of a lost wallet, found from the phrase
+        run: |
+          ARK_SH=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
+            contrib/bitcoin-ark-regtest/board-recovery.sh
 
       - name: The harness's logs
         if: failure()
