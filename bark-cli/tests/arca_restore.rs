@@ -998,3 +998,121 @@ async fn a_leaf_exited_before_the_device_was_lost_is_restored_exited() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// What a wallet's balance says of its coins in the tree.
+fn tree_balance(w: &Arca) -> Value {
+	w.ok(&["balance"])["arca"].clone()
+}
+
+/// The live coins a wallet holds, by id, with their values.
+fn live(w: &Arca) -> BTreeMap<String, String> {
+	w.ok(&["coins"]).as_array().unwrap().iter().filter(|c| matches!(c["state"].as_str(), Some("live" | "pending")))
+		.map(|c| (c["leaf_id"].as_str().unwrap().to_string(), c["value"].to_string())).collect()
+}
+
+/// Lets ten minutes of median time pass, so the next sync of each wallet
+/// catches up with what the server serves to its mailbox key.
+async fn catch_up_due(r: &Running) {
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 610));
+	r.synced().await;
+}
+
+/// Two stores of one mnemonic, both kept, spending in turn: A pays B out of
+/// round; A2, restored from A's mnemonic before that, still shows what it
+/// held until its next sync catches up, then drops the coin A spent and
+/// takes A's change. A2 then offboards part of a coin to an address; A's next
+/// sync drops that coin and takes A2's change. A pays again, and A2 follows.
+/// Each time both show the same coins and the same balance, and a third
+/// store restored from the mnemonic alone shows them too.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_stores_of_one_mnemonic_spending_in_turn_show_the_same_coins() {
+	let mut r = Running::start_kept(1, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, a2, a3, b) = (Arca::new("TSA"), Arca::new("TSA2"), Arca::new("TSA3"), Arca::new("TSB"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000), (x, 2_000_000)]).await;
+	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	assert!(made["restore"]["error"].is_null(), "{}", made["restore"]);
+	let start = tree_balance(&a);
+	assert_eq!(tree_balance(&a2), start, "A2 restored holds what A holds");
+
+	// A spends. Until its next catch-up, A2 shows what it held: nothing is
+	// hidden while it has not looked.
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req_b, "--amount", "600000", "--asset", &xs]);
+	let paid_from = sent["inputs"][0].as_str().unwrap().to_string();
+	b.ok(&["sync"]);
+	a2.ok(&["sync"]);
+	assert_eq!(tree_balance(&a2), start, "A2 has not caught up yet, and shows what it held");
+	catch_up_due(&r).await;
+	let s = a2.ok(&["sync"]);
+	println!("TS A2's catch-up after A's payment: {}", s["caught_up"]);
+	assert!(s["caught_up"]["error"].is_null(), "{}", s["caught_up"]);
+	let gone: Vec<&str> = s["caught_up"]["given_elsewhere"].as_array().unwrap().iter().filter_map(|g| g["leaf_id"].as_str()).collect();
+	assert_eq!(gone, vec![paid_from.as_str()], "A2 gives up the coin A spent: {}", s["caught_up"]);
+	a.ok(&["sync"]);
+	assert_eq!(live(&a2), live(&a), "the same coins after A's payment");
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "the same balance after A's payment");
+	println!("TS after A's payment: {}", tree_balance(&a));
+
+	// A2 offboards part of a coin to an address: a participation with an
+	// offboard and a change leaf.
+	let address = b.ok(&["address"])["address"].as_str().unwrap().to_string();
+	let q = a2.ok(&["offboard", "--asset", &xs, "--amount", "300000", "--address", &address, "--quote"]);
+	let asked = a2.ok(&["offboard", "--asset", &xs, "--amount", "300000", "--address", &address, "--shown", &q.to_string()]);
+	println!("TS A2's offboard: {}", asked);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(built.len() == 1 && failed.is_empty(), "{} built, {} failed", built.len(), failed.len());
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	let mut paid = false;
+	for _ in 0..30 {
+		a2.ok(&["sync"]);
+		if a2.ok(&["offboards"]).as_array().unwrap().iter().any(|o| o["state"] == "paid") {
+			paid = true;
+			break;
+		}
+		r.produce().await;
+		r.synced().await;
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	}
+	assert!(paid, "A2's offboard is paid: {}", a2.ok(&["offboards"]));
+	catch_up_due(&r).await;
+	let s = a.ok(&["sync"]);
+	println!("TS A's catch-up after A2's offboard: {}", s["caught_up"]);
+	assert!(s["caught_up"]["error"].is_null(), "{}", s["caught_up"]);
+	assert!(!s["caught_up"]["given_elsewhere"].as_array().unwrap().is_empty(), "A gives up the coin A2 offboarded: {}", s["caught_up"]);
+	a2.ok(&["sync"]);
+	assert_eq!(live(&a), live(&a2), "the same coins after A2's offboard");
+	assert_eq!(tree_balance(&a), tree_balance(&a2), "the same balance after A2's offboard");
+	println!("TS after A2's offboard: {}", tree_balance(&a));
+
+	// A pays again, from what it took of A2's; A2 follows.
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req_b, "--amount", "100000", "--asset", &xs]);
+	b.ok(&["sync"]);
+	catch_up_due(&r).await;
+	let s = a2.ok(&["sync"]);
+	println!("TS A2's catch-up after A's second payment: {}", s["caught_up"]);
+	a.ok(&["sync"]);
+	assert_eq!(live(&a2), live(&a), "the same coins after A's second payment");
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "the same balance after A's second payment");
+
+	// A third store, from the mnemonic alone.
+	let made = a3.ok(&args);
+	assert!(made["restore"]["error"].is_null(), "{}", made["restore"]);
+	a3.ok(&["sync"]);
+	assert_eq!(live(&a3), live(&a), "a store restored now holds what both hold");
+	assert_eq!(tree_balance(&a3), tree_balance(&a), "and shows the same balance");
+	println!("TS the end: A {} | A2 {} | A3 {}", tree_balance(&a), tree_balance(&a2), tree_balance(&a3));
+	for w in [&a, &a2, &a3, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

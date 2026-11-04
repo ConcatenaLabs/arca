@@ -1592,6 +1592,14 @@ impl Wallet {
 		let mailbox = if talk || gone { self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { waiting() };
 		steps.lap(self, "mailbox");
 		self.exits_meanwhile();
+		// What other stores of the mnemonic did: coins they made taken, coins
+		// held here that they gave up given up here too. At most once every
+		// ten minutes ([`super::restore::CATCH_UP_EVERY`]).
+		let caught_up = if talk && self.catch_up_due()? {
+			self.catch_up().unwrap_or_else(|e| json!({"error": e.to_string()}))
+		} else { Value::Null };
+		steps.lap(self, "catch up");
+		self.exits_meanwhile();
 		// Every coin kept before the wallet named its mailbox key is bound to
 		// it, so that a restore from the mnemonic finds it.
 		let bound = if talk { self.bind_unbound().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { Value::Null };
@@ -1696,6 +1704,7 @@ impl Wallet {
 		}
 		let schedule = self.sync_schedule().unwrap_or_else(|e| json!({"error": e.to_string()}));
 		let mut out = json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
+			"caught_up": caught_up,
 			"participations": participations, "forfeits": forfeits, "exits": exits, "schedule": schedule});
 		steps.lap(self, "home and schedule");
 		out["cost_by_step"] = steps.done();
