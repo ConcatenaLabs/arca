@@ -1873,6 +1873,7 @@ every payment over Lightning the operator has not decided (a paid one closed
 with its preimage, a failed one's leaf taken back), moves every payment it
 asked to receive on (the operator's participation for its leaf taken up,
 the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; every exit step whose date has come is taken first, before the operator is asked anything, and again whenever one comes while it asks; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment. `sync --exits-only` takes the exit steps whose date has come and nothing else, asking the operator nothing |
+| `hand-over-forfeits` | Hands over the forfeits of every round the operator holds for them before it broadcasts it (a round of batches without a sweep, or one that fills on-chain orders), once a witness of the operator's signer's record succeeds, and does nothing else: no re-check against the chain, no other step of `sync`. Forfeits the operator already holds for that round are not sent again. A held round is dropped, and the participation voided, when its forfeits have not come within the operator's window (`info.fills.forfeit_window_seconds`), so a program whose `sync` runs longer or comes less often than that window runs this on a short timer of its own; `sync` does it first, before any slower step (`held` in its answer) |
 | `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain (the current coin of an open offline-refresh plan with its `plan` and `sync_by`, the date it wakes for) and the unpaid receive requests, every plan as `plans` shows it, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now (while the chain has only grown since the last re-check, a live coin is read again only when an output it descends from no longer stands or its exit date is near; after a rollback every coin is), starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `channel list` | Every channel leaf the wallet holds: its latest state, its balance (the latest state's and every credit not folded), its credit and what of it is not folded, the operator's side, and whether a state waits for the operator's answer (see Channel leaves) |
@@ -1982,7 +1983,10 @@ not answer is left out and the others' round goes out, and a pays-on and a
 RECLAIM-D follow. A wallet that drops out of a round holds back nobody: the
 one that answered runs again at once, alone, before a newcomer; the one that
 dropped out, back again, sees in its `sync` why its refresh waits, then runs
-in a round of its own and goes out once it answers. With `ARCA_CLI_OLDER`
+in a round of its own and goes out once it answers. A wallet that syncs less
+often than the window keeps its round by running `hand-over-forfeits` in
+between, and sends nothing again on a second run; the same wallet whose next
+call is its `sync`, past the window, has its round dropped. With `ARCA_CLI_OLDER`
 naming an `arca` built before wallets said `forfeits_before_broadcast`, that
 wallet's refresh is refused as the operator's refusal, in words telling its
 holder to update, and its coin stays live. On an operator that also builds

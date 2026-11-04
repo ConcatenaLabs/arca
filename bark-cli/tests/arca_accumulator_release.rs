@@ -64,7 +64,7 @@ async fn refresh_all(r: &Running, ws: &[&Arca]) -> Vec<Value> {
 	assert!(built[0].broadcast.starts_with("held"), "{}", built[0].broadcast);
 	for w in ws {
 		let s = w.ok(&["sync"]);
-		assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] == "forfeiting"), "{}", s);
+		assert!(common::cli::handed_over(&s), "{}", s);
 	}
 	r.server.rounds.pass().await.unwrap();
 	r.produce().await;

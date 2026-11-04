@@ -166,7 +166,11 @@
 //! that fills on-chain orders is (below): it goes out only once every
 //! participation in it that gives up a coin has handed over its forfeits, and
 //! one that does not within the window is voided, the round dropped, killed
-//! on the chain and built again without it ([`Rounds::pass`]).
+//! on the chain and built again without it ([`Rounds::pass`]). A
+//! participation that gives up no coin (a payment received over Lightning,
+//! a repayment) has no forfeit to hand over, and runs in a round of its own
+//! ([`Rounds::run_free_round_of`]) that goes out at the next pass: it never
+//! waits on a holder's forfeits.
 //!
 //! A held round never waits on a participant that does not answer more than
 //! once ([`Rounds::run_round_of`]):
@@ -727,6 +731,10 @@ struct Picks {
 	reruns: Vec<[u8; 32]>,
 	/// Those that run only alone.
 	solo: Vec<[u8; 32]>,
+	/// Those that give up no coin, when every round is held for its
+	/// forfeits ([`RoundConfig::no_sweep`]): they run in a round of their
+	/// own ([`Rounds::run_free_round_of`]) and never in `shared`.
+	free: Vec<[u8; 32]>,
 }
 
 impl Picks {
@@ -1454,8 +1462,13 @@ impl Rounds {
 		let mut failed = vec![];
 		self.plans_due().await?;
 		for asset in self.assets_waiting().await? {
-			for solo in [false, true] {
-				match if solo { self.run_solo_round_of(asset).await } else { self.run_round_of(asset).await } {
+			for kind in 0..3 {
+				let run = match kind {
+					0 => self.run_free_round_of(asset).await,
+					1 => self.run_round_of(asset).await,
+					_ => self.run_solo_round_of(asset).await,
+				};
+				match run {
 					Ok(Some(b)) => built.push(b),
 					Ok(None) => {},
 					Err(e) => {
@@ -1814,6 +1827,11 @@ impl Rounds {
 		self.plans_due().await?;
 		let assets = self.assets_waiting().await?;
 		for asset in &assets {
+			if let Some(b) = self.run_free_round_of(*asset).await? {
+				return Ok(Some(b));
+			}
+		}
+		for asset in &assets {
 			if let Some(b) = self.run_round_of(*asset).await? {
 				return Ok(Some(b));
 			}
@@ -1892,6 +1910,31 @@ impl Rounds {
 		Ok(None)
 	}
 
+	/// Builds a round of `asset` for its pending participations that give up
+	/// no coin (a payment received over Lightning, a repayment), alone,
+	/// when every round is held for its forfeits ([`RoundConfig::no_sweep`]).
+	/// They have no forfeit to hand over, so their round goes out at the
+	/// next pass ([`Self::pass`]), whoever else waits for a round: in a
+	/// round with a holder's refresh they would wait for that holder's
+	/// forfeits, and run again a window later if those never came. Returns
+	/// `None` when none waits, or without batches without a sweep, where no
+	/// round is held and they share the next round.
+	pub async fn run_free_round_of(&self, asset: AssetId) -> Result<Option<Built>, RoundError> {
+		if !self.config.no_sweep {
+			return Ok(None);
+		}
+		let _one = self.running.lock().await;
+		let now = self.now().await?;
+		if !self.params.assets.contains(&asset) {
+			return Ok(None);
+		}
+		let picks = self.picks(now, |row| row.fill.is_none() && Self::asset_of(row) == Some(asset)).await?;
+		if picks.free.is_empty() {
+			return Ok(None);
+		}
+		self.round_from(asset, now, &picks.free).await
+	}
+
 	/// Builds a round of `asset` for the first participation giving up a
 	/// struck coin whose wait is over, alone: its coins' last participation
 	/// was voided because its forfeits for a held round did not come, so it
@@ -1946,6 +1989,13 @@ impl Rounds {
 		for id in self.store.participations_in(ParticipationState::Pending).await? {
 			let Some(row) = self.store.participation(&id).await? else { continue };
 			if !of(&row) {
+				continue;
+			}
+			// One that gives up no coin has no forfeit to hand over: with
+			// every round held for forfeits, it runs apart, never waiting on
+			// a holder's.
+			if self.config.no_sweep && row.inputs.is_empty() {
+				picks.free.push(id);
 				continue;
 			}
 			match self.standing(&row, now).await? {
@@ -3128,8 +3178,10 @@ impl Rounds {
 				voided += 1;
 			}
 		}
-		log::warn!("round {} ({}), held for its forfeits, dropped unbroadcast: {} participation(s) void, {} run again", r.round_id, txid,
-			voided, again.len().saturating_sub(voided));
+		// Named, so that the participant whose forfeits did not come is found.
+		let missing: Vec<String> = voids.iter().map(|(id, _)| crate::signer::hex(id)).collect();
+		log::warn!("round {} ({}), held for its forfeits, dropped unbroadcast: {} participation(s) void ({}), {} run again", r.round_id,
+			txid, voided, missing.join(", "), again.len().saturating_sub(voided));
 		let dropped = self.store.round(r.round_id).await?.unwrap_or_else(|| r.clone());
 		if let Err(e) = self.void_on_chain(&dropped).await {
 			log::warn!("round {} ({}), dropped unbroadcast: its own coin could not be spent now ({}); the next pass tries again", r.round_id,

@@ -1626,8 +1626,10 @@ participations that did hand theirs over run again in the next round. The
 signer is asked for its half of a forfeit only once the node holds the
 round, and the preimage goes out once the round is final, as for any
 participation. A participation that gives up no coin (a payment received
-over Lightning, a repayment of a swept coin) completes once the round is
-final, as before.
+over Lightning, a repayment of a swept coin) has no forfeit to hand over: it
+runs in a round of its own, built first at each round interval, which goes
+out at the next pass over the rounds and never waits on a holder's forfeits,
+and completes once that round is final.
 
 No participant holds a held round back twice (this holds for fill rounds
 too):

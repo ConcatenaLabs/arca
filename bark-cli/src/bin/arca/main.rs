@@ -302,6 +302,12 @@ enum Cmd {
 		#[arg(long)]
 		exits_only: bool,
 	},
+	/// Hands over the forfeits of every round the operator holds for them
+	/// before it broadcasts it, and does nothing else: for a program whose
+	/// `sync` runs longer, or less often, than the operator's forfeit window
+	/// (`info.fills.forfeit_window_seconds`), to run on a short timer of its
+	/// own. `sync` does it first too.
+	HandOverForfeits,
 	/// When `sync` must next run (`next_sync_at`), when the next exit step
 	/// is due (`next_exit_at`, which `sync --exits-only` takes), and the
 	/// dates of every coin held off the chain, asking nothing of the
@@ -1390,7 +1396,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// The re-check runs on every start: a rollback since the last command
 	// un-credits what it took out before anything is spent or shown.
 	let startup = match &cli.command {
-		Cmd::Recheck | Cmd::Sync { .. } | Cmd::Schedule | Cmd::Watchtower(_) => None,
+		Cmd::Recheck | Cmd::Sync { .. } | Cmd::HandOverForfeits | Cmd::Schedule | Cmd::Watchtower(_) => None,
 		_ => match w.recheck() {
 			Ok(v) => Some(v),
 			Err(e) => {
@@ -1497,6 +1503,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		},
 		Cmd::Sync { exits_only: false } => w.sync(),
 		Cmd::Sync { exits_only: true } => w.sync_exits(),
+		Cmd::HandOverForfeits => w.hand_over_forfeits(),
 		Cmd::Schedule => w.sync_schedule(),
 		Cmd::Recheck => w.recheck(),
 		Cmd::Channel(ChannelCmd::List) => w.channels(),

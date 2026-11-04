@@ -1301,6 +1301,91 @@ impl Wallet {
 		}
 	}
 
+	/// Hands over the forfeits of each of the wallet's participations whose
+	/// round the operator holds for them, and does nothing else. A round
+	/// built without a sweep (or one that fills on-chain orders) goes out only
+	/// once every participation in it that gives up a coin has handed over
+	/// its forfeits, and is dropped, the participation voided, when one has
+	/// not within the operator's window (`info.fills.forfeit_window_seconds`,
+	/// ten minutes by default). This asks the status of each participation
+	/// still open, and signs only for one the status serves an unbroadcast
+	/// round for, once per round: a program whose `sync` runs long, or comes
+	/// less often than the window, runs this (`hand_over_forfeits`) on a short
+	/// timer of its own, and `sync` runs it first, before anything slower.
+	pub(crate) fn progress_held(&mut self) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		for (pid, body, given, wanted, state, _, _) in self.store.participations()? {
+			if !matches!(state.as_str(), "pending" | "issued" | "forfeiting") {
+				continue;
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+			// Only a participation that gives up a coin, or a take, has
+			// forfeits to hand over; one with a coin on its way home on the
+			// chain hands over no more.
+			if given.is_empty() && !Self::is_take(&body) {
+				continue;
+			}
+			if given.iter().any(|l| self.store.coin(l).ok().flatten().is_some_and(|c| c.state == "exiting")) {
+				continue;
+			}
+			let st = match self.server.post("participation_status", &json!({"participation_id": pid})) {
+				Ok(st) => st,
+				Err(e @ Error::Unreachable(_)) => return Err(e),
+				Err(e) => {
+					out.push(json!({"participation": pid, "state": state, "error": e.to_string()}));
+					continue;
+				},
+			};
+			if st["state"] != "issued" || !st["round"]["tx"].is_string() {
+				continue;
+			}
+			if self.handed_held(&pid, &st)? {
+				out.push(Self::handed_note(&pid, &st));
+				continue;
+			}
+			let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
+			match self.complete(&pid, &st, &given, &wanted, &body) {
+				Ok(v) => out.push(v),
+				Err(e) => {
+					self.store.refused(&format!("participation {}", pid), &e.to_string())?;
+					out.push(json!({"participation": pid, "state": "issued", "refused": e.to_string()}));
+				},
+			}
+		}
+		Ok(out)
+	}
+
+	/// The forfeits of every round the operator holds for them, handed over
+	/// ([`Self::progress_held`]) once a witness of the operator's signer's
+	/// record has succeeded, and nothing else: no re-check of the coins
+	/// against the chain, which a forfeit of a coin already given up does not
+	/// need. The command `hand_over_forfeits`.
+	pub fn hand_over_forfeits(&mut self) -> Result<Value, Error> {
+		self.witnessed_now()?;
+		Ok(json!({"held": self.progress_held()?}))
+	}
+
+	/// Whether the server already holds the wallet's forfeits of `pid` for
+	/// the unbroadcast round its status `st` serves: they were accepted for
+	/// that round's txid, so nothing is signed or sent for it again until
+	/// the round goes out (or is dropped, and the participation runs in
+	/// another round).
+	fn handed_held(&self, pid: &str, st: &Value) -> Result<bool, Error> {
+		if !st["round"]["tx"].is_string() {
+			return Ok(false);
+		}
+		let Some(news) = self.store.participation_news(pid)? else { return Ok(false) };
+		let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
+		Ok(news["handed_held"].as_str().is_some_and(|r| Some(r) == st["round"]["txid"].as_str()))
+	}
+
+	fn handed_note(pid: &str, st: &Value) -> Value {
+		json!({"participation": pid, "state": "forfeiting", "round": st["round"]["txid"],
+			"note": "the forfeits are in before the round is broadcast: the round goes out once every participation in it has handed \
+			over its own, and the preimage comes once it is final"})
+	}
+
 	/// Moves every participation on as far as it can go now: submits one the
 	/// server never answered, completes one whose round is final, and gives
 	/// back the coins of one the server will not run (`void`, or `expired`
@@ -1376,6 +1461,10 @@ impl Wallet {
 								continue;
 							},
 						}
+					}
+					if self.handed_held(&pid, &st)? {
+						out.push(Self::handed_note(&pid, &st));
+						continue;
 					}
 					let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
 					let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
@@ -1873,6 +1962,11 @@ impl Wallet {
 		};
 		let Some(pre) = done["preimage"].as_str() else {
 			if finality.is_none() {
+				// The server has them for this held round: a pass that finds
+				// the round still held sends them again only for another
+				// round ([`Self::handed_held`]).
+				news_json["handed_held"] = json!(round_txid.to_string());
+				self.store.set_participation_news(pid, &news_json.to_string())?;
 				return Ok(json!({"participation": pid, "state": "forfeiting", "round": round_txid.to_string(),
 					"note": "the forfeits are in before the round is broadcast: the round goes out once every participation in it has \
 					handed over its own, and the preimage comes once it is final"}));
