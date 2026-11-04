@@ -3007,6 +3007,12 @@ impl Wallet {
 			if on_chain(&coin.output().txout()) && coin.board().is_none() {
 				seen.push("its own leaf".into());
 			}
+			// A channel's leaf spent already (a state settled while the
+			// wallet was away): what is left of it, the credit not folded,
+			// is claimed by the channel's exit.
+			if seen.is_empty() && self.channel_worth(&c)?.is_some() && self.published_leaf(&coin)?.is_some() {
+				seen.push("its own leaf, and a state of the channel published on it".into());
+			}
 			for b in coin.boards() {
 				if !self.chain.unspent(&b)? && coin.board().is_none() {
 					seen.push(format!("the board at {} it rests on, spent", b));

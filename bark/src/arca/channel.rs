@@ -542,16 +542,25 @@ impl Wallet {
 				let policy_w = self.followed_policy(row.expiry, now);
 				let txs = self.accepted_bases(&record)?;
 				let coin = self.resolve(&record, &txs, &policy_w).map_err(|e| Error::Refused(e.to_string()))?;
-				let mut path = vec![];
-				Self::path_outputs(&coin, &mut path);
-				let here = Here { at: self.chain.locate(&path)?, outputs: path };
-				let mut built = vec![];
-				let at = self.bring(&coin, &mut payer, &mut built, &here)?;
-				for u in &built {
-					if let Some(e) = self.channel_broadcast(&u.tx, "unroll", &mut steps) {
-						return Ok(json!({"leaf_id": leaf_id, "state": "unrolling", "steps": steps, "error": e}));
-					}
-				}
+				// Its leaf published by someone else, and spent since (a
+				// state settled while the wallet was away): followed from
+				// there, nothing unrolled again.
+				let at = match self.published_leaf(&coin)? {
+					Some(at) => at,
+					None => {
+						let mut path = vec![];
+						Self::path_outputs(&coin, &mut path);
+						let here = Here { at: self.chain.locate(&path)?, outputs: path };
+						let mut built = vec![];
+						let at = self.bring(&coin, &mut payer, &mut built, &here)?;
+						for u in &built {
+							if let Some(e) = self.channel_broadcast(&u.tx, "unroll", &mut steps) {
+								return Ok(json!({"leaf_id": leaf_id, "state": "unrolling", "steps": steps, "error": e}));
+							}
+						}
+						at
+					},
+				};
 				self.store.set_exit(leaf_id, "unrolling", &json!({"leaf": at.to_string(),
 					"fee_asset": payer.asset.map(|a| a.to_string())}).to_string(), None)?;
 				self.store.set_coin_state(leaf_id, "exiting", "its channel is being closed on the chain")?;
@@ -627,6 +636,11 @@ impl Wallet {
 		if k.credit > settled_state.folded {
 			if let Some(sg) = &k.credit_sig {
 				for (op, out, _) in self.chain.coins_at(std::slice::from_ref(&credit_spk))? {
+					// A claim already in the mempool (an earlier run's): its block is waited for.
+					if !self.chain.unspent(&op)? {
+						return Ok(json!({"leaf_id": leaf_id, "state": "claiming", "steps": steps,
+							"next": "the credit claim is out; run again once it is in a block to sweep"}));
+					}
 					let value_in = out.value.explicit().unwrap_or(0);
 					if policy.claim_amounts(&settled_state, k.credit, value_in).is_ok() {
 						let note = sig_of(sg)?;
@@ -642,7 +656,13 @@ impl Wallet {
 			}
 		}
 		// The wallet's outputs at OP_1 <A>, swept home.
-		let mine = self.chain.coins_at(std::slice::from_ref(&owner_script_pubkey(&policy.owner)))?;
+		// Less those a sweep in the mempool spends already.
+		let mut mine = vec![];
+		for c in self.chain.coins_at(std::slice::from_ref(&owner_script_pubkey(&policy.owner)))? {
+			if self.chain.unspent(&c.0)? {
+				mine.push(c);
+			}
+		}
 		if mine.is_empty() {
 			let swept = prior["swept"].as_str().map(elements::Txid::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?;
 			let home = match swept {
@@ -675,6 +695,34 @@ impl Wallet {
 		self.store.set_exit(leaf_id, "swept", &v.to_string(), Some(&tx.txid().to_string()))?;
 		Ok(json!({"leaf_id": leaf_id, "state": "swept", "steps": steps, "home": {"txid": tx.txid().to_string(),
 			"amount": total.saturating_sub(fee).to_string(), "to": self.chain.address(&to_wallet)?}}))
+	}
+
+	/// Where the leaf output of `coin`, a channel coin of a round, was
+	/// published on the chain, spent since or not: followed from the batch
+	/// output it descends from, spend by spend, along its path. `None` while
+	/// nothing has brought the leaf on the chain. It finds a channel someone
+	/// else unrolled and settled while the wallet was away, whose output
+	/// the lineage watch no longer sees unspent, though the credit not
+	/// folded is still the wallet's to claim from the operator's side until
+	/// the credit window has run.
+	pub(crate) fn published_leaf(&self, coin: &arca_covenant::transfer::ValidCoin) -> Result<Option<OutPoint>, Error> {
+		let leaf = coin.output().txout();
+		let mut path = vec![];
+		Self::path_outputs(coin, &mut path);
+		path.push(leaf.clone());
+		for root in coin.roots() {
+			let from = self.chain.finality(&root.txid)?.height().unwrap_or(0);
+			let mut at = root;
+			for _ in 0..path.len() {
+				let Some((tx, _)) = self.chain.spender(&at, from)? else { break };
+				let Some(j) = tx.output.iter().position(|o| path.contains(o)) else { break };
+				at = OutPoint::new(tx.txid(), j as u32);
+				if tx.output[j] == leaf {
+					return Ok(Some(at));
+				}
+			}
+		}
+		Ok(None)
 	}
 
 	/// Broadcasts `tx`, a step of a channel's exit: noted in `steps`, or

@@ -1710,11 +1710,13 @@ transaction named, and never marks the coin spent.
 Credit not folded has a deadline that a balance does not. Once any state of
 the channel is settled on the chain, by whoever published it, the operator
 may take back what the note's claim has not taken after the channel's credit
-window (`window_units` in `info`, in units of 512 seconds). `sync` does not
-notice a channel closed by someone else: a wallet holding credit not folded
-either folds it (`channel fold`, or any payment from the channel), after
-which nothing of it has a deadline, or runs `channel exit` within the window
-of any close.
+window (`window_units` in `info`, in units of 512 seconds). `sync` notices a
+channel closed by someone else, even one whose state is settled and whose
+side is swept already: it follows the spends from the coin's batch output to
+the channel's leaf and runs the channel's exit from there, which claims the
+credit not folded. A wallet holding credit not folded therefore either folds
+it (`channel fold`, or any payment from the channel), after which nothing of
+it has a deadline, or syncs within the window of any close.
 
 A channel leaf expires with its round, as any leaf. No plan starts from it:
 `care` closes it into a round once its expiry is within reach, for a plain
@@ -1735,9 +1737,9 @@ are not planned.
 
 An exit of a channel coin is the channel's exit: `exit LEAF` runs `channel
 exit`, and so does a wallet taking the coin home by itself (`sync`, when the
-coin cannot be refreshed in time or its path is found on the chain), so a
-channel closed by someone else is followed to its settle and its credit
-claimed. `exit --quote` refuses a channel coin: each step of its exit is
+coin cannot be refreshed in time or its path is found on the chain, spent
+since or not), so a channel closed by someone else is followed to its settle
+and its credit claimed. `exit --quote` refuses a channel coin: each step of its exit is
 priced as it is taken.
 
 ### Holding a supervised asset
