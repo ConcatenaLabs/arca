@@ -459,7 +459,7 @@ async fn profile_handle(r: &mut Running, p: &mut Profiles, path: &str, b: &Value
 			let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
 			let op = OutPoint::new(tx.txid(), vout);
 			r.config.bond = Some(BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice_units(),
-				outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None });
+				outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None });
 			r.restart_server().await;
 			r.synced().await;
 			p.bond = Some((w, op));
@@ -479,7 +479,7 @@ async fn profile_handle(r: &mut Running, p: &mut Profiles, path: &str, b: &Value
 				let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&key_file).unwrap();
 				std::io::Write::write_all(&mut f, hex(&w.secret_bytes()).as_bytes()).unwrap();
 			}
-			let noticed = server::server::bond_notice(&r.config, &key_file).await;
+			let noticed = server::server::bond_notice(&r.config, &key_file, None).await;
 			let _ = std::fs::remove_file(&key_file);
 			let noticed = match noticed {
 				Ok(n) => n,

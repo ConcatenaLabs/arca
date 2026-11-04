@@ -50,7 +50,7 @@ async fn the_bond_is_posted_named_and_noticed() {
 	// posted from a node wallet.
 	let mut r = Running::start_on(&["-disablewallet=0"], |c, _| {
 		c.assets[0].rate = Some(toml::from_str("source = \"node\"").unwrap());
-		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None });
+		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None, instant_budget_fraction: None });
 	}).await;
 	let x = r.x;
 
@@ -111,7 +111,7 @@ async fn the_bond_is_posted_named_and_noticed() {
 	r.produce().await;
 	r.bury().await;
 	r.synced().await;
-	let noticed = bond_notice(&r.config, &key_file).await.unwrap();
+	let noticed = bond_notice(&r.config, &key_file, None).await.unwrap();
 	println!("bond-notice: {}", noticed);
 	r.produce().await;
 	r.bury().await;
@@ -135,11 +135,11 @@ async fn the_bond_is_posted_named_and_noticed() {
 	assert_eq!(b["withdrawable_at"], json!(prev["mediantime"].as_u64().unwrap() + units as u64 * 512));
 	// The second notice of a bond in notice, and its withdrawal before the
 	// delay: refused.
-	let e = bond_notice(&r.config, &key_file).await.unwrap_err();
+	let e = bond_notice(&r.config, &key_file, None).await.unwrap_err();
 	println!("bond-notice again: {}", e);
 	assert!(e.to_string().contains("not bonded"), "{}", e);
 	let to: String = wallet_rpc(&r, "operating").call("getnewaddress", &[]).unwrap();
-	let e = bond_withdraw(&r.config, &key_file, &to).await.unwrap_err();
+	let e = bond_withdraw(&r.config, &key_file, &to, None).await.unwrap_err();
 	println!("bond-withdraw before the delay: {}", e);
 	assert!(e.to_string().contains("non-BIP68-final"), "{}", e);
 
@@ -167,7 +167,7 @@ async fn no_bond_is_posted_under_a_key_that_signed_twice() {
 	let units = min_notice_seconds(LIFETIME, RelativeTime::from_units(338).unwrap()).div_ceil(512) as u16;
 	let mut r = Running::start_on(&["-disablewallet=0"], |c, _| {
 		c.assets[0].rate = Some(toml::from_str("source = \"node\"").unwrap());
-		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None });
+		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None, instant_budget_fraction: None });
 	}).await;
 	let x = r.x;
 	let _: Value = r.rt.client().call("createwallet", &[json!("operating")]).unwrap();

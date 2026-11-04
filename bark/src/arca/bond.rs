@@ -20,6 +20,17 @@
 //! says so, and `sync` asks for its refresh at once, since a coin that has
 //! been through a round has no out-of-round lineage left to double-sign.
 //!
+//! A wallet that takes payments out of round from many others at once (a
+//! maker, a swap service, an LSP) may also set an instant budget
+//! ([`Wallet::set_instant_budget`]): a share of the bond's value, at the
+//! wallet's own node's rate, that it holds out of round at most, all assets
+//! counted in the reference unit. Past it the wallet refuses a payment, and
+//! takes it after its next round, once what it holds is refreshed; `sync`
+//! asks for that refresh at once. Where the operator suggests a share
+//! (`info.bond.instant_budget_ppm`), the wallet takes the lower of the two.
+//! No budget is set unless the wallet's owner sets one: the library imposes
+//! none, and values the bond at its node's rate whatever its asset.
+//!
 //! The wallet keeps the operator's signature over every message of its
 //! coins' lineage ([`arca_covenant::bond::cosigned_by`]) and writes it as
 //! evidence lines ([`Wallet::bond_evidence`]): `{"salt", "form", "rest",
@@ -60,6 +71,9 @@ pub const BOND_SALTS: &str = "bond_salts";
 /// The operator's signatures `watch-bond` read from the chain and the
 /// mempool, as evidence lines.
 pub const BOND_FOUND: &str = "bond_found";
+/// The wallet's instant budget, in millionths of the bond's value, or
+/// absent: see [`Wallet::set_instant_budget`].
+pub const INSTANT_BUDGET: &str = "instant_budget";
 /// How far back `watch-bond` reads the chain at the most: a salt handed in
 /// by another is read for from there, and the wallet's own from the block of
 /// the oldest transaction its coins rest on, when that is later.
@@ -92,6 +106,25 @@ pub struct Standing {
 	pub value: Option<u64>,
 	pub withdrawable_at: Option<u32>,
 	pub why: String,
+}
+
+/// A wallet's instant budget against its operator's bond, in atoms of the
+/// reference unit at the wallet's node's rates.
+#[derive(Debug, Clone)]
+struct Budget {
+	own_ppm: u32,
+	operator_ppm: Option<u32>,
+	/// The share taken: the lower of the two.
+	ppm: u32,
+	/// The bond's value.
+	bond: u128,
+	/// The budget: `ppm` millionths of `bond`.
+	value: u128,
+	/// What the wallet holds out of round, the payment asked for with it.
+	held: u128,
+	/// The room left, `value` less `held`, in atoms of each asset the node
+	/// prices.
+	room_atoms: BTreeMap<AssetId, u64>,
 }
 
 impl Standing {
@@ -251,6 +284,65 @@ impl Wallet {
 		Ok((h > b).then(|| format!("{} atoms of the reference unit at this node's rates, more than the bond's {}", h, b)))
 	}
 
+	/// Sets the wallet's instant budget: the share of the bond's value, in
+	/// millionths (more than 0, at most 1,000,000), that it holds out of round
+	/// at most; `None` sets none. See the [module documentation](self).
+	pub fn set_instant_budget(&self, ppm: Option<u32>) -> Result<Value, Error> {
+		match ppm {
+			Some(p) if p == 0 || p > 1_000_000 => return Err(Error::Parse(format!(
+				"an instant budget of {} millionths is not a share of the bond, more than 0 and at most 1,000,000", p))),
+			Some(p) => self.store.set_meta(INSTANT_BUDGET, &p.to_string())?,
+			None => self.store.set_meta(INSTANT_BUDGET, "")?,
+		}
+		Ok(json!({"instant_budget_ppm": ppm}))
+	}
+
+	/// [`Self::set_instant_budget`] from a share written as a decimal
+	/// fraction (`"0.1"`), or `"off"`.
+	pub fn set_instant_budget_text(&self, share: &str) -> Result<Value, Error> {
+		if share == "off" {
+			return self.set_instant_budget(None);
+		}
+		let f: f64 = share.parse().map_err(|_| Error::Parse(format!("an instant budget of {:?}: a share of the bond such as 0.1, or off", share)))?;
+		if !(f > 0.0 && f <= 1.0) {
+			return Err(Error::Parse(format!("an instant budget of {}: a share of the bond more than 0 and at most 1", share)));
+		}
+		self.set_instant_budget(Some(((f * 1_000_000.0).round() as u32).max(1)))
+	}
+
+	/// The instant budget the wallet set, in millionths of the bond.
+	fn own_budget_ppm(&self) -> Result<Option<u32>, Error> {
+		Ok(self.store.meta(INSTANT_BUDGET)?.and_then(|v| v.parse::<u32>().ok()).filter(|p| *p > 0 && *p <= 1_000_000))
+	}
+
+	/// The instant budget against a standing bond of `value` of `asset`, and
+	/// what `held` is worth, both in the reference unit at the wallet's
+	/// node's rates: `None` while the wallet sets no budget. The share is the
+	/// lower of the wallet's own and the operator's suggestion. A value the
+	/// node cannot price is refused, never guessed.
+	fn budget(&self, info: &Value, held: &BTreeMap<AssetId, u64>, asset: AssetId, value: u64) -> Result<Option<Budget>, Error> {
+		let Some(own) = self.own_budget_ppm()? else { return Ok(None) };
+		let operator = info["bond"]["instant_budget_ppm"].as_u64().and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 0);
+		let ppm = operator.map_or(own, |o| o.min(own));
+		let rates = self.chain.fee_rates()?;
+		let worth = |a: &AssetId, v: u64| -> Result<u128, Error> {
+			let r = rates.get(a).ok_or_else(|| Error::Refused(format!("this wallet's node has no rate for asset {}, so it cannot weigh \
+				what it holds out of round against its instant budget; it takes no payment out of round until it can", a)))?;
+			Ok(v as u128 * *r as u128 / 100_000_000)
+		};
+		let bond = worth(&asset, value)?;
+		let mut h = 0u128;
+		for (a, v) in held {
+			h += worth(a, *v)?;
+		}
+		let value = bond * ppm as u128 / 1_000_000;
+		// The room left in each asset the node prices, in its own atoms (rounded down).
+		let room = value.saturating_sub(h);
+		let room_atoms = rates.iter().filter(|(_, r)| **r > 0)
+			.map(|(a, r)| (*a, (room * 100_000_000 / *r as u128).min(u64::MAX as u128) as u64)).collect();
+		Ok(Some(Budget { own_ppm: own, operator_ppm: operator, ppm, bond, value, held: h, room_atoms }))
+	}
+
 	/// The bond's check before the wallet takes a payment out of round of
 	/// `incoming` (the asset and amount, when the request names them): `Ok`
 	/// with a note when the operator names no bond and the wallet never saw
@@ -284,6 +376,13 @@ impl Wallet {
 			return Err(Error::Refused(format!("with this payment the wallet would hold out of round {}: a double-sign would pay the \
 				operator more than its bond costs it; have coins refreshed in a round first", why)));
 		}
+		if let Some(b) = self.budget(&info, &held, asset, value)? {
+			if b.held > b.value {
+				return Err(Error::Refused(format!("with this payment the wallet would hold out of round {} atoms of the reference unit at \
+					this node's rates, past its instant budget of {} ({} millionths of the bond's {}): it takes the rest after the next round, \
+					once what it holds is refreshed", b.held, b.value, b.ppm, b.bond)));
+			}
+		}
 		Ok(None)
 	}
 
@@ -309,7 +408,8 @@ impl Wallet {
 		if s.state == "none" && self.store.meta(BOND_SEEN)?.is_none() {
 			return Ok(vec![]);
 		}
-		let covered = s.state == "bonded" && self.exceeds(&held, s.asset.expect("bonded"), s.value.expect("bonded")).ok().flatten().is_none();
+		let covered = s.state == "bonded" && self.exceeds(&held, s.asset.expect("bonded"), s.value.expect("bonded")).ok().flatten().is_none()
+			&& self.budget(&info, &held, s.asset.expect("bonded"), s.value.expect("bonded")).ok().flatten().is_none_or(|b| b.held <= b.value);
 		if covered {
 			return Ok(vec![]);
 		}
@@ -336,12 +436,25 @@ impl Wallet {
 			},
 			_ => json!(false),
 		};
+		let budget = match (s.state, s.asset, s.value) {
+			("bonded", Some(a), Some(v)) => match self.budget(&info, &held, a, v) {
+				Ok(Some(b)) => json!({"ppm": b.ppm, "own_ppm": b.own_ppm, "operator_ppm": b.operator_ppm, "bond_value": b.bond.to_string(),
+					"value": b.value.to_string(), "held_value": b.held.to_string(), "room": b.value.saturating_sub(b.held).to_string(),
+					"room_atoms": b.room_atoms.iter().map(|(a, v)| (a.to_string(), json!(v.to_string()))).collect::<serde_json::Map<_, _>>()}),
+				Ok(None) => Value::Null,
+				Err(e) => json!({"error": e.to_string()}),
+			},
+			_ => match self.own_budget_ppm()? {
+				Some(p) => json!({"ppm": p, "own_ppm": p, "value": "0", "room": "0"}),
+				None => Value::Null,
+			},
+		};
 		Ok(json!({
 			"state": s.state, "why": s.why, "required": self.store.meta(BOND_SEEN)?.is_some(),
 			"coin": s.coin.as_ref().map(|(op, _)| format!("{}:{}", op.txid, op.vout)),
 			"asset": s.asset.map(|a| a.to_string()), "value": s.value.map(|v| v.to_string()), "withdrawable_at": s.withdrawable_at,
 			"out_of_round": held.iter().map(|(a, v)| json!({"asset": a.to_string(), "value": v.to_string()})).collect::<Vec<_>>(),
-			"covers": covers,
+			"covers": covers, "instant_budget": budget,
 		}))
 	}
 

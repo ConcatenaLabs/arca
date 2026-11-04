@@ -81,6 +81,16 @@ payment out of round
   file>`, then add the `notice` line it prints to `[bond]` and restart. The bond
   can be withdrawn at `info.bond.withdrawable_at`:
   `arcad <config> bond-withdraw <key file> <address>`.
+- **To move the bond to another coin without a time unbonded,** post the new
+  coin while `[bond] outpoint` still names the old one, name the new coin
+  once it is final and restart, then give the old coin its notice by name:
+  `arcad <config> bond-notice <key file> <old coin>`, and after the delay
+  `arcad <config> bond-withdraw <key file> <address> <old coin> <notice
+  output>` ([Moving the bond to another coin](../server/README.md#moving-the-bond-to-another-coin)).
+- **Optionally, suggest an instant budget:** `[bond] instant_budget_fraction`
+  (`0.1`: a tenth of the bond's value) is published in `info.bond`; a
+  counterparty's wallet takes it where it is lower than its own
+  ([Limits an operator publishes](../server/README.md#limits-an-operator-publishes)).
 - **Never co-sign anything outside the signer.** The signer signs one message
   under a coin's salt, ever. A second signature made any other way, with a
   copy of the key or by a signer started on another record, burns the bond in

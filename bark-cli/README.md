@@ -266,6 +266,21 @@ and a board whose registration never reached the server, are not recovered.
   of a resting order in the tree (`order rest`, `order fill-resting`) does not
   ask the bond first; the coin it pays counts in what the wallet holds out of
   round and, when the bond does not cover it, is refreshed at once too.
+- **An instant budget, for a counterparty.** A wallet that takes payments
+  out of round from many people (a maker, a swap service, an LSP) sets the
+  share of the bond's value it holds out of round at most: `instant-budget
+  0.1` holds a tenth, `instant-budget off` none. The bond is valued as above,
+  at the wallet's node's rate for its asset, so a lower price of that asset
+  lowers the budget at once. Where the operator suggests a share
+  (`info.bond.instant_budget_ppm`), the lower of the two is taken. Past the
+  budget, `receive`, `swap offer` and `swap accept` are refused (the rest is
+  taken after the next round, once what the wallet holds is refreshed), and
+  `sync` asks for that refresh at once. `bond` shows the budget
+  (`instant_budget`: the share taken in millionths, `ppm`, the wallet's own
+  and the operator's, the bond's value, the budget, what the wallet holds
+  out of round, and the `room` left, each in atoms of the reference unit, and
+  that room in atoms of each asset the node prices, `room_atoms`).
+  A wallet sets no budget unless its owner sets one.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
@@ -1804,7 +1819,8 @@ registry for both commands.
 | `supervised-check TXID:VOUT` | Reads the published batch at output `VOUT` of round `TXID` of a supervised asset, from the published tree and the chain alone (see Holding a supervised asset): the asset supervised on the wallet's node, every leaf `landing-1` with the allowance the operator publishes, every output of the round explicit, each leaf's landing and whether the node shows it frozen; `ok` and the `problems` found |
 | `supply ASSET` | For an asset the operator serves issuer-operated, the operator's supply report (`issuer_supply`): each mint of its rounds and each burn of its own, the totals, what is final, the value live in its burn-only batches and where its mint limiter stands; each mint and burn read again from the wallet's node, with what the chain says beside the operator's figure (`on_chain`, `agrees`), and `checked_on_the_node: true` only when every one agrees. It checks the transactions the report lists, not that the list is whole: a mint left out of it is found only by following the asset's reissuance token on the chain |
 | `leaf-template [vtxo-1\|vtxo-2]` | The template of the wallet's own new leaves, after setting it when one is named: its refreshes, its change and what its receive requests ask a sender for. `vtxo-1` (the default) has the tapscript collaborative path; `vtxo-2` has the Simplicity program `arca/collab-2`, whose pair also binds the coin's index and the coins it is spent beside, so one leg of a swap never moves without the other. Both exit alike, by the same script; a `vtxo-2` coin's collaborative spend is larger on the chain (556 vB against 280). Coins held keep their template until refreshed; a coin of a supervised asset is `landing-1` whatever is set, the leaves an in-tree fill of a resting order makes the wallet are `vtxo-1` (the fill request names no template), and a `vtxo-2` coin is refreshed by `sync` rather than planned |
-| `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, and whether the bond covers it (`covers`) |
+| `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, whether the bond covers it (`covers`), and the instant budget when one is set (`instant_budget`) |
+| `instant-budget SHARE` | Sets the share of the bond's value the wallet holds out of round at most (`0.1`, or `off`): a counterparty's instant budget |
 | `bond-evidence` | Every message the operator key signed that the wallet's coins rest on, as evidence lines (`lines`): what the wallet hands a watcher |
 | `watch-bond [--evidence FILE]… [--fee-asset ASSET]` | Compares the wallet's evidence and every file's under each salt, reads the chain and the mempool for spends of the coins they name, and burns the operator's bond on two different messages under one salt: what it counted (`evidence`), what it read (`scanned`), the `conflicts`, the slash it sent (`slashed`), and each slash sent before again until final (`resent`) |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |

@@ -1211,14 +1211,23 @@ pub async fn withdraw(config: &Config, asset: &str, atoms: &str, to: &str, fee_a
 		"fee": built.fee.amount.to_string(), "fee_asset": built.fee.asset.to_string(), "could_pay": can.to_string(), "owed": owed.to_string()}))
 }
 
-/// `arcad <config> bond-notice <key file>`: the notice of the configured
-/// bond coin, signed with `W`'s key from `key_file`, its fee from the
-/// operator's wallet, broadcast. Returns its id, the notice output and the
-/// line that names it in `[bond]`. From then on the bond reads as in notice
-/// (once the configuration names it), and wallets take no payment out of
-/// round from the operator.
-pub async fn bond_notice(config: &Config, key_file: &std::path::Path) -> Result<serde_json::Value, StartError> {
-	let (bond, finality, wallet) = bond_spender(config).await?;
+/// `arcad <config> bond-notice <key file> [<bond coin>]`: the notice of the
+/// configured bond coin, or of `coin`, another coin at the bond's script
+/// (one the configuration named before), signed with `W`'s key from
+/// `key_file`, its fee from the operator's wallet, broadcast. Returns its
+/// id, the notice output and the line that names it in `[bond]`. From then
+/// on the configured bond reads as in notice (once the configuration names
+/// it), and wallets take no payment out of round from the operator. A
+/// notice of another coin leaves the configured bond as it stands: wallets
+/// count only the coin `info.bond` names, and one signature pair burns
+/// every coin at the script, the noticed one with them until its
+/// withdrawal.
+pub async fn bond_notice(config: &Config, key_file: &std::path::Path, coin: Option<&str>) -> Result<serde_json::Value, StartError> {
+	let (mut bond, finality, wallet) = bond_spender(config).await?;
+	if let Some(c) = coin {
+		bond.outpoint = Some(crate::bond::parse_outpoint(c).map_err(|e| StartError(format!("the bond coin: {}", e)))?);
+		bond.notice = None;
+	}
 	let w = withdraw_key(key_file, &bond)?;
 	let b = bond.clone();
 	let view = finality.call(move |c| crate::bond::read(c, &b)).await.map_err(err("the node"))?;
@@ -1233,11 +1242,19 @@ pub async fn bond_notice(config: &Config, key_file: &std::path::Path) -> Result<
 		"config": format!("notice = \"{}\"", notice)}))
 }
 
-/// `arcad <config> bond-withdraw <key file> <address>`: once the notice's
-/// delay has run, the whole bond to `address`, signed with `W`'s key, its
-/// fee from the operator's wallet, broadcast.
-pub async fn bond_withdraw(config: &Config, key_file: &std::path::Path, to: &str) -> Result<serde_json::Value, StartError> {
-	let (bond, finality, wallet) = bond_spender(config).await?;
+/// `arcad <config> bond-withdraw <key file> <address> [<bond coin>
+/// <notice output>]`: once the notice's delay has run, the whole bond to
+/// `address`, signed with `W`'s key, its fee from the operator's wallet,
+/// broadcast: the configured bond, or the coin at the bond's script and its
+/// notice output named (see [`bond_notice`]).
+pub async fn bond_withdraw(config: &Config, key_file: &std::path::Path, to: &str, coins: Option<(&str, &str)>)
+	-> Result<serde_json::Value, StartError>
+{
+	let (mut bond, finality, wallet) = bond_spender(config).await?;
+	if let Some((c, n)) = coins {
+		bond.outpoint = Some(crate::bond::parse_outpoint(c).map_err(|e| StartError(format!("the bond coin: {}", e)))?);
+		bond.notice = Some(crate::bond::parse_outpoint(n).map_err(|e| StartError(format!("the notice output: {}", e)))?);
+	}
 	let w = withdraw_key(key_file, &bond)?;
 	let b = bond.clone();
 	let view = finality.call(move |c| crate::bond::read(c, &b)).await.map_err(err("the node"))?;

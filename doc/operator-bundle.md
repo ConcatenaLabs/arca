@@ -373,7 +373,17 @@ step:
 `https://<DOMAIN>/arca/v1/info` shows it under `bond`, `final` once its block
 is final. To end a bond, the notice and the withdrawal are arcad's own
 commands, signed with the withdrawal key's file
-([the server's README](../server/README.md#the-equivocation-bond)).
+([the server's README](../server/README.md#the-equivocation-bond)); to move
+it to another coin without a time unbonded, post the new coin first and give
+the old one its notice by name once the new one is named
+([Moving the bond to another coin](../server/README.md#moving-the-bond-to-another-coin)).
+
+**The limits wallets read.** Wallets value the bond at their own node's rate
+for its asset, and read the operator's other limits from `info`: each asset's
+in-flight cap, and, when `BOND_INSTANT_BUDGET` is set (written into arcad's
+`[bond] instant_budget_fraction`), the share of the bond the operator suggests a maker, swap
+service or LSP hold out of round at once
+([Limits an operator publishes](../server/README.md#limits-an-operator-publishes)).
 
 ## Listing the operator in the registry
 

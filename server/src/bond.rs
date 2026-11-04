@@ -78,6 +78,12 @@ pub struct BondSection {
 	/// The notice output, `txid:vout`, once a notice is given.
 	#[serde(default)]
 	pub notice: Option<String>,
+	/// The share of the bond's value the operator suggests a counterparty
+	/// take on out of round at once, more than 0 and at most 1 (`0.1`: a
+	/// tenth); `info.bond` publishes it. A suggestion only: each
+	/// counterparty sets its own budget, and a wallet takes the lower.
+	#[serde(default)]
+	pub instant_budget_fraction: Option<f64>,
 }
 
 /// The bond the configuration names: its policy and where its coins are.
@@ -86,6 +92,8 @@ pub struct Bond {
 	pub policy: BondPolicy,
 	pub outpoint: Option<OutPoint>,
 	pub notice: Option<OutPoint>,
+	/// [`BondSection::instant_budget_fraction`], in millionths.
+	pub instant_budget_ppm: Option<u32>,
 }
 
 /// `txid:vout`, as the configuration and `info` write an outpoint.
@@ -113,8 +121,14 @@ impl Bond {
 				({} units): a coin paid out of round before the notice could outlive the bond", d.seconds(), least, least.div_ceil(512)));
 		}
 		let policy = BondPolicy::new(chain, operator, w, d).map_err(|e| e.to_string())?;
+		let instant_budget_ppm = match s.instant_budget_fraction {
+			None => None,
+			Some(f) if f > 0.0 && f <= 1.0 => Some(((f * 1_000_000.0).round() as u32).max(1)),
+			Some(f) => return Err(format!("instant_budget_fraction: {} is not a share of the bond, more than 0 and at most 1", f)),
+		};
 		Ok(Bond {
 			policy,
+			instant_budget_ppm,
 			outpoint: s.outpoint.as_deref().map(parse_outpoint).transpose().map_err(|e| format!("outpoint: {}", e))?,
 			notice: s.notice.as_deref().map(parse_outpoint).transpose().map_err(|e| format!("notice: {}", e))?,
 		})
@@ -277,12 +291,28 @@ mod test {
 		let max = RelativeTime::from_units(338).unwrap();
 		assert_eq!(min_notice_seconds(LIFETIME, max), 28 * 86_400 + 338 * 512 + 86_400);
 		let chain = Chain::new(elements::BlockHash::from_byte_array([1; 32]));
-		let s = |units: u16| BondSection { withdraw_key: key(2).to_string(), notice_units: units, outpoint: None, notice: None };
+		let s = |units: u16| BondSection { withdraw_key: key(2).to_string(), notice_units: units, outpoint: None, notice: None, instant_budget_fraction: None };
 		let least = min_notice_seconds(LIFETIME, max).div_ceil(512) as u16;
 		assert!(Bond::from_section(&s(least - 1), chain, key(1), LIFETIME, max).unwrap_err().contains("shorter"));
 		assert!(Bond::from_section(&s(least), chain, key(1), LIFETIME, max).is_ok());
 		let same = BondSection { withdraw_key: key(1).to_string(), ..s(least) };
 		assert!(Bond::from_section(&same, chain, key(1), LIFETIME, max).unwrap_err().contains("operator key"));
+	}
+
+	#[test]
+	fn the_suggested_budget_is_a_share_of_the_bond() {
+		let max = RelativeTime::from_units(338).unwrap();
+		let chain = Chain::new(elements::BlockHash::from_byte_array([1; 32]));
+		let least = min_notice_seconds(LIFETIME, max).div_ceil(512) as u16;
+		let s = |f: Option<f64>| BondSection { withdraw_key: key(2).to_string(), notice_units: least, outpoint: None, notice: None,
+			instant_budget_fraction: f };
+		let ppm = |f| Bond::from_section(&s(f), chain, key(1), LIFETIME, max).map(|b| b.instant_budget_ppm);
+		assert_eq!(ppm(None), Ok(None));
+		assert_eq!(ppm(Some(0.1)), Ok(Some(100_000)));
+		assert_eq!(ppm(Some(1.0)), Ok(Some(1_000_000)));
+		for bad in [0.0, -0.1, 1.5] {
+			assert!(ppm(Some(bad)).unwrap_err().contains("not a share of the bond"), "{}", bad);
+		}
 	}
 
 	#[test]

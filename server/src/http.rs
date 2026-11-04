@@ -628,12 +628,15 @@ async fn bond_info(app: &App) -> Option<api::BondInfo> {
 	};
 	let p = &bond.policy;
 	let rate = view.asset.and_then(|a| app.params.rates.view(&a, crate::rates::unix_now())).and_then(|r| r.rate);
+	let reference = view.value.zip(rate).map(|(v, r)| crate::rates::value_of(v, r));
 	Some(api::BondInfo {
 		state: view.state.into(),
 		outpoint: bond.outpoint.as_ref().map(crate::bond::outpoint_text),
 		asset: view.asset.map(|a| a.to_string()),
 		value: view.value.map(|v| v.to_string()),
-		reference_value: view.value.zip(rate).map(|(v, r)| crate::rates::value_of(v, r).to_string()),
+		reference_value: reference.map(|v| v.to_string()),
+		instant_budget_ppm: bond.instant_budget_ppm,
+		instant_budget: reference.zip(bond.instant_budget_ppm).map(|(v, ppm)| (v as u128 * ppm as u128 / 1_000_000).to_string()),
 		operator: hex(&p.operator.serialize()),
 		withdraw_key: hex(&p.withdraw.serialize()),
 		notice_units: p.notice.units(),
