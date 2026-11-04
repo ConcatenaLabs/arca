@@ -28,6 +28,7 @@ pub mod cosign;
 pub mod delegations;
 pub mod fees;
 pub mod forfeits;
+pub mod fresh;
 pub mod http;
 pub mod issuer;
 pub mod keeper;

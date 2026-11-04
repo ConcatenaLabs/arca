@@ -237,7 +237,14 @@ pub async fn view(finality: &Arc<FinalityService>, bond: &Bond) -> Result<View, 
 		_ => None,
 	};
 	if let Some(op) = standing {
-		v.final_ = finality.watch(op.txid, "bond").await.map(|f| f.is_final()).unwrap_or(false);
+		// Watched once, while the finality service has not located it: a
+		// watch waits for the service's pass and writes, and `info` reads
+		// the bond every few seconds.
+		let f = match finality.status(&op.txid).await {
+			Ok(crate::chain::Finality::NotInChain) | Err(_) => finality.watch(op.txid, "bond").await,
+			located => located,
+		};
+		v.final_ = f.map(|f| f.is_final()).unwrap_or(false);
 	}
 	Ok(v)
 }
