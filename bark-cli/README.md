@@ -110,8 +110,8 @@ the restore again (it takes only what the wallet does not hold). Stores of
 one mnemonic kept side by side (a phone and a browser) follow each other:
 `sync` catches up, at most once every ten minutes (`caught_up` in its
 answer), with what the server serves to the mailbox key, as a restore reads
-it. It takes every coin the store does not hold, checked as a restore checks
-it, and gives up every coin it holds as live that another store gave up in a
+it. It takes every coin the store does not hold under a nonce it never drew
+(another store's), checked as a restore checks it, and gives up every coin it holds as live that another store gave up in a
 transfer the operator co-signed or in a participation the operator released,
 on the owner's own signatures (`given_elsewhere`), so every store shows the
 same coins after its next catch-up, and shows what it held until then. Each

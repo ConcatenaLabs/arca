@@ -447,7 +447,8 @@ impl Wallet {
 	/// operator co-signed, or in a participation the operator released and
 	/// this store never made, is given up as the restore gives
 	/// it up (`given_elsewhere`); and a coin it could not take is said, not
-	/// recorded as refused again, since it is looked at again next time.
+	/// recorded as refused again, since it is looked at again next time; and
+	/// a coin under a nonce this store drew is left to its mailbox read.
 	fn take_served(&mut self, info: &Value, entries: &[Value], served_receives: &[Value], catching_up: bool) -> Result<TakenServed, Error> {
 		self.keepers_acknowledged(info, entries)?;
 		self.no_foreign_acks(info, entries)?;
@@ -474,6 +475,11 @@ impl Wallet {
 						elsewhere.insert(id, Taken { entry: e.clone(), coin });
 					}
 				}
+				continue;
+			}
+			// A coin under a nonce this store drew is its own mailbox's to
+			// take, with its arrival; a catch-up takes the other stores'.
+			if catching_up && self.drew_nonce_of(e)? {
 				continue;
 			}
 			match self.restore_coin(e, &mut trees, now) {
@@ -632,6 +638,12 @@ impl Wallet {
 		Ok(false)
 	}
 
+	/// Whether this store drew the owner nonce served coin `e` names.
+	fn drew_nonce_of(&self, e: &Value) -> Result<bool, Error> {
+		let Ok(nonce) = unhex32(e["owner_nonce"].as_str().unwrap_or("")) else { return Ok(false) };
+		Ok(self.store.nonce(&nonce)?.is_some())
+	}
+
 	/// A coin the store holds, checked as held, if it still checks.
 	fn held_valid(&self, c: &super::store::CoinRow, now: MedianTime) -> Option<ValidCoin> {
 		let record = Self::record_of(c).ok()?;
@@ -641,7 +653,8 @@ impl Wallet {
 
 	/// What other stores of the mnemonic did since this one last looked, from
 	/// what the server serves to the mailbox key, checked as a restore checks
-	/// it: every coin this store does not hold, taken; and every coin it holds
+	/// it: every coin this store does not hold under a nonce it never drew
+	/// (another store's; its own are its mailbox's), taken; and every coin it holds
 	/// that another store gave up, on the owner's own signatures, given up
 	/// here too (`given_elsewhere`), so every store of the mnemonic shows the
 	/// same coins. `sync` runs it at most once every ten minutes; the coins
