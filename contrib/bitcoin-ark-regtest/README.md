@@ -34,7 +34,8 @@ builds them; follow it to build them by hand.
     regtest.sh gw … / peer …   # lightning-cli on the gateway or the peer
     regtest.sh admin …     # captaind's admin RPC
     regtest.sh limits MAX MIN [OFF]   # captaind restarted with its largest coin and
-                                      # board MAX sats, least board MIN, largest offboard OFF
+                                      # board MAX sats, least board MIN, largest offboard
+                                      # and arkoor OFF
     regtest.sh down        # stops every process `up` started, by the PIDs in $H/pids
 
 The ark's settings are short so a test runs in minutes: rounds every 10
