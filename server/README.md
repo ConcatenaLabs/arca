@@ -968,7 +968,9 @@ its on-chain output holds for its unlock. The fixed parts are set in the
 asset's atoms or as a value in the reference unit (`refresh_base_value`,
 `offboard_base_value`), taken in atoms at the asset's rate (see Exchange
 rates) and published both ways. A fee short of the asset's schedule is
-refused (`fee`), naming the asset and its schedule.
+refused (`fee`), naming the asset and its schedule. A coin the operator names
+as all its lowest node still waits on (`holding_back`, see Rounds) is
+refreshed for no fee, its window or not.
 
 Each forfeit carries the refund delay the server publishes with the
 participation (the longest exit delay), and leaves uncommitted the margin the
@@ -1699,7 +1701,9 @@ lowest node every slot of which has its consent but those given up by the
 participation and by the ones taken before it in the same round is brought
 back: once the round is final and its owners release, the watcher reclaims
 the node. What that pays back beyond the coins given up to complete it is
-what its other slots hold in flight, and that is what the participation is
+what then leaves flight: each coin in flight resting on the node whose every
+lowest node is back once it is (a coin a payment made from coins of two
+nodes stays in flight until both are), and that is what the participation is
 credited with: the coins that complete it opened nothing, so they are not
 credited a second time. So a participation that refreshes the last coin of
 such a node together with fresh coins runs while the node's other slots pay
@@ -1713,13 +1717,25 @@ A node can lack the coins of several holders. A participation that does not
 fit alone is judged again together with the ones already waiting that give
 up other last coins of the same nodes, and they all run when together they
 fit. And when everything of an asset in flight rests on nodes that come back
-only once several of the waiting participations run, waiting frees nothing:
-the first of them runs whatever the cap, once a round for each asset, and the
-others are judged again beside it, so the node comes back. Value on a node
-that lacks a coin nobody offers holds the cap as before. The operator names
-such coins to their holders (`POST holding_back`), and the wallet library
-refreshes each at its next sync, so no coin left at rest keeps a node's
-value out until its batch's horizon.
+only once several of the waiting participations run, and on no node that
+lacks a coin nobody offers, waiting frees nothing: the first of them that
+opens at most one cap of new value runs whatever the cap, once a round for
+each asset, and the others are judged again beside it, so the node comes
+back. A participation that would open more keeps waiting; its holder brings
+the node back by refreshing the node's coin alone. Value on a node that
+lacks a coin nobody offers holds the cap as before.
+
+The operator names such coins to their holders (`POST holding_back`): a coin
+that is all its lowest node still waits on, once everything else on the node
+is given up and released or moved with a delegation. That is a coin of a
+round, or a coin a payment out of round made from one (the payee's coin, the
+payer's change), which rests on the payer's old node through RECLAIM-D's
+delegations. The wallet library refreshes each at its next sync, and the
+operator charges no refresh fee for it, whatever its schedule, since the
+refresh serves the operator's capital. So no coin left at rest keeps a
+node's value out until its batch's horizon. The read proves the holder's
+keys, and a node waiting on coins of two holders is named to neither: each
+learns only that its own coins are the last.
 
 Two kinds of refresh run whatever the cap too: one with a coin within six
 days of its first expiry, or, on a board or a batch without a sweep, of its
@@ -2728,7 +2744,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST channel_update` | Co-signs a channel state its owner signed and, for a payment into another channel, signs the receiver's next note (see Channel leaves) |
 | `POST channel_state` | What the server holds of a channel, for its owner's key: its terms, latest signed state with both signatures, latest note, and whether anything waits for the signer |
-| `POST holding_back` | Of up to 64 coins (`leaf_ids`), each resting on a batch leaf, the ones that alone keep their lowest node's fronted value from coming back: the node holds coins already given up and released (or moved with a delegation), it can come back, and every slot of it without its consent is among the coins asked after. Each with what the node's other slots hold (`back`, atoms). A wallet refreshes such a coin at once: its refresh opens nothing under the in-flight cap, and once its round is final and the coins are released the watcher reclaims the node (see Rounds). A read, bounded like the others |
+| `POST holding_back` | Of up to 64 coins (`leaf_ids`), each on a batch leaf or made from one by payments out of round, the ones that alone keep a lowest node's fronted value from coming back: the node can come back, something on it is given up or moved already, and every coin it still waits on (down RECLAIM-D's delegations, each coin nothing has spent) is among the coins asked after. Each with what the nodes it is named for hold beyond those coins (`back`, atoms). Up to 64 keys (`keys`), each proven under one `challenge` (the call `holding_back`, an empty request); only the coins served to one of them (owned by it, bound to it as a mailbox, or posted to it) are asked after, and a request naming no key is refused `unauthenticated` (401) unless `holding_back_unauthenticated` is set. A wallet refreshes such a coin at once and for no fee: its refresh opens nothing under the in-flight cap and costs no refresh fee, and once its round is final and the coins are released the watcher reclaims the node (see Rounds). A read, bounded like the others |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), once void or expired whether each coin it gave up is its owner's again off the chain (`returned`), and for a take the order it takes (`fill`, with its input and outputs once in a round) and, while its round is held for the takes' forfeits, the round's transaction without its witnesses (`round.tx`) |
 | `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST withdraw_participation` | Takes back a pending participation for the owners of its coins, each signing its withdrawal digest (see Withdrawing a participation that waits); answered as `participation_status` answers, the participation void; refused `in_round` once a round has taken it |
@@ -2760,13 +2776,13 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST bind_mailbox` | Binds leaves made before their wallet named its mailbox key when it asked for them: up to 64 bindings, each an owner key, a mailbox key and the owner key's signature over the binding; answers the mailbox each key is bound to (a binding made before stands), or none for a key the server knows no leaf of |
 | `POST witness` | Takes the heads of the signer's record a wallet holds (at most 32, each `{entry, hash, signature}`) and a nonce the wallet draws fresh for the call, hands them to the signer, and answers the running hash the record holds at each entry, each signed, its latest entry, signed (`head`), the record's end signed together with the nonce (`end`), and whether the signer is stopped (`stopped`), with its proof (`proof`: the signed head that stopped it and, when the record holds another there, that head, signed) |
 
-`mailbox_read`, `leaf_data` and `plans` need a proof of the key: a challenge from
+`mailbox_read`, `leaf_data`, `plans`, `owed` and `holding_back` need a proof of the key: a challenge from
 `challenge`, signed with BIP340 over the tagged hash
 `SHA256(T ‖ T ‖ genesis_hash ‖ len(call) ‖ call ‖ challenge ‖ key ‖ SHA256(request))`
 with `T = SHA256("Arca/auth")`, where `request` is what the read asks besides
 its proof: for `mailbox_read` its cursor (eight bytes) and page size (four),
 little-endian; for `leaf_data` the same of its cursor and page size, or
-nothing when it names neither (it then reads the first page); for `plans` nothing. The tag keeps it apart from
+nothing when it names neither (it then reads the first page); for `plans`, `owed` and `holding_back` nothing. The tag keeps it apart from
 everything else a leaf key signs, the genesis hash to one chain, the call and
 the request to one read, the challenge to a short while. A challenge is
 stored nowhere: it is the time it was issued, 12 random bytes, and a keyed
@@ -3924,6 +3940,18 @@ coins beside a fresh coin, all in flight being that node's, both run and the
 node is reclaimed; on a node one of whose coins was
 paid on without a delegation the refreshes past the cap keep waiting; an asset
 with a cap of 0 and an empty pool waits and holds up no other asset's round.
+A holder refreshing a node's last coin beside eight fresh coins while another
+holder refreshes its other last coin beside one waits, the other running
+alone, so in flight rises by that one's two coins; once the first takes its
+participation back, the operator names its coin. A leaf paid on out of round
+with a delegation leaves the payee's coin and the payer's change on its node:
+while the payee holds its coin the operator names the change to nobody, and
+once the payee and the node's other holders refresh and release it names the
+change to its holder, under a full cap, paying back the rest of the node;
+asked with no key the read is refused (401), and by a key holding none of
+the coins it names nothing. With a refresh fee of 5,000 ppm the change's
+refresh is taken for no fee while a coin nobody names is refused `fee`, and
+once the change is released the node comes back by RECLAIM-D.
 A transfer refused for good after it was recorded with a delegation is
 dropped whole, its coin live again. A refresh with no release on a node one
 of whose coins was paid on keeps waiting under the cap, and the node waits;

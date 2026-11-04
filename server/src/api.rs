@@ -2044,13 +2044,21 @@ pub struct WithdrawParticipation {
 	pub signatures: Vec<String>,
 }
 
-/// `POST /v1/holding_back`: of a wallet's coins, each on a batch leaf
-/// ([`HOLDING_BACK_ASKED`] at most), the ones that alone keep their lowest
-/// node's fronted value from coming back.
+/// `POST /v1/holding_back`: of a wallet's coins ([`HOLDING_BACK_ASKED`] at
+/// most), whether on a batch leaf or paid on out of round from one, the ones
+/// that alone keep a lowest node's fronted value from coming back. `keys`
+/// prove the keys the coins are served to (a wallet's mailbox key, or a
+/// coin's owner key), each signing the authentication digest of the call
+/// `holding_back`, the challenge and the key, with an empty request
+/// ([`crate::auth`]); coins served to none of them are not asked after.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HoldingBackRequest {
 	pub leaf_ids: Vec<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub challenge: Option<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub keys: Vec<KeyProof>,
 }
 
 /// The most coins one `holding_back` call asks after.

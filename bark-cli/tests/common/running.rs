@@ -134,6 +134,7 @@ impl Running {
 			pool_coins: server::wallet::POOL_COINS,
 			max_request_bytes: 64 * 1024,
 			challenge_ttl_seconds: 120,
+			holding_back_unauthenticated: false,
 			// The test builds each round when it wants one.
 			round_interval_seconds: 0,
 			node: NodeConfig {

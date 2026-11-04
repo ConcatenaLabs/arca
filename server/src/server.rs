@@ -58,6 +58,13 @@ pub struct Config {
 	/// How long a challenge is good for, in seconds.
 	#[serde(default = "default_challenge_ttl")]
 	pub challenge_ttl_seconds: u64,
+	/// Whether `holding_back` also answers a request that proves no key,
+	/// about any coin it names, as wallets on a leaf library older than the
+	/// proof ask it. Off by default: such an answer tells anyone which
+	/// holders of a node have refreshed. An operator turns it on only while
+	/// its own wallets and services are still on such a library.
+	#[serde(default)]
+	pub holding_back_unauthenticated: bool,
 	/// How often a round is built when participations wait, in seconds; 0
 	/// builds none on a timer (a round is then built by `Rounds::run_round`).
 	#[serde(default = "default_round_interval")]
@@ -1421,6 +1428,7 @@ fn restart_only(a: &Config, b: &Config) -> Vec<String> {
 	differ("fee_multiple", a.fee_multiple == b.fee_multiple);
 	differ("max_request_bytes", a.max_request_bytes == b.max_request_bytes);
 	differ("challenge_ttl_seconds", a.challenge_ttl_seconds == b.challenge_ttl_seconds);
+	differ("holding_back_unauthenticated", a.holding_back_unauthenticated == b.holding_back_unauthenticated);
 	differ("round_interval_seconds", a.round_interval_seconds == b.round_interval_seconds);
 	differ("node", a.node == b.node);
 	differ("finality", a.finality == b.finality);
@@ -1953,6 +1961,7 @@ impl Server {
 			participations: participations.clone(), plans: plans.clone(), orders: orders.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(),
 			channels, certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
+			holding_back_unauthenticated: config.holding_back_unauthenticated,
 			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
 				config.limits.source_burst),
 			witnesses: Limiter::new(config.limits.witness_per_second, config.limits.witness_burst, config.limits.witness_source_per_second,

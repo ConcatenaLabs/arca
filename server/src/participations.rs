@@ -938,9 +938,23 @@ impl Participations {
 		let refund_delay = p.refund_delay;
 		let mut margins = Vec::with_capacity(n);
 		let mut due: BTreeMap<AssetId, u64> = BTreeMap::new();
-		for ((c, expiry), share) in coins.iter().zip(&expiries).zip(&shares) {
+		// A coin that alone keeps its node's fronted value out, as the
+		// operator names it to its holder (`holding_back`), is refreshed for
+		// nothing, its window or not: the refresh gives the operator its
+		// capital back, and serves the holder nothing it asked for.
+		// Asked only when the schedule charges anything for these coins.
+		let fees: Vec<u64> = coins.iter().zip(&expiries).zip(&shares).map(|((_, e), s)| schedule.refresh(*s, *e, now)).collect();
+		let named: HashSet<[u8; 32]> = if fees.iter().any(|f| *f > 0) {
+			let ids: Vec<[u8; 32]> = req.inputs.iter().map(|i| i.leaf_id.0).collect();
+			crate::rounds::holding_back(&self.store, &ids).await?.into_iter().map(|(l, _)| l).collect()
+		} else {
+			HashSet::new()
+		};
+		for ((c, fee), i) in coins.iter().zip(&fees).zip(&req.inputs) {
 			margins.push(forfeit_margin(c, refund_delay, self.floor(c.asset).await?));
-			*due.entry(c.asset).or_default() += schedule.refresh(*share, *expiry, now);
+			if !named.contains(&i.leaf_id.0) {
+				*due.entry(c.asset).or_default() += fee;
+			}
 		}
 		let mut wanted = Vec::with_capacity(m);
 		for o in &req.outputs {

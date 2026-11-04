@@ -51,7 +51,7 @@ use serde_json::{json, Value};
 
 use arca_covenant::sign::sign_digest;
 use arca_covenant::{CoinRecord, Delegation, ExplicitOutput, NewLeaf, Rebindable, Release, ValidOrigin};
-use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, random32, transfer_body, want_leaf, Held};
+use common::client::{auths_json, forfeit_sig, hex, new_leaf, participation_body, random32, transfer_body, unhex, want_leaf, Held};
 use common::flow::{forfeit_for, held_by, Coin};
 use common::keys::{keypair, xonly};
 use common::rounds::{created, round_final, status, validate_new_leaf, VALUE};
@@ -1657,12 +1657,33 @@ async fn two_holders_of_a_nodes_last_coins_bring_it_back() {
 	assert_eq!(after, 2 * VALUE, "only the two fresh coins stay in flight");
 }
 
-/// The leaf ids `holding_back` names of `coins`, with what each node pays back.
+/// The leaf ids `holding_back` names of `coins`, asked by their holders
+/// (each owner key proven), with what each node pays back.
 fn holding_back(r: &Running, coins: &[&Coin]) -> Vec<(String, String)> {
-	let ids: Vec<String> = coins.iter().map(|c| hex(&c.held.id.0)).collect();
-	let a = r.http.post("holding_back", &json!({"leaf_ids": ids})).ok();
+	let keys: Vec<Keypair> = coins.iter().map(|c| c.held.key).collect();
+	holding_back_by(r, coins, &keys)
+}
+
+/// [`holding_back`], asked after `coins` by whoever proves `keys`.
+fn holding_back_by(r: &Running, coins: &[&Coin], keys: &[Keypair]) -> Vec<(String, String)> {
+	let a = r.http.post("holding_back", &holding_back_body(r, coins, keys)).ok();
 	a["leaves"].as_array().unwrap().iter().map(|l| (l["leaf_id"].as_str().unwrap().to_string(), l["back"].as_str().unwrap().to_string()))
 		.collect()
+}
+
+/// A `holding_back` request after `coins`, each of `keys` signing a fresh
+/// challenge (none when `keys` is empty).
+fn holding_back_body(r: &Running, coins: &[&Coin], keys: &[Keypair]) -> Value {
+	let ids: Vec<String> = coins.iter().map(|c| hex(&c.held.id.0)).collect();
+	if keys.is_empty() {
+		return json!({"leaf_ids": ids});
+	}
+	let challenge: [u8; 32] = unhex(r.http.post("challenge", &json!({})).ok()["challenge"].as_str().unwrap()).try_into().unwrap();
+	let proofs: Vec<Value> = keys.iter().map(|k| {
+		let d = server::auth::auth_digest(&r.chain, "holding_back", &challenge, &xonly(k), &[]);
+		json!({"key": hex(&xonly(k).serialize()), "signature": hex(sign_digest(k, &d, &random32()).as_ref())})
+	}).collect();
+	json!({"leaf_ids": ids, "challenge": hex(&challenge), "keys": proofs})
 }
 
 /// A coin left at rest beside released ones keeps its node's fronted value
@@ -1715,4 +1736,150 @@ async fn the_operator_names_the_coins_that_alone_hold_a_node_back() {
 	println!("{} reclaim(s); in flight {}", reclaims, n(&pool(&r, x), "in_flight"));
 	assert_eq!(reclaims, 1, "node A is reclaimed");
 	assert!(holding_back(&r, &[&c[1], &c[2]]).is_empty(), "nothing is held back any more");
+}
+
+/// A payment's coins hold their payer's old node back until each is
+/// refreshed and released (arca#599): the payee's coin and the payer's
+/// change, neither on a batch leaf. Node A holds U0, U1 and U2; U0 pays P
+/// out of round with a delegation, keeping change C. U1, U2 and P refresh
+/// and release, so all A waits on is C, and the operator names C to its
+/// holder, though C rests on A only through its payment. Before P refreshes
+/// A waits on two holders, and C is named to neither. The read proves the
+/// holder's key (arca#606): asked with no key, or by a key that holds none of
+/// the coins, it answers nothing. C's refresh then runs under a full cap and,
+/// with the operator charging a refresh fee, for no fee (arca#607), while a
+/// coin nobody names still pays it. Once C is released, A is reclaimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payments_change_is_named_once_the_rest_of_its_node_is_back() {
+	let cap = 2 * VALUE;
+	let (r, c) = first_leaves(Some(cap), &["PC U0", "PC U1", "PC U2"]).await;
+	let x = r.x;
+	let paid = pay(&r, &c[0], &[(keypair("PC P"), 400_000), (keypair("PC U0 change"), 0)], true);
+	let (p, change) = (&paid[0], &paid[1]);
+	assert!(holding_back(&r, &[change]).is_empty(), "nothing is given up yet");
+
+	// U1 and U2 refresh and release; P still holds its coin.
+	let ks = [keypair("PC U1 2"), keypair("PC U2 2")];
+	let mut parts = vec![];
+	for (coin, k) in [&c[1], &c[2]].into_iter().zip(&ks) {
+		parts.push(submit(&r, &[coin], &[*k]));
+	}
+	round(&r).await;
+	let mut renewed = vec![];
+	for ((coin, k), (id, nn)) in [&c[1], &c[2]].into_iter().zip(&ks).zip(&parts) {
+		renewed.push(complete(&r, id, &[coin], &[*k], nn, true).await.remove(0));
+	}
+	let two = holding_back(&r, &[change]);
+	println!("asked after C while P holds its coin: {:?}", two);
+	assert!(two.is_empty(), "A waits on P as well");
+
+	// P refreshes and releases: A waits on C alone.
+	let kp = keypair("PC P 2");
+	let (idp, np) = submit(&r, &[p], &[kp]);
+	round(&r).await;
+	complete(&r, &idp, &[p], &[kp], &np, true).await;
+	let in_flight = n(&pool(&r, x), "in_flight");
+	println!("in flight {} of a cap of {}", in_flight, cap);
+	assert!(in_flight > cap, "the cap is full");
+	let cv = change.valid(&r).value;
+	let named = holding_back(&r, &[change]);
+	println!("asked after C by its holder: {:?}", named);
+	assert_eq!(named, vec![(hex(&change.held.id.0), (3 * VALUE - cv).to_string())], "C is named, A paying back the rest");
+
+	// The read proves its keys.
+	let bare = r.http.post("holding_back", &holding_back_body(&r, &[change], &[]));
+	println!("asked with no key: {} {}", bare.status, bare.json);
+	assert_eq!(bare.status, 401, "{}", bare.json);
+	assert_eq!(bare.json["error"]["code"], "unauthenticated", "{}", bare.json);
+	let stranger = holding_back_by(&r, &[change], &[keypair("PC stranger")]);
+	println!("asked after C by a key that holds none of it: {:?}", stranger);
+	assert!(stranger.is_empty(), "C is not the stranger's to ask after");
+
+	// The operator charges a refresh fee: C's refresh pays none, a coin it
+	// does not name still does.
+	let mut config = r.server.config();
+	config.fees.refresh_ppm = 5_000;
+	r.server.reload(&config).await.unwrap();
+	let (w, _) = want_leaf(&keypair("PC U1 3"), x, VALUE);
+	let (body, _) = participation_body(&[&renewed[0].held], &[w], &[], None, xonly(&r.s), r.chain);
+	let unnamed = r.http.post("submit_participation", &body);
+	println!("U1's new coin refreshed for no fee: {} {}", unnamed.status, unnamed.json);
+	assert_eq!(unnamed.json["error"]["code"], "fee", "{}", unnamed.json);
+	let kc = keypair("PC change 2");
+	let (idc, nc) = submit(&r, &[change], &[kc]);
+	let built = r.server.rounds.run_round().await.unwrap().expect("C's refresh runs under the full cap");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	assert_ne!(status(&r, &idc)["state"], "pending", "{}", status(&r, &idc));
+	complete(&r, &idc, &[change], &[kc], &nc, true).await;
+	r.synced().await;
+	let reclaims = passes(&r).await;
+	println!("{} reclaim(s): {:?}; in flight {}", reclaims.len(), reclaims.iter().map(|k| &k.detail).collect::<Vec<_>>(),
+		n(&pool(&r, x), "in_flight"));
+	assert_eq!(reclaims.len(), 1, "node A is reclaimed");
+	assert!(reclaims[0].detail.contains("RECLAIM-D"), "{}", reclaims[0].detail);
+}
+
+/// The "waiting frees nothing" rule runs a participation of at most one cap
+/// of new value (arca#604). As `two_holders_of_a_nodes_last_coins_bring_it_back`,
+/// but P gives up U1 beside eight fresh coins: P waits, Q runs by the rule
+/// beside its one fresh coin, and in flight rises by Q's alone. P's way out
+/// is to take its participation back and refresh U1 without fresh coins:
+/// the operator then names U1, which is all A waits on.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_unstuck_participation_is_at_most_one_cap() {
+	let cap = VALUE * 3 / 2;
+	let fresh_n = 9;
+	let (mut r, c) = first_leaves(Some(cap), &["US U0", "US U1", "US U2"]).await;
+	let x = r.x;
+	let wk: Vec<Keypair> = (0..fresh_n).map(|j| keypair(&format!("US W{} board", j))).collect();
+	let ws = boards(&mut r, &wk, x).await;
+	let k0 = keypair("US U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	let mut wparts = vec![];
+	for (j, w) in ws.iter().enumerate() {
+		let k = keypair(&format!("US W{} 1", j));
+		wparts.push((submit(&r, &[w], &[k]), k));
+	}
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	let mut fresh = vec![];
+	for (((id, nn), k), w) in wparts.iter().zip(&ws) {
+		fresh.push(complete(&r, id, &[w], &[*k], nn, true).await.remove(0));
+	}
+	let before = n(&pool(&r, x), "in_flight");
+	assert_eq!(before, VALUE, "node A holds U0's coin in flight");
+	let mut pin: Vec<&Coin> = vec![&c[1]];
+	pin.extend(fresh[..fresh_n - 1].iter());
+	let kp: Vec<Keypair> = (0..pin.len()).map(|j| keypair(&format!("US P {}", j))).collect();
+	let qin: Vec<&Coin> = vec![&c[2], &fresh[fresh_n - 1]];
+	let kq = [keypair("US Q 0"), keypair("US Q 1")];
+	let (idp, _) = submit(&r, &pin, &kp);
+	assert!(holding_back(&r, &[&c[1]]).is_empty(), "U1 is given up already");
+	let (idq, nq) = submit(&r, &qin, &kq);
+	let built = r.server.rounds.run_round().await.unwrap().expect("a round is built");
+	let (sp, sq) = (status(&r, &idp), status(&r, &idq));
+	println!("cap {}, in flight {}: P (U1 + {} fresh) {} / Q {}", cap, before, fresh_n - 1, sp["state"], sq["state"]);
+	println!("P waits: {}", sp["waiting"]);
+	assert_eq!(sp["state"], "pending", "P opens eight coins: {}", sp);
+	assert!(sp["waiting"].as_str().unwrap().starts_with("This refresh waits for a later round"), "{}", sp);
+	assert_ne!(sq["state"], "pending", "Q runs by the rule: {}", sq);
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	complete(&r, &idq, &qin, &kq, &nq, true).await;
+	r.synced().await;
+	let peak = n(&pool(&r, x), "in_flight");
+	println!("in flight after the round {} (before {}, cap {})", peak, before, cap);
+	assert_eq!(peak, before + 2 * VALUE, "only Q's two coins went in flight");
+	// P takes its participation back; U1 is all A waits on, and the
+	// operator names it to its holder.
+	let d = server::participations::withdraw_digest(&r.chain, &xonly(&r.s), &idp);
+	let sigs: Vec<String> = kp.iter().map(|_| ()).zip(&pin).map(|(_, c)| hex(sign_digest(&c.held.key, &d, &random32()).as_ref())).collect();
+	let w = r.http.post("withdraw_participation", &json!({"participation_id": hex(&idp), "signatures": sigs})).ok();
+	println!("P withdrawn: {}", w["state"]);
+	let named = holding_back(&r, &[&c[1]]);
+	println!("asked after U1: {:?}", named);
+	assert_eq!(named.len(), 1, "{:?}", named);
 }

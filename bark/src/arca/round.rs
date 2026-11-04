@@ -692,6 +692,20 @@ impl Wallet {
 	/// deadline) unless `max_fee_ppm` is given, is refused. The quote is what
 	/// [`Wallet::participate`] submits.
 	pub fn refresh_quote(&self, leaf_ids: &[String], max_fee_ppm: Option<u64>) -> Result<RefreshQuote, Error> {
+		self.refresh_quote_as(leaf_ids, max_fee_ppm, false)
+	}
+
+	/// [`Self::refresh_quote`] of coins the operator names as alone keeping
+	/// their node's fronted value out (`holding_back`): such a refresh
+	/// serves the operator's capital, so the operator charges nothing for it
+	/// and the wallet pays nothing, whatever the schedule says. An operator
+	/// that asks a fee for it after all refuses the participation, and the
+	/// coin stays live.
+	pub(crate) fn named_refresh_quote(&self, leaf_ids: &[String]) -> Result<RefreshQuote, Error> {
+		self.refresh_quote_as(leaf_ids, Some(0), true)
+	}
+
+	fn refresh_quote_as(&self, leaf_ids: &[String], max_fee_ppm: Option<u64>, waived: bool) -> Result<RefreshQuote, Error> {
 		let info = self.server_info()?;
 		let now = self.now()?;
 		let rows: Vec<_> = if leaf_ids.is_empty() {
@@ -740,7 +754,7 @@ impl Wallet {
 				}
 			}
 			let schedule = schedule_of(&info, a.valid.asset);
-			let fee = refresh_fee(&schedule, value, expiry, now.to_consensus_u32());
+			let fee = if waived { 0 } else { refresh_fee(&schedule, value, expiry, now.to_consensus_u32()) };
 			let free = in_free_window(expiry, now.to_consensus_u32());
 			let bound = max_fee_ppm.unwrap_or(if free { 0 } else { DEFAULT_MAX_FEE_PPM });
 			if !fee_within(fee, value, bound) {

@@ -523,3 +523,149 @@ async fn a_coin_that_alone_holds_its_node_back_is_refreshed_by_the_next_sync() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// A payment's change holds its payer's old node back once the payee has
+/// refreshed (arca#599). A and B refresh into one lowest node with RECLAIM-D;
+/// A pays C out of round, keeping change. B and C refresh and release, A does
+/// nothing: the node waits on A's change alone, which rests on it only
+/// through the payment. A's next sync asks the operator which of its coins
+/// hold a node back (`holding_back`, proving its mailbox key), and asks for
+/// the change's refresh at once; once that round is final and A releases,
+/// the watcher reclaims the node by RECLAIM-D. Before C refreshes, A's sync
+/// asks for nothing: the node waits on C too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payers_change_that_alone_holds_its_node_back_is_refreshed_by_the_next_sync() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x.to_string();
+	let x_id = r.x;
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (a, b, c) = (Arca::new("PCA"), Arca::new("PCB"), Arca::new("PCC"));
+	for w in [&a, &b, &c] {
+		w.ok(&create);
+	}
+	for w in [&a, &b] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x_id, 5_000_000);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("both boards credited", || {
+		a.ok(&["boards"])[0]["server"]["state"] == "credited" && b.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	// Round 1: A's and B's leaves under one lowest node with RECLAIM-D.
+	refresh_all(&r, &[&a, &b]).await;
+
+	// A pays C out of round, keeping change.
+	let req = c.ok(&["receive"]);
+	let sent = a.ok(&["send", req["request"].as_str().unwrap(), "--amount", "600000", "--asset", &x]);
+	assert!(sent["change"].is_string(), "the payment leaves change: {}", sent);
+	assert_eq!(c.ok(&["mailbox"])["accepted"].as_array().unwrap().len(), 1);
+	let mine = live(&a, &x);
+	assert_eq!(mine.len(), 1, "A holds its change alone: {:?}", mine);
+	let change = mine[0]["leaf_id"].as_str().unwrap().to_string();
+	println!("A's change {} ({})", change, mine[0]["kind"]);
+
+	// Round 2: B alone refreshes and releases; the node still waits on C.
+	refresh_all(&r, &[&b]).await;
+	let s = a.ok(&["sync"]);
+	println!("A's sync while C holds its coin: refresh {}", s["refresh"]);
+	assert!(s["refresh"].as_array().is_none_or(|a| a.is_empty()), "the node waits on C as well: {}", s["refresh"]);
+
+	// Round 3: C refreshes and releases; A's sync names its change.
+	refresh_all(&r, &[&c]).await;
+	let s = a.ok(&["sync"]);
+	println!("A's sync once C released: refresh {}", s["refresh"]);
+	let asked = s["refresh"].as_array().cloned().unwrap_or_default();
+	assert_eq!(asked.len(), 1, "{}", s["refresh"]);
+	assert_eq!(asked[0]["leaf_id"], change.as_str(), "{}", asked[0]);
+	assert_eq!(asked[0]["state"], "pending", "{}", asked[0]);
+
+	// Round 4: A's refresh; A releases, and the node comes back.
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(!built.is_empty(), "the change's refresh is built");
+	r.produce().await;
+	r.bury().await;
+	for t in &built {
+		r.round_state(&t.tx.txid(), RoundState::Final).await;
+	}
+	let s = a.ok(&["sync"]);
+	assert!(s["participations"].as_array().unwrap().iter().any(|p| p["state"] == "released"), "{}", s["participations"]);
+	let ks = reclaims(&r).await;
+	println!("{} reclaim(s): {:?}", ks.len(), ks.iter().map(|k| &k.detail).collect::<Vec<_>>());
+	let k = ks.iter().find(|w| w.detail.contains("RECLAIM-D")).expect("the node is reclaimed by RECLAIM-D");
+	assert_eq!(k.state, NurseryState::Final);
+	let pool = r.server.store.pool_flow().await.unwrap()[&x_id.into_inner().to_byte_array()].clone();
+	println!("after the reclaim: transferred {}, in flight {}", pool.transferred, pool.in_flight);
+	assert_eq!(pool.transferred, 0);
+	for w in [&a, &b, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A coin the operator names is refreshed for no fee (arca#607): as
+/// `a_coin_that_alone_holds_its_node_back_is_refreshed_by_the_next_sync`, the
+/// operator charging 5,000 ppm for a refresh. B's sync refreshes the named
+/// coin weeks before its window and pays nothing; the operator, which names
+/// it, takes the refresh without a fee.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_coin_is_refreshed_for_no_fee() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x.to_string();
+	let x_id = r.x;
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (a, b) = (Arca::new("NFA"), Arca::new("NFB"));
+	for w in [&a, &b] {
+		w.ok(&create);
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x_id, 5_000_000);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("both boards credited", || {
+		a.ok(&["boards"])[0]["server"]["state"] == "credited" && b.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	refresh_all(&r, &[&a, &b]).await;
+	let mut config = r.server.config();
+	config.fees.refresh_ppm = 5_000;
+	r.server.reload(&config).await.unwrap();
+	let p = a.ok(&["participate", "--max-fee-ppm", "10000"]);
+	println!("A's own refresh: {}", p["participations"]);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	for t in &built {
+		r.round_state(&t.tx.txid(), RoundState::Final).await;
+	}
+	a.ok(&["sync"]);
+	let s = b.ok(&["sync"]);
+	println!("B's sync once A released: refresh {}", s["refresh"]);
+	let asked = s["refresh"].as_array().cloned().unwrap_or_default();
+	assert_eq!(asked.len(), 1, "{}", s["refresh"]);
+	assert_eq!(asked[0]["state"], "pending", "{}", asked[0]);
+	let fees = asked[0]["fees"].as_array().cloned().unwrap_or_default();
+	println!("fee B pays for the named refresh: {:?}", fees);
+	assert!(fees.iter().all(|f| f["amount"] == "0"), "the named refresh pays nothing: {:?}", fees);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
