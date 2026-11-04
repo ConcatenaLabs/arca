@@ -1782,18 +1782,52 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// The wallet's live coins on a batch leaf that alone keep their lowest
-	/// node's fronted value from coming back, as the operator answers
-	/// (`holding_back`): refreshed at once ([`Self::refresh_due`]), each opens
-	/// nothing under the operator's in-flight cap and gives the operator its
-	/// capital back. None when the operator does not answer, or does not
-	/// know the call: the next sync asks again.
+	/// The wallet's live coins that alone keep a lowest node's fronted value
+	/// from coming back, as the operator answers (`holding_back`): a coin of
+	/// a round, or one a payment out of round made (the payee's coin, the
+	/// payer's change), resting on the payer's old node. Refreshed at once
+	/// and for no fee ([`Self::refresh_due`]), each opens nothing under the
+	/// operator's in-flight cap and gives the operator its capital back. The
+	/// read proves the wallet's mailbox key, and the operator answers only
+	/// for coins served to it. An operator that does not know the proof is
+	/// asked after the wallet's coins of a round without it, as it was before
+	/// it took the proof. None when the operator does not answer, or does not
+	/// know the call: the next sync asks again. A resting order's coin is not
+	/// asked after: refreshing it would cancel the order.
 	pub(crate) fn holding_back(&self) -> Result<Vec<String>, Error> {
-		let coins: Vec<String> = self.store.coins_in("live")?.into_iter().filter(|c| c.kind == "batch").map(|c| c.leaf_id).collect();
+		let live: Vec<_> = self.store.coins_in("live")?.into_iter()
+			.filter(|c| c.kind != "board" && !super::resting::is_order_coin(c)).collect();
+		if live.is_empty() {
+			return Ok(vec![]);
+		}
+		let mailbox = self.keys.mailbox()?;
+		let x = mailbox.x_only_public_key().0;
+		let proof = self.server.post("challenge", &json!({})).ok()
+			.and_then(|v| unhex32(v["challenge"].as_str().unwrap_or("")).ok())
+			.map(|c| (c, sign(&mailbox, &super::client::auth_digest(&self.genesis, "holding_back", &c, &x, &[]))));
+		let coins: Vec<String> = live.iter().map(|c| c.leaf_id.clone()).collect();
+		let batch: Vec<String> = live.iter().filter(|c| c.kind == "batch").map(|c| c.leaf_id.clone()).collect();
 		let mut out = vec![];
 		// The operator's bound on one call (`holding_back`).
-		for chunk in coins.chunks(64) {
-			let Ok(a) = self.server.post("holding_back", &json!({"leaf_ids": chunk})) else { return Ok(out) };
+		for (k, chunk) in coins.chunks(64).enumerate() {
+			let proven = proof.as_ref().and_then(|(c, sig)| self.server.post("holding_back", &json!({"leaf_ids": chunk,
+				"challenge": hex(c), "keys": [{"key": hex(&x.serialize()), "signature": hex(sig.as_ref())}]})).ok());
+			let a = match proven {
+				Some(a) => a,
+				None if k == 0 => {
+					// An operator that does not take the proof: its own form.
+					for chunk in batch.chunks(64) {
+						let Ok(a) = self.server.post("holding_back", &json!({"leaf_ids": chunk})) else { return Ok(out) };
+						for l in a["leaves"].as_array().into_iter().flatten() {
+							if let Some(id) = l["leaf_id"].as_str().filter(|id| chunk.iter().any(|c| c == id)) {
+								out.push(id.to_string());
+							}
+						}
+					}
+					return Ok(out);
+				},
+				None => return Ok(out),
+			};
 			for l in a["leaves"].as_array().into_iter().flatten() {
 				if let Some(id) = l["leaf_id"].as_str().filter(|id| chunk.iter().any(|c| c == id)) {
 					out.push(id.to_string());
@@ -1814,7 +1848,8 @@ impl Wallet {
 	/// From a day before its exit date, a coin not refreshed goes home
 	/// ([`Self::home`]). A coin the bond does not cover, or one that alone
 	/// keeps its node's fronted value from coming back
-	/// ([`Self::holding_back`]), is asked for at once, its window or not.
+	/// ([`Self::holding_back`]), is asked for at once, its window or not;
+	/// the latter for no fee ([`Self::named_refresh_quote`]).
 	pub(crate) fn refresh_due(&mut self) -> Result<Vec<Value>, Error> {
 		let now = self.now()?.to_consensus_u32();
 		let refused = self.refused_refreshes()?;
@@ -1830,7 +1865,8 @@ impl Wallet {
 		// without a sweep nothing else ever asks for its refresh, and the
 		// operator's capital stays out until the batch's horizon.
 		let mut uncovered = self.uncovered()?;
-		uncovered.extend(self.holding_back()?);
+		let named = self.holding_back()?;
+		uncovered.extend(named.iter().cloned());
 		for c in self.store.coins_in("live")? {
 			if planned.contains(&c.leaf_id) {
 				continue;
@@ -1848,7 +1884,11 @@ impl Wallet {
 			}
 			asked_at.insert(c.leaf_id.clone(), now);
 			self.store.set_meta(REFRESH_ASKED, &serde_json::to_string(&asked_at).expect("a map"))?;
-			let asked = self.refresh_quote(std::slice::from_ref(&c.leaf_id), None).and_then(|q| self.participate(q, None));
+			let asked = if named.contains(&c.leaf_id) {
+				self.named_refresh_quote(std::slice::from_ref(&c.leaf_id))
+			} else {
+				self.refresh_quote(std::slice::from_ref(&c.leaf_id), None)
+			}.and_then(|q| self.participate(q, None));
 			out.push(match asked {
 				Ok(v) => {
 					let p = &v["participations"][0];

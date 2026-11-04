@@ -265,3 +265,47 @@ fn reach<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], budget: usiz
 		}
 	})
 }
+
+/// The coins the consent of `leaf`, a slot of the lowest node whose children
+/// hash is `node_hash`, still waits on, once [`can_complete`] holds for that
+/// node: down its delegations, each coin nothing has spent, which its holder
+/// brings in by refreshing it and releasing the node. A coin given up in a
+/// refresh waits on nothing more (its release is recorded, or comes with
+/// its participation), and neither does the `htlc-1` leaf of a paid payment
+/// out of the tree once its sender released it. `None` when the slot moved
+/// into a reassignment on a batch without RECLAIM-D (`delegated` false),
+/// where only its owner's own release brings the node back, which can no
+/// longer come.
+pub fn waiting_on<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], delegated: bool, budget: usize)
+	-> Pin<Box<dyn Future<Output = Result<Option<Vec<[u8; 32]>>, StoreError>> + Send + 'a>>
+{
+	Box::pin(async move {
+		if budget == 0 {
+			return Ok(None);
+		}
+		match store.spent_by(&leaf).await? {
+			SpentBy::Reassignment { outputs, .. } => {
+				if !delegated {
+					return Ok(None);
+				}
+				let mut out = vec![];
+				for (o, _) in outputs {
+					match waiting_on(store, o, node_hash, delegated, budget - 1).await? {
+						Some(w) => for l in w {
+							if !out.contains(&l) {
+								out.push(l);
+							}
+						},
+						None => return Ok(None),
+					}
+				}
+				Ok(Some(out))
+			},
+			SpentBy::Other => Ok(Some(vec![])),
+			SpentBy::Nothing => match store.send_of_leaf(&leaf).await? {
+				Some(s) if s.state == SendState::Paid && !store.paid_send_releases(&leaf, &node_hash).await?.is_empty() => Ok(Some(vec![])),
+				_ => Ok(Some(vec![leaf])),
+			},
+		}
+	})
+}

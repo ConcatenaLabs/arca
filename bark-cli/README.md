@@ -495,9 +495,13 @@ and a board whose registration never reached the server, are not recovered.
   quarter of the day-long window, while the coin is still in it (the
   schedule wakes for it then, and not sooner). A coin that alone keeps its
   lowest node's fronted value from coming back (the other coins on it given
-  up and released, as the operator answers `holding_back`) is asked for at
-  once, its window or not: on a batch without a sweep nothing else would ask,
-  and its refresh gives the operator its capital back. A participation whose coin is on
+  up and released, as the operator answers `holding_back`, the read proving
+  the wallet's mailbox key) is asked for at once, its window or not, and for
+  no fee: on a batch without a sweep nothing else would ask, and its refresh
+  gives the operator its capital back. That covers a coin a payment out of
+  round made, the payer's change as well as a coin received: it rests on the
+  payer's old node until it is refreshed. A resting order's coin is not asked
+  after, since its refresh would cancel the order. A participation whose coin is on
   its way home on the chain is not handed over again; once the operator
   releases it, the wallet takes the new leaves with the preimage the server
   publishes. From `home_from`, `sync` takes on the chain every
@@ -2056,7 +2060,13 @@ delegates its coin, the maker's next `sync` (taking up its credit and the
 order resting again) delegates the order's coin, once; a second fill of the
 rest and the maker's cancel of what then rests carry no delegation, since
 the order resting again keeps the order's key, which has delegated; both
-refresh, and neither node comes back by RECLAIM-D before its expiry.
+refresh, and neither node comes back by RECLAIM-D before its expiry. Once
+one wallet of a node refreshes and releases, the other's next `sync` refreshes
+its coin there at once, and the node comes back; with the operator charging
+5,000 ppm for a refresh, that refresh pays nothing. A payer whose payee and
+the node's other holder refresh and release has its change named at its next
+`sync`, not before the payee refreshed, and once the change is refreshed and
+released the node comes back by RECLAIM-D.
 
 `tests/arca_fills.rs` runs the same way: two orders made with SeqDEX's fill
 covenant (their scripts derived by SeqDEX's own `seqob-covenant` when

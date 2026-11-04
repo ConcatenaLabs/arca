@@ -380,14 +380,85 @@ fn lowest_of(record: &[u8]) -> Option<[u8; 32]> {
 	arca_covenant::LeafRecord::from_bytes(record).ok().and_then(|r| r.branch().ok()).and_then(|b| b.nodes.last().map(|n| n.children_hash()))
 }
 
+/// Of the coins `leaf_ids`, the ones that keep a lowest node's fronted value
+/// from coming back, and nothing else does: each coin rests on the node,
+/// directly as one of its batch leaves or through its lineage of
+/// reassignments (a payment out of round, whose payee and payer's change
+/// each rest on the payer's old node), the node can come back
+/// ([`crate::delegations::can_complete`]), something on it is given up or
+/// moved already, and every coin it still waits on
+/// ([`crate::delegations::waiting_on`]) is among `leaf_ids`. Each with what
+/// the nodes it is named for hold beyond the coins they wait on. The holder
+/// brings that value back by refreshing those coins: such a refresh opens
+/// nothing under the in-flight cap ([`Rounds::within_cap`]) and costs no
+/// refresh fee ([`crate::participations`]), and once its round is final and
+/// the coins released, the watcher reclaims the node. A node waiting on
+/// coins of several holders is named to none of them.
+pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], u64)>, StoreError> {
+	let asked: HashSet<[u8; 32]> = leaf_ids.iter().copied().collect();
+	let mut nodes: BTreeMap<[u8; 32], Option<(Vec<[u8; 32]>, u64)>> = BTreeMap::new();
+	let mut seen: HashSet<([u8; 32], [u8; 32])> = HashSet::new();
+	let mut back: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+	for (id, bl) in store.batch_leaves_under(leaf_ids).await? {
+		let Some(h) = lowest_of(&bl.record) else { continue };
+		if !nodes.contains_key(&h) {
+			let held = held_back_by(store, &bl, h, &asked).await?;
+			nodes.insert(h, held);
+		}
+		if let Some(Some((waits, b))) = nodes.get(&h) {
+			if waits.contains(&id) && seen.insert((id, h)) {
+				*back.entry(id).or_default() += b;
+			}
+		}
+	}
+	Ok(leaf_ids.iter().filter_map(|id| back.get(id).map(|b| (*id, *b))).collect())
+}
+
+/// Of node `h` of `bl`'s batch, the coins it still waits on and what it holds
+/// beyond them, when those are all among `asked` and it holds something
+/// more ([`holding_back`]).
+async fn held_back_by(store: &Store, bl: &crate::store::BatchLeafRow, h: [u8; 32], asked: &HashSet<[u8; 32]>)
+	-> Result<Option<(Vec<[u8; 32]>, u64)>, StoreError>
+{
+	let Some(round) = store.round(bl.round_id).await? else { return Ok(None) };
+	if !matches!(round.state, RoundState::Broadcast | RoundState::Final) {
+		return Ok(None);
+	}
+	let Some((batch, leaves)) = store.batch(&round.txid, bl.vout).await? else { return Ok(None) };
+	let slots: Vec<&crate::store::BatchLeafRow> = leaves.iter().filter(|l| lowest_of(&l.record) == Some(h)).collect();
+	let ids: Vec<[u8; 32]> = slots.iter().map(|l| l.leaf_id).collect();
+	if !crate::delegations::can_complete(store, &ids, h).await? {
+		return Ok(None);
+	}
+	let (mut value, mut waits) = (0u64, vec![]);
+	for l in slots {
+		value = value.saturating_add(l.value);
+		let Some(w) = crate::delegations::waiting_on(store, l.leaf_id, h, batch.delegated_reclaim, arca_covenant::node::RECLAIM_STEPS).await? else {
+			return Ok(None);
+		};
+		for c in w {
+			if !asked.contains(&c) {
+				return Ok(None);
+			}
+			if !waits.contains(&c) {
+				waits.push(c);
+			}
+		}
+	}
+	let mut waited = 0u64;
+	for c in &waits {
+		waited = waited.saturating_add(store.leaf(c).await?.map_or(0, |l| l.value));
+	}
+	let back = value.saturating_sub(waited);
+	Ok((!waits.is_empty() && back > 0).then_some((waits, back)))
+}
+
 /// A lowest node holding fronted value, as [`Rounds::within_cap`] reads it.
 struct OpenNode {
 	/// Its batch's asset.
 	asset: AssetId,
 	/// Whether its batch has RECLAIM-D.
 	delegated: bool,
-	/// What its leaves hold, which a reclaim of it pays back.
-	value: u64,
 	/// Each slot's batch leaf, owner key and value, in owner order.
 	slots: Vec<([u8; 32], [u8; 32], u64)>,
 }
@@ -399,9 +470,6 @@ struct Lacking {
 	asset: AssetId,
 	/// The slots without their consent yet.
 	slots: Vec<[u8; 32]>,
-	/// What its other slots hold, in flight now: what bringing it back pays
-	/// beyond the slots given up to do so.
-	back: u64,
 }
 
 /// What one participation asks of the in-flight cap ([`Rounds::within_cap`]).
@@ -472,10 +540,18 @@ impl<'a> CapJudge<'a> {
 				*opens.entry(*k).or_default() += v;
 			}
 		}
+		// What bringing those nodes back takes out of flight: each coin in
+		// flight whose every node is then back, and one of them by `group`.
+		// A coin that also rests on a node still held stays in flight.
+		let new = self.brings_back(group);
 		let mut returns: BTreeMap<AssetId, u64> = BTreeMap::new();
-		for h in self.brings_back(group) {
-			let m = &self.missing[&h];
-			*returns.entry(m.asset).or_default() += m.back;
+		if !new.is_empty() {
+			for (a, v, ns) in self.in_flight.values() {
+				let back = ns.iter().all(|n| n.is_some_and(|n| self.back.contains(&n) || new.contains(&n)));
+				if back && ns.iter().any(|n| n.is_some_and(|n| new.contains(&n))) {
+					*returns.entry(*a).or_default() += v;
+				}
+			}
 		}
 		assets.into_iter().find_map(|a| {
 			let f = self.flight.get(&a).copied().unwrap_or(0);
@@ -557,9 +633,14 @@ impl<'a> CapJudge<'a> {
 		self.brings_back(&group).into_iter().filter(|h| !alone.contains(h)).collect()
 	}
 
-	/// Of `asset`, what is in flight on `nodes`.
+	/// Of `asset`, what is in flight on `nodes` and comes back with them:
+	/// each coin resting on one of them whose every node is one of them or
+	/// back already. A coin that also rests on a node that lacks a coin
+	/// nobody offers is not pinned on them.
 	fn pinned(&self, nodes: &HashSet<[u8; 32]>, asset: AssetId) -> u64 {
-		self.in_flight.values().filter(|(a, _, ns)| *a == asset && ns.iter().any(|n| n.is_some_and(|n| nodes.contains(&n))))
+		self.in_flight.values().filter(|(a, _, ns)| *a == asset
+			&& ns.iter().any(|n| n.is_some_and(|n| nodes.contains(&n)))
+			&& ns.iter().all(|n| n.is_some_and(|n| nodes.contains(&n) || self.back.contains(&n))))
 			.map(|(_, v, _)| *v).sum()
 	}
 
@@ -580,13 +661,16 @@ impl<'a> CapJudge<'a> {
 		// waiting frees nothing, so the first of them that would bring such
 		// a node back runs, and the others are judged beside it. Value on a
 		// node that lacks a coin nobody offers is not stuck on them, and
-		// holds the cap as before.
+		// holds the cap as before. The one that runs so opens at most one
+		// cap of new value: the rule frees a node, and never carries fresh
+		// coins of any size past the cap beside it.
 		let mut unstuck: HashSet<AssetId> = HashSet::new();
 		while let Some((i, a)) = {
 			let stuck = self.stuck_nodes(asks, &waiting);
 			waiting.iter().find_map(|i| {
 				let (a, f, _) = self.over(&[&asks[*i]])?;
 				let it = !unstuck.contains(&a) && self.caps[&a] > 0
+					&& asks[*i].opens.get(&a).copied().unwrap_or(0) <= self.caps[&a]
 					&& self.touches(&asks[*i]).any(|h| stuck.contains(h) && self.missing[h].asset == a)
 					&& f <= self.pinned(&stuck, a);
 				it.then_some((*i, a))
@@ -2224,9 +2308,8 @@ impl Rounds {
 			for l in leaves {
 				if let Some(h) = lowest_of(&l.record).filter(|h| open.contains(h)) {
 					let n = nodes.entry(h).or_insert_with(|| OpenNode {
-						asset: AssetId::from_byte_array(batch.asset), delegated: batch.delegated_reclaim, value: 0, slots: vec![],
+						asset: AssetId::from_byte_array(batch.asset), delegated: batch.delegated_reclaim, slots: vec![],
 					});
-					n.value = n.value.saturating_add(l.value);
 					n.slots.push((l.leaf_id, l.owner_key, l.value));
 				}
 			}
@@ -2247,25 +2330,20 @@ impl Rounds {
 			completable.insert(*h);
 			let mut left = arca_covenant::node::RECLAIM_STEPS;
 			let mut lacks = vec![];
-			let mut lacking = 0u64;
-			for (leaf, key, value) in &n.slots {
+			for (leaf, key, _) in &n.slots {
 				let Ok(key) = elements::secp256k1_zkp::XOnlyPublicKey::from_slice(key) else {
 					lacks.push(*leaf);
-					lacking = lacking.saturating_add(*value);
 					continue;
 				};
 				match crate::delegations::consent(&self.store, *leaf, key, *h, left).await? {
 					// Without RECLAIM-D a node comes back by its owners' own
 					// releases only.
 					Some(c) if n.delegated || c.direct() => left = left.saturating_sub(c.steps()),
-					_ => {
-						lacks.push(*leaf);
-						lacking = lacking.saturating_add(*value);
-					},
+					_ => lacks.push(*leaf),
 				}
 			}
 			if !lacks.is_empty() {
-				missing.insert(*h, Lacking { asset: n.asset, slots: lacks, back: n.value.saturating_sub(lacking) });
+				missing.insert(*h, Lacking { asset: n.asset, slots: lacks });
 			}
 		}
 		// What each participation gives up of every capped asset, what of it
@@ -2322,63 +2400,9 @@ impl Rounds {
 		Ok(out)
 	}
 
-	/// Of `leaf_ids` (coins each resting on a batch leaf), the ones that keep
-	/// their lowest node's fronted value from coming back, and nothing else
-	/// does: the node holds coins already given up and released (or moved
-	/// with a delegation), it can come back ([`crate::delegations::can_complete`]),
-	/// and every slot of it without its consent is among `leaf_ids`. Each with
-	/// what the node's other slots hold. The holder brings that value back by
-	/// refreshing those coins: such a refresh opens nothing under the in-flight
-	/// cap ([`Self::within_cap`]), and once its round is final and the coins
-	/// released, the watcher reclaims the node.
+	/// [`holding_back`] in this server's store.
 	pub async fn holding_back(&self, leaf_ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], u64)>, StoreError> {
-		let asked: HashSet<[u8; 32]> = leaf_ids.iter().copied().collect();
-		let mut nodes: BTreeMap<[u8; 32], Option<u64>> = BTreeMap::new();
-		let mut out = vec![];
-		for id in leaf_ids {
-			let Some(bl) = self.store.batch_leaf(id).await? else { continue };
-			let Some(h) = lowest_of(&bl.record) else { continue };
-			if !nodes.contains_key(&h) {
-				let back = self.held_back_by(&bl, h, &asked).await?;
-				nodes.insert(h, back);
-			}
-			if let Some(Some(back)) = nodes.get(&h) {
-				out.push((*id, *back));
-			}
-		}
-		Ok(out)
-	}
-
-	/// What node `h` of `bl`'s batch holds beyond its slots in `asked`, when
-	/// those are all it waits on ([`Self::holding_back`]).
-	async fn held_back_by(&self, bl: &crate::store::BatchLeafRow, h: [u8; 32], asked: &HashSet<[u8; 32]>) -> Result<Option<u64>, StoreError> {
-		let Some(round) = self.store.round(bl.round_id).await? else { return Ok(None) };
-		if !matches!(round.state, RoundState::Broadcast | RoundState::Final) {
-			return Ok(None);
-		}
-		let Some((batch, leaves)) = self.store.batch(&round.txid, bl.vout).await? else { return Ok(None) };
-		let slots: Vec<&crate::store::BatchLeafRow> = leaves.iter().filter(|l| lowest_of(&l.record) == Some(h)).collect();
-		let ids: Vec<[u8; 32]> = slots.iter().map(|l| l.leaf_id).collect();
-		if !crate::delegations::can_complete(&self.store, &ids, h).await? {
-			return Ok(None);
-		}
-		let mut left = arca_covenant::node::RECLAIM_STEPS;
-		let (mut back, mut lacks_asked, mut lacks_other) = (0u64, false, false);
-		for l in slots {
-			let consent = match elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&l.owner_key) {
-				Ok(key) => crate::delegations::consent(&self.store, l.leaf_id, key, h, left).await?,
-				Err(_) => None,
-			};
-			match consent {
-				Some(c) if batch.delegated_reclaim || c.direct() => {
-					left = left.saturating_sub(c.steps());
-					back = back.saturating_add(l.value);
-				},
-				_ if asked.contains(&l.leaf_id) => lacks_asked = true,
-				_ => lacks_other = true,
-			}
-		}
-		Ok((back > 0 && lacks_asked && !lacks_other).then_some(back))
+		holding_back(&self.store, leaf_ids).await
 	}
 
 	/// Records why `row` waits.
@@ -3997,7 +4021,7 @@ mod tests {
 			let mut missing = BTreeMap::new();
 			let mut flight = BTreeMap::new();
 			for (h, lacks) in nodes {
-				missing.insert(id(*h), Lacking { asset: x(), slots: lacks.iter().map(|l| id(*l)).collect(), back: V });
+				missing.insert(id(*h), Lacking { asset: x(), slots: lacks.iter().map(|l| id(*l)).collect() });
 				flight.insert(id(100 + *h), (x(), V, vec![Some(id(*h))]));
 			}
 			(missing, flight)
@@ -4059,6 +4083,75 @@ mod tests {
 			// the other node waits: in flight is no longer all theirs.
 			let asks = [ask(&[11], &[20]), ask(&[12], &[21]), ask(&[13], &[22]), ask(&[14], &[23])];
 			assert_eq!(judge(&[(1, &[11, 12]), (2, &[13, 14])], 0, &asks), vec![true, true, false, false]);
+		}
+
+		#[test]
+		fn the_unstuck_participation_opens_at_most_one_cap() {
+			// Node 1 holds 10 in flight and lacks 11 (P's) and 12 (Q's). P
+			// gives up 11 beside a billion of fresh value: it waits, and Q,
+			// beside one fresh coin, runs by the rule instead.
+			let caps = BTreeMap::from([(x(), 15)]);
+			let (missing, coins) = world(&[(1, &[11, 12])]);
+			let huge = 1_000_000_000u64;
+			let mut p = ask(&[11], &[]);
+			*p.adds.get_mut(&x()).unwrap() += huge;
+			p.opens.insert(x(), huge);
+			p.given.insert(id(200));
+			let verdicts = CapJudge::new(&caps, BTreeMap::from([(x(), V)]), &coins, &missing).judge(&[p, ask(&[12], &[21])]);
+			// Q's run leaves 3V in flight; P would bring node 1 back (V) and open the rest.
+			assert_eq!(verdicts[0], CapVerdict::Waits { asset: x(), in_flight: 3 * V, would: 2 * V + huge }, "{:?}", verdicts);
+			assert_eq!(verdicts[1], CapVerdict::Runs);
+			// One cap's worth of fresh value is the most it carries.
+			let mut p = ask(&[11], &[]);
+			*p.adds.get_mut(&x()).unwrap() += 15;
+			p.opens.insert(x(), 15);
+			let verdicts = CapJudge::new(&caps, BTreeMap::from([(x(), V)]), &coins, &missing).judge(&[p, ask(&[12], &[21])]);
+			assert_eq!(verdicts, vec![CapVerdict::Runs, CapVerdict::Runs]);
+		}
+
+		#[test]
+		fn a_coin_on_a_node_that_lacks_an_idle_coin_is_not_pinned() {
+			// Node 1 lacks 11 and 12; coin 101 rests on node 1 AND node 2,
+			// which lacks 13 that nobody offers. Bringing node 1 back frees
+			// nothing of coin 101, so waiting is not futile: P and Q wait.
+			let caps = BTreeMap::from([(x(), 15)]);
+			let mut missing = BTreeMap::new();
+			missing.insert(id(1), Lacking { asset: x(), slots: vec![id(11), id(12)] });
+			missing.insert(id(2), Lacking { asset: x(), slots: vec![id(13)] });
+			let mut coins = BTreeMap::new();
+			coins.insert(id(101), (x(), 100, vec![Some(id(1)), Some(id(2))]));
+			let verdicts = CapJudge::new(&caps, BTreeMap::from([(x(), 100)]), &coins, &missing)
+				.judge(&[ask(&[11], &[20]), ask(&[12], &[23])]);
+			assert!(verdicts.iter().all(|v| *v != CapVerdict::Runs), "{:?}", verdicts);
+			// With node 2 lacking nothing the waiting frees, coin 101 rests
+			// on node 1 alone as far as anyone can help: it is pinned there.
+			coins.insert(id(101), (x(), 100, vec![Some(id(1))]));
+			let verdicts = CapJudge::new(&caps, BTreeMap::from([(x(), 100)]), &coins, &missing)
+				.judge(&[ask(&[11], &[20]), ask(&[12], &[23])]);
+			assert_eq!(verdicts, vec![CapVerdict::Runs, CapVerdict::Runs]);
+		}
+
+		#[test]
+		fn a_node_is_credited_with_what_leaves_flight() {
+			// Node 1 lacks 11. Coin 101 (15) rests on node 1 and on node 2,
+			// which lacks 13: node 1's reclaim leaves it in flight, so a
+			// refresh of 11 beside a fresh coin is credited nothing and waits.
+			let caps = BTreeMap::from([(x(), 15)]);
+			let mut missing = BTreeMap::new();
+			missing.insert(id(1), Lacking { asset: x(), slots: vec![id(11)] });
+			missing.insert(id(2), Lacking { asset: x(), slots: vec![id(13)] });
+			let mut coins = BTreeMap::new();
+			coins.insert(id(101), (x(), 15, vec![Some(id(1)), Some(id(2))]));
+			let verdicts = CapJudge::new(&caps, BTreeMap::from([(x(), 15)]), &coins, &missing).judge(&[ask(&[11], &[20])]);
+			assert_eq!(verdicts, vec![CapVerdict::Waits { asset: x(), in_flight: 15, would: 25 }]);
+			// Brought back with node 2 in the same pass, it is credited.
+			let verdicts = CapJudge::new(&caps, BTreeMap::from([(x(), 15)]), &coins, &missing)
+				.judge(&[ask(&[13], &[]), ask(&[11], &[20])]);
+			assert_eq!(verdicts, vec![CapVerdict::Runs, CapVerdict::Runs]);
+			// A coin resting on node 1 alone is credited at its value.
+			coins.insert(id(101), (x(), 15, vec![Some(id(1))]));
+			let verdicts = CapJudge::new(&caps, BTreeMap::from([(x(), 15)]), &coins, &missing).judge(&[ask(&[11], &[20])]);
+			assert_eq!(verdicts, vec![CapVerdict::Runs]);
 		}
 
 		#[test]

@@ -28,9 +28,10 @@
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]); answered at a bounded rate of their own ([`Limiter`]) |
 //! | `bind_mailbox` | POST | by each leaf's owner key's signature over its binding; at the reads' rate |
+//! | `holding_back` | POST | by a challenge signed with each key named, answering only for the coins served to them ([`crate::auth`]); at the reads' rate |
 //! | `witness` | POST | no: the heads it hands over are the signer's, signed, and at most four without a valid signature; answered at a bounded rate of its own, for each source and overall ([`Limiter`]) |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -89,6 +90,9 @@ pub struct App {
 	pub anchor_depth: u32,
 	pub max_request: usize,
 	pub challenge_ttl: Duration,
+	/// Whether `holding_back` answers a request that proves no key
+	/// (`Config::holding_back_unauthenticated`).
+	pub holding_back_unauthenticated: bool,
 	/// Bounds the operator nonces handed out.
 	pub nonces: Limiter,
 	/// Bounds the witnesses answered: each reads the signer's record under
@@ -1369,7 +1373,11 @@ async fn participation_status_call(State(app): State<Arc<App>>, body: Result<Byt
 
 /// `POST /v1/holding_back`: of the coins asked after, the ones that alone
 /// keep their lowest node's fronted value from coming back
-/// ([`Rounds::holding_back`]). A read, bounded like the others.
+/// ([`Rounds::holding_back`]). Each key named is proven over a fresh
+/// challenge, as for `owed`, and only the coins served to one of them (owned
+/// by it, bound to it as a mailbox, or posted to it) are asked after: the
+/// answer tells whether the other holders of a node have refreshed, which is
+/// for its holders alone to learn. A read, bounded like the others.
 async fn holding_back(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
 	body: Result<Bytes, BytesRejection>) -> Result<Json<api::HoldingBack>, Refusal>
 {
@@ -1378,7 +1386,25 @@ async fn holding_back(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInf
 	if req.leaf_ids.len() > api::HOLDING_BACK_ASKED {
 		return Err(Refusal::malformed(format!("at most {} coins are asked after at once", api::HOLDING_BACK_ASKED)));
 	}
-	let ids = req.leaf_ids.iter().map(|l| unhex32(l)).collect::<Result<Vec<_>, _>>().map_err(Refusal::malformed)?;
+	if req.keys.len() > owed::MAX_OWED_KEYS {
+		return Err(Refusal::malformed(format!("{} keys; a holding_back read names at most {}", req.keys.len(), owed::MAX_OWED_KEYS)));
+	}
+	let mut ids = req.leaf_ids.iter().map(|l| unhex32(l)).collect::<Result<Vec<_>, _>>().map_err(Refusal::malformed)?;
+	if req.keys.is_empty() {
+		if !app.holding_back_unauthenticated {
+			return Err(Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated",
+				"a holding_back read names the keys whose coins it asks after, each signing a fresh challenge".to_string()));
+		}
+	} else {
+		let challenge = req.challenge.clone().ok_or_else(|| Refusal::malformed("a holding_back read that names keys names their challenge"))?;
+		let mut keys = Vec::with_capacity(req.keys.len());
+		for k in &req.keys {
+			let a = api::Auth { key: k.key.clone(), challenge: challenge.clone(), signature: k.signature.clone() };
+			keys.push(authenticate(&app, "holding_back", &a, &[]).await?.serialize());
+		}
+		let served: HashSet<[u8; 32]> = app.store.served_among(&keys, &ids).await?.into_iter().collect();
+		ids.retain(|l| served.contains(l));
+	}
 	let leaves = app.rounds.holding_back(&ids).await?.into_iter()
 		.map(|(l, back)| api::HoldingBackLeaf { leaf_id: hex(&l), back: back.to_string() }).collect();
 	Ok(Json(api::HoldingBack { leaves }))
