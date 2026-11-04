@@ -1716,7 +1716,10 @@ fit. And when everything of an asset in flight rests on nodes that come back
 only once several of the waiting participations run, waiting frees nothing:
 the first of them runs whatever the cap, once a round for each asset, and the
 others are judged again beside it, so the node comes back. Value on a node
-that lacks a coin nobody offers holds the cap as before.
+that lacks a coin nobody offers holds the cap as before. The operator names
+such coins to their holders (`POST holding_back`), and the wallet library
+refreshes each at its next sync, so no coin left at rest keeps a node's
+value out until its batch's horizon.
 
 Two kinds of refresh run whatever the cap too: one with a coin within six
 days of its first expiry, or, on a board or a batch without a sweep, of its
@@ -2725,6 +2728,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST channel_update` | Co-signs a channel state its owner signed and, for a payment into another channel, signs the receiver's next note (see Channel leaves) |
 | `POST channel_state` | What the server holds of a channel, for its owner's key: its terms, latest signed state with both signatures, latest note, and whether anything waits for the signer |
+| `POST holding_back` | Of up to 64 coins (`leaf_ids`), each resting on a batch leaf, the ones that alone keep their lowest node's fronted value from coming back: the node holds coins already given up and released (or moved with a delegation), it can come back, and every slot of it without its consent is among the coins asked after. Each with what the node's other slots hold (`back`, atoms). A wallet refreshes such a coin at once: its refresh opens nothing under the in-flight cap, and once its round is final and the coins are released the watcher reclaims the node (see Rounds). A read, bounded like the others |
 | `POST participation_status` | A participation's state (`pending`, `issued`, `released`, `void`, `expired`), its unlock hash, its forfeits' refund delay and margins, its round and where each of its outputs is in it, while it is pending why the last round did not take it (`waiting`), once void why it never runs (`void_reason`), once void or expired whether each coin it gave up is its owner's again off the chain (`returned`), and for a take the order it takes (`fill`, with its input and outputs once in a round) and, while its round is held for the takes' forfeits, the round's transaction without its witnesses (`round.tx`) |
 | `POST transfer_status` | How a transfer stands, by its id (`transfer_id`): `recorded` (not yet co-signed), `signed`, or `unknown` (never recorded, or dropped); with `leaf_id`, that output when it is one of the transfer's (`output`: its leaf, owner key, asset and value). Not authenticated: the id names the transfer. A wallet checks a notice that a coin is pending for it by it, when it reads the notice and at every sync while it holds one |
 | `POST withdraw_participation` | Takes back a pending participation for the owners of its coins, each signing its withdrawal digest (see Withdrawing a participation that waits); answered as `participation_status` answers, the participation void; refused `in_round` once a round has taken it |
