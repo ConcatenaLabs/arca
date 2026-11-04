@@ -564,7 +564,14 @@ async fn a_refused_transfer_that_carried_a_delegation_gives_its_coin_back() {
 /// Round 1: one leaf for each of `names` (at most four), all under one lowest
 /// node with RECLAIM-D, on a server whose X is capped at `cap` when given.
 async fn first_leaves(cap: Option<u64>, names: &[&str]) -> (Running, Vec<Coin>) {
+	first_leaves_with(cap, names, false).await
+}
+
+/// [`first_leaves`], `holding_back` answering a request that proves no key
+/// when `keyless`.
+async fn first_leaves_with(cap: Option<u64>, names: &[&str], keyless: bool) -> (Running, Vec<Coin>) {
 	let mut r = Running::start_with(|c, _| {
+		c.holding_back_unauthenticated = keyless;
 		c.batches.delegated_reclaim = true;
 		c.batches.holder_batches = Some(0);
 		if let Some(cap) = cap {
@@ -1882,4 +1889,72 @@ async fn the_unstuck_participation_is_at_most_one_cap() {
 	let named = holding_back(&r, &[&c[1]]);
 	println!("asked after U1: {:?}", named);
 	assert_eq!(named.len(), 1, "{:?}", named);
+}
+
+/// A holder named for two coins of one node refreshes them together for no
+/// fee (arca#612). Node A holds U0, U1 and U2; U0 refreshes and releases, and
+/// the holder of U1 and U2 is named for both. With a refresh fee of 5,000
+/// ppm, each alone at a fee of 0 is refused `fee`, since A comes back only
+/// once both are refreshed and the operator judges the waiver on the
+/// participation's own coins; both in one participation are taken for no
+/// fee. The wallet library asks for them together.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holders_named_coins_of_one_node_are_refreshed_together_for_no_fee() {
+	let cap = VALUE / 2;
+	let (r, c) = first_leaves(Some(cap), &["NT U0", "NT U1", "NT U2"]).await;
+	let x = r.x;
+	let k0 = keypair("NT U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	let both = holding_back(&r, &[&c[1], &c[2]]);
+	println!("asked after U1 and U2: {:?}", both);
+	assert_eq!(both.len(), 2, "both are named to their holder");
+	let mut config = r.server.config();
+	config.fees.refresh_ppm = 5_000;
+	r.server.reload(&config).await.unwrap();
+	for (j, coin) in [&c[1], &c[2]].into_iter().enumerate() {
+		let (w, _) = want_leaf(&keypair(&format!("NT U{} 3", j + 1)), x, VALUE);
+		let (body, _) = participation_body(&[&coin.held], &[w], &[], None, xonly(&r.s), r.chain);
+		let a = r.http.post("submit_participation", &body);
+		println!("U{} alone at a fee of 0: {} {}", j + 1, a.status, a.json);
+		assert_eq!(a.status, 422, "{}", a.json);
+		assert_eq!(a.json["error"]["code"], "fee", "{}", a.json);
+	}
+	let (w1, _) = want_leaf(&keypair("NT U1 4"), x, VALUE);
+	let (w2, _) = want_leaf(&keypair("NT U2 4"), x, VALUE);
+	let (body, _) = participation_body(&[&c[1].held, &c[2].held], &[w1, w2], &[], None, xonly(&r.s), r.chain);
+	let a = r.http.post("submit_participation", &body);
+	println!("U1 and U2 together at a fee of 0: {} {}", a.status, a.json);
+	assert_eq!(a.status, 200, "{}", a.json);
+	assert_eq!(a.json["fees"], json!([]), "{}", a.json);
+}
+
+/// With `holding_back_unauthenticated` on, a request that proves no key is
+/// asked after batch leaves alone, as older libraries ask it (arca#613).
+/// Node A holds U0 to U3; U0 refreshes and releases, and asked with no key
+/// after U1, U2 and U3 the operator names all three. U1 then pays P out of
+/// round with a delegation, keeping change C. Asked with no key after P, C,
+/// U2 and U3 it names nothing: a payment's coins are not batch leaves, and
+/// their lineage would tell whose coins share a node. Their holders, proving
+/// their keys, are named all four.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyless_read_is_asked_after_batch_leaves_alone() {
+	let (r, c) = first_leaves_with(Some(2 * VALUE), &["KL U0", "KL U1", "KL U2", "KL U3"], true).await;
+	let k0 = keypair("KL U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	let leaves = holding_back_by(&r, &[&c[1], &c[2], &c[3]], &[]);
+	println!("no key, asked after U1, U2 and U3: {:?}", leaves);
+	assert_eq!(leaves.len(), 3, "the batch leaves are answered as older libraries ask");
+	let paid = pay(&r, &c[1], &[(keypair("KL P"), 400_000), (keypair("KL U1 change"), 0)], true);
+	let (p, change) = (&paid[0], &paid[1]);
+	let a = r.http.post("holding_back", &holding_back_body(&r, &[p, change, &c[2], &c[3]], &[]));
+	println!("no key, asked after P, C, U2 and U3: {} {}", a.status, a.json);
+	assert_eq!(a.status, 200, "{}", a.json);
+	assert_eq!(a.json["leaves"], json!([]), "a payment's coins are for proven keys only: {}", a.json);
+	let proven = holding_back(&r, &[p, change, &c[2], &c[3]]);
+	println!("their holders, asked after P, C, U2 and U3: {:?}", proven);
+	assert_eq!(proven.len(), 4, "{:?}", proven);
 }

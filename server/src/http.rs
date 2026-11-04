@@ -1395,6 +1395,10 @@ async fn holding_back(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInf
 			return Err(Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated",
 				"a holding_back read names the keys whose coins it asks after, each signing a fresh challenge".to_string()));
 		}
+		// The form older libraries ask, and all it is kept for: coins that are
+		// batch leaves themselves. A payment's coins (the payee's, the payer's
+		// change) tell whose coins share a node, which is for proven keys only.
+		ids = app.store.batch_leaves_among(&ids).await?;
 	} else {
 		let challenge = req.challenge.clone().ok_or_else(|| Refusal::malformed("a holding_back read that names keys names their challenge"))?;
 		let mut keys = Vec::with_capacity(req.keys.len());

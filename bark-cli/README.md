@@ -500,7 +500,10 @@ and a board whose registration never reached the server, are not recovered.
   no fee: on a batch without a sweep nothing else would ask, and its refresh
   gives the operator its capital back. That covers a coin a payment out of
   round made, the payer's change as well as a coin received: it rests on the
-  payer's old node until it is refreshed. A resting order's coin is not asked
+  payer's old node until it is refreshed. Every such coin of an asset is
+  asked for in one participation: a node named for several of the wallet's
+  coins comes back only once all of them are refreshed, and the operator
+  waives the fee for them together, not for one of them alone. A resting order's coin is not asked
   after, since its refresh would cancel the order. A participation whose coin is on
   its way home on the chain is not handed over again; once the operator
   releases it, the wallet takes the new leaves with the preimage the server
@@ -2066,7 +2069,10 @@ its coin there at once, and the node comes back; with the operator charging
 5,000 ppm for a refresh, that refresh pays nothing. A payer whose payee and
 the node's other holder refresh and release has its change named at its next
 `sync`, not before the payee refreshed, and once the change is refreshed and
-released the node comes back by RECLAIM-D.
+released the node comes back by RECLAIM-D. A wallet holding two coins of a
+node beside another wallet's has both named once the other refreshes and
+releases, and its next `sync` refreshes the two in one participation, paying
+nothing under a 5,000 ppm schedule.
 
 `tests/arca_fills.rs` runs the same way: two orders made with SeqDEX's fill
 covenant (their scripts derived by SeqDEX's own `seqob-covenant` when
