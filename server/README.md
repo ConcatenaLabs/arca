@@ -2684,8 +2684,10 @@ meanwhile.
   time (after its claims' deadline, for a batch of claim leaves whose
   deadline is later), the watcher brings what is left of it on the chain, a step a coin
   each pass. A lowest node every owner of which has released it, or
-  consented through a delegation, is left to its RECLAIM or RECLAIM-D above,
-  and an accumulator slot whose owner released it to its release. A slot of
+  consented through a delegation, is left to its RECLAIM or RECLAIM-D above
+  while it is not unrolled (no entry under it on the chain; one that is can
+  no longer be reclaimed, and its coins are collected as any others), and an
+  accumulator slot whose owner released it to its release. A slot of
   an accumulator batch goes out by the operator's own exit authorisation,
   which pays only the slot's own entry, from where the batch is now,
   followed through every exit and release.
@@ -2739,6 +2741,23 @@ meanwhile.
   comes back at the batch's expiry as before (Swept coins are repaid). Step
   the time forward to collect in tranches: each start sets the horizons the
   setting names and no others.
+- **What the operator is owed, collected early.** A batch without a sweep
+  comes back by RECLAIM, by RECLAIM-D, or at its service horizon: a coin
+  given up beside a holder who went away holds the operator's capital until
+  then. `[batches] collect_owed_after_seconds` (off when absent; less than
+  `collect_after_seconds`) collects, from that long after its round, each
+  tree batch without a sweep the way a batch with a sweep is collected early
+  (above): the collection brings on the chain only the coins their owners
+  gave up in a round that is final, down to their leaves, forfeits and
+  claims them, and a coin paid on out of round only where every coin its
+  transfer made was given up so and every coin it spent is a leaf of the
+  same batch. A lowest node every owner of which released or consented is
+  still left to its RECLAIM while it is not unrolled. It lands no live coin: a holder's coin stays in
+  the Ark, its holder's to refresh, pay on or take home at the same fees,
+  until the batch's service horizon, which does not move. A coin given up
+  in a round broadcast but not final is left until that round is final, so
+  nothing is forfeited for a round that could still be lost. Accumulator
+  batches are not collected early: they are collected at their horizon.
 
 - **What a sweep owes.** Each sweep of its own that is final is counted
   once: every coin it took from its holder is recorded owed, the sweep with
@@ -3670,6 +3689,17 @@ later batch is left, and the chain refuses the operator a holder's entry
 spent anywhere but its leaf (`Script evaluated without error but finished
 with a false/empty top stack element`) and its leaf forfeited with another
 coin's signature (`Invalid Schnorr signature`), each forced into a block.
+`tests/owed_collection.rs` collects early the coins the operator is owed in
+a batch without a sweep (`collect_owed_after_seconds`): nothing before the
+age; past it, the coins given up beside holders who went away are forfeited
+and claimed (one through its payer's reassignment), one given up in a round
+not yet final only once that round is final, the reclaimed node left to its
+RECLAIM, no live coin landed and the horizon unmoved; a node unrolled for
+one coin whose other holders then refresh and release it, their coins
+collected rather than left to a RECLAIM that cannot come; the chain refuses the
+operator a holder's entry spent anywhere but its leaf and its leaf forfeited
+with another coin's signature, each forced into a block; and the holders
+beside then refresh, pay on and take their coins home.
 `tests/held_strikes.rs` runs
 participants that drop out of held rounds: a hostile one rejoining with the
 same coin every cycle never shares a round again and every honest refresh

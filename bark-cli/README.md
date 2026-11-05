@@ -1987,6 +1987,13 @@ forfeited and claimed, its own coin is never taken home, and its `sync`
 refreshes it, the operator naming it for no fee, into a batch without a
 sweep for its whole value.
 
+`tests/arca_owed_collection.rs` runs a holder who went away beside a coin
+given up, in a batch without a sweep whose coins the operator is owed are
+collected early (`[batches] collect_owed_after_seconds`): the coin given up
+is forfeited and claimed long before the batch's horizon, the holder's own
+coin is never taken home, and its `sync` refreshes it for its whole value,
+its balance unchanged.
+
 `tests/arca_no_sweep.rs` runs the same way, its operator building batches
 without a sweep (`[batches] no_sweep`): every wallet signs its refresh's
 forfeits against the served round before it is broadcast, a wallet that does

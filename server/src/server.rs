@@ -176,6 +176,17 @@ pub struct BatchesSection {
 	/// `collect_after_seconds` when absent.
 	#[serde(default)]
 	pub collect_sweep_batches_after_seconds: Option<u32>,
+	/// Collects early, this many seconds after its round, the paths to the
+	/// coins the operator is owed in each tree batch without a sweep, as a
+	/// batch with a sweep is collected early ([`crate::watcher`]): the coins
+	/// their owners gave up in a round that is final, down to their leaves,
+	/// forfeited and claimed, and a coin paid on out of round whose transfer's
+	/// coins were all given up so, through its reassignment. It lands no live
+	/// coin: a holder's coin stays in the Ark, refreshable and payable as
+	/// before, until the batch's service horizon. Off when absent; less than
+	/// `collect_after_seconds`.
+	#[serde(default)]
+	pub collect_owed_after_seconds: Option<u32>,
 }
 
 /// How takes of on-chain orders are bounded.
@@ -1823,6 +1834,17 @@ impl Server {
 			}
 			params.collect_after_seconds = c;
 		}
+		let collect_owed_after = match config.batches.collect_owed_after_seconds {
+			Some(0) => return Err(StartError("batches.collect_owed_after_seconds is at least 1".into())),
+			Some(a) if a >= params.collect_after_seconds =>
+				return Err(StartError(format!("batches.collect_owed_after_seconds ({}) is not less than batches.collect_after_seconds ({}): \
+					past the service horizon the whole batch is collected", a, params.collect_after_seconds))),
+			other => other,
+		};
+		if let Some(a) = collect_owed_after {
+			log::info!("tree batches without a sweep have the paths to the coins the operator is owed collected {} s after their round; \
+				their holders' coins stay in the Ark until the service horizon, {} s after it", a, params.collect_after_seconds);
+		}
 		if let Some((min, max)) = config.exit_delay_units {
 			params.min_exit_delay = RelativeTime::from_units(min).map_err(err("exit_delay_units"))?;
 			params.max_exit_delay = RelativeTime::from_units(max).map_err(err("exit_delay_units"))?;
@@ -1905,6 +1927,7 @@ impl Server {
 				block_share_vbytes: config.watcher.block_share_vbytes.max(1),
 				block_interval: Duration::from_secs(config.watcher.block_interval_seconds.max(1)),
 				unroll_at_release: config.watcher.unroll_at_release,
+				collect_owed_after,
 			});
 
 		// The first pass before anything is answered, so the chain is known,

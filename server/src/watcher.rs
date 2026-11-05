@@ -95,17 +95,21 @@
 //!    ([`Params::collect_after_seconds`] after its round) the watcher brings
 //!    what is left of it on the chain, one step a coin a pass
 //!    ([`Watcher::collect_batch`]): a lowest node every owner of which
-//!    released or consented, and an accumulator slot its owner released, is
-//!    left to its reclaim or release (6); every other live coin lands as its
-//!    holder's own leaf (a slot of an accumulator batch by the operator's own
-//!    exit authorisation), every given-up coin is brought down
+//!    released or consented, while it is not unrolled, and an accumulator
+//!    slot its owner released, is left to its reclaim or release (6);
+//!    every other live coin lands as its holder's own leaf (a slot of an
+//!    accumulator batch by the operator's own exit authorisation), every
+//!    given-up coin is brought down
 //!    to its leaf for its forfeit (1, 3), and every coin paid on out of round
 //!    lands through its lineage's checkpoints and reassignments (1). A
 //!    claim leaf of a distribution nobody took up is left to its lapse (8);
 //!    a coin taken up from one lands as any coin paid on out of round. An
 //!    `htlc-1` coin is brought on the chain once its outcome is the
 //!    operator's (a receive past its timeout whose preimage never came, a
-//!    send the operator paid), and refunded or claimed from there.
+//!    send the operator paid), and refunded or claimed from there. With
+//!    `[batches] collect_owed_after_seconds`, a tree batch without a sweep
+//!    older than that has, before its horizon, only the paths to the coins
+//!    the operator is owed collected so, and lands no live coin.
 //!
 //! A fee is paid from the value a transaction takes, or from the margin its
 //! signers left, when the node accepts that asset for fees now (the fee the
@@ -190,6 +194,11 @@ pub struct WatcherConfig {
 	/// Whether every live coin of a released batch is brought on the chain
 	/// under its holder's key before the sweep.
 	pub unroll_at_release: bool,
+	/// How long after its round a tree batch without a sweep has the paths
+	/// to the coins the operator is owed collected, before its service
+	/// horizon (`[batches] collect_owed_after_seconds`; never when `None`):
+	/// see [`Watcher::collect_batch`].
+	pub collect_owed_after: Option<u32>,
 }
 
 impl Default for WatcherConfig {
@@ -197,6 +206,7 @@ impl Default for WatcherConfig {
 		WatcherConfig {
 			reclaim_early: true, max_sweep_inputs: 50, recovery_interval: Duration::from_secs(30),
 			max_claim_inputs: 200, block_share_vbytes: 45_000, block_interval: Duration::from_secs(60), unroll_at_release: true,
+			collect_owed_after: None,
 		}
 	}
 }
@@ -2701,16 +2711,26 @@ impl Watcher {
 	// -----------------------------------------------------------------------
 
 	/// Collects every batch without a sweep past its service horizon
-	/// ([`Params::collect_after_seconds`] after its round): see
-	/// [`Self::collect_batch`].
+	/// ([`Params::collect_after_seconds`] after its round), and, with
+	/// [`WatcherConfig::collect_owed_after`], the paths to the coins the
+	/// operator is owed of each tree batch without a sweep older than that
+	/// and not past its horizon yet: see [`Self::collect_batch`].
 	async fn collections(&self, now: MedianTime) -> Result<(), WatcherError> {
+		let no_sweep = arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
 		for round in self.store.rounds_in(RoundState::Final).await? {
 			for b in self.store.batches(round.round_id).await? {
 				let Some(at) = b.collect_mtp else { continue };
-				if now.to_consensus_u32() < at {
+				let owed_only = if now.to_consensus_u32() >= at {
+					// A batch with a sweep is only ever collected early.
+					b.token != no_sweep
+				} else if b.token == no_sweep && b.kind == arca_covenant::BatchKind::Tree
+					&& self.config.collect_owed_after.is_some_and(|a| now.to_consensus_u32() >= round.created_mtp.saturating_add(a))
+				{
+					true
+				} else {
 					continue;
-				}
-				let r = self.collect_batch(&round, &b, now).await;
+				};
+				let r = self.collect_batch(&round, &b, owed_only, now).await;
 				Self::item(&format!("the collection of the batch at output {} of round {}", b.vout, round.round_id), r)?;
 			}
 		}
@@ -2721,7 +2741,9 @@ impl Watcher {
 	/// step a coin a pass: what the operator fronted comes back on the chain,
 	/// and every holder's coin lands there as its holder's own. A lowest node
 	/// every owner of which has released it, or consented through a
-	/// delegation, is left to its RECLAIM or RECLAIM-D ([`Self::reclaims`]).
+	/// delegation, is left to its RECLAIM or RECLAIM-D ([`Self::reclaims`])
+	/// while it is not unrolled; once an entry under it is on the chain it
+	/// can no longer be reclaimed, and its coins are collected as any others.
 	/// Every other leaf is brought on the chain by the operator's own
 	/// authorisations and the entry's preimage: a live coin under its
 	/// holder's key, as a coin of a released batch is brought
@@ -2736,20 +2758,27 @@ impl Watcher {
 	/// chain once its outcome is the operator's ([`Self::htlc_decided`]),
 	/// and its refund or claim then finishes it; one still open is left.
 	///
-	/// A batch with a sweep collected early (`[batches]
-	/// collect_sweep_batches_before`) is still its holders' to refresh until
-	/// its own expiry, so its collection lands no live coin: it brings on
-	/// the chain only the coins their owners gave up (their forfeits
-	/// stored), down to their leaves, and a coin paid on out of round only
-	/// where every coin its transfer made was given up too, since its
-	/// reassignment lands them all, and every coin it spent is a leaf of this
-	/// batch, so nothing of another batch moves. A live coin's path may come on the
-	/// chain as far as its entry, which only its own leaf can spend; the
-	/// coin stays where it was, its holder's to refresh. What is left comes
-	/// back at the batch's expiry, as before.
-	async fn collect_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
+	/// With `owed_only`, the collection takes only the paths to the coins
+	/// the operator is owed, and lands no live coin. So it runs for a batch
+	/// with a sweep collected early (`[batches]
+	/// collect_sweep_batches_before`), still its holders' to refresh until
+	/// its own expiry, and for a tree batch without a sweep before its
+	/// service horizon (`[batches] collect_owed_after_seconds`), its holders'
+	/// to refresh until then. It brings on the chain only the coins their
+	/// owners gave up in a round that is final (their forfeits stored), down
+	/// to their leaves, and a coin paid on out of round only where every coin
+	/// its transfer made was given up so too, since its reassignment lands
+	/// them all, and every coin it spent is a leaf of this batch, so nothing
+	/// of another batch moves. A live coin's path may come on the chain as
+	/// far as its entry, which only its own leaf can spend; the coin stays
+	/// where it was, its holder's to refresh or pay on at the same fees.
+	/// What is left comes back by RECLAIM, at the batch's expiry, or at its
+	/// service horizon, as before.
+	async fn collect_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, owed_only: bool, now: MedianTime)
+		-> Result<(), WatcherError>
+	{
 		let Some((_, leaves)) = self.store.batch(&round.txid, b.vout).await? else { return Ok(()) };
-		let early = b.token != arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
+		let early = owed_only;
 		// What is left to its reclaim: a tree's lowest nodes every slot of
 		// which consents, an accumulator batch's slots whose owners released
 		// them.
@@ -2757,7 +2786,15 @@ impl Watcher {
 			arca_covenant::BatchKind::Tree => {
 				let tree = self.tree(round, b.vout).await?;
 				let (released, consents) = self.slots(b, &tree, &leaves).await?;
-				tree.levels()[0].iter().filter(|n| n.leaves.clone().all(|j| released.contains_key(&j) || consents.contains_key(&j)))
+				// A lowest node already unrolled (an entry under it seen, by a
+				// holder's exit or an earlier collection) can no longer be
+				// reclaimed: its coins are collected as any others, or none
+				// of them would ever come back.
+				let seen = self.store.tree_sightings(round.round_id, b.vout).await?;
+				let unrolled = |n: &arca_covenant::tree::TreeNode| seen.iter()
+					.any(|s| s.kind == TreeScriptKind::Entry && n.leaves.contains(&(s.idx as usize)));
+				tree.levels()[0].iter()
+					.filter(|n| !unrolled(n) && n.leaves.clone().all(|j| released.contains_key(&j) || consents.contains_key(&j)))
 					.flat_map(|n| n.leaves.clone()).collect()
 			},
 			arca_covenant::BatchKind::Accumulator => {
@@ -2799,6 +2836,12 @@ impl Watcher {
 				LeafState::Live if claims.contains(&leaf) => continue,
 				LeafState::Live if early => continue,
 				LeafState::Live => false,
+				LeafState::Spent if early && self.live_forfeit(&leaf).await?.is_some() => {
+					if !self.given_up_final(&leaf).await? {
+						continue;
+					}
+					true
+				},
 				LeafState::Spent if self.live_forfeit(&leaf).await?.is_some() => true,
 				LeafState::Spent => {
 					let outs = self.store.transfer_outputs_of(&leaf).await?;
@@ -2836,19 +2879,19 @@ impl Watcher {
 			}
 		}
 		if live + given > 0 {
-			log::info!("watcher: the batch at output {} of round {}, past its service horizon, is collected: {} live coin(s) brought a step \
-				nearer the chain under their holders' keys, {} given-up coin(s) a step nearer their forfeits", b.vout, round.round_id, live,
-				given);
+			log::info!("watcher: the batch at output {} of round {}, {}, is collected: {} live coin(s) brought a step \
+				nearer the chain under their holders' keys, {} given-up coin(s) a step nearer their forfeits", b.vout, round.round_id,
+				if early { "for the coins the operator is owed" } else { "past its service horizon" }, live, given);
 		}
 		Ok(())
 	}
 
-	/// Whether every coin of `ids` was given up, its forfeit stored: none
-	/// is live or paid on again.
+	/// Whether every coin of `ids` was given up in a round that is final,
+	/// its forfeit stored: none is live or paid on again.
 	async fn all_given_up(&self, ids: &[[u8; 32]]) -> Result<bool, WatcherError> {
 		for id in ids {
 			let given = match self.store.leaf(id).await? {
-				Some(row) if row.state == LeafState::Spent => self.live_forfeit(id).await?.is_some(),
+				Some(row) if row.state == LeafState::Spent => self.given_up_final(id).await?,
 				_ => false,
 			};
 			if !given {
@@ -2856,6 +2899,14 @@ impl Watcher {
 			}
 		}
 		Ok(!ids.is_empty())
+	}
+
+	/// Whether the coin `leaf` was given up in a round that is final, its
+	/// forfeit stored: an early collection brings nothing down for a forfeit
+	/// whose round could still be lost.
+	async fn given_up_final(&self, leaf: &[u8; 32]) -> Result<bool, WatcherError> {
+		let Some(f) = self.live_forfeit(leaf).await? else { return Ok(false) };
+		Ok(self.store.round(f.round_id).await?.is_some_and(|r| r.state == RoundState::Final))
 	}
 
 	/// Whether the outcome of the `htlc-1` coin `leaf` under `terms` is the

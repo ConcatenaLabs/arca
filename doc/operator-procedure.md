@@ -394,6 +394,12 @@ What it changes for the operator:
   holder's coin (see Batches with a sweep collected early, in the server's
   README). Move the time forward a few days at a time to collect in
   tranches, and remove the setting once their expiry has passed.
+- **What you are owed, sooner.** A coin given up beside a holder who went
+  away holds your capital until the batch's service horizon. Set
+  `[batches] collect_owed_after_seconds` (three days, 259200, is a good
+  start) to have the watcher bring those coins on the chain, forfeit and
+  claim them that long after their round; it lands no holder's coin (see
+  What the operator is owed, collected early, in the server's README).
 - **No plans.** The server refuses offline-refresh plans, and stops an open
   one before its next step.
 - **Accumulator batches without a sweep.** With `accumulator_exit_rate_ppm`
