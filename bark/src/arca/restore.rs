@@ -620,19 +620,13 @@ impl Wallet {
 	/// participation the operator released that this store never made.
 	/// Checked on the owner's signatures by [`Self::restore_given`].
 	fn given_elsewhere(&self, e: &Value) -> Result<bool, Error> {
-		let mut mine: Option<BTreeSet<String>> = None;
 		for g in e["given"].as_array().cloned().unwrap_or_default() {
 			if g["transfer"]["state"] == "signed" {
 				return Ok(true);
 			}
 			let p = &g["participation"];
-			if p["state"] == "released" {
-				if mine.is_none() {
-					mine = Some(self.store.participations()?.into_iter().map(|q| q.0).collect());
-				}
-				if !mine.as_ref().is_some_and(|m| m.contains(p["participation_id"].as_str().unwrap_or(""))) {
-					return Ok(true);
-				}
+			if p["state"] == "released" && self.store.participation_state(p["participation_id"].as_str().unwrap_or(""))?.is_none() {
+				return Ok(true);
 			}
 		}
 		Ok(false)

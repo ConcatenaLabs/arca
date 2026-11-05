@@ -383,10 +383,9 @@ impl Wallet {
 	/// paying the fee where the node accepts the asset.
 	pub(crate) fn progress_orders(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
-		let parts = self.store.participations()?;
 		let now = self.now()?.to_consensus_u32();
 		for (id, terms, _, amount, placed_at, unlock_after) in self.store.orders()? {
-			let Some((_, _, _, _, state, preimage, _)) = parts.iter().find(|p| p.0 == id) else { continue };
+			let Some((_, _, _, _, state, preimage, _)) = self.store.participation(&id)? else { continue };
 			let Some(at) = placed_at else {
 				if state == "released" {
 					let news: Value = serde_json::from_str(&self.store.participation_news(&id)?.unwrap_or_default())
@@ -547,11 +546,10 @@ impl Wallet {
 	/// what it credited, the credits unspent at its credit program, and
 	/// when its REFUND opens. Asks the node only.
 	pub fn orders(&self) -> Result<Value, Error> {
-		let parts = self.store.participations()?;
 		let mut out = vec![];
 		for (id, terms, index, amount, placed_at, _) in self.store.orders()? {
 			let t = Self::order_terms(&terms)?;
-			let state = parts.iter().find(|p| p.0 == id).map(|p| p.4.clone()).unwrap_or_default();
+			let state = self.store.participation_state(&id)?.unwrap_or_default();
 			let s = self.order_standing(&t, amount, placed_at.as_deref(), &state)?;
 			let own = t.maker_prog == self.keys.order_program(index)?;
 			let credits: Vec<Value> = self.chain.coins_at(&[t.maker_script_pubkey()])?.into_iter()
@@ -591,7 +589,7 @@ impl Wallet {
 		let (_, terms, index, amount, placed_at, _) = self.store.orders()?.into_iter().find(|o| o.0 == id)
 			.ok_or_else(|| Error::Refused(format!("the wallet placed no order {}", id)))?;
 		let t = Self::order_terms(&terms)?;
-		let state = self.store.participations()?.into_iter().find(|p| p.0 == id).map(|p| p.4).unwrap_or_default();
+		let state = self.store.participation_state(&id)?.unwrap_or_default();
 		let s = self.order_standing(&t, amount, placed_at.as_deref(), &state)?;
 		let (Some((at, held)), "resting") = (s.at, s.state) else {
 			return Err(Error::Refused(format!("order {} is {}: only an order resting on the chain is refunded", id, s.state)));

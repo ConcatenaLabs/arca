@@ -308,12 +308,11 @@ impl Wallet {
 	/// Then sends again each fill the wallet sent and has no answer to.
 	pub(crate) fn progress_resting(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
-		let parts = self.store.participations()?;
 		for r in self.store.restings()? {
 			if r.state != "participating" {
 				continue;
 			}
-			let Some(p) = parts.iter().find(|p| p.0 == r.id) else { continue };
+			let Some(p) = self.store.participation(&r.id)? else { continue };
 			let state = p.4.as_str();
 			match state {
 				"released" => {},

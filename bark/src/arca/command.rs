@@ -24,10 +24,10 @@ use super::keys::Keys;
 use super::{Config, Error, Wallet};
 
 /// Every command [`run`] takes, with its arguments.
-pub const COMMANDS: &str = "info, address, openamp_key, balance, coins, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
+pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
-	participations, settle_quote {asset, value, expiry}, sync, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
+	participations, settle_quote {asset, value, expiry}, sync {catch_up?}, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
 	refresh_received {max_fee_ppm?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
@@ -156,7 +156,7 @@ fn reads_only(command: &str) -> bool {
 		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
 		| "info" | "supply" | "leaf_template" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
 		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
-		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards")
+		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels")
 }
 
 /// What `arca` runs before a command: the witness (unless the command stays
@@ -229,7 +229,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"address" => w.address(),
 		"openamp_key" => w.openamp_key().map(|k| json!({"key": k.to_string(), "path": "m/5/0"})),
 		"balance" => w.balance(),
-		"coins" => w.coins(),
+		"coins" => w.coins_listed(a["held"].as_bool() == Some(true)),
 		"record" => w.record(req_str(&a["leaf_id"], "the coin")?),
 		"board" => {
 			let amount = opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?;
@@ -291,7 +291,9 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			let expiry = u32::try_from(expiry).map_err(|_| Error::Parse("the expiry is out of range".into()))?;
 			w.settle_quote(asset(req_str(&a["asset"], "the asset")?)?, value, expiry)
 		},
-		"sync" => w.sync(),
+		// `"catch_up": false` from a program that is the only store of its
+		// mnemonic ([`super::Wallet::sync_catching_up`]).
+		"sync" => w.sync_catching_up(a["catch_up"].as_bool() != Some(false)),
 		"hand_over_forfeits" => w.hand_over_forfeits(),
 		"schedule" => w.sync_schedule(),
 		"recheck" => w.recheck(),

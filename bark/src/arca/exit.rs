@@ -1116,7 +1116,7 @@ impl Wallet {
 	fn let_go(&mut self, leaf_id: &str, state: &str) -> Result<(), Error> {
 		match state {
 			"given" => {
-				for (pid, _, given, _, pstate, _, _) in self.store.participations()? {
+				for (pid, _, given, _, pstate, _, _) in self.store.participations_in(&["submitting", "pending", "issued"])? {
 					if matches!(pstate.as_str(), "submitting" | "pending" | "issued") && given.contains(&format!("\"{}\"", leaf_id)) {
 						self.store.set_participation(&pid, "withdrawn", None, None)?;
 					}
@@ -1512,6 +1512,15 @@ impl Wallet {
 	/// date comes is taken at once. What it says includes `schedule`
 	/// ([`Wallet::sync_schedule`]): when it must run next.
 	pub fn sync(&mut self) -> Result<Value, Error> {
+		self.sync_catching_up(true)
+	}
+
+	/// [`Self::sync`]; with `catch_up` false, without the catch-up between
+	/// stores of one mnemonic ([`Self::catch_up`]): for a program that is the
+	/// only store of its mnemonic (a service wallet on one machine), where the
+	/// catch-up can find nothing, and reads every coin ever served to the
+	/// mailbox key to find it. Every other step runs as in [`Self::sync`].
+	pub fn sync_catching_up(&mut self, catch_up: bool) -> Result<Value, Error> {
 		// The schedule's relative times count from this sync.
 		let start = self.now()?.to_consensus_u32();
 		self.store.set_meta(super::wallet::LAST_SYNC, &start.to_string())?;
@@ -1522,7 +1531,7 @@ impl Wallet {
 		let (mut early_home, mut early_exits) = self.exit_steps();
 		*self.exit_watch.borrow_mut() = Some(start);
 		*self.exits_done.borrow_mut() = (vec![], vec![]);
-		let out = self.sync_asking(recheck);
+		let out = self.sync_asking(recheck, catch_up);
 		*self.exit_watch.borrow_mut() = None;
 		let (h, e) = std::mem::take(&mut *self.exits_done.borrow_mut());
 		early_home.extend(h);
@@ -1547,7 +1556,7 @@ impl Wallet {
 
 	/// The part of [`Self::sync`] that asks the operator, with every exit step
 	/// whose date comes meanwhile taken at once ([`Self::exits_meanwhile`]).
-	fn sync_asking(&mut self, recheck: Value) -> Result<Value, Error> {
+	fn sync_asking(&mut self, recheck: Value, catch_up: bool) -> Result<Value, Error> {
 		// What each step cost (milliseconds, and requests of the node and of
 		// the operator): `cost_by_step`, for a program that logs a slow sync.
 		let mut steps = Steps::start(self);
@@ -1602,7 +1611,7 @@ impl Wallet {
 		// What other stores of the mnemonic did: coins they made taken, coins
 		// held here that they gave up given up here too. At most once every
 		// ten minutes ([`super::restore::CATCH_UP_EVERY`]).
-		let caught_up = if talk && self.catch_up_due()? {
+		let caught_up = if talk && catch_up && self.catch_up_due()? {
 			self.catch_up().unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { Value::Null };
 		steps.lap(self, "catch up");

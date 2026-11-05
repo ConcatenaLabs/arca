@@ -253,7 +253,7 @@ impl Wallet {
 	/// in a round.
 	fn out_of_round(&self) -> Result<BTreeMap<AssetId, u64>, Error> {
 		let mut out: BTreeMap<AssetId, u64> = BTreeMap::new();
-		for c in self.store.coins()? {
+		for c in self.store.coins_in_states(&HELD)? {
 			if (c.kind == "transfer" || c.kind == "fill") && HELD.contains(&c.state.as_str()) {
 				let a = AssetId::from_str(&c.asset).map_err(|e| Error::Store(e.to_string()))?;
 				*out.entry(a).or_default() = out.get(&a).copied().unwrap_or(0).saturating_add(c.value);
@@ -413,7 +413,7 @@ impl Wallet {
 		if covered {
 			return Ok(vec![]);
 		}
-		Ok(self.store.coins()?.into_iter()
+		Ok(self.store.coins_in("live")?.into_iter()
 			.filter(|c| (c.kind == "transfer" || c.kind == "fill") && c.state == "live")
 			.map(|c| c.leaf_id).collect())
 	}

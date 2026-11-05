@@ -15,7 +15,7 @@ use arca_covenant::{BoardRecord, Chain, CoinRecord, MedianTime, RelativeTime, Te
 use super::chain::{hex, unhex, unhex32, ChainSource, Finality};
 use super::client::ServerClient;
 use super::keys::{p2wpkh, Keys, CHANGE, ORDERS, RECEIVE};
-use super::store::{CoinRow, Store};
+use super::store::{CoinRow, Store, GONE};
 use super::{random32, Error};
 
 /// The file beside the database that holds the mnemonic.
@@ -188,6 +188,13 @@ pub struct Wallet {
 	/// Each coin's roots, by leaf id, with the bases they were read from
 	/// ([`Wallet::roots_of_row`]).
 	pub(crate) roots_cache: std::cell::RefCell<std::collections::HashMap<String, (Vec<String>, Vec<OutPoint>)>>,
+	/// Each batch coin's unlock hash, by leaf id, read from its record once
+	/// (a record never changes) ([`Wallet::follow_standing_rounds`]).
+	pub(crate) unlock_cache: std::cell::RefCell<std::collections::HashMap<String, Option<String>>>,
+	/// The last expiry of a participation's new leaves in a round, by
+	/// participation and round, read from its news once: its leaves in a
+	/// round never change ([`Wallet::new_leaves_expired`]).
+	pub(crate) expiry_cache: std::cell::RefCell<std::collections::HashMap<(String, String), u32>>,
 	/// The tip the last complete re-check ran at ([`Wallet::recheck`]): a
 	/// command that starts on the same tip needs none ([`Wallet::tip_rechecked`]).
 	pub(crate) rechecked_at: std::cell::RefCell<Option<String>>,
@@ -827,7 +834,8 @@ impl Wallet {
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
-			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default() })
+			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
+			unlock_cache: Default::default(), expiry_cache: Default::default() })
 	}
 
 	/// Whether the wallet asks for `vtxo-2` leaves for itself: in a refresh,
@@ -1368,7 +1376,7 @@ impl Wallet {
 		if let Some(top) = held.first() {
 			add(top, &mut ask);
 		}
-		for c in self.store.coins()? {
+		for c in self.store.coins_in_states(&HELD)? {
 			if c.kind != "transfer" || !HELD.contains(&c.state.as_str()) {
 				continue;
 			}
@@ -1525,7 +1533,7 @@ impl Wallet {
 	fn exit_after(&mut self, at: u64, why: &str) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
 		let given_up = self.given_up_set()?;
-		for c in self.store.coins()? {
+		for c in self.store.coins_in_states(&HELD)? {
 			if c.kind != "transfer" || !HELD.contains(&c.state.as_str()) || (c.state == "forfeited" && given_up.contains(&c.leaf_id)) {
 				continue;
 			}
@@ -1559,14 +1567,21 @@ impl Wallet {
 		Ok(c.state == "forfeited" && self.given_up_set()?.contains(&c.leaf_id))
 	}
 
-	/// Every coin given up in a released participation whose new leaves the
-	/// wallet all holds ([`Self::given_up_for_held_leaves`]), read once: a
-	/// wallet that rests many orders has as many participations as coins, and
-	/// asking per coin read every participation for each.
+	/// Every coin held `forfeited` that was given up in a released
+	/// participation whose new leaves the wallet all holds
+	/// ([`Self::given_up_for_held_leaves`]), read once: a wallet that rests
+	/// many orders has as many participations as coins, and asking per coin
+	/// read every participation for each. Only a coin held `forfeited` is
+	/// ever asked about, so only the participations that gave one up are
+	/// read, and none when the wallet holds none.
 	pub(crate) fn given_up_set(&self) -> Result<std::collections::HashSet<String>, Error> {
 		let mut out = std::collections::HashSet::new();
-		for (_, _, given, wanted, state, _, _) in self.store.participations()? {
-			if state != "released" {
+		let forfeited: Vec<String> = self.store.coins_in("forfeited")?.into_iter().map(|c| c.leaf_id).collect();
+		if forfeited.is_empty() {
+			return Ok(out);
+		}
+		for (_, _, given, wanted, state, _, _) in self.store.participations_in(&["released"])? {
+			if state != "released" || !forfeited.iter().any(|l| given.contains(l.as_str())) {
 				continue;
 			}
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
@@ -1592,7 +1607,7 @@ impl Wallet {
 				}
 			}
 			if held {
-				out.extend(given);
+				out.extend(given.into_iter().filter(|l| forfeited.contains(l)));
 			}
 		}
 		Ok(out)
@@ -1641,7 +1656,7 @@ impl Wallet {
 		// its home date, whatever the operator does: those first (D67), as
 		// the operator's refund follows them closest.
 		let claims = self.receive_home_dates()?;
-		let mut coins = self.store.coins()?;
+		let mut coins = self.store.coins_in_states(Self::HOMEWARD)?;
 		coins.sort_by_key(|c| !claims.get(&c.leaf_id).is_some_and(|h| now >= *h as u64));
 		let given_up = self.given_up_set()?;
 		for c in coins {
@@ -1993,7 +2008,7 @@ impl Wallet {
 		// closed until then.
 		let currents = self.plan_currents()?;
 		let given_up = self.given_up_set()?;
-		for c in self.store.coins()? {
+		for c in self.store.coins_in_states(Self::HOMEWARD)? {
 			if !Self::homeward(&c.state) || (c.state == "forfeited" && given_up.contains(&c.leaf_id)) {
 				continue;
 			}
@@ -2137,7 +2152,7 @@ impl Wallet {
 		// for its forfeits: a refresh giving up coins wakes the wallet too.
 		let held = terms["no_sweep"].as_bool().unwrap_or(false);
 		let mut waiting = false;
-		for (_, body, given, _, state, _, _) in self.store.participations()? {
+		for (_, body, given, _, state, _, _) in self.store.participations_in(&["submitting", "pending", "issued", "forfeiting"])? {
 			if !matches!(state.as_str(), "submitting" | "pending" | "issued" | "forfeiting") {
 				continue;
 			}
@@ -2196,7 +2211,7 @@ impl Wallet {
 	/// again). By leaf id, with the participation's state.
 	pub(crate) fn refused_refreshes(&self) -> Result<BTreeMap<String, String>, Error> {
 		let mut out = BTreeMap::new();
-		for (pid, _, given, _, state, _, _) in self.store.participations()? {
+		for (pid, _, given, _, state, _, _) in self.store.participations_in(&["refused", "void", "expired"])? {
 			if !matches!(state.as_str(), "refused" | "void" | "expired") {
 				continue;
 			}
@@ -2840,7 +2855,7 @@ impl Wallet {
 		};
 		let mut parts = vec![];
 		let mut still_final: BTreeSet<String> = BTreeSet::new();
-		for p in self.store.participations()? {
+		for p in self.store.participations_in(&["released"])? {
 			if p.4 == "released" && p.6.is_some() && !self.new_leaves_expired(&p.0)? {
 				if let Some(r) = p.6.as_deref().filter(|r| known_final.contains(*r)) {
 					still_final.insert(r.to_string());
@@ -3192,7 +3207,7 @@ impl Wallet {
 	fn round_lost(&mut self, round: &Txid) -> Result<Vec<Value>, Error> {
 		let r = round.to_string();
 		let mut back = vec![];
-		for (pid, _, given, wanted, state, _, pround) in self.store.participations()? {
+		for (pid, _, given, wanted, state, _, pround) in self.store.participations_in(&["released", "forfeiting"])? {
 			if pround.as_deref() != Some(r.as_str()) || !matches!(state.as_str(), "released" | "forfeiting") {
 				continue;
 			}
@@ -3269,15 +3284,24 @@ impl Wallet {
 	/// coin says which asset would pay, or that it cannot come home until the
 	/// wallet holds one.
 	pub fn coins(&self) -> Result<Value, Error> {
+		self.coins_listed(false)
+	}
+
+	/// [`Self::coins`], or with `held` only the coins the wallet holds: not
+	/// those it spent, exited or lost, which a wallet that trades all day
+	/// counts by the thousand, and whose rows are then not read at all.
+	pub fn coins_listed(&self, held: bool) -> Result<Value, Error> {
 		let alone = self.keepers()?.0.is_empty();
 		let stopped = self.rolled_back()?.is_some();
 		let unreachable = self.unreachable()?;
 		let refused = self.refused_refreshes()?;
 		let given_up = self.given_up_set()?;
 		let waiting = self.refresh_waiting_coins()?;
+		// Only a coin with an exit recorded can have been kept safe.
+		let exits = self.store.exit_ids()?;
 		let mut fee_view: Option<Vec<FeeHolding>> = None;
 		let mut out = vec![];
-		for c in self.store.coins()? {
+		for c in if held { self.store.coins_not_in(&GONE)? } else { self.store.coins()? } {
 			let mut v = Self::coin_json(&c);
 			// Given up in a refresh the operator has not put in a round (as
 			// the wallet last knew): a payment or a trade that needs it takes
@@ -3287,7 +3311,7 @@ impl Wallet {
 					v["refresh_waiting"] = json!(pid);
 				}
 			}
-			let (kept, reboarded) = self.kept_safe(&c.leaf_id)?;
+			let (kept, reboarded) = if exits.contains(&c.leaf_id) { self.kept_safe(&c.leaf_id)? } else { (false, false) };
 			if kept {
 				v[super::tower::KEPT_SAFE] = json!(true);
 				v["kept_safe_note"] = json!(super::tower::KEPT_SAFE_NOTE);
@@ -3434,13 +3458,16 @@ impl Wallet {
 		// shown apart, and in no total.
 		let awaiting = self.awaiting_preimage()?;
 		let mut per: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
-		for c in self.store.coins()? {
+		// The coins the wallet holds, read once: those it spent or lost,
+		// which no figure here counts, are not read.
+		let held_coins = self.store.coins_not_in(&GONE)?;
+		for c in &held_coins {
 			if matches!(c.state.as_str(), "spent" | "exited" | "lost") {
 				continue;
 			}
-			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" } else { Self::standing(&c) };
+			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" } else { Self::standing(c) };
 			// A channel coin counts the wallet's side of it alone.
-			let worth = self.channel_worth(&c)?.unwrap_or(c.value);
+			let worth = self.channel_worth(c)?.unwrap_or(c.value);
 			*per.entry(c.asset.clone()).or_default().entry(standing.to_string()).or_default() += worth;
 			// Of what is exiting, a coin kept safe on the chain while the
 			// wallet was away, to be boarded back ([`super::tower`]).
@@ -3466,13 +3493,13 @@ impl Wallet {
 		// Each asset held, Arca and on-chain together: a coin whose exit's
 		// claim is out is counted once, as the claim's output on the chain.
 		let mut held: BTreeMap<String, u128> = BTreeMap::new();
-		for c in self.store.coins()? {
+		for c in &held_coins {
 			if matches!(c.state.as_str(), "spent" | "exited" | "lost") || (c.state == "exiting" && c.note.starts_with("claimed by"))
 				|| awaiting.contains(&c.leaf_id)
 			{
 				continue;
 			}
-			*held.entry(c.asset.clone()).or_default() += self.channel_worth(&c)?.unwrap_or(c.value) as u128;
+			*held.entry(c.asset.clone()).or_default() += self.channel_worth(c)?.unwrap_or(c.value) as u128;
 		}
 		for (a, v) in &onchain {
 			*held.entry(a.clone()).or_default() += *v as u128;
