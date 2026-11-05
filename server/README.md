@@ -3621,7 +3621,16 @@ window, the dropped round refused by the node and when forced into a block
 (`bad-txns-inputs-missingorspent`), the others' round built again and
 completed; and at the service horizon an absent holder's coin, and an absent
 receiver's coin paid out of round, landing on the chain as their own leaves,
-while a coin given up is forfeited and claimed. `tests/held_strikes.rs` runs
+while a coin given up is forfeited and claimed. `tests/sweep_collection.rs`
+collects batches with a sweep made before batches without one
+(`collect_sweep_batches_before`): only those batches get a horizon, the
+coins given up on them are forfeited and claimed (one through its payer's
+reassignment), no live coin lands, a coin whose transfer spent a leaf of a
+later batch is left, and the chain refuses the operator a holder's entry
+spent anywhere but its leaf (`Script evaluated without error but finished
+with a false/empty top stack element`) and its leaf forfeited with another
+coin's signature (`Invalid Schnorr signature`), each forced into a block.
+`tests/held_strikes.rs` runs
 participants that drop out of held rounds: a hostile one rejoining with the
 same coin every cycle never shares a round again and every honest refresh
 goes out; the answering participations rebuilt alone first; a struck coin,
