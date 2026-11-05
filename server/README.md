@@ -1707,9 +1707,13 @@ batch: there is nothing for them to outlive.
 An asset's section may cap what the operator fronts for refreshes whose old
 coins have not come back yet (`in_flight_cap`, in atoms, or
 `in_flight_cap_value`, a value at the asset's rate; no cap when absent): the
-value of every coin given up in a round broadcast or final while a batch leaf
-of its asset that it rests on (its own, or one up its lineage of
+value of every coin given up in a round built, broadcast or final while a
+batch leaf of its asset that it rests on (its own, or one up its lineage of
 reassignments) is in a batch neither reclaimed there nor swept (`in_flight`).
+A round held for its forfeits counts from when it is built, so a refresh
+judged while an earlier round of its asset is held waits as it would once
+that round is out, and the rounds built in one forfeit window cannot
+together front past the cap.
 A coin whose own forfeit is final on the chain, brought down by a collection
 (through its lineage's reassignments when it was paid on out of round), counts
 for nothing either.
@@ -4040,6 +4044,10 @@ users' leaves alone and what reclaims paid back; with `holder_batches` 0
 every round strands the maker's four leaves. A maker leaf paid on out of
 round is counted `transferred`.
 
+`tests/held_cap.rs` runs the in-flight cap beside a round held for its
+forfeits: a refresh judged while an earlier round of its asset is held waits
+("1000000 of a cap of 1500000 in flight; this refresh would take it to
+2000000"), as it does once that round is out.
 `tests/release_delegation.rs` runs batches with RECLAIM-D. Two leaves share
 a lowest node; one is paid on twice out of round (each time with change), the
 other kept: while one of the coins it became is held the node waits, even with
