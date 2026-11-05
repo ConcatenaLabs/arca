@@ -236,6 +236,10 @@ struct Memo {
 	/// Answers the node may change while the view stands (its fee whitelist,
 	/// rates and relay floor): kept within one command, between gaps.
 	command: HashMap<String, Kept>,
+	/// The answers [`Memo::command`] held when the last command ended: a
+	/// command that shares that command's look ([`ChainSource::share_view`])
+	/// shares them too.
+	last_command: HashMap<String, Kept>,
 	/// Whether the node takes a batch of calls in one request: unknown until
 	/// one is tried; a proxy that takes one call at a time is asked one by one.
 	batch: Option<bool>,
@@ -415,14 +419,21 @@ impl ChainSource {
 		let mut m = self.memo.lock().expect("the chain memo");
 		m.looked_this_command = false;
 		m.shared = false;
-		m.command.clear();
+		m.last_command = std::mem::take(&mut m.command);
 	}
 
 	/// Lets the command just started answer from another command's look made
 	/// within [`BURST_VIEW_FOR`]: for a command that reads only, of a caller
 	/// that runs it as one of a burst.
 	pub fn share_view(&self) {
-		self.memo.lock().expect("the chain memo").shared = true;
+		let mut m = self.memo.lock().expect("the chain memo");
+		m.shared = true;
+		// The node's rates and whitelist read with that look, as the look
+		// itself: while it serves (no gap since, younger than the burst's
+		// window), so do they.
+		if !Self::look_due(&m) {
+			m.command = std::mem::take(&mut m.last_command);
+		}
 	}
 
 
@@ -1467,6 +1478,14 @@ pub fn unhex32(s: &str) -> Result<[u8; 32], Error> {
 mod test {
 	use super::*;
 
+	/// The gaps are counted for the whole process: the tests that count a
+	/// source's requests, or call for a gap, run one at a time.
+	static GAPS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+	fn serial() -> std::sync::MutexGuard<'static, ()> {
+		GAPS_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+	}
+
 	/// A command that shares the view answers from another's look made within
 	/// BURST_VIEW_FOR; one that does not looks when it starts; one started
 	/// later looks again, and a gap calls for a look at once.
@@ -1487,6 +1506,7 @@ mod test {
 
 	#[test]
 	fn a_burst_of_commands_shares_one_look() {
+		let _serial = serial();
 		let mut m = Memo { looked: Some(web_time::Instant::now()), gaps: GAPS.load(Ordering::SeqCst), ..Default::default() };
 		m.looked_this_command = true;
 		assert!(!ChainSource::look_due(&m), "this command's own fresh look stands");
@@ -1510,6 +1530,7 @@ mod test {
 	/// next must see its own transaction in the mempool.
 	#[test]
 	fn a_broadcast_calls_for_a_look_before_the_next_read() {
+		let _serial = serial();
 		let (url, requests) = picky_proxy();
 		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
 		let sent = || requests.load(Ordering::SeqCst);
@@ -1521,6 +1542,35 @@ mod test {
 		assert_eq!(sent(), n + 1, "the broadcast itself");
 		assert!(chain.validates_anchors().unwrap());
 		assert_eq!(sent(), n + 2, "a look before the next read, though the last was a moment ago");
+	}
+
+	/// A burst of commands that only read shares one look, and the node's
+	/// rates read with it: a page that reads the balance, the coins and the
+	/// rest one after another asks the node once.
+	#[test]
+	fn a_burst_shares_the_rates_read_with_its_look() {
+		let _serial = serial();
+		let (url, requests) = picky_proxy();
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let sent = || requests.load(Ordering::SeqCst);
+		chain.new_command();
+		chain.fee_rates().unwrap();
+		let n = sent();
+		assert!(n >= 1);
+		chain.new_command();
+		chain.share_view();
+		chain.fee_rates().unwrap();
+		assert!(chain.validates_anchors().unwrap());
+		assert_eq!(sent(), n, "the next command of the burst asks the node nothing");
+		chain.new_command();
+		chain.fee_rates().unwrap();
+		assert!(sent() > n, "a command that does not share the view reads them again");
+		let m = sent();
+		gap();
+		chain.new_command();
+		chain.share_view();
+		chain.fee_rates().unwrap();
+		assert!(sent() > m, "and so does one after a gap");
 	}
 
 	#[test]
@@ -1712,6 +1762,7 @@ mod test {
 	/// still asked in batches for the rest.
 	#[test]
 	fn a_look_rides_with_a_read_and_a_refused_method_is_asked_alone() {
+		let _serial = serial();
 		let (url, requests) = picky_proxy();
 		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
 		let sent = || requests.load(Ordering::SeqCst);
@@ -1797,6 +1848,7 @@ mod test {
 	/// read again.
 	#[test]
 	fn a_change_of_the_mempool_keeps_what_the_tip_fixes() {
+		let _serial = serial();
 		let (url, counts) = busy_mempool();
 		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
 		let asked = |m: &str| counts.lock().unwrap().get(m).copied().unwrap_or(0);
@@ -1827,6 +1879,7 @@ mod test {
 	/// the child, the parent goes first, and both are mined.
 	#[test]
 	fn a_chain_a_reorganisation_dropped_is_broadcast_again_parents_first() {
+		let _serial = serial();
 		use sequentia_ext::regtest::Regtest;
 		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
 			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
@@ -1881,6 +1934,7 @@ mod test {
 	/// transaction in no block.
 	#[test]
 	fn a_transaction_whose_parent_can_never_return_is_gone() {
+		let _serial = serial();
 		use sequentia_ext::regtest::Regtest;
 		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
 			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
@@ -1947,6 +2001,7 @@ mod test {
 
 	#[test]
 	fn a_lineage_is_read_from_the_chain_only_once_its_root_is_spent() {
+		let _serial = serial();
 		use sequentia_ext::regtest::Regtest;
 		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
 			eprintln!("SEQUENTIAD_EXEC is not set: skipped");

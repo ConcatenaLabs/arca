@@ -112,13 +112,16 @@ impl Wallet {
 	pub(crate) fn returning(&self) -> Result<Vec<(String, u64)>, Error> {
 		let Some(m) = self.store.meta(OWED_META)? else { return Ok(vec![]) };
 		let entries: Vec<Value> = serde_json::from_str(&m).unwrap_or_default();
-		let done: Vec<String> = self.store.participations()?.into_iter().filter(|p| p.4 == "released").map(|p| p.0).collect();
 		let mut out = vec![];
 		for e in entries {
 			if !matches!(e["state"].as_str(), Some("owed") | Some("claimed")) {
 				continue;
 			}
-			if e["participation_id"].as_str().is_some_and(|p| done.iter().any(|d| d == p)) {
+			let released = match e["participation_id"].as_str() {
+				Some(p) => self.store.participation_state(p)?.as_deref() == Some("released"),
+				None => false,
+			};
+			if released {
 				continue;
 			}
 			let (Some(a), Some(v)) = (e["asset"].as_str(), e["owed"].as_str().and_then(|v| v.parse::<u64>().ok())) else { continue };
@@ -186,7 +189,7 @@ impl Wallet {
 			let (wanted, nonce, entry) = self.repayment_leaf(&info, e, k)?;
 			let id = participation_id(&self.genesis, &self.operator, &[], std::slice::from_ref(&wanted), &[], None);
 			let pid = hex(&id);
-			if self.store.participations()?.iter().any(|p| p.0 == pid) {
+			if self.store.participation_state(&pid)?.is_some() {
 				continue;
 			}
 			let key = self.keys.leaf(&nonce)?;
@@ -218,7 +221,7 @@ impl Wallet {
 	/// participation; one the wallet holds already is followed by `sync`.
 	fn adopt_owed(&mut self, e: &Value) -> Result<Value, Error> {
 		let pid = e["participation_id"].as_str().unwrap_or("").to_string();
-		if self.store.participations()?.iter().any(|p| p.0 == pid) {
+		if self.store.participation_state(&pid)?.is_some() {
 			return Ok(json!({"leaf_id": e["leaf_id"], "state": "claimed", "participation": pid}));
 		}
 		let info = self.server_info()?;

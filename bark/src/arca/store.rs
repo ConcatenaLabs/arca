@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS participation (
 	round TEXT,
 	created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS participation_state ON participation(state);
 CREATE TABLE IF NOT EXISTS transfer (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	body TEXT NOT NULL,
@@ -171,6 +172,7 @@ CREATE TABLE IF NOT EXISTS tower_deposit (
 	updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tower_deposit_owner ON tower_deposit(owner);
+CREATE INDEX IF NOT EXISTS forfeit_participation ON forfeit(participation);
 CREATE TABLE IF NOT EXISTS tower_sealed (id TEXT PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tower_hint (hint TEXT NOT NULL, id TEXT NOT NULL, k INTEGER NOT NULL, PRIMARY KEY (hint, id));
 ";
@@ -213,6 +215,13 @@ pub struct RestingRow {
 	/// `participating`, `published`, `cancelled` or `not_rested`.
 	pub state: String,
 }
+
+/// The states a coin never leaves on its own: what the wallet holds no more.
+pub const GONE: [&str; 3] = ["spent", "exited", "lost"];
+
+/// A participation as the store holds it: `(id, body, given, wanted,
+/// state, preimage, round)`.
+pub type ParticipationRow = (String, String, String, String, String, Option<String>, Option<String>);
 
 /// A coin as the store holds it.
 #[derive(Debug, Clone)]
@@ -734,6 +743,27 @@ impl Store {
 		Ok(rows)
 	}
 
+	/// The coins in none of `states`, in the order [`Self::coins`] gives:
+	/// found through the state's index, so that a coin in one of `states`
+	/// (one the wallet spent long ago, say) is not read, nor its record.
+	pub fn coins_not_in(&self, states: &[&str]) -> Result<Vec<CoinRow>, Error> {
+		if states.is_empty() {
+			return self.coins();
+		}
+		let marks = vec!["?"; states.len()].join(", ");
+		let mut st = self.conn.prepare(&format!("SELECT {} FROM coin WHERE rowid IN (SELECT rowid FROM coin INDEXED BY coin_state \
+			WHERE state NOT IN ({})) ORDER BY created_at, leaf_id", Self::COIN_COLS, marks)).map_err(db)?;
+		let rows = st.query_map(rusqlite::params_from_iter(states.iter()), Self::coin_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// The coins with an exit recorded.
+	pub fn exit_ids(&self) -> Result<std::collections::HashSet<String>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id FROM exit").map_err(db)?;
+		let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(db)?;
+		rows.collect::<Result<_, _>>().map_err(db)
+	}
+
 	/// Every coin's state, by leaf id, without the coins' records.
 	pub fn coin_states(&self) -> Result<BTreeMap<String, String>, Error> {
 		let mut st = self.conn.prepare("SELECT leaf_id, state FROM coin").map_err(db)?;
@@ -795,18 +825,77 @@ impl Store {
 		Ok(())
 	}
 
-	/// `(id, body, given, wanted, state, preimage, round)` of every participation.
-	#[allow(clippy::type_complexity)]
 	/// When the wallet recorded participation `id` (its wall-clock seconds).
 	pub fn participation_created(&self, id: &str) -> Result<Option<u64>, Error> {
 		self.conn.query_row("SELECT created_at FROM participation WHERE id = ?1", params![id], |r| r.get::<_, i64>(0)).optional()
 			.map(|t| t.map(|t| t.max(0) as u64)).map_err(db)
 	}
 
-	pub fn participations(&self) -> Result<Vec<(String, String, String, String, String, Option<String>, Option<String>)>, Error> {
+	/// `(id, body, given, wanted, state, preimage, round)` of every participation, oldest first.
+	pub fn participations(&self) -> Result<Vec<ParticipationRow>, Error> {
 		let mut st = self.conn.prepare("SELECT id, body, given, wanted, state, preimage, round FROM participation ORDER BY created_at").map_err(db)?;
-		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
-			.map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		let rows = st.query_map([], Self::participation_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	fn participation_row(r: &rusqlite::Row) -> rusqlite::Result<ParticipationRow> {
+		Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+	}
+
+	/// Participation `id`, as [`Self::participations`] gives it.
+	pub fn participation(&self, id: &str) -> Result<Option<ParticipationRow>, Error> {
+		self.conn.query_row("SELECT id, body, given, wanted, state, preimage, round FROM participation WHERE id = ?1", params![id],
+			Self::participation_row).optional().map_err(db)
+	}
+
+	/// The round participation `id` was released in, if any.
+	pub fn participation_round(&self, id: &str) -> Result<Option<String>, Error> {
+		Ok(self.conn.query_row("SELECT round FROM participation WHERE id = ?1", params![id], |r| r.get::<_, Option<String>>(0))
+			.optional().map_err(db)?.flatten())
+	}
+
+	/// The participations released whose news holds releases not yet sent
+	/// (`releases`, without `"releases_sent":true`), oldest first: the test
+	/// [`super::Wallet::send_releases`] makes of the news, made by the
+	/// database over the released participations alone.
+	pub fn released_with_releases_unsent(&self) -> Result<Vec<String>, Error> {
+		let mut st = self.conn.prepare("SELECT id FROM participation WHERE rowid IN (SELECT rowid FROM participation INDEXED BY \
+			participation_state WHERE state = 'released') AND instr(news, '\"releases\"') > 0 AND instr(news, '\"releases_sent\":true') = 0 \
+			ORDER BY created_at").map_err(db)?;
+		let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(db)?;
+		rows.collect::<Result<_, _>>().map_err(db)
+	}
+
+	/// The state of participation `id`, if the wallet holds it.
+	pub fn participation_state(&self, id: &str) -> Result<Option<String>, Error> {
+		self.conn.query_row("SELECT state FROM participation WHERE id = ?1", params![id], |r| r.get(0)).optional().map_err(db)
+	}
+
+	/// The participations in any of `states`, in the order
+	/// [`Self::participations`] gives: read by the state's index.
+	pub fn participations_in(&self, states: &[&str]) -> Result<Vec<ParticipationRow>, Error> {
+		if states.is_empty() {
+			return Ok(vec![]);
+		}
+		let marks = vec!["?"; states.len()].join(", ");
+		let mut st = self.conn.prepare(&format!("SELECT id, body, given, wanted, state, preimage, round FROM participation WHERE state IN ({}) \
+			ORDER BY created_at", marks)).map_err(db)?;
+		let rows = st.query_map(rusqlite::params_from_iter(states.iter()), Self::participation_row).map_err(db)?
+			.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// The participations in none of `states`, in the order
+	/// [`Self::participations`] gives: found through the state's index.
+	pub fn participations_not_in(&self, states: &[&str]) -> Result<Vec<ParticipationRow>, Error> {
+		if states.is_empty() {
+			return self.participations();
+		}
+		let marks = vec!["?"; states.len()].join(", ");
+		let mut st = self.conn.prepare(&format!("SELECT id, body, given, wanted, state, preimage, round FROM participation WHERE rowid IN \
+			(SELECT rowid FROM participation INDEXED BY participation_state WHERE state NOT IN ({})) ORDER BY created_at", marks)).map_err(db)?;
+		let rows = st.query_map(rusqlite::params_from_iter(states.iter()), Self::participation_row).map_err(db)?
+			.collect::<Result<Vec<_>, _>>().map_err(db)?;
 		Ok(rows)
 	}
 
@@ -939,6 +1028,14 @@ impl Store {
 		let mut st = self.conn.prepare("SELECT leaf_id, participation, round, connector_vout, unlock_hash, refund_units, margin, from_height,
 			state, note FROM forfeit WHERE leaf_id = ?1 ORDER BY created_at").map_err(db)?;
 		let rows = st.query_map(params![leaf_id], Self::forfeit_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// The forfeits signed for participation `pid`.
+	pub fn forfeits_for(&self, pid: &str) -> Result<Vec<ForfeitRow>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, participation, round, connector_vout, unlock_hash, refund_units, margin, from_height,
+			state, note FROM forfeit WHERE participation = ?1 ORDER BY created_at").map_err(db)?;
+		let rows = st.query_map(params![pid], Self::forfeit_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
 		Ok(rows)
 	}
 
@@ -1210,6 +1307,49 @@ mod tests {
 		assert_eq!(s.coin_states().unwrap()["leaf7"], "exited");
 		let plan: String = s.conn.query_row("EXPLAIN QUERY PLAN SELECT leaf_id FROM coin WHERE state IN ('live', 'pending')", [], |r| r.get(3)).unwrap();
 		assert!(plan.contains("coin_state"), "the query plan reads {}", plan);
+		// The coins held: every coin but those spent, exited or lost, in the
+		// same order, found through the index.
+		let held = ids(s.coins_not_in(&GONE).unwrap());
+		assert_eq!(held, all.iter().filter(|l| ["leaf1", "leaf3", "leaf4", "leaf6"].contains(&l.as_str())).cloned().collect::<Vec<_>>());
+		assert_eq!(ids(s.coins_not_in(&[]).unwrap()), all);
+	}
+
+	/// Participations by id and by state, and the forfeits of one, read
+	/// without reading every participation.
+	#[test]
+	fn participations_are_read_by_id_and_by_state() {
+		let s = Store::open_connection(Connection::open_in_memory().unwrap()).unwrap();
+		for (id, st) in [("p0", "released"), ("p1", "pending"), ("p2", "void"), ("p3", "released"), ("p4", "issued")] {
+			s.put_participation(id, "{}", &format!("[\"{}-coin\"]", id), "[]").unwrap();
+			s.set_participation(id, st, None, (st == "released").then_some("r1")).unwrap();
+		}
+		let ids = |v: Vec<ParticipationRow>| v.into_iter().map(|p| p.0).collect::<Vec<_>>();
+		let all = ids(s.participations().unwrap());
+		assert_eq!(all.len(), 5);
+		assert_eq!(ids(s.participations_in(&["released"]).unwrap()), all.iter().filter(|p| ["p0", "p3"].contains(&p.as_str())).cloned()
+			.collect::<Vec<_>>());
+		assert_eq!(ids(s.participations_not_in(&["void", "released"]).unwrap()), all.iter().filter(|p| ["p1", "p4"].contains(&p.as_str()))
+			.cloned().collect::<Vec<_>>());
+		assert!(s.participations_in(&[]).unwrap().is_empty());
+		assert_eq!(s.participation("p4").unwrap().unwrap().4, "issued");
+		assert!(s.participation("nope").unwrap().is_none());
+		assert_eq!(s.participation_state("p2").unwrap().as_deref(), Some("void"));
+		assert_eq!(s.participation_round("p3").unwrap().as_deref(), Some("r1"));
+		assert_eq!(s.participation_round("p1").unwrap(), None);
+		// Releases still to send: of the released participations, those whose
+		// news holds releases not yet sent.
+		s.set_participation_news("p0", r#"{"releases":[{"leaf_id":"a"}]}"#).unwrap();
+		s.set_participation_news("p3", r#"{"releases":[{"leaf_id":"b"}],"releases_sent":true}"#).unwrap();
+		s.set_participation_news("p1", r#"{"releases":[{"leaf_id":"c"}]}"#).unwrap();
+		assert_eq!(s.released_with_releases_unsent().unwrap(), vec!["p0".to_string()]);
+		s.set_participation_news("p0", r#"{"releases":[{"leaf_id":"a"}],"releases_sent":true}"#).unwrap();
+		assert!(s.released_with_releases_unsent().unwrap().is_empty());
+		let plan: String = s.conn.query_row("EXPLAIN QUERY PLAN SELECT id FROM participation WHERE state IN ('released')", [], |r| r.get(3))
+			.unwrap();
+		assert!(plan.contains("participation_state"), "the query plan reads {}", plan);
+		let plan: String = s.conn.query_row("EXPLAIN QUERY PLAN SELECT leaf_id FROM forfeit WHERE participation = 'p1'", [], |r| r.get(3))
+			.unwrap();
+		assert!(plan.contains("forfeit_participation"), "the query plan reads {}", plan);
 	}
 
 	#[test]

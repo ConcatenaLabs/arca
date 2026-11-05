@@ -103,12 +103,12 @@ const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amou
 `run(command, args)` is the library's `bark::arca::command::run`, which every
 program that embeds the library calls, and takes the command line's commands, each with its
 arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`, `openamp_key`,
-`balance`, `coins`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
+`balance`, `coins {held?}`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
 `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, shown}`, `participations`, `settle_quote {asset,
-value, expiry}`, `sync`, `hand_over_forfeits`, `schedule`,
+value, expiry}`, `sync {catch_up?}`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?}`, `withdraw_participation {participation}`, `refusals`; a payment to an address on the chain from leaves
@@ -152,6 +152,16 @@ each cost (`cost.start` and `cost.command`, each `{ms, node, operator}`: the
 milliseconds and the requests made of the node and of the operator; the
 re-check's own parts are under `start.recheck.ms`, and a `sync` answers what
 each of its steps cost under `cost_by_step`).
+
+A program that holds many coins asks for what it needs. `coins` with `"held":
+true` lists only the coins the wallet holds, leaving out those it spent, exited
+or lost, which a wallet that trades all day counts by the thousand and which are
+then not read at all. `sync` with `"catch_up": false` leaves out the catch-up
+between stores of one mnemonic: a program that is the only store of its mnemonic
+(a service wallet on one machine) has no other store to catch up with, and the
+catch-up reads every coin ever served to its mailbox key to find that out. A
+command that only reads, run as one of a burst, answers from the look at the
+chain another made within three seconds when asked with `"shared_view": true`.
 
 An in-tree swap passes two texts between two wallets. The maker's `swap_offer`
 holds its coins and signs nothing, and answers what it gives, gets and pays (the

@@ -552,7 +552,7 @@ impl Wallet {
 		if st["waiting"].as_str().is_none() || wall < since.saturating_add(WITHDRAW_AFTER) {
 			return Ok(None);
 		}
-		let Some((_, body, given, ..)) = self.store.participations()?.into_iter().find(|p| p.0 == pid) else { return Ok(None) };
+		let Some((_, body, given, ..)) = self.store.participation(&pid)? else { return Ok(None) };
 		let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
 		if !Self::is_refresh(&body) {
 			return Ok(None);

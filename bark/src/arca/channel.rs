@@ -37,7 +37,7 @@ use arca_covenant::{CoinRecord, ExplicitOutput};
 
 use super::chain::{hex, unhex};
 use super::exit::{Here, Payer};
-use super::store::CoinRow;
+use super::store::{CoinRow, GONE};
 use super::wallet::{sign, Wallet};
 use super::Error;
 
@@ -252,7 +252,7 @@ impl Wallet {
 		let planned = self.planned_coins()?;
 		let awaiting = self.awaiting_preimage()?;
 		let mut with_channel: BTreeSet<String> = BTreeSet::new();
-		for c in self.store.coins()? {
+		for c in self.store.coins_not_in(&GONE)? {
 			if !matches!(c.state.as_str(), "spent" | "exited" | "lost") && self.channel_coin(&c.leaf_id).is_ok() {
 				with_channel.insert(c.asset.clone());
 			}
@@ -365,7 +365,7 @@ impl Wallet {
 	/// asking nothing.
 	pub fn channels(&self) -> Result<Value, Error> {
 		let mut out = vec![];
-		for c in self.store.coins()? {
+		for c in self.store.coins_not_in(&GONE)? {
 			if matches!(c.state.as_str(), "spent" | "exited" | "lost") {
 				continue;
 			}

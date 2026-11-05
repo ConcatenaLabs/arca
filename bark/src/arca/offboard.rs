@@ -170,12 +170,11 @@ impl Wallet {
 		// The same offboard asked again (same asset, amount and address)
 		// while the first is still the wallet's to finish: it goes on.
 		let list: Vec<Value> = self.store.meta(OFFBOARDS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-		let parts = self.store.participations()?;
 		for e in list.iter().rev() {
 			let same = e["asset"] == json!(asset.to_string()) && e["amount"] == json!(amount.to_string())
 				&& e["script"] == json!(hex(script.as_bytes())) && e["at"].is_null();
 			let pid = e["offboard"].as_str().unwrap_or("");
-			let open = parts.iter().any(|p| p.0 == pid && matches!(p.4.as_str(), "submitting" | "pending" | "issued" | "forfeiting"));
+			let open = self.store.participation_state(pid)?.is_some_and(|s| matches!(s.as_str(), "submitting" | "pending" | "issued" | "forfeiting"));
 			if same && open {
 				if let Some(v) = self.offboard_under_way(pid)? {
 					return Ok(v);
@@ -213,7 +212,7 @@ impl Wallet {
 		loop {
 			let id = participation_id(&self.genesis, &self.operator, &ids, &wanted, &fees, not_before);
 			let pid = hex(&id);
-			if !self.store.participations()?.iter().any(|p| p.0 == pid) {
+			if self.store.participation_state(&pid)?.is_none() {
 				break;
 			}
 			if not_before.is_none() {
@@ -279,7 +278,7 @@ impl Wallet {
 	/// under way. `None` when the operator neither holds nor takes it: it is
 	/// over, its coins the wallet's.
 	fn offboard_under_way(&mut self, pid: &str) -> Result<Option<Value>, Error> {
-		let Some((_, body, given, _, state, _, _)) = self.store.participations()?.into_iter().find(|p| p.0 == pid) else { return Ok(None) };
+		let Some((_, body, given, _, state, _, _)) = self.store.participation(pid)? else { return Ok(None) };
 		let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
 		let st = if state == "submitting" {
 			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
@@ -331,13 +330,12 @@ impl Wallet {
 		if list.is_empty() {
 			return Ok(vec![]);
 		}
-		let parts = self.store.participations()?;
 		let now = self.now()?.to_consensus_u32();
 		let mut out = vec![];
 		let mut changed = false;
 		for e in list.iter_mut() {
 			let id = e["offboard"].as_str().unwrap_or("").to_string();
-			let Some((_, _, _, _, state, preimage, _)) = parts.iter().find(|p| p.0 == id) else { continue };
+			let Some((_, _, _, _, state, preimage, _)) = self.store.participation(&id)? else { continue };
 			let Some(at) = e["at"].as_str().map(str::to_string) else {
 				if state == "released" {
 					let news: Value = serde_json::from_str(&self.store.participation_news(&id)?.unwrap_or_default())
@@ -405,17 +403,16 @@ impl Wallet {
 	/// wallet's again).
 	pub fn offboards(&self) -> Result<Value, Error> {
 		let list: Vec<Value> = self.store.meta(OFFBOARDS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-		let parts = self.store.participations()?;
 		let mut out = vec![];
 		for e in &list {
 			let id = e["offboard"].as_str().unwrap_or("");
-			let state = parts.iter().find(|p| p.0 == id).map(|p| p.4.as_str()).unwrap_or("unknown");
+			let state = self.store.participation_state(id)?.unwrap_or_else(|| "unknown".into());
 			let script = Script::from(unhex(e["script"].as_str().unwrap_or(""))?);
 			let mut v = json!({"offboard": id, "asset": e["asset"], "amount": e["amount"], "address": self.chain.address(&script)?,
 				"script": e["script"]});
 			match e["at"].as_str() {
 				None => {
-					v["state"] = json!(match state {
+					v["state"] = json!(match state.as_str() {
 						"submitting" | "pending" => "waiting",
 						"issued" | "forfeiting" => "in_round",
 						"released" => "unlocking",

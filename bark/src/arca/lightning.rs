@@ -1016,7 +1016,7 @@ impl Wallet {
 					return Err(Error::Refused(format!("the operator names participation {} for the payment, which is not the one its \
 						hash gives", pid)));
 				}
-				if !self.store.participations()?.iter().any(|p| p.0 == pid) {
+				if self.store.participation_state(&pid)?.is_none() {
 					// No coin given up; one leaf wanted, the wallet's.
 					let wanted = json!([{"nonce": rec["nonce"], "asset": rec["asset"], "value": rec["value"]}]);
 					self.store.atomically(|s| {
@@ -1079,7 +1079,7 @@ impl Wallet {
 		let mut rec = self.receives()?.get(hash).cloned().unwrap_or_default();
 		let handed = rec["state"] == "claiming";
 		let pid = rec["participation"].as_str().unwrap_or("").to_string();
-		if let Some(p) = self.store.participations()?.into_iter().find(|p| p.0 == pid).filter(|_| !handed) {
+		if let Some(p) = self.store.participation(&pid)?.filter(|_| !handed) {
 			if matches!(p.4.as_str(), "void" | "expired" | "refused") {
 				rec["state"] = json!("failed");
 				rec["reason"] = json!(format!("its leaf never came: the participation is {}", p.4));

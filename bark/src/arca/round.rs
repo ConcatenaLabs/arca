@@ -1030,7 +1030,7 @@ impl Wallet {
 	/// again. One a round took is answered `in_round`, its coins still given
 	/// up there, and is completed as any other.
 	pub fn withdraw_participation(&self, pid: &str) -> Result<Value, Error> {
-		let Some((_, body, _, _, state, _, _)) = self.store.participations()?.into_iter().find(|p| p.0 == pid) else {
+		let Some((_, body, _, _, state, _, _)) = self.store.participation(pid)? else {
 			return Err(Error::Refused(format!("the wallet made no participation {}", pid)));
 		};
 		if state != "pending" {
@@ -1085,7 +1085,7 @@ impl Wallet {
 	/// id: that refresh's id.
 	pub(crate) fn refresh_waiting_coins(&self) -> Result<std::collections::BTreeMap<String, String>, Error> {
 		let mut out = std::collections::BTreeMap::new();
-		for (pid, body, given, _, state, _, _) in self.store.participations()? {
+		for (pid, body, given, _, state, _, _) in self.store.participations_in(&["pending"])? {
 			if state != "pending" {
 				continue;
 			}
@@ -1105,7 +1105,7 @@ impl Wallet {
 	/// `asset`, oldest first: each one's id and the coins it gives up.
 	fn pending_refreshes_of(&self, asset: AssetId) -> Result<Vec<(String, Vec<String>)>, Error> {
 		let mut out = vec![];
-		for (pid, body, given, _, state, _, _) in self.store.participations()? {
+		for (pid, body, given, _, state, _, _) in self.store.participations_in(&["pending"])? {
 			if state != "pending" {
 				continue;
 			}
@@ -1314,7 +1314,7 @@ impl Wallet {
 	/// timer of its own, and `sync` runs it first, before anything slower.
 	pub(crate) fn progress_held(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
-		for (pid, body, given, wanted, state, _, _) in self.store.participations()? {
+		for (pid, body, given, wanted, state, _, _) in self.store.participations_in(&["pending", "issued", "forfeiting"])? {
 			if !matches!(state.as_str(), "pending" | "issued" | "forfeiting") {
 				continue;
 			}
@@ -1394,14 +1394,18 @@ impl Wallet {
 	/// not answer for stops no other.
 	pub(crate) fn progress_participations(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
-		for (pid, body, given, wanted, state, _, _) in self.store.participations()? {
+		// A participation completed with its releases not yet taken (the
+		// server was not reached, or its round not final there yet): only
+		// those whose news holds releases not sent are read, not every
+		// participation a wallet ever completed.
+		for pid in self.store.released_with_releases_unsent()? {
+			if let Some(r) = self.send_releases(&pid)? {
+				out.push(json!({"participation": pid, "state": "released", "released": r}));
+			}
+		}
+		for (pid, body, given, wanted, state, _, _) in self.store.participations_not_in(&["released", "void", "expired", "refused", "lost"])? {
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
-			// A participation completed with its releases not yet taken (the
-			// server was not reached, or its round not final there yet).
 			if state == "released" {
-				if let Some(r) = self.send_releases(&pid)? {
-					out.push(json!({"participation": pid, "state": "released", "released": r}));
-				}
 				continue;
 			}
 			if matches!(state.as_str(), "void" | "expired" | "refused" | "lost") {
@@ -2105,7 +2109,7 @@ impl Wallet {
 		let news: Value = serde_json::from_str(&self.store.participation_news(pid)?
 			.ok_or_else(|| Error::Store(format!("participation {} has no new leaves recorded", pid)))?)
 			.map_err(|e| Error::Store(e.to_string()))?;
-		let (given, round) = self.store.participations()?.into_iter().find(|p| p.0 == pid)
+		let (given, round) = self.store.participation(pid)?
 			.map(|p| (p.2, news["round"].as_str().unwrap_or("").to_string()))
 			.ok_or_else(|| Error::Store(format!("no participation {}", pid)))?;
 		let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
@@ -2245,13 +2249,28 @@ impl Wallet {
 	/// which no preimage opens anything. A participation with no new leaves
 	/// recorded has not.
 	pub(crate) fn new_leaves_expired(&self, pid: &str) -> Result<bool, Error> {
-		let Some(news) = self.store.participation_news(pid)? else { return Ok(false) };
-		let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
-		let mut last = 0u32;
-		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
-			let record = NewRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(Error::Store)?;
-			last = last.max(record.schedule().expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX));
-		}
+		// Its leaves in a round never change: their last expiry is read from
+		// the news once a round, not decoded again at every re-check.
+		let round = self.store.participation_round(pid)?.unwrap_or_default();
+		let key = (pid.to_string(), round);
+		let cached = self.expiry_cache.borrow().get(&key).copied();
+		let last = match cached {
+			Some(l) => l,
+			None => {
+				let Some(news) = self.store.participation_news(pid)? else { return Ok(false) };
+				let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
+				let mut last = 0u32;
+				for n in news["leaves"].as_array().cloned().unwrap_or_default() {
+					let record = NewRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(Error::Store)?;
+					last = last.max(record.schedule().expiries().last().map(|e| e.to_consensus_u32()).unwrap_or(u32::MAX));
+				}
+				// Kept once the news names the round its leaves are of.
+				if !key.1.is_empty() && news["round"].as_str() == Some(key.1.as_str()) {
+					self.expiry_cache.borrow_mut().insert(key, last);
+				}
+				last
+			},
+		};
 		Ok(last != 0 && self.now()?.to_consensus_u32() > last)
 	}
 
@@ -2380,7 +2399,7 @@ impl Wallet {
 			return Ok(None);
 		}
 		if self.round_gone(f)? {
-			let pstate = self.store.participations()?.into_iter().find(|p| p.0 == f.participation).map(|p| p.4).unwrap_or_default();
+			let pstate = self.store.participation_state(&f.participation)?.unwrap_or_default();
 			// A coin the operator keeps given up under this forfeit (its
 			// participation will never run) is still to be taken on the
 			// chain: the forfeit may still confirm, from any mempool that
@@ -2441,16 +2460,31 @@ impl Wallet {
 	pub(crate) fn follow_standing_rounds(&mut self) -> Result<Vec<Value>, Error> {
 		let mut changes = vec![];
 		let coins = self.store.coins()?;
-		// Each batch coin's unlock hash, read from its record once: a
-		// participation's rounds are matched against every coin, and a wallet
-		// that rests many orders holds hundreds of both.
-		let unlocks: Vec<Option<String>> = coins.iter().map(|c| (c.kind == "batch").then(|| Self::record_of(c).ok()
-			.and_then(|r| NewRecord::of_coin(&r)).map(|(record, _, _)| hex(&record.unlock_hash()))).flatten()).collect();
-		let opens = |i: usize, round: &str, h: &str| -> bool {
-			let c = &coins[i];
-			c.kind == "batch" && c.bases.iter().any(|b| b == round) && unlocks[i].as_deref() == Some(h)
-		};
-		for (pid, _, given, _, state, _, pround) in self.store.participations()? {
+		// Each batch coin's unlock hash, read from its record once a process
+		// (a record never changes), and the coins each round and unlock hash
+		// open, indexed once: a participation's rounds are matched against
+		// every coin, and a wallet that trades all day holds thousands of both.
+		let mut opening: std::collections::HashMap<(&str, String), Vec<usize>> = std::collections::HashMap::new();
+		{
+			let mut memo = self.unlock_cache.borrow_mut();
+			for (i, c) in coins.iter().enumerate() {
+				if c.kind != "batch" {
+					continue;
+				}
+				let unlock = memo.entry(c.leaf_id.clone()).or_insert_with(|| Self::record_of(c).ok().and_then(|r| NewRecord::of_coin(&r))
+					.map(|(record, _, _)| hex(&record.unlock_hash()))).clone();
+				let Some(unlock) = unlock else { continue };
+				for b in &c.bases {
+					let at = opening.entry((b.as_str(), unlock.clone())).or_default();
+					if at.last() != Some(&i) {
+						at.push(i);
+					}
+				}
+			}
+		}
+		let opened = |round: &str, h: &str| -> Vec<usize> { opening.get(&(round, h.to_string())).cloned().unwrap_or_default() };
+		let state_of: std::collections::HashMap<&str, &str> = coins.iter().map(|c| (c.leaf_id.as_str(), c.state.as_str())).collect();
+		for (pid, _, given, _, state, _, pround) in self.store.participations_not_in(&["submitting", "withdrawn", "refused"])? {
 			if matches!(state.as_str(), "submitting" | "withdrawn" | "refused") {
 				continue;
 			}
@@ -2458,15 +2492,13 @@ impl Wallet {
 			// Its rounds, each with the unlock hash its forfeits name.
 			let mut rounds: BTreeMap<String, String> = BTreeMap::new();
 			let mut forfeits: Vec<ForfeitRow> = vec![];
-			for l in &given {
-				for f in self.store.forfeits_of(l)? {
-					if f.participation == pid {
-						rounds.insert(f.round.clone(), f.unlock_hash.clone());
-						forfeits.push(f);
-					}
+			for f in self.store.forfeits_for(&pid)? {
+				if given.contains(&f.leaf_id) {
+					rounds.insert(f.round.clone(), f.unlock_hash.clone());
+					forfeits.push(f);
 				}
 			}
-			let held_of = |k: &str| -> Vec<&super::store::CoinRow> { (0..coins.len()).filter(|i| opens(*i, k, &rounds[k])).map(|i| &coins[i]).collect() };
+			let held_of = |k: &str| -> Vec<&super::store::CoinRow> { opened(k, &rounds[k]).into_iter().map(|i| &coins[i]).collect() };
 			// One round, released in it, its leaves not lost: nothing to follow.
 			if rounds.len() == 1 && state == "released" && pround.as_deref().is_some_and(|r| rounds.contains_key(r))
 				&& held_of(pround.as_deref().unwrap_or("")).iter().all(|c| c.state != "lost")
@@ -2488,7 +2520,7 @@ impl Wallet {
 				// the chain while the round was out leaves its leaves to the
 				// operator.
 				let refunded = forfeits.iter().any(|f| &f.round == k && matches!(f.state.as_str(), "refunded" | "refunding"));
-				let exited = given.iter().any(|l| coins.iter().any(|c| &c.leaf_id == l && c.state == "exited"));
+				let exited = given.iter().any(|l| state_of.get(l.as_str()) == Some(&"exited"));
 				if refunded || exited {
 					let why = format!("round {} is in the chain again, but the coin given up for this leaf came back to the wallet on \
 						the chain while it was out (by {}): the leaf is the operator's, who sweeps it with its batch", k,
@@ -2557,7 +2589,7 @@ impl Wallet {
 				changes.push(json!({"leaf_id": c.leaf_id, "from": "lost", "to": to, "why": why}));
 			}
 			for (j, h) in rounds.iter().filter(|(j, _)| *j != k) {
-				for c in (0..coins.len()).filter(|i| opens(*i, j, h)).map(|i| &coins[i]).filter(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				for c in opened(j, h).into_iter().map(|i| &coins[i]).filter(|c| matches!(c.state.as_str(), "live" | "pending")) {
 					let why = format!("round {} is out of the chain: round {} of the same participation stands, and the wallet holds its \
 						leaves in their place", j, k);
 					self.store.set_coin_state(&c.leaf_id, "lost", &why)?;
@@ -2593,7 +2625,7 @@ impl Wallet {
 	/// participation `f` belongs to stands in: released in it and in a
 	/// block of the chain. The coin was exchanged for that round's leaves.
 	fn stands_elsewhere(&self, f: &ForfeitRow) -> Result<Option<String>, Error> {
-		let Some(p) = self.store.participations()?.into_iter().find(|p| p.0 == f.participation) else { return Ok(None) };
+		let Some(p) = self.store.participation(&f.participation)? else { return Ok(None) };
 		let Some(round) = p.6.filter(|r| p.4 == "released" && *r != f.round) else { return Ok(None) };
 		let txid = Txid::from_str(&round).map_err(|e| Error::Store(e.to_string()))?;
 		Ok(self.chain.finality(&txid)?.in_chain().then_some(round))
@@ -2604,7 +2636,7 @@ impl Wallet {
 	/// (`f`'s unlock hash).
 	fn holds_preimage(&self, f: &ForfeitRow) -> Result<bool, Error> {
 		let unlock = unhex32(&f.unlock_hash)?;
-		Ok(self.store.participations()?.into_iter().filter(|p| p.0 == f.participation).filter_map(|p| p.5)
+		Ok(self.store.participation(&f.participation)?.into_iter().filter_map(|p| p.5)
 			.filter_map(|pre| unhex32(&pre).ok()).any(|pre| sha256::Hash::hash(&pre).to_byte_array() == unlock))
 	}
 

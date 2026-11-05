@@ -20,6 +20,13 @@
 //!    store no longer places final, and the leaf is uncredited again.
 //! 3. The same for a board: credited by hand while its block is out of the
 //!    chain, it is uncredited by the next pass over the boards.
+//! 4. A burial that drops while the round's block stays in the chain: the
+//!    parent chain reorganises only the Bitcoin blocks above a final round's
+//!    anchor (or a credited board's), so no disconnection names the block,
+//!    and the anchor is no longer buried as deep as finality asks. The next
+//!    pass finds it by the burial depth alone: the round's leaf is
+//!    uncredited, and credited again once the anchor is buried; the same
+//!    with the operator stopped across the reorganisation, and for a board.
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -214,4 +221,119 @@ async fn a_credited_board_out_of_the_chain_is_found_by_the_next_pass() {
 	let took = until("the next pass to find the board no longer final", 30, || http.board_status(&id).json["state"] == "pending").await;
 	println!("a missed disconnection: board {} credited by hand while out of the chain; uncredited by the next pass {} ms later",
 		id, took.as_millis());
+}
+
+/// The block holding `txid`, that block's anchor height on the parent chain,
+/// and its confirmations.
+fn block_of(r: &Running, txid: &Txid) -> (elements::BlockHash, u64, i64) {
+	let v: Value = r.rt.client().call("getrawtransaction", &[json!(txid.to_string()), json!(true)]).unwrap();
+	let b: elements::BlockHash = v["blockhash"].as_str().unwrap().parse().unwrap();
+	let h = r.rt.client().block_header(&b).unwrap();
+	let conf: Value = r.rt.client().call("getblockheader", &[json!(b.to_string())]).unwrap();
+	(b, sequentia_ext::BlockHeaderExt::bitcoin_anchor(&h).height as u64, conf["confirmations"].as_i64().unwrap())
+}
+
+/// The anchor height of the chain's tip.
+fn tip_anchor(r: &Running) -> u64 {
+	let tip = r.rt.client().best_block_hash().unwrap();
+	sequentia_ext::BlockHeaderExt::bitcoin_anchor(&r.rt.client().block_header(&tip).unwrap()).height as u64
+}
+
+/// A round final and its new leaf credited, in a block anchored to a parent
+/// block of its own and buried: the round's txid and the new leaf's key.
+async fn final_round(r: &mut Running) -> (Txid, Keypair) {
+	let (a, x) = (keypair("P A"), r.x);
+	let (a_board, a_tx) = credited_board(r, &a, x).await;
+	r.rt.mine_parent(1).unwrap();
+	r.rt.anchor_to_parent_tip().unwrap();
+	let a2 = keypair("P A, new");
+	let (pa, a2_nonce) = participate(r, &a_board, &a2);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	let txid = built.tx.txid();
+	common::rounds::send_held(r, &txid).await;
+	r.produce().await;
+	r.bury().await;
+	let t0 = Instant::now();
+	while round_row_state(r, &txid).await != Some(RoundState::Final) {
+		assert!(t0.elapsed() < Duration::from_secs(60), "the round final within 60 s");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	let st = status(r, &pa);
+	let (a2_valid, a2_record, round) = validate_new_leaf(r, &pa, 0, &a2, &a2_nonce);
+	if st["state"] != "released" {
+		let a_old = a_board.record.resolve(std::slice::from_ref(&a_tx), &r.policy()).unwrap();
+		let f = forfeit_for(&a_old, &a2_valid, &round, &st);
+		let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&pa),
+			"forfeits": [{"leaf_id": a_board.id.to_string(), "signature": forfeit_sig(&f, &a)}],
+			"leaves": [auths_json(&a2_valid, &a2, created(&a2_record))]})).ok();
+		assert_eq!(done["state"], "released", "{}", done);
+	}
+	assert_eq!(leaf_state(r, &a2), "live");
+	(txid, a2)
+}
+
+/// Case 4 for a round, with the operator up or stopped (`down`) across the
+/// reorganisation.
+async fn burial_drops(down: bool) {
+	let mut r = start().await;
+	let (txid, a2) = final_round(&mut r).await;
+	let (block, anchor, _) = block_of(&r, &txid);
+	println!("round {} final in block {} anchored at P={}, tip anchored at {}", txid, block, anchor, tip_anchor(&r));
+	if down {
+		r.server.stop();
+		println!("operator stopped");
+	}
+	// Only the parent blocks above P are orphaned: the round's block stays.
+	let orphaned = tokio::task::block_in_place(|| r.rt.orphan_parent_from(anchor + 1)).unwrap();
+	let (block_after, _, conf) = block_of(&r, &txid);
+	assert_eq!(block_after, block, "the round's block stays in the chain");
+	assert!(conf > 0, "the round's block in the active chain");
+	println!("parent blocks {}..{} orphaned; round's block {} still in chain (confirmations {}), tip anchored at {}",
+		anchor + 1, anchor + orphaned.len() as u64, block, conf, tip_anchor(&r));
+	if down {
+		r.restart_server().await;
+		println!("operator restarted");
+	}
+	r.synced().await;
+	let rr = &r;
+	let took = until("A2 uncredited after the burial dropped", 60, || leaf_state(rr, &a2) == "pending").await;
+	println!("A2 pending {} ms after sync; round {:?}; status {:?}", took.as_millis(), round_row_state(&r, &txid).await,
+		r.server.rounds.finality().status(&txid).await.unwrap());
+	assert_eq!(round_row_state(&r, &txid).await, Some(RoundState::Broadcast));
+	r.bury().await;
+	let took = until("A2 credited again", 60, || leaf_state(rr, &a2) == "live").await;
+	assert_eq!(round_row_state(&r, &txid).await, Some(RoundState::Final));
+	println!("buried again: A2 live {} ms later", took.as_millis());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_final_round_whose_burial_drops_is_uncredited_until_buried_again() {
+	burial_drops(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burial_that_drops_while_the_operator_is_stopped_is_found_when_it_starts() {
+	burial_drops(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credited_board_whose_burial_drops_is_uncredited_until_buried_again() {
+	let mut r = start().await;
+	let x = r.x;
+	let (held, tx) = credited_board(&mut r, &keypair("PB A"), x).await;
+	let id = held.id;
+	let http = r.http.clone();
+	assert_eq!(http.board_status(&id).json["state"], "credited");
+	let (block, anchor, _) = block_of(&r, &tx.txid());
+	println!("board {} credited in block {} anchored at {}, tip anchored at {}", id, block, anchor, tip_anchor(&r));
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(anchor + 1)).unwrap();
+	let (block_after, _, conf) = block_of(&r, &tx.txid());
+	assert_eq!(block_after, block, "the board's block stays in the chain");
+	assert!(conf > 0, "the board's block in the active chain");
+	r.synced().await;
+	let took = until("the board uncredited after its burial dropped", 60, || http.board_status(&id).json["state"] == "pending").await;
+	println!("board's block still in chain; uncredited {} ms after sync", took.as_millis());
+	r.bury().await;
+	until("the board credited again", 60, || http.board_status(&id).json["state"] == "credited").await;
+	println!("buried again: credited");
 }
