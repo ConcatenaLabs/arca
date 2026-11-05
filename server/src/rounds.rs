@@ -391,14 +391,16 @@ fn lowest_of(record: &[u8]) -> Option<[u8; 32]> {
 /// each rest on the payer's old node), the node can come back
 /// ([`crate::delegations::can_complete`]), something on it is given up or
 /// moved already, and every coin it still waits on
-/// ([`crate::delegations::waiting_on`]) is among `leaf_ids`. Each with what
+/// ([`crate::delegations::waiting_on`]) is among `leaf_ids` or is another
+/// holder's coin at hand ([`ActiveCoins`]). Each with what
 /// the nodes it is named for hold beyond the coins they wait on. The holder
 /// brings that value back by refreshing those coins: such a refresh opens
 /// nothing under the in-flight cap ([`Rounds::within_cap`]) and costs no
 /// refresh fee ([`crate::participations`]), and once its round is final and
 /// the coins released, the watcher reclaims the node. A node waiting on
-/// coins of several holders is named to none of them.
-pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], u64)>, StoreError> {
+/// coins of several holders is named to each of them once every one of
+/// those coins is at hand, and to none while a holder is away.
+pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]], active: &ActiveCoins) -> Result<Vec<([u8; 32], u64)>, StoreError> {
 	let asked: HashSet<[u8; 32]> = leaf_ids.iter().copied().collect();
 	let mut nodes: BTreeMap<[u8; 32], Option<(Vec<[u8; 32]>, u64)>> = BTreeMap::new();
 	let mut seen: HashSet<([u8; 32], [u8; 32])> = HashSet::new();
@@ -406,7 +408,7 @@ pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]]) -> Result<Vec<([
 	for (id, bl) in store.batch_leaves_under(leaf_ids).await? {
 		let Some(h) = lowest_of(&bl.record) else { continue };
 		if !nodes.contains_key(&h) {
-			let held = held_back_by(store, &bl, h, &asked).await?;
+			let held = held_back_by(store, &bl, h, leaf_ids, &asked, active).await?;
 			nodes.insert(h, held);
 		}
 		if let Some(Some((waits, b))) = nodes.get(&h) {
@@ -421,7 +423,8 @@ pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]]) -> Result<Vec<([
 /// Of node `h` of `bl`'s batch, the coins it still waits on and what it holds
 /// beyond them, when those are all among `asked` and it holds something
 /// more ([`holding_back`]).
-async fn held_back_by(store: &Store, bl: &crate::store::BatchLeafRow, h: [u8; 32], asked: &HashSet<[u8; 32]>)
+async fn held_back_by(store: &Store, bl: &crate::store::BatchLeafRow, h: [u8; 32], leaf_ids: &[[u8; 32]], asked: &HashSet<[u8; 32]>,
+	active: &ActiveCoins)
 	-> Result<Option<(Vec<[u8; 32]>, u64)>, StoreError>
 {
 	let Some(round) = store.round(bl.round_id).await? else { return Ok(None) };
@@ -441,7 +444,7 @@ async fn held_back_by(store: &Store, bl: &crate::store::BatchLeafRow, h: [u8; 32
 			return Ok(None);
 		};
 		for c in w {
-			if !asked.contains(&c) {
+			if !asked.contains(&c) && !at_hand(store, active, &c, leaf_ids).await? {
 				return Ok(None);
 			}
 			if !waits.contains(&c) {
@@ -455,6 +458,63 @@ async fn held_back_by(store: &Store, bl: &crate::store::BatchLeafRow, h: [u8; 32
 	}
 	let back = value.saturating_sub(waited);
 	Ok((!waits.is_empty() && back > 0).then_some((waits, back)))
+}
+
+/// How long a coin counts as its holder's at hand ([`ActiveCoins`]) after
+/// its holder last asked after it or gave it up: ten minutes, a few times
+/// what the wallet library's `sync` waits between asks on a timer.
+pub const ACTIVE_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The coins whose holders are at hand: asked after in a `holding_back`
+/// read that proved their keys, or given up in a participation, within
+/// [`ACTIVE_FOR`], each with the keys that did so. [`holding_back`] names a
+/// node's coins to each of its holders once every coin the node waits on is
+/// asked after or at hand: each holder then refreshes its own coins alone,
+/// which opens nothing under the cap, and the node comes back once the last
+/// has. A node with a coin whose holder is away is named to nobody, so no
+/// refresh is fronted on it that waits for that holder. Kept in memory: it
+/// fills again within a sync of a restart.
+#[derive(Default)]
+pub struct ActiveCoins(std::sync::Mutex<ActiveSeen>);
+
+#[derive(Default)]
+struct ActiveSeen {
+	coins: std::collections::HashMap<[u8; 32], (std::time::Instant, Vec<[u8; 32]>)>,
+	pruned: Option<std::time::Instant>,
+}
+
+impl ActiveCoins {
+	/// Records `ids` as at hand now, by the holder proving `keys`; forgets
+	/// what is older than [`ACTIVE_FOR`], at most once a minute.
+	pub fn mark(&self, ids: impl IntoIterator<Item = [u8; 32]>, keys: &[[u8; 32]]) {
+		let now = std::time::Instant::now();
+		let mut g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+		for id in ids {
+			g.coins.insert(id, (now, keys.to_vec()));
+		}
+		if g.pruned.is_none_or(|p| now.duration_since(p) >= std::time::Duration::from_secs(60)) {
+			g.coins.retain(|_, (t, _)| now.duration_since(*t) < ACTIVE_FOR);
+			g.pruned = Some(now);
+		}
+	}
+
+	/// The keys that last marked `id` at hand, within [`ACTIVE_FOR`].
+	fn keys_of(&self, id: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+		let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+		g.coins.get(id).filter(|(t, _)| t.elapsed() < ACTIVE_FOR).map(|(_, k)| k.clone())
+	}
+}
+
+/// Whether `c`, a coin a node waits on that is not among `asked`, is
+/// another holder's at hand ([`ActiveCoins`]): marked by keys none of the
+/// coins `asked` is served to. A coin marked by the asker's own keys does not
+/// count: one holder's coins of a node are named, and refreshed for no fee,
+/// together, never one without the other.
+async fn at_hand(store: &Store, active: &ActiveCoins, c: &[u8; 32], asked: &[[u8; 32]]) -> Result<bool, StoreError> {
+	match active.keys_of(c) {
+		Some(keys) => Ok(store.served_among(&keys, asked).await?.is_empty()),
+		None => Ok(false),
+	}
 }
 
 /// A lowest node holding fronted value, as [`Rounds::within_cap`] reads it.
@@ -510,12 +570,16 @@ struct CapJudge<'a> {
 	taken: HashSet<[u8; 32]>,
 	/// The nodes those bring back.
 	back: HashSet<[u8; 32]>,
+	/// The participations taken together, each set only for the node it
+	/// brings back with all of them: a round runs each set whole or not at
+	/// all ([`Rounds::whole_sets`]).
+	sets: Vec<Vec<usize>>,
 }
 
 impl<'a> CapJudge<'a> {
 	fn new(caps: &'a BTreeMap<AssetId, u64>, flight: BTreeMap<AssetId, u64>,
 		in_flight: &'a BTreeMap<[u8; 32], (AssetId, u64, Vec<Option<[u8; 32]>>)>, missing: &'a BTreeMap<[u8; 32], Lacking>) -> Self {
-		CapJudge { caps, flight, in_flight, missing, taken: HashSet::new(), back: HashSet::new() }
+		CapJudge { caps, flight, in_flight, missing, taken: HashSet::new(), back: HashSet::new(), sets: vec![] }
 	}
 
 	/// The nodes not brought back yet of which `ask` gives up a lacking slot.
@@ -616,6 +680,7 @@ impl<'a> CapJudge<'a> {
 				for j in &group {
 					runs[*j] = true;
 				}
+				self.sets.push(group.clone());
 				waiting.retain(|j| !group.contains(j));
 				any = true;
 				k = 0;
@@ -648,7 +713,60 @@ impl<'a> CapJudge<'a> {
 			.map(|(_, v, _)| *v).sum()
 	}
 
-	fn judge(mut self, asks: &[CapAsk]) -> Vec<CapVerdict> {
+	/// Of `asset`, what is in flight now and what `group` would add beyond
+	/// what the nodes it brings back return: its new value and that net.
+	fn new_value(&self, group: &[&CapAsk], asset: AssetId) -> (u64, u64, u64) {
+		let opens: u64 = group.iter().map(|a| a.opens.get(&asset).copied().unwrap_or(0)).sum();
+		let new = self.brings_back(group);
+		let returns: u64 = self.in_flight.values().filter(|(a, _, ns)| *a == asset
+			&& ns.iter().all(|n| n.is_some_and(|n| self.back.contains(&n) || new.contains(&n)))
+			&& ns.iter().any(|n| n.is_some_and(|n| new.contains(&n))))
+			.map(|(_, v, _)| *v).sum();
+		(self.flight.get(&asset).copied().unwrap_or(0), opens, opens.saturating_sub(returns))
+	}
+
+	/// A set of waiting participations that together bring back a node
+	/// none of them brings back alone, and that the set rule runs past the
+	/// cap: of each such node not yet back, of an asset not yet freed this
+	/// pass, the waiting participations giving up a slot it lacks, when they
+	/// open at most one cap of new value and, net of what the nodes they
+	/// bring back return, leave at most twice the cap in flight. Of several,
+	/// the one leaving the least in flight. With the set's asset.
+	fn stuck_set(&self, asks: &[CapAsk], waiting: &[usize], freed: &HashSet<AssetId>) -> Option<(Vec<usize>, AssetId)> {
+		let stuck = self.stuck_nodes(asks, waiting);
+		let mut best: Option<(u64, Vec<usize>, AssetId)> = None;
+		for (h, m) in self.missing.iter().filter(|(h, _)| stuck.contains(*h)) {
+			let a = m.asset;
+			let cap = self.caps.get(&a).copied().unwrap_or(0);
+			if freed.contains(&a) || cap == 0 {
+				continue;
+			}
+			let set: Vec<usize> = waiting.iter().copied().filter(|i| m.slots.iter().any(|l| asks[*i].given.contains(l))).collect();
+			let refs: Vec<&CapAsk> = set.iter().map(|i| &asks[*i]).collect();
+			if !self.brings_back(&refs).contains(h) {
+				continue;
+			}
+			let (f, opens, net) = self.new_value(&refs, a);
+			// Every other asset the set gives up stays within its own cap.
+			let others = refs.iter().flat_map(|r| r.adds.keys()).filter(|b| **b != a).all(|b| {
+				let (fb, _, nb) = self.new_value(&refs, *b);
+				nb == 0 || fb.saturating_add(nb) <= self.caps[b]
+			});
+			let after = f.saturating_add(net);
+			if others && opens <= cap && after <= cap.saturating_mul(2) && best.as_ref().is_none_or(|(b, _, _)| after < *b) {
+				best = Some((after, set, a));
+			}
+		}
+		best.map(|(_, set, a)| (set, a))
+	}
+
+	#[cfg(test)]
+	fn judge(self, asks: &[CapAsk]) -> Vec<CapVerdict> {
+		self.judge_sets(asks).0
+	}
+
+	/// [`Self::judge`], with the sets of participations taken together.
+	fn judge_sets(mut self, asks: &[CapAsk]) -> (Vec<CapVerdict>, Vec<Vec<usize>>) {
 		let mut runs = vec![false; asks.len()];
 		let mut waiting = vec![];
 		for (i, ask) in asks.iter().enumerate() {
@@ -668,7 +786,29 @@ impl<'a> CapJudge<'a> {
 		// holds the cap as before. The one that runs so opens at most one
 		// cap of new value: the rule frees a node, and never carries fresh
 		// coins of any size past the cap beside it.
+		//
+		// Before it, the set rule: the waiting participations that together
+		// bring back a node none of them brings back alone run together,
+		// once a pass for each asset, whatever else is in flight, when they
+		// open at most one cap of new value and leave at most twice the cap
+		// in flight net of what the node returns ([`Self::stuck_set`]).
+		// Without it a node shared by several holders, each refreshing its
+		// coin beside fresh ones, stays out while anything else is in flight,
+		// and the cap stays full with it. Both rules share the pass's one
+		// freeing of each asset: a pass fronts at most one cap of new value
+		// beyond the cap through them.
 		let mut unstuck: HashSet<AssetId> = HashSet::new();
+		while let Some((set, a)) = self.stuck_set(asks, &waiting, &unstuck) {
+			unstuck.insert(a);
+			let refs: Vec<&CapAsk> = set.iter().map(|i| &asks[*i]).collect();
+			self.take(&refs);
+			for i in &set {
+				runs[*i] = true;
+			}
+			waiting.retain(|j| !set.contains(j));
+			self.sets.push(set);
+			self.retry(asks, &mut waiting, &mut runs);
+		}
 		while let Some((i, a)) = {
 			let stuck = self.stuck_nodes(asks, &waiting);
 			waiting.iter().find_map(|i| {
@@ -686,7 +826,7 @@ impl<'a> CapJudge<'a> {
 			waiting.retain(|j| *j != i);
 			self.retry(asks, &mut waiting, &mut runs);
 		}
-		runs.iter().enumerate().map(|(i, r)| match r {
+		let verdicts = runs.iter().enumerate().map(|(i, r)| match r {
 			true => CapVerdict::Runs,
 			false => {
 				// Every participation still waiting is over a cap: one that
@@ -696,9 +836,21 @@ impl<'a> CapJudge<'a> {
 					None => CapVerdict::Runs,
 				}
 			},
-		}).collect()
+		}).collect();
+		(verdicts, self.sets)
 	}
 }
+
+/// The members of each of `sets` some member of which is not among `ids`
+/// ([`Rounds::whole_sets`]).
+fn broken_sets(ids: &HashSet<[u8; 32]>, sets: &[Vec<[u8; 32]>]) -> HashSet<[u8; 32]> {
+	sets.iter().filter(|s| s.iter().any(|i| !ids.contains(i))).flatten().copied().collect()
+}
+
+/// Why a participation the in-flight cap took beside others waits when one
+/// of them cannot run in the round ([`Rounds::whole_sets`]).
+const SET_WAITS: &str = "This refresh waits for a later round: it brings a node back together with other holders' refreshes, and one \
+	of them cannot run in this round. Nothing is lost meanwhile.";
 
 /// How close to its first expiry a coin given up must be for its refresh to
 /// run whatever the in-flight cap ([`Rounds::within_cap`]): six days, a day
@@ -938,6 +1090,8 @@ pub struct Rounds {
 	in_flight_seen: Mutex<Option<(std::time::Instant, BTreeMap<[u8; 32], u64>)>>,
 	/// Each participation's holder, once read ([`Rounds::holder_of`]).
 	holders: Mutex<std::collections::HashMap<[u8; 32], Option<[u8; 32]>>>,
+	/// The coins whose holders are at hand ([`ActiveCoins`]).
+	pub active: Arc<ActiveCoins>,
 }
 
 /// A batch a round builds: its asset, its leaves (each a participation's
@@ -1049,10 +1203,11 @@ pub fn issuance_vsize(operator: elements::secp256k1_zkp::XOnlyPublicKey, asset: 
 
 impl Rounds {
 	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, wallet: Arc<Wallet>, nursery: Arc<Nursery>,
-		signer: SignerClient, config: RoundConfig) -> Arc<Rounds>
+		signer: SignerClient, config: RoundConfig, active: Arc<ActiveCoins>) -> Arc<Rounds>
 	{
 		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
-			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), in_flight_seen: Mutex::new(None), holders: Mutex::new(Default::default()) })
+			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), in_flight_seen: Mutex::new(None), holders: Mutex::new(Default::default()),
+			active })
 	}
 
 	/// The finality service this operator follows the chain with.
@@ -1649,9 +1804,19 @@ impl Rounds {
 				},
 			}
 		}
-		let chosen = self.within_cap(chosen, now).await?;
+		let (chosen, sets) = self.within_cap(chosen, now).await?;
 		let chosen = self.fundable_fills(chosen, now).await?;
-		let (mut chosen, ties) = self.tie_reruns(chosen).await?;
+		let chosen = self.whole_sets(chosen, &sets).await?;
+		let (mut chosen, mut ties) = self.tie_reruns(chosen).await?;
+		// A re-run cut there may leave a set short: the rest of it waits, and
+		// the ties are made again for what is left.
+		loop {
+			let kept = self.whole_sets(chosen.clone(), &sets).await?;
+			if kept.len() == chosen.len() {
+				break;
+			}
+			(chosen, ties) = self.tie_reruns(kept).await?;
+		}
 		loop {
 			if chosen.is_empty() {
 				return Ok(None);
@@ -1661,6 +1826,7 @@ impl Rounds {
 				Err(RoundError::Wallet(WalletError::Insufficient { asset: short, need, have })) => {
 					let row = chosen.pop().expect("not empty");
 					self.wait(&row, short, need, have).await?;
+					chosen = self.whole_sets(chosen, &sets).await?;
 				},
 				// The node refused the round: an order spent since it was
 				// checked drops out, and the round is built without it.
@@ -2059,11 +2225,21 @@ impl Rounds {
 		}
 		// What the wallet can fund: a participation whose outputs do not fit
 		// waits, saying why, and delays no other.
-		let chosen = self.within_cap(chosen, now).await?;
+		let (chosen, sets) = self.within_cap(chosen, now).await?;
 		let chosen = self.fundable(chosen, now).await?;
+		let chosen = self.whole_sets(chosen, &sets).await?;
 		// A re-run spends a coin that keeps it apart from every lost round of
 		// its participation's; one with no such coin is never taken.
-		let (mut chosen, ties) = self.tie_reruns(chosen).await?;
+		let (mut chosen, mut ties) = self.tie_reruns(chosen).await?;
+		// A re-run cut there may leave a set short: the rest of it waits, and
+		// the ties are made again for what is left.
+		loop {
+			let kept = self.whole_sets(chosen.clone(), &sets).await?;
+			if kept.len() == chosen.len() {
+				break;
+			}
+			(chosen, ties) = self.tie_reruns(kept).await?;
+		}
 		loop {
 			if chosen.is_empty() {
 				return Ok(None);
@@ -2078,6 +2254,7 @@ impl Rounds {
 					let i = chosen.iter().rposition(|r| r.outputs.iter().any(|o| o.asset == a)).unwrap_or(chosen.len() - 1);
 					let row = chosen.remove(i);
 					self.wait(&row, short, need, have).await?;
+					chosen = self.whole_sets(chosen, &sets).await?;
 				},
 				// The limiter allows no such mint now (it moved since the
 				// participations were taken): they wait, saying why.
@@ -2313,7 +2490,12 @@ impl Rounds {
 	///
 	/// A participation that does not fit alone is judged again together with
 	/// the ones already waiting that give up other last coins of the same
-	/// nodes, and all of them run when together they fit. And when every
+	/// nodes, and all of them run when together they fit. Waiting ones that
+	/// together bring back a node none of them brings back alone run
+	/// together whatever else is in flight, within one cap of new value and
+	/// twice the cap in flight net of the node's return, once a pass for each
+	/// asset ([`CapJudge::stuck_set`]); the round runs each such set whole or
+	/// not at all ([`Rounds::whole_sets`]). And when every
 	/// value of an asset in flight can come back only through refreshes the
 	/// cap holds, waiting cannot free anything: the first of them runs
 	/// whatever the cap (once a pass), and the others are judged again beside
@@ -2327,11 +2509,11 @@ impl Rounds {
 	/// coins out of the Ark), which the float the cap keeps is for. What
 	/// either gives up still counts in flight. Coins on accumulator batches
 	/// count like any others, and never complete a node.
-	async fn within_cap(&self, chosen: Vec<ParticipationRow>, now: MedianTime) -> Result<Vec<ParticipationRow>, RoundError> {
+	async fn within_cap(&self, chosen: Vec<ParticipationRow>, now: MedianTime) -> Result<(Vec<ParticipationRow>, Vec<Vec<[u8; 32]>>), RoundError> {
 		let caps: BTreeMap<AssetId, u64> = self.params.assets.ids().into_iter()
 			.filter_map(|a| self.params.in_flight_cap(&a).map(|c| (a, c))).collect();
 		if caps.is_empty() || chosen.is_empty() {
-			return Ok(chosen);
+			return Ok((chosen, vec![]));
 		}
 		let flight: BTreeMap<AssetId, u64> = self.store.in_flight().await?.into_iter()
 			.map(|(a, v)| (AssetId::from_byte_array(a), v)).collect();
@@ -2434,7 +2616,8 @@ impl Rounds {
 			ask.exempt |= row.outputs.iter().any(|o| matches!(o.kind, WantedKind::Offboard { .. }));
 			asks.push(ask);
 		}
-		let judged = CapJudge::new(&caps, flight, &in_flight, &missing).judge(&asks);
+		let (judged, sets) = CapJudge::new(&caps, flight, &in_flight, &missing).judge_sets(&asks);
+		let sets: Vec<Vec<[u8; 32]>> = sets.into_iter().map(|s| s.into_iter().map(|i| chosen[i].id).collect()).collect();
 		let mut out = Vec::with_capacity(chosen.len());
 		for (row, verdict) in chosen.into_iter().zip(judged) {
 			match verdict {
@@ -2447,12 +2630,34 @@ impl Rounds {
 				},
 			}
 		}
+		Ok((out, sets))
+	}
+
+	/// Of `chosen`, every participation but those of a set the in-flight cap
+	/// took together ([`Rounds::within_cap`]) that has lost a member since
+	/// (to the wallet's funds, a re-run's tie, the batch): the cap credited
+	/// each member with a node that comes back only once all of them run,
+	/// so the rest of the set waits for a round that takes it whole, and
+	/// none of it is fronted on a return that does not come.
+	async fn whole_sets(&self, chosen: Vec<ParticipationRow>, sets: &[Vec<[u8; 32]>]) -> Result<Vec<ParticipationRow>, RoundError> {
+		let broken = broken_sets(&chosen.iter().map(|r| r.id).collect(), sets);
+		if broken.is_empty() {
+			return Ok(chosen);
+		}
+		let mut out = Vec::with_capacity(chosen.len());
+		for row in chosen {
+			if broken.contains(&row.id) {
+				self.wait_for(&row, SET_WAITS).await?;
+			} else {
+				out.push(row);
+			}
+		}
 		Ok(out)
 	}
 
 	/// [`holding_back`] in this server's store.
 	pub async fn holding_back(&self, leaf_ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], u64)>, StoreError> {
-		holding_back(&self.store, leaf_ids).await
+		holding_back(&self.store, leaf_ids, &self.active).await
 	}
 
 	/// Records why `row` waits.
@@ -4204,6 +4409,70 @@ mod tests {
 			coins.insert(id(101), (x(), 15, vec![Some(id(1))]));
 			let verdicts = CapJudge::new(&caps, BTreeMap::from([(x(), 15)]), &coins, &missing).judge(&[ask(&[11], &[20])]);
 			assert_eq!(verdicts, vec![CapVerdict::Runs]);
+		}
+
+		/// A cap of 100 with 10 in flight on node 1 and `extra` on a node no
+		/// waiting participation holds back.
+		fn judge_100(nodes: &[(u8, &[u8])], extra: u64, asks: &[CapAsk]) -> (Vec<CapVerdict>, Vec<Vec<usize>>) {
+			let caps = BTreeMap::from([(x(), 100)]);
+			let (missing, mut coins) = world(nodes);
+			coins.insert(id(250), (x(), extra, vec![Some(id(251))]));
+			let flight = BTreeMap::from([(x(), coins.values().map(|c| c.1).sum::<u64>())]);
+			CapJudge::new(&caps, flight, &coins, &missing).judge_sets(asks)
+		}
+
+		#[test]
+		fn holders_that_bring_a_node_back_run_beside_value_held_elsewhere() {
+			// The testnet's tSEQ, 2026-11-05: node 1 lacks three holders'
+			// coins, each refreshed beside a fresh one, and the asset is over
+			// its cap with value nobody waiting can bring back (95 + 10 of a
+			// cap of 100). The three run together and node 1 comes back; a
+			// refresh beside them that brings nothing back still waits.
+			let asks = [ask(&[11], &[20]), ask(&[], &[24]), ask(&[12], &[21]), ask(&[13], &[22])];
+			let (v, sets) = judge_100(&[(1, &[11, 12, 13])], 95, &asks);
+			assert_eq!(v[0], CapVerdict::Runs);
+			assert_eq!(v[2], CapVerdict::Runs);
+			assert_eq!(v[3], CapVerdict::Runs);
+			// 105 in flight and the set's 60 given up (node 1's 10 and the
+			// set's last coins to come back with it).
+			assert_eq!(v[1], CapVerdict::Waits { asset: x(), in_flight: 165, would: 175 }, "{:?}", v);
+			assert_eq!(sets, vec![vec![0, 2, 3]]);
+			// One holder alone of the three brings nothing back: it waits.
+			let (v, sets) = judge_100(&[(1, &[11, 12, 13])], 95, &[ask(&[11], &[20]), ask(&[12], &[21])]);
+			assert!(v.iter().all(|v| *v != CapVerdict::Runs), "{:?}", v);
+			assert!(sets.is_empty());
+		}
+
+		#[test]
+		fn a_set_carries_at_most_one_cap_and_leaves_at_most_two() {
+			// The set's own new value: P beside nine fresh coins and Q beside
+			// two open 110, past one cap of 100.
+			let p = ask(&[11], &[20, 21, 22, 23, 24, 25, 26, 27, 28]);
+			let (v, _) = judge_100(&[(1, &[11, 12])], 95, &[p, ask(&[12], &[29, 30])]);
+			assert!(v.iter().all(|v| *v != CapVerdict::Runs), "{:?}", v);
+			// What it leaves in flight: 195 + 20 − 10 is past twice the cap.
+			let (v, _) = judge_100(&[(1, &[11, 12])], 185, &[ask(&[11], &[20]), ask(&[12], &[21])]);
+			assert!(v.iter().all(|v| *v != CapVerdict::Runs), "{:?}", v);
+			// At twice the cap exactly it runs.
+			let (v, _) = judge_100(&[(1, &[11, 12])], 180, &[ask(&[11], &[20]), ask(&[12], &[21])]);
+			assert_eq!(v, vec![CapVerdict::Runs, CapVerdict::Runs]);
+		}
+
+		#[test]
+		fn the_set_rule_frees_one_node_a_pass() {
+			// Two nodes, each brought back by two holders: one set a pass.
+			let asks = [ask(&[11], &[20]), ask(&[12], &[21]), ask(&[13], &[22]), ask(&[14], &[23])];
+			let (v, sets) = judge_100(&[(1, &[11, 12]), (2, &[13, 14])], 95, &asks);
+			assert_eq!(v.iter().filter(|v| **v == CapVerdict::Runs).count(), 2, "{:?}", v);
+			assert_eq!(sets.len(), 1);
+		}
+
+		#[test]
+		fn a_set_short_of_a_member_runs_none_of_it() {
+			let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+			let sets = vec![vec![a, b]];
+			assert!(broken_sets(&HashSet::from([a, b, c]), &sets).is_empty());
+			assert_eq!(broken_sets(&HashSet::from([a, c]), &sets), HashSet::from([a, b]));
 		}
 
 		#[test]

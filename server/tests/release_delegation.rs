@@ -1958,3 +1958,336 @@ async fn a_keyless_read_is_asked_after_batch_leaves_alone() {
 	println!("their holders, asked after P, C, U2 and U3: {:?}", proven);
 	assert_eq!(proven.len(), 4, "{:?}", proven);
 }
+
+// ---------------------------------------------------------------------------
+// The in-flight cap on a node several holders bring back (arca#594, #611).
+
+/// What `/v1/info` says a round can pay of `asset` now.
+fn fundable(r: &Running, asset: AssetId) -> u64 {
+	let info = r.http.get("info").json;
+	info["assets"].as_array().unwrap().iter().find(|a| a["asset"] == asset.to_string()).unwrap()["fundable"]
+		.as_str().unwrap().parse().unwrap()
+}
+
+/// The testnet's tSEQ on 2026-11-05, small: an asset over its cap with value
+/// nobody waiting can bring back, and a node that comes back only once
+/// several holders refresh beside fresh coins. Node A holds U0 to U3 and
+/// node B Z0 to Z3. One participation refreshes and releases U0, Z0, Z1 and
+/// Z2 while nothing is in flight, so it runs: A holds U0's coin in flight,
+/// and B three coins that come back only once Z3's holder, who never
+/// refreshes, does. That is four coins in flight against a cap of three and
+/// a half. W0 to W3 are fresh coins on a node holding nothing in flight, and
+/// G one on a batch of its own. Returns the server, the cap, U1 to U3, the
+/// W and G.
+async fn held_elsewhere(tag: &str) -> (Running, u64, Vec<Coin>, Vec<Coin>, Coin) {
+	let cap = VALUE * 7 / 2;
+	let names: Vec<String> = (0..4).map(|j| format!("{} U{}", tag, j)).collect();
+	let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+	let (mut r, c) = first_leaves(Some(cap), &refs).await;
+	let x = r.x;
+	let zk: Vec<Keypair> = (0..4).map(|j| keypair(&format!("{} Z{} board", tag, j))).collect();
+	let zs = boards(&mut r, &zk, x).await;
+	let mut parts = vec![];
+	for (j, b) in zs.iter().enumerate() {
+		let k = keypair(&format!("{} Z{} 1", tag, j));
+		parts.push((submit(&r, &[b], &[k]), k));
+	}
+	round(&r).await;
+	let mut z = vec![];
+	for (((id, nn), k), b) in parts.iter().zip(&zs) {
+		z.push(complete(&r, id, &[b], &[*k], nn, false).await.remove(0));
+	}
+	let gk = [keypair(&format!("{} G board", tag))];
+	let gs = boards(&mut r, &gk, x).await;
+	let kg = keypair(&format!("{} G 1", tag));
+	let (idg, ng) = submit(&r, &[&gs[0]], &[kg]);
+	round(&r).await;
+	let g = complete(&r, &idg, &[&gs[0]], &[kg], &ng, false).await.remove(0);
+	let wk: Vec<Keypair> = (0..4).map(|j| keypair(&format!("{} W{} board", tag, j))).collect();
+	let ws = boards(&mut r, &wk, x).await;
+	let first: Vec<&Coin> = vec![&c[0], &z[0], &z[1], &z[2]];
+	let fk: Vec<Keypair> = (0..4).map(|j| keypair(&format!("{} F{} 2", tag, j))).collect();
+	let (id0, n0) = submit(&r, &first, &fk);
+	let mut wparts = vec![];
+	for (j, w) in ws.iter().enumerate() {
+		let k = keypair(&format!("{} W{} 1", tag, j));
+		wparts.push((submit(&r, &[w], &[k]), k));
+	}
+	round(&r).await;
+	complete(&r, &id0, &first, &fk, &n0, true).await;
+	let mut fresh = vec![];
+	for (((id, nn), k), w) in wparts.iter().zip(&ws) {
+		fresh.push(complete(&r, id, &[w], &[*k], nn, true).await.remove(0));
+	}
+	let before = n(&pool(&r, x), "in_flight");
+	println!("in flight {} of a cap of {}", before, cap);
+	assert_eq!(before, 4 * VALUE, "A holds U0's coin in flight and B three");
+	(r, cap, c[1..].to_vec(), fresh, g)
+}
+
+/// Gives up `coins` in one participation, each for a leaf of its value, under
+/// keys named for `who`.
+fn submit_as(r: &Running, who: &str, coins: &[&Coin]) -> ([u8; 32], Vec<[u8; 32]>, Vec<Keypair>) {
+	let keys: Vec<Keypair> = (0..coins.len()).map(|j| keypair(&format!("{} {}", who, j))).collect();
+	let (id, nn) = submit(r, coins, &keys);
+	(id, nn, keys)
+}
+
+/// Takes participation `id` giving up `coins` back.
+fn withdraw(r: &Running, id: &[u8; 32], coins: &[&Coin]) -> Value {
+	let d = server::participations::withdraw_digest(&r.chain, &xonly(&r.s), id);
+	let sigs: Vec<String> = coins.iter().map(|c| hex(sign_digest(&c.held.key, &d, &random32()).as_ref())).collect();
+	r.http.post("withdraw_participation", &json!({"participation_id": hex(id), "signatures": sigs})).ok()
+}
+
+/// Three holders of node A's last coins, each refreshing it beside a fresh
+/// coin, while the asset is over its cap with value they cannot bring back
+/// (arca#594 as the testnet met it). Two of them alone wait: together they
+/// bring nothing back. Once the third asks, the three run together in one
+/// round, opening three coins against a cap of three and a half and leaving
+/// six in flight net of A's return, within twice the cap. A refresh of a
+/// fresh coin beside them waits: it brings nothing back. A is reclaimed, and
+/// then the cap holds again: G's refresh, which brings nothing back, waits.
+#[tokio::test(flavor = "multi_thread")]
+async fn holders_of_a_node_bring_it_back_while_the_asset_is_over_its_cap() {
+	let (r, cap, u, w, g) = held_elsewhere("HE").await;
+	let x = r.x;
+	let (idp, np, kp) = submit_as(&r, "HE P", &[&u[0], &w[0]]);
+	let (idq, nq, kq) = submit_as(&r, "HE Q", &[&u[1], &w[1]]);
+	let built = r.server.rounds.run_round().await.unwrap();
+	let (sp, sq) = (status(&r, &idp), status(&r, &idq));
+	println!("P and Q alone: {} / {}: {}", sp["state"], sq["state"], sp["waiting"]);
+	assert!(built.is_none(), "nothing runs");
+	assert_eq!((sp["state"].as_str(), sq["state"].as_str()), (Some("pending"), Some("pending")));
+	assert!(sp["waiting"].as_str().unwrap().starts_with("This refresh waits for a later round"), "{}", sp);
+
+	let (idr, nr, kr) = submit_as(&r, "HE R", &[&u[2], &w[2]]);
+	let (idf, _, _) = submit_as(&r, "HE F", &[&w[3]]);
+	let built = r.server.rounds.run_round().await.unwrap().expect("a round is built");
+	let (sp, sq, sr, sf) = (status(&r, &idp), status(&r, &idq), status(&r, &idr), status(&r, &idf));
+	println!("with R: P {} / Q {} / R {} / fresh {}: {}", sp["state"], sq["state"], sr["state"], sf["state"], sf["waiting"]);
+	for s in [&sp, &sq, &sr] {
+		assert_ne!(s["state"], "pending", "the three run together: {}", s);
+	}
+	assert_eq!(sf["state"], "pending", "the fresh refresh brings nothing back: {}", sf);
+	assert!(sf["waiting"].as_str().unwrap().starts_with("This refresh waits for a later round"), "{}", sf);
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	let peak = n(&pool(&r, x), "in_flight");
+	complete(&r, &idp, &[&u[0], &w[0]], &kp, &np, true).await;
+	complete(&r, &idq, &[&u[1], &w[1]], &kq, &nq, true).await;
+	complete(&r, &idr, &[&u[2], &w[2]], &kr, &nr, true).await;
+	r.synced().await;
+	let reclaims = passes(&r).await.len();
+	let after = n(&pool(&r, x), "in_flight");
+	println!("in flight after the round {}, {} reclaim(s), after the reclaim {}; cap {}", peak, reclaims, after, cap);
+	assert_eq!(peak, 10 * VALUE, "four before, six given up");
+	assert_eq!(reclaims, 1, "node A is reclaimed");
+	assert_eq!(after, 6 * VALUE, "B's three and the three fresh coins");
+	assert!(after <= 2 * cap);
+
+	// The fresh refresh would now bring back the node the three left open,
+	// which is another matter: it is taken back.
+	assert_eq!(withdraw(&r, &idf, &[&w[3]])["state"], "void");
+	let (idg, _, _) = submit_as(&r, "HE G", &[&g]);
+	r.server.rounds.run_round().await.unwrap();
+	let sg = status(&r, &idg);
+	println!("G after: {} {}", sg["state"], sg["waiting"]);
+	assert_eq!(sg["state"], "pending", "the cap holds again: {}", sg);
+	assert!(sg["waiting"].as_str().unwrap().contains(&format!("{} of a cap of {} in flight", after, cap)), "{}", sg);
+}
+
+/// The set the cap runs together cannot be made to front more than its
+/// bound. A holder who joins it and then withdraws leaves the rest waiting:
+/// without it they bring nothing back. A set whose own new value is more
+/// than one cap (R beside two fresh coins: four against three and a half)
+/// waits whole. Nothing runs, nothing is reclaimed, and what is in flight
+/// stays as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_set_cannot_be_made_to_front_more_than_one_cap() {
+	let (r, _, u, w, _) = held_elsewhere("HW").await;
+	let x = r.x;
+	let (idp, _, _) = submit_as(&r, "HW P", &[&u[0], &w[0]]);
+	let (idq, _, _) = submit_as(&r, "HW Q", &[&u[1], &w[1]]);
+	let (idr, _, _) = submit_as(&r, "HW R", &[&u[2], &w[2]]);
+	let wd = withdraw(&r, &idr, &[&u[2], &w[2]]);
+	println!("R withdrawn: {}", wd["state"]);
+	let built = r.server.rounds.run_round().await.unwrap();
+	let (sp, sq) = (status(&r, &idp), status(&r, &idq));
+	println!("after R withdrew: P {} / Q {}", sp["state"], sq["state"]);
+	assert!(built.is_none(), "nothing runs");
+	assert_eq!((sp["state"].as_str(), sq["state"].as_str()), (Some("pending"), Some("pending")));
+
+	let (idr2, _, _) = submit_as(&r, "HW R2", &[&u[2], &w[2], &w[3]]);
+	let built = r.server.rounds.run_round().await.unwrap();
+	let (sp, sq, sr) = (status(&r, &idp), status(&r, &idq), status(&r, &idr2));
+	println!("R beside two fresh coins: P {} / Q {} / R {}: {}", sp["state"], sq["state"], sr["state"], sr["waiting"]);
+	assert!(built.is_none(), "the set opens more than a cap, and waits whole");
+	for s in [&sp, &sq, &sr] {
+		assert_eq!(s["state"], "pending", "{}", s);
+	}
+	assert_eq!(n(&pool(&r, x), "in_flight"), 4 * VALUE);
+	assert!(passes(&r).await.is_empty(), "nothing is reclaimed");
+}
+
+/// A set the cap takes together runs whole or not at all: split across
+/// rounds, its first part would be fronted on a return that does not come.
+/// An offboard asked first takes all but five coins of what the operator's
+/// wallet can pay, so the round can fund P's and Q's refreshes and not R's.
+/// R waits for the wallet, P and Q wait beside it, the offboard runs alone,
+/// and nothing of A's set goes in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_set_the_wallet_cannot_fund_whole_waits_whole() {
+	let (mut r, _, u, w, _) = held_elsewhere("HS").await;
+	let x = r.x;
+	let can = fundable(&r, x);
+	let big = can - 5 * VALUE;
+	let ko = keypair("HS O board");
+	let (record, tx, _) = r.board_in(&ko, x, big);
+	r.produce().await;
+	r.bury().await;
+	let bid = record.leaf_id();
+	let http = r.http.clone();
+	r.wait("O's board credited", || http.board_status(&bid).json["state"] == "credited").await;
+	let o = Coin { held: Held { key: ko, nonce: record.owner_nonce, id: bid, record: CoinRecord::Board(record) }, bases: vec![tx] };
+	let to = elements::Script::from(vec![0x00, 0x14, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
+		0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33]);
+	let out = OutputRequest::Offboard { asset: x, value: big - 100_000, script: to };
+	let (body, ido) = participation_body(&[&o.held], &[out], &[(x, 100_000)], None, xonly(&r.s), r.chain);
+	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending", "{}", body);
+	println!("fundable {}; the offboard pays {}", can, big - 100_000);
+	let (idp, _, _) = submit_as(&r, "HS P", &[&u[0], &w[0]]);
+	let (idq, _, _) = submit_as(&r, "HS Q", &[&u[1], &w[1]]);
+	let (idr, _, _) = submit_as(&r, "HS R", &[&u[2], &w[2]]);
+	let built = r.server.rounds.run_round().await.unwrap().expect("the offboard's round");
+	let (so, sp, sq, sr) = (status(&r, &ido), status(&r, &idp), status(&r, &idq), status(&r, &idr));
+	println!("offboard {} / P {}: {} / Q {} / R {}: {}", so["state"], sp["state"], sp["waiting"], sq["state"], sr["state"], sr["waiting"]);
+	assert_eq!(so["state"], "issued", "{}", so);
+	assert_eq!(built.offboards, 1);
+	assert_eq!(sr["state"], "pending", "{}", sr);
+	assert!(sr["waiting"].as_str().unwrap().contains("The operator's wallet cannot fund it"), "{}", sr);
+	for s in [&sp, &sq] {
+		assert_eq!(s["state"], "pending", "{}", s);
+		assert!(s["waiting"].as_str().unwrap().contains("it brings a node back together with other holders' refreshes"), "{}", s);
+	}
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	assert_eq!(n(&pool(&r, x), "in_flight"), 4 * VALUE, "nothing of the set went in flight");
+}
+
+/// A holder at rest beside another holder's waiting refresh is named, and
+/// the node comes back. Node A holds U0, U1 and U2; U0 refreshed and
+/// released, so A holds U0's coin in flight, over a cap of half a coin. P
+/// gives up U1 beside a fresh coin and waits; Q, who holds U2, never asks
+/// for a refresh. Before P's participation is in, Q's U2 is named to nobody.
+/// Once it is in, U1 is coming (a coin given up waits on nothing more), so
+/// U2 is all A waits on and is named to Q, with A's U0 and U1 behind it.
+/// Q's refresh of U2 alone brings A back beside P's: together they open
+/// P's fresh coin and A pays back U0's, so both run under the full cap, and
+/// A is reclaimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holder_at_rest_beside_a_waiting_refresh_is_named() {
+	let cap = VALUE / 2;
+	let (mut r, c) = first_leaves(Some(cap), &["AH U0", "AH U1", "AH U2"]).await;
+	let x = r.x;
+	let ws = boards(&mut r, &[keypair("AH W board")], x).await;
+	let k0 = keypair("AH U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	let kw = keypair("AH W 1");
+	let (idw, nw) = submit(&r, &[&ws[0]], &[kw]);
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	let fresh = complete(&r, &idw, &[&ws[0]], &[kw], &nw, true).await.remove(0);
+	assert_eq!(n(&pool(&r, x), "in_flight"), VALUE);
+
+	let before = holding_back(&r, &[&c[2]]);
+	println!("Q asks after U2 before P is at hand: {:?}", before);
+	assert!(before.is_empty(), "A waits on P's U1 too, whose holder is away");
+	let (idp, np, kp) = submit_as(&r, "AH P", &[&c[1], &fresh]);
+	assert!(r.server.rounds.run_round().await.unwrap().is_none());
+	println!("P: {} {}", status(&r, &idp)["state"], status(&r, &idp)["waiting"]);
+	assert_eq!(status(&r, &idp)["state"], "pending");
+	let named = holding_back(&r, &[&c[2]]);
+	println!("Q asks after U2 once P's refresh is in: {:?}", named);
+	assert_eq!(named, vec![(hex(&c[2].held.id.0), (2 * VALUE).to_string())]);
+
+	let (idq, nq, kq) = submit_as(&r, "AH Q", &[&c[2]]);
+	let built = r.server.rounds.run_round().await.unwrap().expect("Q's refresh runs");
+	println!("Q: {}; P: {}", status(&r, &idq)["state"], status(&r, &idp)["state"]);
+	assert_ne!(status(&r, &idq)["state"], "pending");
+	assert_ne!(status(&r, &idp)["state"], "pending", "P runs beside Q");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	complete(&r, &idq, &[&c[2]], &kq, &nq, true).await;
+	complete(&r, &idp, &[&c[1], &fresh], &kp, &np, true).await;
+	r.synced().await;
+	let reclaims = passes(&r).await.len();
+	let after = n(&pool(&r, x), "in_flight");
+	println!("{} reclaim(s); in flight {}", reclaims, after);
+	assert_eq!(reclaims, 1, "node A is reclaimed");
+	assert_eq!(after, VALUE, "the fresh coin alone");
+}
+
+/// Two holders at rest on one node are each named once the other is at hand
+/// (holders that sync but never refresh on their own: no sweep asks them
+/// to). Node A holds U0, U1 and U2; U0 refreshed and released, over a cap of
+/// half a coin. A read that proves no key (`holding_back_unauthenticated`
+/// on) marks nobody at hand: Q, asking after U2 next, is named nothing. P
+/// asks after U1 and is named it, Q being at hand; Q asks again and is
+/// named U2. With a refresh fee, each named coin alone is refreshed for no
+/// fee, as each holder's library asks for it: the other coin is another
+/// holder's. Both run under the full cap, and once both are released, A is
+/// reclaimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_holders_at_rest_on_a_node_are_each_named() {
+	let (r, c) = first_leaves_with(Some(VALUE / 2), &["TR U0", "TR U1", "TR U2"], true).await;
+	let x = r.x;
+	let k0 = keypair("TR U0 2");
+	let (id0, n0) = submit(&r, &[&c[0]], &[k0]);
+	round(&r).await;
+	complete(&r, &id0, &[&c[0]], &[k0], &n0, true).await;
+	assert_eq!(n(&pool(&r, x), "in_flight"), VALUE);
+
+	let keyless = holding_back_by(&r, &[&c[1]], &[]);
+	println!("a keyless read after U1: {:?}", keyless);
+	assert!(keyless.is_empty());
+	let q0 = holding_back(&r, &[&c[2]]);
+	println!("Q asks after U2 after the keyless read: {:?}", q0);
+	assert!(q0.is_empty(), "a read proving no key marks nobody at hand");
+	let p1 = holding_back(&r, &[&c[1]]);
+	println!("P asks after U1, Q at hand since: {:?}", p1);
+	assert_eq!(p1, vec![(hex(&c[1].held.id.0), VALUE.to_string())]);
+	let q1 = holding_back(&r, &[&c[2]]);
+	println!("Q asks again: {:?}", q1);
+	assert_eq!(q1, vec![(hex(&c[2].held.id.0), VALUE.to_string())]);
+
+	let mut config = r.server.config();
+	config.fees.refresh_ppm = 5_000;
+	r.server.reload(&config).await.unwrap();
+	let mut parts = vec![];
+	for (j, coin) in [&c[1], &c[2]].into_iter().enumerate() {
+		let k = keypair(&format!("TR {} 3", j));
+		let (wl, nn) = want_leaf(&k, x, VALUE);
+		let (body, id) = participation_body(&[&coin.held], &[wl], &[], None, xonly(&r.s), r.chain);
+		let a = r.http.post("submit_participation", &body);
+		println!("U{} alone at a fee of 0: {} {}", j + 1, a.status, a.json["fees"]);
+		assert_eq!(a.status, 200, "{}", a.json);
+		assert_eq!(a.json["fees"], json!([]), "{}", a.json);
+		parts.push((id, nn, k));
+	}
+	let built = r.server.rounds.run_round().await.unwrap().expect("both run under the full cap");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &built.tx.txid()).await;
+	for ((id, nn, k), coin) in parts.iter().zip([&c[1], &c[2]]) {
+		assert_ne!(status(&r, id)["state"], "pending");
+		complete(&r, id, &[coin], &[*k], &[*nn], true).await;
+	}
+	r.synced().await;
+	let reclaims = passes(&r).await.len();
+	println!("{} reclaim(s); in flight {}", reclaims, n(&pool(&r, x), "in_flight"));
+	assert_eq!(reclaims, 1, "node A is reclaimed");
+}
