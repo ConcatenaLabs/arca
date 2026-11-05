@@ -343,6 +343,11 @@ holder_window_seconds = 259200
 delegated_reclaim = false
 no_sweep = false
 collect_after_seconds = 2419200
+# With no_sweep on: the batches with a sweep of rounds made before this median
+# time (Unix seconds) are collected early, this long after their round; only
+# the coins their owners gave up are brought on the chain.
+# collect_sweep_batches_before = 1793509238
+# collect_sweep_batches_after_seconds = 259200
 
 # The Lightning gateway beside each asset's own node.
 [lightning]

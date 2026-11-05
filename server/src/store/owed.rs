@@ -281,6 +281,17 @@ impl Store {
 		).await?.iter().map(|r| array32(r.get(0), "leaf id")).collect()
 	}
 
+	/// Every coin the transfer or fill that spent `leaf` spends: its inputs,
+	/// `leaf` among them, and a fill's order coin.
+	pub async fn transfer_inputs_beside(&self, leaf: &[u8; 32]) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		conn.query(
+			"SELECT b.leaf_id FROM transfer_input a JOIN transfer_input b USING (transfer_id) WHERE a.leaf_id = $1
+			 UNION ALL SELECT f.order_leaf FROM transfer_input a JOIN order_fill f USING (transfer_id) WHERE a.leaf_id = $1",
+			&[&&leaf[..]],
+		).await?.iter().map(|r| array32(r.get(0), "leaf id")).collect()
+	}
+
 	/// The batches whose sweep token is `token`.
 	pub async fn batches_of_token(&self, token: &[u8]) -> Result<Vec<([u8; 32], u32)>, StoreError> {
 		let conn = self.conn().await?;

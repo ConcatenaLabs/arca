@@ -1978,6 +1978,13 @@ fees sped up by a child with a second input in an accepted one (the coin's
 own asset for the fee refused); and a coin received out of round refreshed
 in the next round, while the sender's change is left as it is.
 
+`tests/arca_sweep_collection.rs` runs a holder whose batch with a sweep is
+collected early by an operator that turned `no_sweep` on
+(`[batches] collect_sweep_batches_before`): the coin given up beside it is
+forfeited and claimed, its own coin is never taken home, and its `sync`
+refreshes it, the operator naming it for no fee, into a batch without a
+sweep for its whole value.
+
 `tests/arca_no_sweep.rs` runs the same way, its operator building batches
 without a sweep (`[batches] no_sweep`): every wallet signs its refresh's
 forfeits against the served round before it is broadcast, a wallet that does

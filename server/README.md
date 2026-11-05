@@ -1691,6 +1691,9 @@ coins have not come back yet (`in_flight_cap`, in atoms, or
 value of every coin given up in a round broadcast or final while a batch leaf
 of its asset that it rests on (its own, or one up its lineage of
 reassignments) is in a batch neither reclaimed there nor swept (`in_flight`).
+A coin whose own forfeit is final on the chain, brought down by a collection
+(through its lineage's reassignments when it was paid on out of round), counts
+for nothing either.
 Coins resting on boards alone count for nothing, since the forfeit of a board
 pays the operator back at once. A participation that would take an asset past
 its cap waits for a later round, saying so in plain words in its status
@@ -2668,6 +2671,34 @@ meanwhile.
   children) and its entry (226 vB), plus a forfeit (280 vB) and its share of
   a claim for a coin given up, or a checkpoint (347 vB) and a reassignment
   (339 vB) for one paid on out of round, at the node's floor in the asset.
+- **Batches with a sweep collected early.** An operator that turned
+  `no_sweep` on still holds the batches with a sweep it built before, whose
+  capital comes back by RECLAIM, by RECLAIM-D, or at their expiry: a coin
+  given up beside a holder who stays, or beside a coin paid on out of round
+  without a delegation, holds the operator's capital until then.
+  `[batches] collect_sweep_batches_before` (a median time, Unix seconds; off
+  when absent) gives each such batch a service horizon,
+  `[batches] collect_sweep_batches_after_seconds` after its round
+  (`collect_after_seconds` when absent): every tree batch with a sweep, not
+  burn-only, of a round made before that time and before the first round
+  that built a batch without a sweep. The server sets these horizons at
+  start, and takes them off again when the setting is removed; it refuses
+  to start with the setting and without `no_sweep`. Past its horizon such a
+  batch is collected as above with one difference: its holders keep their
+  coins in the Ark until the batch's own expiry, as they were promised, so
+  the collection lands no live coin. It brings on the chain only the coins
+  their owners gave up, down to their leaves, forfeits and claims them; and
+  a coin paid on out of round only where every coin its transfer made was
+  given up too, since its reassignment lands them all, and every coin that
+  transfer spent is a leaf of the same batch. Unrolling a given-up
+  coin's path puts its siblings' nodes and entries on the chain; an entry
+  opens only into its owner's leaf, so a holder's coin there stays its
+  holder's, refreshed or paid on out of round as before, at the same fees. The
+  transactions are the collection's own: unroll, entry, forfeit, claim,
+  checkpoint and reassignment, never a sweep. Whatever the collection leaves
+  comes back at the batch's expiry as before (Swept coins are repaid). Step
+  the time forward to collect in tranches: each start sets the horizons the
+  setting names and no others.
 
 - **What a sweep owes.** Each sweep of its own that is final is counted
   once: every coin it took from its holder is recorded owed, the sweep with
@@ -3590,7 +3621,16 @@ window, the dropped round refused by the node and when forced into a block
 (`bad-txns-inputs-missingorspent`), the others' round built again and
 completed; and at the service horizon an absent holder's coin, and an absent
 receiver's coin paid out of round, landing on the chain as their own leaves,
-while a coin given up is forfeited and claimed. `tests/held_strikes.rs` runs
+while a coin given up is forfeited and claimed. `tests/sweep_collection.rs`
+collects batches with a sweep made before batches without one
+(`collect_sweep_batches_before`): only those batches get a horizon, the
+coins given up on them are forfeited and claimed (one through its payer's
+reassignment), no live coin lands, a coin whose transfer spent a leaf of a
+later batch is left, and the chain refuses the operator a holder's entry
+spent anywhere but its leaf (`Script evaluated without error but finished
+with a false/empty top stack element`) and its leaf forfeited with another
+coin's signature (`Invalid Schnorr signature`), each forced into a block.
+`tests/held_strikes.rs` runs
 participants that drop out of held rounds: a hostile one rejoining with the
 same coin every cycle never shares a round again and every honest refresh
 goes out; the answering participations rebuilt alone first; a struck coin,

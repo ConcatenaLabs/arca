@@ -2735,8 +2735,21 @@ impl Watcher {
 	/// any coin paid on out of round. An `htlc-1` leaf is brought on the
 	/// chain once its outcome is the operator's ([`Self::htlc_decided`]),
 	/// and its refund or claim then finishes it; one still open is left.
+	///
+	/// A batch with a sweep collected early (`[batches]
+	/// collect_sweep_batches_before`) is still its holders' to refresh until
+	/// its own expiry, so its collection lands no live coin: it brings on
+	/// the chain only the coins their owners gave up (their forfeits
+	/// stored), down to their leaves, and a coin paid on out of round only
+	/// where every coin its transfer made was given up too, since its
+	/// reassignment lands them all, and every coin it spent is a leaf of this
+	/// batch, so nothing of another batch moves. A live coin's path may come on the
+	/// chain as far as its entry, which only its own leaf can spend; the
+	/// coin stays where it was, its holder's to refresh. What is left comes
+	/// back at the batch's expiry, as before.
 	async fn collect_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
 		let Some((_, leaves)) = self.store.batch(&round.txid, b.vout).await? else { return Ok(()) };
+		let early = b.token != arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
 		// What is left to its reclaim: a tree's lowest nodes every slot of
 		// which consents, an accumulator batch's slots whose owners released
 		// them.
@@ -2755,6 +2768,10 @@ impl Watcher {
 			},
 		};
 		let reclaimed = |i: usize| left.contains(&i);
+		// A transfer's reassignment needs each coin it spends on the chain:
+		// one collected early spends only this batch's leaves, so nothing of
+		// another batch moves.
+		let here: HashSet<[u8; 32]> = leaves.iter().map(|l| l.leaf_id).collect();
 		let mut stack = vec![];
 		let mut claims = HashSet::new();
 		for (i, bl) in leaves.iter().enumerate() {
@@ -2780,10 +2797,17 @@ impl Watcher {
 				// A claim leaf nobody took up: its lapse, or its return, pays
 				// the payer.
 				LeafState::Live if claims.contains(&leaf) => continue,
+				LeafState::Live if early => continue,
 				LeafState::Live => false,
 				LeafState::Spent if self.live_forfeit(&leaf).await?.is_some() => true,
 				LeafState::Spent => {
-					stack.extend(self.store.transfer_outputs_of(&leaf).await?);
+					let outs = self.store.transfer_outputs_of(&leaf).await?;
+					if early && !(self.all_given_up(&outs).await?
+						&& self.store.transfer_inputs_beside(&leaf).await?.iter().all(|i| here.contains(i)))
+					{
+						continue;
+					}
+					stack.extend(outs);
 					continue;
 				},
 				_ => continue,
@@ -2817,6 +2841,21 @@ impl Watcher {
 				given);
 		}
 		Ok(())
+	}
+
+	/// Whether every coin of `ids` was given up, its forfeit stored: none
+	/// is live or paid on again.
+	async fn all_given_up(&self, ids: &[[u8; 32]]) -> Result<bool, WatcherError> {
+		for id in ids {
+			let given = match self.store.leaf(id).await? {
+				Some(row) if row.state == LeafState::Spent => self.live_forfeit(id).await?.is_some(),
+				_ => false,
+			};
+			if !given {
+				return Ok(false);
+			}
+		}
+		Ok(!ids.is_empty())
 	}
 
 	/// Whether the outcome of the `htlc-1` coin `leaf` under `terms` is the
