@@ -141,6 +141,16 @@ async fn a_payment_under_a_hash_through_the_commands_moves_exactly_what_its_quot
 	assert!(num(&rq["claim_margins"]) > 0);
 	assert_eq!(num(&rq["claimed"]), num(&rq["value"]) - num(&rq["claim_margins"]));
 	assert!(ok(&q, "lightning_receives", json!({})).as_object().unwrap().is_empty(), "the quote asked nothing of the operator");
+	// The operator's limit on one payment into the tree, as its info publishes it: in the quote,
+	// and a receive above it refused before the operator is asked.
+	let leg = ok(&q, "info", json!({}))["server_info"]["assets"].as_array().unwrap().iter().find(|a| a["asset"] == json!(xs)).unwrap()["lightning"].clone();
+	println!("LC the operator's leg in X: {}", leg);
+	assert_eq!(rq["max_payment"], leg["max_payment"]["receive"], "the quote shows the operator's limit");
+	let over = (num(&rq["max_payment"]) + 1).to_string();
+	let e = library(&q, "lightning_receive", json!({"asset": xs, "amount": over})).unwrap_err();
+	println!("LC a receive one atom over the operator's limit: {}", e);
+	assert!(e.contains("above the most the operator takes in one payment over Lightning"), "{}", e);
+	assert!(ok(&q, "lightning_receives", json!({})).as_object().unwrap().is_empty(), "nothing asked of the operator");
 	let inv = ok(&q, "lightning_receive", json!({"asset": xs, "amount": "100000", "hash": hash}));
 	assert_eq!((inv["payment_hash"].as_str(), inv["hash_given"].as_bool()), (Some(hash.as_str()), Some(true)), "{}", inv);
 	assert_eq!(inv["value"], rq["value"]);
@@ -151,6 +161,7 @@ async fn a_payment_under_a_hash_through_the_commands_moves_exactly_what_its_quot
 	let before = (p.ok(&["coins"]), ok(&p, "lightning_payments", json!({})));
 	let pq = ok(&p, "lightning_pay_quote", json!({"invoice": invoice, "asset": xs}));
 	println!("LC the payment's quote: {}", pq);
+	assert_eq!(pq["max_payment"], leg["max_payment"]["send"], "the quote shows the operator's limit");
 	assert_eq!((pq["payment_hash"].as_str(), num(&pq["amount"]), num(&pq["fee"])), (Some(hash.as_str()), 100_000, 100));
 	assert_eq!(num(&pq["spends"]), 100_000 + 100 + num(&pq["margins"]), "what leaves the wallet: the amount, the fee and the margins");
 	let given: u64 = pq["gives"].as_array().unwrap().iter().map(|l| num(&p.ok(&["coins"]).as_array().unwrap().iter()
