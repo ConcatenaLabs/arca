@@ -36,7 +36,8 @@ pub struct PoolFlow {
 	/// What sweeps of expired batches paid back in the last hour.
 	pub swept_last_hour: u64,
 	/// What the operator fronted for refreshes and offboards whose old coins
-	/// have not come back: each coin given up in a round broadcast or final,
+	/// have not come back: each coin given up in a round built (held for its
+	/// forfeits), broadcast or final,
 	/// while a batch leaf of its asset it rests on (its own, or one up its
 	/// lineage of reassignments) is in a batch neither reclaimed there nor
 	/// swept, and its own forfeit not final on the chain. A coin resting on
@@ -46,13 +47,15 @@ pub struct PoolFlow {
 }
 
 /// The common part of [`Store::in_flight`] and [`Store::in_flight_slots`]:
-/// each coin given up in a round broadcast or final, its lineage up through
+/// each coin given up in a round built, broadcast or final (a round held for
+/// its forfeits counts from when it is built, so the rounds built in one
+/// forfeit window are judged together by the cap), its lineage up through
 /// reassignments, and what has come back.
 const IN_FLIGHT_WITH: &str = "
 	WITH RECURSIVE given AS MATERIALIZED (
 	   SELECT pi.leaf_id, pi.asset, pi.value FROM participation_input pi
 	   JOIN participation p USING (participation_id) JOIN round r ON r.round_id = p.round_id
-	   WHERE pi.active AND p.state IN ('issued', 'released') AND r.state IN ('broadcast', 'final')),
+	   WHERE pi.active AND p.state IN ('issued', 'released') AND r.state IN ('built', 'broadcast', 'final')),
 	 up (root, asset, leaf_id, depth) AS (
 	   SELECT leaf_id, asset, leaf_id, 0 FROM given
 	   UNION
@@ -227,7 +230,7 @@ impl Store {
 	}
 
 	/// The batch leaves whose value is in flight: each given up, or paid on
-	/// and some coin it became given up, in a round broadcast or final, its
+	/// and some coin it became given up, in a round built, broadcast or final, its
 	/// batch neither reclaimed there nor swept. Each with the coin given up
 	/// whose value it holds: a coin resting on several such leaves comes
 	/// back once every one of them has. A tree's lowest nodes above them are
