@@ -143,3 +143,80 @@ async fn nursery_on_regtest() {
 	assert!(coin.iter().all(|c| (Txid::from_byte_array(c.txid), c.vout) != (b.tx.input[0].previous_output.txid, b.tx.input[0].previous_output.vout)));
 	println!("B lost: {} spent its coin and is final", b2.txid());
 }
+
+/// A pass of the nursery while it holds many final transactions, and a
+/// rollback it never hears of. The finality service ends a pass every poll
+/// interval, so a nursery whose passes looked up each final transaction it
+/// ever held fell behind once that took longer, and then only ever missed
+/// events (the testnet's operator, 2026-11-02 to 11-04: about 30,000 final
+/// transactions, 75 s a pass, "chain events missed" every pass). A pass now
+/// looks again only at what the store no longer places final, in one
+/// statement, and still finds a final transaction whose block left the chain
+/// while its disconnection never reached the nursery.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_reads_only_what_is_no_longer_final() {
+	let db = TestDb::new().await;
+	let mut rt = tokio::task::block_in_place(node::start);
+	let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
+	let x = tokio::task::block_in_place(|| purse.issue(&rt, "asset X", 100_000_000_000));
+	node::list_fee_asset(&rt, x, 100_000_000);
+	let source = Arc::new(NodeSource::new(rt.client().clone()));
+	let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
+	let mut rx = finality.subscribe();
+	let wallet = Arc::new(Wallet::new(db.store.clone(), finality.clone(), xonly(&keypair("operator")),
+		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 2, spend_from: SpendFrom::Final, pool_coins: server::wallet::POOL_COINS }).unwrap());
+	let nursery = Nursery::new(db.store.clone(), finality.clone(), Some(wallet.clone()), Duration::ZERO);
+	follow(&finality, &nursery, &mut rx).await;
+	let to = wallet.receive_script().await.unwrap();
+	tokio::task::block_in_place(|| purse.pay(&rt, vec![explicit_txout(AssetAmount::new(x, 9_000_000), to)]));
+	tokio::task::block_in_place(|| rt.produce_block()).unwrap();
+	tokio::task::block_in_place(|| node::bury(&rt));
+	follow(&finality, &nursery, &mut rx).await;
+
+	let built = wallet.build(&BuildRequest {
+		outputs: vec![ExplicitOutput::new(x, 1_000_000, node::op_true())], connector: None, fee_asset: x,
+	}).await.unwrap();
+	let a = built.tx.clone();
+	nursery.submit(&a, NurseryKind::Wallet, Some(built.fee)).await.unwrap();
+	tokio::task::block_in_place(|| rt.produce_block()).unwrap();
+	tokio::task::block_in_place(|| node::bury(&rt));
+	follow(&finality, &nursery, &mut rx).await;
+	assert_eq!(db.store.nursery_get(&a.txid().to_byte_array()).await.unwrap().unwrap().state, NurseryState::Final);
+	let block = db.store.tx_location(&a.txid().to_byte_array()).await.unwrap().unwrap();
+
+	// 5,000 more final transactions in A's block, as a long-running
+	// operator's nursery holds them.
+	const MANY: usize = 5_000;
+	let (client, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	client.execute(
+		"WITH t AS (SELECT sha256(int8send(g)) AS txid FROM generate_series(1, $3::BIGINT) g),
+		  w AS (INSERT INTO watched_tx (txid, kind) SELECT txid, 'nursery' FROM t RETURNING txid),
+		  b AS (INSERT INTO tx_block (txid, block_hash) SELECT txid, $2 FROM w RETURNING txid)
+		 INSERT INTO nursery_tx (txid, tx, kind, state) SELECT txid, $1, 'wallet', 'final' FROM b",
+		&[&serialize(&a), &&block.hash[..], &(MANY as i64)]).await.unwrap();
+	let still = db.store.nursery_final_not_final(true, 2).await.unwrap();
+	assert!(still.is_empty(), "every one is final: {}", still.len());
+	let t = std::time::Instant::now();
+	nursery.pass().await.unwrap();
+	let took = t.elapsed();
+	println!("a pass with {} final transactions held: {:?}", MANY + 1, took);
+	for r in db.store.nursery_in(NurseryState::Final).await.unwrap() {
+		assert!(finality.status(&Txid::from_byte_array(r.txid)).await.unwrap().is_final(), "the statement agrees with status");
+	}
+	assert_eq!(db.store.nursery_in(NurseryState::Final).await.unwrap().len(), MANY + 1, "a pass leaves them final");
+
+	// A's block rolled back with the node's mempool emptied; the service
+	// follows it, but the nursery is handed none of its events (it lagged).
+	node::invalidate(&rt, &elements::BlockHash::from_byte_array(block.hash));
+	tokio::task::block_in_place(|| rt.node.restart(&["-persistmempool=0"])).unwrap();
+	finality.sync().await.unwrap();
+	while rx.try_recv().is_ok() {}
+	let back = db.store.nursery_final_not_final(true, 2).await.unwrap();
+	println!("after the rollback the store no longer places {} final", back.len());
+	assert!(back.iter().any(|r| r.txid == a.txid().to_byte_array()), "A is among them");
+	nursery.pass().await.unwrap();
+	assert_eq!(db.store.nursery_get(&a.txid().to_byte_array()).await.unwrap().unwrap().state, NurseryState::Pending);
+	assert!(node::in_mempool(&rt, &a.txid()), "broadcast again");
+	println!("A found out of finality by a pass, and broadcast again");
+}

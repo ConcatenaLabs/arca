@@ -111,6 +111,26 @@ fn receive_state(st: LightningReceiveState) -> Value {
 	}
 }
 
+/// The boards the phrase's own Bitcoin account funded that no wallet of the
+/// phrase registered, found on the chain and taken in
+/// ([bark::Wallet::recover_boards]): each one's `funding` (outpoint),
+/// `amount`, `vtxo` and `outcome`; or `{"error"}`. Part of `catch_up`.
+pub async fn boards_on_chain(wallet: &Wallet) -> Value {
+	let txs = match crate::exit::funding_transactions(wallet).await {
+		Ok(txs) => txs,
+		Err(e) => return json!({ "error": format!("{:#}", e) }),
+	};
+	match wallet.recover_boards(txs).await {
+		Ok(found) => json!(found.iter().map(|b| json!({
+			"funding": b.funding.to_string(),
+			"amount": sat(b.amount),
+			"vtxo": b.vtxo.map(|v| v.to_string()),
+			"outcome": b.outcome,
+		})).collect::<Vec<_>>()),
+		Err(e) => json!({ "error": format!("{:#}", e) }),
+	}
+}
+
 /// Runs one command on an open wallet.
 pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Value> {
 	match cmd {
@@ -280,17 +300,22 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 			Ok(json!({ "fee": sat(e.fee), "gross": sat(e.gross_amount) }))
 		},
 		// Refreshes the coins that are due, in the server's next round. A coin whose refresh
-		// is scheduled is left to the server.
+		// is scheduled is left to the server. A refresh makes one coin, so what one call
+		// refreshes fits under the server's largest coin, and the rest is refreshed at the
+		// next call ([bark::Wallet::get_vtxos_to_refresh]). A coin due that is alone above
+		// the largest (made before the server lowered it) cannot be refreshed: it leaves the
+		// ark to the holder's own address first (`offboarded`, [crate::exit::offboard_oversized]).
 		"refresh" => {
+			let offboarded = crate::exit::offboard_oversized(wallet).await?;
 			let due = wallet.get_vtxos_to_refresh().await?;
 			if due.is_empty() {
-				return Ok(json!({ "refreshed": 0 }));
+				return Ok(json!({ "refreshed": 0, "offboarded": offboarded }));
 			}
 			let n = due.len();
 			let r = wallet.refresh_vtxos(due).await;
 			crate::exit::note_server(wallet, r.is_err());
 			r?;
-			Ok(json!({ "refreshed": n }))
+			Ok(json!({ "refreshed": n, "offboarded": offboarded }))
 		},
 		// Schedules with the server the refresh of every coin that has none yet, so the
 		// server renews it with the wallet closed; the wallet takes the new coin in at its
@@ -320,15 +345,19 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 		},
 		// What other wallets of the phrase did since this store was made: coins
 		// they made or received, from the server's recovery mailbox, and coins of
-		// this store they spent.
+		// this store they spent; then the boards the phrase's own Bitcoin coins
+		// funded that no wallet of the phrase registered (one whose store was
+		// lost before its board's confirmations), found on the chain.
 		"catch_up" => {
 			let r = wallet.catch_up_from_server().await?;
+			let boards = boards_on_chain(wallet).await;
 			Ok(json!({
 				"recovered": r.recovery.recovered().ids().map(|i| i.to_string()).collect::<Vec<_>>(),
 				"recovered_sat": sat(r.recovery.recovered().total_amount()),
 				"spent_elsewhere": r.spent_elsewhere.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
 				"failed": r.recovery.failed().ids().map(|i| i.to_string()).collect::<Vec<_>>(),
 				"complete": r.recovery.is_complete(),
+				"boards": boards,
 			}))
 		},
 		"history" => Ok(serde_json::to_value(wallet.history().await?)?),

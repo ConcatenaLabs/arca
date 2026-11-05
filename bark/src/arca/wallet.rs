@@ -1786,6 +1786,61 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// The wallet's live coins that alone keep a lowest node's fronted value
+	/// from coming back, as the operator answers (`holding_back`): a coin of
+	/// a round, or one a payment out of round made (the payee's coin, the
+	/// payer's change), resting on the payer's old node. Refreshed at once
+	/// and for no fee, an asset's together ([`Self::refresh_due`]), they
+	/// open nothing under the operator's in-flight cap and give the operator
+	/// its capital back. The read proves the wallet's mailbox key, and the operator answers only
+	/// for coins served to it. An operator that does not know the proof is
+	/// asked after the wallet's coins of a round without it, as it was before
+	/// it took the proof. None when the operator does not answer, or does not
+	/// know the call: the next sync asks again. A resting order's coin is not
+	/// asked after: refreshing it would cancel the order.
+	pub(crate) fn holding_back(&self) -> Result<Vec<String>, Error> {
+		let live: Vec<_> = self.store.coins_in("live")?.into_iter()
+			.filter(|c| c.kind != "board" && !super::resting::is_order_coin(c)).collect();
+		if live.is_empty() {
+			return Ok(vec![]);
+		}
+		let mailbox = self.keys.mailbox()?;
+		let x = mailbox.x_only_public_key().0;
+		let proof = self.server.post("challenge", &json!({})).ok()
+			.and_then(|v| unhex32(v["challenge"].as_str().unwrap_or("")).ok())
+			.map(|c| (c, sign(&mailbox, &super::client::auth_digest(&self.genesis, "holding_back", &c, &x, &[]))));
+		let coins: Vec<String> = live.iter().map(|c| c.leaf_id.clone()).collect();
+		let batch: Vec<String> = live.iter().filter(|c| c.kind == "batch").map(|c| c.leaf_id.clone()).collect();
+		let mut out = vec![];
+		// The operator's bound on one call (`holding_back`).
+		for (k, chunk) in coins.chunks(64).enumerate() {
+			let proven = proof.as_ref().and_then(|(c, sig)| self.server.post("holding_back", &json!({"leaf_ids": chunk,
+				"challenge": hex(c), "keys": [{"key": hex(&x.serialize()), "signature": hex(sig.as_ref())}]})).ok());
+			let a = match proven {
+				Some(a) => a,
+				None if k == 0 => {
+					// An operator that does not take the proof: its own form.
+					for chunk in batch.chunks(64) {
+						let Ok(a) = self.server.post("holding_back", &json!({"leaf_ids": chunk})) else { return Ok(out) };
+						for l in a["leaves"].as_array().into_iter().flatten() {
+							if let Some(id) = l["leaf_id"].as_str().filter(|id| chunk.iter().any(|c| c == id)) {
+								out.push(id.to_string());
+							}
+						}
+					}
+					return Ok(out);
+				},
+				None => return Ok(out),
+			};
+			for l in a["leaves"].as_array().into_iter().flatten() {
+				if let Some(id) = l["leaf_id"].as_str().filter(|id| chunk.iter().any(|c| c == id)) {
+					out.push(id.to_string());
+				}
+			}
+		}
+		Ok(out)
+	}
+
 	/// D57: asks for the refresh of every live coin in its refresh window,
 	/// from [`REFRESH_FROM`] to [`HOME_FROM`] before its exit date, one
 	/// participation for each, as `participate` makes it: the refresh is
@@ -1795,7 +1850,16 @@ impl Wallet {
 	/// asked for again six hours ([`REFUSED_AGAIN`]) after it was last asked
 	/// for, while it is still in its refresh window.
 	/// From a day before its exit date, a coin not refreshed goes home
-	/// ([`Self::home`]).
+	/// ([`Self::home`]). A coin the bond does not cover, or one that alone
+	/// keeps its node's fronted value from coming back
+	/// ([`Self::holding_back`]), is asked for at once, its window or not;
+	/// the latter for no fee ([`Self::named_refresh_quote`]), every named
+	/// coin of an asset in one participation: a node named for several of
+	/// the wallet's coins comes back only once all of them are refreshed, so
+	/// the operator waives the fee for them together and for none alone. The
+	/// six-hour wait holds such a group only while it holds each of its
+	/// coins, and a group the wallet cannot quote (one coin not final, say)
+	/// is asked for coin by coin.
 	pub(crate) fn refresh_due(&mut self) -> Result<Vec<Value>, Error> {
 		let now = self.now()?.to_consensus_u32();
 		let refused = self.refused_refreshes()?;
@@ -1806,8 +1870,16 @@ impl Wallet {
 		let planned: Vec<String> = self.plan_currents()?.into_iter().map(|(_, c, _)| c).collect();
 		// A coin resting on an out-of-round lineage the operator's bond does
 		// not cover is refreshed at once, its window or not: a coin that has
-		// been through a round has no such lineage left.
-		let uncovered = self.uncovered()?;
+		// been through a round has no such lineage left. So is a coin that
+		// alone keeps its node's fronted value from coming back: on a batch
+		// without a sweep nothing else ever asks for its refresh, and the
+		// operator's capital stays out until the batch's horizon.
+		let mut uncovered = self.uncovered()?;
+		let named = self.holding_back()?;
+		uncovered.extend(named.iter().cloned());
+		// The named coins due, by asset, each with whether the six-hour wait
+		// holds it.
+		let mut together: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
 		for c in self.store.coins_in("live")? {
 			if planned.contains(&c.leaf_id) {
 				continue;
@@ -1818,26 +1890,46 @@ impl Wallet {
 			}
 			// A refresh the operator refused is asked for again six hours
 			// after it was asked, not at every sync.
-			if let (Some(_), Some(t)) = (refused.get(&c.leaf_id), asked_at.get(&c.leaf_id)) {
-				if now < t.saturating_add(REFUSED_AGAIN) {
-					continue;
-				}
+			let waits = match (refused.get(&c.leaf_id), asked_at.get(&c.leaf_id)) {
+				(Some(_), Some(t)) => now < t.saturating_add(REFUSED_AGAIN),
+				_ => false,
+			};
+			if named.contains(&c.leaf_id) {
+				together.entry(c.asset.clone()).or_default().push((c.leaf_id.clone(), waits));
+				continue;
+			}
+			if waits {
+				continue;
 			}
 			asked_at.insert(c.leaf_id.clone(), now);
 			self.store.set_meta(REFRESH_ASKED, &serde_json::to_string(&asked_at).expect("a map"))?;
 			let asked = self.refresh_quote(std::slice::from_ref(&c.leaf_id), None).and_then(|q| self.participate(q, None));
-			out.push(match asked {
-				Ok(v) => {
-					let p = &v["participations"][0];
-					match p.get("error") {
-						None => json!({"leaf_id": c.leaf_id, "participation": p["participation"], "state": p["state"], "fees": p["fees"]}),
-						Some(e) => json!({"leaf_id": c.leaf_id, "error": e,
-							"note": "the coin stays live: sync asks for its refresh again, and takes it on the chain from home_from"}),
+			out.push(refresh_entry(&c.leaf_id, asked.map(|v| v["participations"][0].clone()).map_err(|e| e.to_string())));
+		}
+		for coins in together.into_values() {
+			if coins.iter().all(|(_, waits)| *waits) {
+				continue;
+			}
+			let ids: Vec<String> = coins.into_iter().map(|(id, _)| id).collect();
+			for id in &ids {
+				asked_at.insert(id.clone(), now);
+			}
+			self.store.set_meta(REFRESH_ASKED, &serde_json::to_string(&asked_at).expect("a map"))?;
+			match self.named_refresh_quote(&ids) {
+				Ok(q) => {
+					// `participate` gives up an asset's coins in the order
+					// quoted, at most MAX_GIVEN in each participation.
+					let asked = self.participate(q, None).map_err(|e| e.to_string());
+					for (k, id) in ids.iter().enumerate() {
+						let p = asked.as_ref().map(|v| v["participations"][k / super::round::MAX_GIVEN].clone()).map_err(|e| e.clone());
+						out.push(refresh_entry(id, p));
 					}
 				},
-				Err(e) => json!({"leaf_id": c.leaf_id, "error": e.to_string(),
-					"note": "the coin stays live: sync asks for its refresh again, and takes it on the chain from home_from"}),
-			});
+				Err(_) => for id in &ids {
+					let asked = self.named_refresh_quote(std::slice::from_ref(id)).and_then(|q| self.participate(q, None));
+					out.push(refresh_entry(id, asked.map(|v| v["participations"][0].clone()).map_err(|e| e.to_string())));
+				},
+			}
 		}
 		Ok(out)
 	}
@@ -2941,6 +3033,12 @@ impl Wallet {
 			if on_chain(&coin.output().txout()) && coin.board().is_none() {
 				seen.push("its own leaf".into());
 			}
+			// A channel's leaf spent already (a state settled while the
+			// wallet was away): what is left of it, the credit not folded,
+			// is claimed by the channel's exit.
+			if seen.is_empty() && self.channel_worth(&c)?.is_some() && self.published_leaf(&coin)?.is_some() {
+				seen.push("its own leaf, and a state of the channel published on it".into());
+			}
 			for b in coin.boards() {
 				if !self.chain.unspent(&b)? && coin.board().is_none() {
 					seen.push(format!("the board at {} it rests on, spent", b));
@@ -4035,6 +4133,19 @@ pub(crate) fn sign(key: &Keypair, digest: &[u8; 32]) -> elements::secp256k1_zkp:
 }
 
 use elements::hashes::Hash as _;
+
+/// What [`Wallet::refresh_due`] answers for coin `leaf_id`, asked for in the
+/// participation `asked` (its entry in `participate`'s answer).
+fn refresh_entry(leaf_id: &str, asked: Result<Value, String>) -> Value {
+	let note = "the coin stays live: sync asks for its refresh again, and takes it on the chain from home_from";
+	match asked {
+		Ok(p) => match p.get("error") {
+			None => json!({"leaf_id": leaf_id, "participation": p["participation"], "state": p["state"], "fees": p["fees"]}),
+			Some(e) => json!({"leaf_id": leaf_id, "error": e, "note": note}),
+		},
+		Err(e) => json!({"leaf_id": leaf_id, "error": e, "note": note}),
+	}
+}
 
 #[cfg(test)]
 mod tests {

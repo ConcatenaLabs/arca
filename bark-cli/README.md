@@ -106,13 +106,18 @@ received over Lightning under a request that named no mailbox key, each binding
 signed by the coin's own key.
 
 `create --mnemonic` restores a wallet from its mnemonic, and `restore` runs
-the restore again (it takes only what the wallet does not hold). A restore
-retires the old device: stop the wallet the mnemonic was restored from, and
-never run it beside the restored one. Two live stores of one mnemonic draw
-their own nonces and refuse each other's coins: a leaf one claims under a
-nonce the other never drew is refused there ("a coin for owner nonce …,
-which this wallet never drew"), and the other's own claim of it is refused
-as a double spend. A restore that stops at an error keeps what it took
+the restore again (it takes only what the wallet does not hold). Stores of
+one mnemonic kept side by side (a phone and a browser) follow each other:
+`sync` catches up, at most once every ten minutes (`caught_up` in its
+answer), with what the server serves to the mailbox key, as a restore reads
+it. It takes every coin the store does not hold under a nonce it never drew
+(another store's), checked as a restore checks it, and gives up every coin it holds as live that another store gave up in a
+transfer the operator co-signed or in a participation the operator released,
+on the owner's own signatures (`given_elsewhere`), so every store shows the
+same coins after its next catch-up, and shows what it held until then. Each
+store still draws its own nonces, and its mailbox read refuses a coin paid
+under a nonce it never drew ("a coin for owner nonce …, which this wallet
+never drew"), which its catch-up takes instead. A restore that stops at an error keeps what it took
 before it and says so; `restore` takes the rest once the cause is gone. A
 take whose round is held for its takes' forfeits is restored from the round
 the take's status serves, as `sync` reads it, and its forfeits handed over
@@ -266,6 +271,21 @@ and a board whose registration never reached the server, are not recovered.
   of a resting order in the tree (`order rest`, `order fill-resting`) does not
   ask the bond first; the coin it pays counts in what the wallet holds out of
   round and, when the bond does not cover it, is refreshed at once too.
+- **An instant budget, for a counterparty.** A wallet that takes payments
+  out of round from many people (a maker, a swap service, an LSP) sets the
+  share of the bond's value it holds out of round at most: `instant-budget
+  0.1` holds a tenth, `instant-budget off` none. The bond is valued as above,
+  at the wallet's node's rate for its asset, so a lower price of that asset
+  lowers the budget at once. Where the operator suggests a share
+  (`info.bond.instant_budget_ppm`), the lower of the two is taken. Past the
+  budget, `receive`, `swap offer` and `swap accept` are refused (the rest is
+  taken after the next round, once what the wallet holds is refreshed), and
+  `sync` asks for that refresh at once. `bond` shows the budget
+  (`instant_budget`: the share taken in millionths, `ppm`, the wallet's own
+  and the operator's, the bond's value, the budget, what the wallet holds
+  out of round, and the `room` left, each in atoms of the reference unit, and
+  that room in atoms of each asset the node prices, `room_atoms`).
+  A wallet sets no budget unless its owner sets one.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
@@ -473,7 +493,18 @@ and a board whose registration never reached the server, are not recovered.
   before anything is signed, and a refresh the operator refuses, voids or
   lets expire is asked for again six hours after `sync` last asked for it, a
   quarter of the day-long window, while the coin is still in it (the
-  schedule wakes for it then, and not sooner). A participation whose coin is on
+  schedule wakes for it then, and not sooner). A coin that alone keeps its
+  lowest node's fronted value from coming back (the other coins on it given
+  up and released, as the operator answers `holding_back`, the read proving
+  the wallet's mailbox key) is asked for at once, its window or not, and for
+  no fee: on a batch without a sweep nothing else would ask, and its refresh
+  gives the operator its capital back. That covers a coin a payment out of
+  round made, the payer's change as well as a coin received: it rests on the
+  payer's old node until it is refreshed. Every such coin of an asset is
+  asked for in one participation: a node named for several of the wallet's
+  coins comes back only once all of them are refreshed, and the operator
+  waives the fee for them together, not for one of them alone. A resting order's coin is not asked
+  after, since its refresh would cancel the order. A participation whose coin is on
   its way home on the chain is not handed over again; once the operator
   releases it, the wallet takes the new leaves with the preimage the server
   publishes. From `home_from`, `sync` takes on the chain every
@@ -993,7 +1024,12 @@ back after its delay) or `not_made` (the participation ended without a round,
 or the operator refused it: the coins are the wallet's again). The operator
 refuses an offboard paying one of its own Arca scripts (`script_reused`), and
 each of its refusals is final: the wallet puts the coins back and posts nothing
-again.
+again. The same offboard asked again (the same asset, amount and address, or
+the same coins to the same address) goes on with the first while the wallet
+has not finished it: one the operator never answered is posted again as it
+stood, one the operator holds is answered as under way (`already`), its coins
+given up to it again, and `sync` completes it. Only one the operator does not
+hold is made anew, as a participation of its own.
 
     arca offboard --asset X --amount 300000 --address ADDR --quote   # fee, coins, change
     arca offboard … --shown '<the quote>'                            # paid in the next round
@@ -1674,11 +1710,13 @@ transaction named, and never marks the coin spent.
 Credit not folded has a deadline that a balance does not. Once any state of
 the channel is settled on the chain, by whoever published it, the operator
 may take back what the note's claim has not taken after the channel's credit
-window (`window_units` in `info`, in units of 512 seconds). `sync` does not
-notice a channel closed by someone else: a wallet holding credit not folded
-either folds it (`channel fold`, or any payment from the channel), after
-which nothing of it has a deadline, or runs `channel exit` within the window
-of any close.
+window (`window_units` in `info`, in units of 512 seconds). `sync` notices a
+channel closed by someone else, even one whose state is settled and whose
+side is swept already: it follows the spends from the coin's batch output to
+the channel's leaf and runs the channel's exit from there, which claims the
+credit not folded. A wallet holding credit not folded therefore either folds
+it (`channel fold`, or any payment from the channel), after which nothing of
+it has a deadline, or syncs within the window of any close.
 
 A channel leaf expires with its round, as any leaf. No plan starts from it:
 `care` closes it into a round once its expiry is within reach, for a plain
@@ -1699,9 +1737,9 @@ are not planned.
 
 An exit of a channel coin is the channel's exit: `exit LEAF` runs `channel
 exit`, and so does a wallet taking the coin home by itself (`sync`, when the
-coin cannot be refreshed in time or its path is found on the chain), so a
-channel closed by someone else is followed to its settle and its credit
-claimed. `exit --quote` refuses a channel coin: each step of its exit is
+coin cannot be refreshed in time or its path is found on the chain, spent
+since or not), so a channel closed by someone else is followed to its settle
+and its credit claimed. `exit --quote` refuses a channel coin: each step of its exit is
 priced as it is taken.
 
 ### Holding a supervised asset
@@ -1804,7 +1842,8 @@ registry for both commands.
 | `supervised-check TXID:VOUT` | Reads the published batch at output `VOUT` of round `TXID` of a supervised asset, from the published tree and the chain alone (see Holding a supervised asset): the asset supervised on the wallet's node, every leaf `landing-1` with the allowance the operator publishes, every output of the round explicit, each leaf's landing and whether the node shows it frozen; `ok` and the `problems` found |
 | `supply ASSET` | For an asset the operator serves issuer-operated, the operator's supply report (`issuer_supply`): each mint of its rounds and each burn of its own, the totals, what is final, the value live in its burn-only batches and where its mint limiter stands; each mint and burn read again from the wallet's node, with what the chain says beside the operator's figure (`on_chain`, `agrees`), and `checked_on_the_node: true` only when every one agrees. It checks the transactions the report lists, not that the list is whole: a mint left out of it is found only by following the asset's reissuance token on the chain |
 | `leaf-template [vtxo-1\|vtxo-2]` | The template of the wallet's own new leaves, after setting it when one is named: its refreshes, its change and what its receive requests ask a sender for. `vtxo-1` (the default) has the tapscript collaborative path; `vtxo-2` has the Simplicity program `arca/collab-2`, whose pair also binds the coin's index and the coins it is spent beside, so one leg of a swap never moves without the other. Both exit alike, by the same script; a `vtxo-2` coin's collaborative spend is larger on the chain (556 vB against 280). Coins held keep their template until refreshed; a coin of a supervised asset is `landing-1` whatever is set, the leaves an in-tree fill of a resting order makes the wallet are `vtxo-1` (the fill request names no template), and a `vtxo-2` coin is refreshed by `sync` rather than planned |
-| `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, and whether the bond covers it (`covers`) |
+| `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, whether the bond covers it (`covers`), and the instant budget when one is set (`instant_budget`) |
+| `instant-budget SHARE` | Sets the share of the bond's value the wallet holds out of round at most (`0.1`, or `off`): a counterparty's instant budget |
 | `bond-evidence` | Every message the operator key signed that the wallet's coins rest on, as evidence lines (`lines`): what the wallet hands a watcher |
 | `watch-bond [--evidence FILE]… [--fee-asset ASSET]` | Compares the wallet's evidence and every file's under each salt, reads the chain and the mempool for spends of the coins they name, and burns the operator's bond on two different messages under one salt: what it counted (`evidence`), what it read (`scanned`), the `conflicts`, the slash it sent (`slashed`), and each slash sent before again until final (`resent`) |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |
@@ -1836,6 +1875,7 @@ every payment over Lightning the operator has not decided (a paid one closed
 with its preimage, a failed one's leaf taken back), moves every payment it
 asked to receive on (the operator's participation for its leaf taken up,
 the leaf claimed with the preimage once held), takes on the chain every coin whose refresh has not completed a day before its exit date, and moves every exit on; every exit step whose date has come is taken first, before the operator is asked anything, and again whenever one comes while it asks; it says when it must run next (`schedule`). Run it at least once a day while the wallet holds a coin off the chain or waits for a payment. `sync --exits-only` takes the exit steps whose date has come and nothing else, asking the operator nothing |
+| `hand-over-forfeits` | Hands over the forfeits of every round the operator holds for them before it broadcasts it (a round of batches without a sweep, or one that fills on-chain orders), once a witness of the operator's signer's record succeeds, and does nothing else: no re-check against the chain, no other step of `sync`. Forfeits the operator already holds for that round are not sent again. A held round is dropped, and the participation voided, when its forfeits have not come within the operator's window (`info.fills.forfeit_window_seconds`), so a program whose `sync` runs longer or comes less often than that window runs this on a short timer of its own; `sync` does it first, before any slower step (`held` in its answer) |
 | `schedule` | When `sync` must next run (`next_sync_at`, a median time, and `due`), when the next exit step is due (`next_exit_at` and `exit_due`, which `sync --exits-only` takes), what holds it back (`why`), the dates of every coin held off the chain (the current coin of an open offline-refresh plan with its `plan` and `sync_by`, the date it wakes for) and the unpaid receive requests, every plan as `plans` shows it, asking nothing of the operator: for a program that runs `sync` on a timer |
 | `recheck` | Re-checks every coin against the chain as it is now (while the chain has only grown since the last re-check, a live coin is read again only when an output it descends from no longer stands or its exit date is near; after a rollback every coin is), starts the exit of any coin whose round or board the chain holds fails the wallet's checks, whose lineage shows on the chain, or that is past its exit date, and reports what changed and whether the tip it last saw was reorganised away |
 | `channel list` | Every channel leaf the wallet holds: its latest state, its balance (the latest state's and every credit not folded), its credit and what of it is not folded, the operator's side, and whether a state waits for the operator's answer (see Channel leaves) |
@@ -1945,7 +1985,10 @@ not answer is left out and the others' round goes out, and a pays-on and a
 RECLAIM-D follow. A wallet that drops out of a round holds back nobody: the
 one that answered runs again at once, alone, before a newcomer; the one that
 dropped out, back again, sees in its `sync` why its refresh waits, then runs
-in a round of its own and goes out once it answers. With `ARCA_CLI_OLDER`
+in a round of its own and goes out once it answers. A wallet that syncs less
+often than the window keeps its round by running `hand-over-forfeits` in
+between, and sends nothing again on a second run; the same wallet whose next
+call is its `sync`, past the window, has its round dropped. With `ARCA_CLI_OLDER`
 naming an `arca` built before wallets said `forfeits_before_broadcast`, that
 wallet's refresh is refused as the operator's refusal, in words telling its
 holder to update, and its coin stays live. On an operator that also builds
@@ -2026,7 +2069,16 @@ delegates its coin, the maker's next `sync` (taking up its credit and the
 order resting again) delegates the order's coin, once; a second fill of the
 rest and the maker's cancel of what then rests carry no delegation, since
 the order resting again keeps the order's key, which has delegated; both
-refresh, and neither node comes back by RECLAIM-D before its expiry.
+refresh, and neither node comes back by RECLAIM-D before its expiry. Once
+one wallet of a node refreshes and releases, the other's next `sync` refreshes
+its coin there at once, and the node comes back; with the operator charging
+5,000 ppm for a refresh, that refresh pays nothing. A payer whose payee and
+the node's other holder refresh and release has its change named at its next
+`sync`, not before the payee refreshed, and once the change is refreshed and
+released the node comes back by RECLAIM-D. A wallet holding two coins of a
+node beside another wallet's has both named once the other refreshes and
+releases, and its next `sync` refreshes the two in one participation, paying
+nothing under a 5,000 ppm schedule.
 
 `tests/arca_fills.rs` runs the same way: two orders made with SeqDEX's fill
 covenant (their scripts derived by SeqDEX's own `seqob-covenant` when

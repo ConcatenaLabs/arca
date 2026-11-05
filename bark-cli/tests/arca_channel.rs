@@ -174,3 +174,118 @@ async fn channels_pay_at_once_take_credit_offline_and_close_both_ways() {
 	println!("B's side {} came home on the chain: on-chain X {} -> {}", b_side, before, after);
 	assert!(after > before + b_side - 50_000, "B's side, less the exit's fees, is home");
 }
+
+/// A channel closed on the chain by someone else, at a state older than the
+/// credit its owner was paid: the owner's own `sync` takes its credit not
+/// folded by itself, with no `channel exit` asked. Another store of B's
+/// mnemonic, copied before A paid B, stands for whoever closes it (the
+/// operator could do the same): it unrolls B's channel, settles its opening
+/// state after the exit delay and sweeps B's side, knowing nothing of the
+/// note A's payment gave B.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_closed_by_someone_else_has_its_credit_claimed_by_sync() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.assets[0].channel_capacity = Some("2000000".into());
+	}).await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("closed by another A");
+	let b = Arca::new("closed by another B");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1",
+		"--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for w in [&a, &b] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, r.x, 5_000_000);
+	}
+	r.produce().await;
+	for w in [&a, &b] {
+		w.ok(&["board", &x, &BOARD.to_string()]);
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit both boards", || {
+		a.ok(&["boards"])[0]["server"]["state"] == "credited" && b.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	for w in [&a, &b] {
+		w.ok(&["channel", "open", "--capacity", &CAPACITY.to_string()]);
+	}
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	let round = built.tx.txid();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&round, RoundState::Final).await;
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	let (la, lb) = (channel(&a)["leaf_id"].as_str().unwrap().to_string(), channel(&b)["leaf_id"].as_str().unwrap().to_string());
+
+	// Another store of B's mnemonic, as B stood before it was paid.
+	let other = Arca::new("closed by another B, elsewhere");
+	std::fs::create_dir_all(&other.dir).unwrap();
+	for e in std::fs::read_dir(&b.dir).unwrap() {
+		let e = e.unwrap();
+		if e.file_type().unwrap().is_file() {
+			std::fs::copy(e.path(), other.dir.join(e.file_name())).unwrap();
+		}
+	}
+
+	// A pays B; B reads its note and does not fold it.
+	const PAID: u64 = 300_000;
+	a.ok(&["channel", "pay", &la, &lb, &PAID.to_string()]);
+	let seen = b.ok(&["channel", "sync", &lb]);
+	assert_eq!(num(&seen["credit_not_folded"]), PAID, "{}", seen);
+
+	// The other store closes B's channel at its opening state, and sweeps B's side.
+	let mut last = Value::Null;
+	for step in 0..12 {
+		let e = other.ok(&["channel", "exit", &lb]);
+		println!("the other store's exit of B's channel, run {}: {}", step, e);
+		let state = e["state"].as_str().unwrap().to_string();
+		last = e;
+		if state == "exited" {
+			break;
+		}
+		if state == "waiting" {
+			common::node::advance_mtp(&r.rt, 600);
+		}
+		r.produce().await;
+	}
+	assert_eq!(last["state"], "exited", "{}", last);
+	r.produce().await;
+	r.bury().await;
+	let before = num(&b.ok(&["balance"])["sequentia_onchain"][&x]);
+
+	// B's own sync, as B runs it on its return: the credit claimed by itself.
+	let mut home = 0;
+	for step in 0..12 {
+		let s = b.ok(&["sync"]);
+		println!("B's sync, run {}: re-check {}; exits {}", step, s["start"]["recheck"]["changes"], s["exits"]);
+		for e in s["exits"].as_array().into_iter().flatten() {
+			assert!(e["error"].is_null(), "an exit step of B's sync refused: {}", e);
+			if e["leaf_id"] == lb.as_str() && !e["home"].is_null() {
+				home += num(&e["home"]["amount"]);
+			}
+		}
+		let l = b.ok(&["channel", "list"]);
+		let coin = l.as_array().unwrap().iter().find(|c| c["leaf_id"] == lb.as_str()).cloned().unwrap_or(Value::Null);
+		println!("B's channel after it: {}", coin);
+		if coin.is_null() || coin["coin_state"] == "exited" {
+			break;
+		}
+		r.produce().await;
+	}
+	r.produce().await;
+	r.bury().await;
+	let after = num(&b.ok(&["balance"])["sequentia_onchain"][&x]);
+	let coins = b.ok(&["coins"]);
+	let state = coins.as_array().unwrap().iter().find(|c| c["leaf_id"] == lb.as_str()).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+	println!("B's channel coin is {}; on-chain X {} -> {}", state, before, after);
+	assert_eq!(state, "exited", "{}", coins);
+	assert!(home > PAID - 50_000 && home <= PAID, "B's credit not folded, less the claim's and the sweep's fees, swept home: {}", home);
+	assert!(after >= before + home, "and in B's on-chain balance: {} -> {}", before, after);
+}

@@ -9,6 +9,7 @@
 //!     COOKIE=$H/btc/regtest/.cookie MNEMONIC="…" [FEERATE=5] \
 //!     cargo run --features native --example regtest_drive -- DATADIR COMMAND [JSON]
 //!
+//! `new_mnemonic` prints a fresh phrase (no wallet is opened);
 //! `sync` is the wallet's own sync (what its daemon runs while it is open),
 //! `funding_address` the first address of the phrase's BIP84 account (whose
 //! coins pay an exit's fees), `board_funding` `{"sats"}` a board paid from
@@ -49,6 +50,16 @@ async fn main() -> anyhow::Result<()> {
 		Some(s) => serde_json::from_str(&s).context("the arguments are not JSON")?,
 		None => serde_json::json!({}),
 	};
+
+	// A phrase of its own for a test run, from the time and this process.
+	if cmd == "new_mnemonic" {
+		use bark::ark::bitcoin::hashes::{sha256, Hash};
+		let seed = format!("{}-{:?}", std::process::id(), std::time::SystemTime::now());
+		let entropy = sha256::Hash::hash(seed.as_bytes()).to_byte_array();
+		let m = bark::bip39::Mnemonic::from_entropy(&entropy[..16])?;
+		println!("{}", serde_json::json!({ "mnemonic": m.to_string() }));
+		return Ok(());
+	}
 
 	let net = arca_bark_wasm::command::network(&std::env::var("NETWORK").unwrap_or_else(|_| "regtest".into()))?;
 	let mnemonic = bark::bip39::Mnemonic::from_str(env("MNEMONIC")?.trim())?;

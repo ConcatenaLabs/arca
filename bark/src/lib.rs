@@ -412,6 +412,7 @@ mod psbtext;
 mod utils;
 
 pub use self::arkoor::{ArkoorCreateResult, ArkoorAddressError};
+pub use self::board::{FoundBoard, BOARD_SEARCH_BLOCKS, BOARD_SEARCH_KEYS};
 pub use self::payment_request::{
 	AvailablePaymentMethod, PaymentInitOutput, PaymentMethodParsingError, PaymentRequest,
 };
@@ -513,6 +514,39 @@ pub const SCHEDULED_REFRESH_GRACE: BlockDelta = 6;
 /// refresh for: about half a day of Bitcoin blocks, so a server that misses a round or two,
 /// or a burst of blocks, still leaves it time to run the refresh before the coin expires.
 pub const SCHEDULED_REFRESH_MARGIN: BlockDelta = 72;
+
+/// Splits `items` into groups whose amounts add up to at most `max` each, filling the
+/// groups first fit in the order given, and the items whose amount alone is above `max`.
+/// With no `max`, every item is in one group.
+///
+/// A refresh makes one coin of what its inputs hold, and the server refuses a coin above
+/// its largest (`max_vtxo_amount`), so the wallet refreshes in groups that fit under it.
+/// A coin above it on its own (made before the server lowered its largest) cannot be
+/// refreshed at all and leaves the ark instead ([Wallet::oversized_vtxos_due]).
+pub fn split_under_max<T>(
+	items: Vec<T>,
+	amount: impl Fn(&T) -> Amount,
+	max: Option<Amount>,
+) -> (Vec<Vec<T>>, Vec<T>) {
+	let max = match max {
+		Some(m) => m,
+		None => return (if items.is_empty() { vec![] } else { vec![items] }, vec![]),
+	};
+	let mut groups: Vec<(Amount, Vec<T>)> = Vec::new();
+	let mut over = Vec::new();
+	for item in items {
+		let a = amount(&item);
+		if a > max {
+			over.push(item);
+			continue;
+		}
+		match groups.iter_mut().find(|(sum, _)| *sum + a <= max) {
+			Some((sum, g)) => { *sum += a; g.push(item); },
+			None => groups.push((a, vec![item])),
+		}
+	}
+	(groups.into_iter().map(|(_, g)| g).collect(), over)
+}
 
 /// Refuse an [ArkInfo] whose parameters would make participation unsafe:
 /// `vtxo_lifetime` must leave room to board and broadcast a unilateral exit
@@ -2407,6 +2441,7 @@ impl Wallet {
 			busy.extend(round.state().participation().inputs.iter().map(|v| v.id()));
 		}
 
+		let max = self.ark_info().await.ok().flatten().and_then(|i| i.max_vtxo_amount);
 		let mut by_expiry = std::collections::BTreeMap::<BlockHeight, Vec<WalletVtxo>>::new();
 		for v in self.spendable_vtxos().await? {
 			if busy.contains(&v.id())
@@ -2418,7 +2453,17 @@ impl Wallet {
 			}
 			by_expiry.entry(v.expiry_height()).or_default().push(v);
 		}
-		Ok(by_expiry.into_iter().map(|(expiry, vtxos)| (expiry.saturating_sub(margin).max(tip), vtxos)).collect())
+		let mut ret = Vec::new();
+		for (expiry, vtxos) in by_expiry {
+			let height = expiry.saturating_sub(margin).max(tip);
+			let (groups, over) = split_under_max(vtxos, |v| v.amount(), max);
+			for v in over {
+				info!("Not scheduling the refresh of {} ({}): it is above the server's largest coin",
+					v.id(), v.amount());
+			}
+			ret.extend(groups.into_iter().map(|g| (height, g)));
+		}
+		Ok(ret)
 	}
 
 	/// This will find all VTXOs that meets must-refresh criteria. Then, if there are some VTXOs to
@@ -2426,7 +2471,35 @@ impl Wallet {
 	///
 	/// A coin whose refresh is scheduled with the server ([Wallet::schedule_refreshes]) is
 	/// left to it until [SCHEDULED_REFRESH_GRACE] blocks past the scheduled height.
+	///
+	/// What it returns fits in one coin of the server's: at most its largest coin
+	/// (`max_vtxo_amount`) in all, the coins expiring soonest first. The rest is
+	/// refreshed by a later call, and a coin alone above the largest is left out
+	/// ([Wallet::oversized_vtxos_due]).
 	pub async fn get_vtxos_to_refresh(&self) -> anyhow::Result<Vec<WalletVtxo>> {
+		let mut vtxos = self.vtxos_due_for_refresh().await?;
+		vtxos.sort_by_key(|v| v.expiry_height());
+		let (mut groups, _) = split_under_max(vtxos, |v| v.amount(), self.max_vtxo_amount().await);
+		Ok(if groups.is_empty() { vec![] } else { groups.swap_remove(0) })
+	}
+
+	/// The coins due for a refresh that the server cannot refresh: each alone above its
+	/// largest coin (`max_vtxo_amount`), made before the server lowered it. A refresh of
+	/// one is refused, so the wallet takes it out of the ark to a Bitcoin address of its
+	/// own instead ([Wallet::offboard_vtxos]); [Wallet::get_vtxos_to_refresh] leaves them out.
+	pub async fn oversized_vtxos_due(&self) -> anyhow::Result<Vec<WalletVtxo>> {
+		let max = self.max_vtxo_amount().await;
+		let (_, over) = split_under_max(self.vtxos_due_for_refresh().await?, |v| v.amount(), max);
+		Ok(over)
+	}
+
+	/// The server's largest coin, as it last said (connecting when not yet connected),
+	/// or None when it names none or cannot be reached.
+	async fn max_vtxo_amount(&self) -> Option<Amount> {
+		self.require_ark_info().await.ok().and_then(|i| i.max_vtxo_amount)
+	}
+
+	async fn vtxos_due_for_refresh(&self) -> anyhow::Result<Vec<WalletVtxo>> {
 		let tip = self.inner.chain.tip().await?;
 		let scheduled = self.scheduled_refresh_heights().await?;
 		let mut vtxos = self.spendable_vtxos().await?;
@@ -2710,6 +2783,34 @@ mod tests {
 		check_ark_info_safe, wrap_server_connect_error,
 		MAX_NB_ROUND_NONCES, MIN_MAINNET_VTXO_EXIT_DELTA, MISSING_SERVER_TRANSPORT_HELP,
 	};
+
+	#[test]
+	fn refreshes_are_split_under_the_servers_largest_coin() {
+		use super::split_under_max;
+		let sat = Amount::from_sat;
+		let id = |v: &(u32, Amount)| v.1;
+		// Second's mainnet ark: 10,000,000 sat at most in one coin.
+		let max = Some(sat(10_000_000));
+		let coins = vec![(1, sat(6_000_000)), (2, sat(30_000_000)), (3, sat(6_000_000)), (4, sat(4_000_000))];
+		let (groups, over) = split_under_max(coins.clone(), id, max);
+		let ids = |g: &Vec<(u32, Amount)>| g.iter().map(|v| v.0).collect::<Vec<_>>();
+		assert_eq!(groups.iter().map(ids).collect::<Vec<_>>(), vec![vec![1, 4], vec![3]]);
+		assert_eq!(ids(&over), vec![2]);
+		for g in &groups {
+			assert!(g.iter().map(|v| v.1).sum::<Amount>() <= sat(10_000_000));
+		}
+		// A coin of exactly the largest fits alone.
+		let (groups, over) = split_under_max(vec![(5, sat(10_000_000))], id, max);
+		assert_eq!(groups.len(), 1);
+		assert!(over.is_empty());
+		// A server that names no largest coin: one group of everything.
+		let (groups, over) = split_under_max(coins, id, None);
+		assert_eq!(groups.len(), 1);
+		assert_eq!(groups[0].len(), 4);
+		assert!(over.is_empty());
+		let (groups, over) = split_under_max(Vec::<(u32, Amount)>::new(), id, max);
+		assert!(groups.is_empty() && over.is_empty());
+	}
 
 	#[test]
 	fn no_transport_connect_error_is_reworded_for_wallet_users() {

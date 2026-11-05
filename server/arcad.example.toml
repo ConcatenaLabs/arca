@@ -31,6 +31,14 @@ max_request_bytes = 65536
 # by a key kept in the database, drawn once, and is itself stored nowhere.
 challenge_ttl_seconds = 120
 
+# Whether `holding_back` also answers a request that proves no key, as
+# wallets on a leaf library older than the proof ask it: only about coins
+# that are batch leaves themselves, never a payment's coins. Such an answer tells
+# anyone which holders of a lowest node have refreshed, so it stays off
+# unless the operator's own wallets and services are still on such a
+# library. Changed only by a restart.
+holding_back_unauthenticated = false
+
 # How often a round is built while participations wait, in seconds. 0 builds
 # none on a timer.
 round_interval_seconds = 60
@@ -279,6 +287,7 @@ min_leaf = "1000"
 # notice_units = 5232
 # outpoint = "<txid>:<vout>"
 # notice = "<txid>:<vout>"
+# instant_budget_fraction = 0.1   # optional: the share of the bond suggested to counterparties
 
 # Takes of on-chain orders (take_order): no order is taken, or filled in a
 # round, whose maker can refund it within order_margin_seconds, an order

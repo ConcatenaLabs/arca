@@ -478,7 +478,10 @@ async fn a_receive_never_claimed_in_a_batch_without_a_sweep_comes_back_at_the_ho
 		let (http, h) = (g.r.http.clone(), hex(&w.hash));
 		g.r.wait("the payment held", || http.post("lightning_receive_status", &json!({"payment_hash": h})).json["state"] == "accepted").await;
 	}
-	let built = g.r.server.rounds.run_round_of(x).await.unwrap().expect("a round");
+	// The receives give up no coin: with every round held for forfeits, they
+	// run in a round of their own, which goes out at once.
+	let built = g.r.server.rounds.run_free_round_of(x).await.unwrap().expect("a round");
+	assert_eq!(built.participations, 2, "both receives, and nothing else");
 	g.r.produce().await;
 	g.r.bury().await;
 	round_final(&g.r, &built.tx.txid()).await;

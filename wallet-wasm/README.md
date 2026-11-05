@@ -108,7 +108,7 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
 `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, shown}`, `participations`, `settle_quote {asset,
-value, expiry}`, `sync`, `schedule`,
+value, expiry}`, `sync`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?}`, `withdraw_participation {participation}`, `refusals`; a payment to an address on the chain from leaves
@@ -147,7 +147,7 @@ take (`vtxo-1` or `vtxo-2`, the CLI README's `leaf-template`); and `care {scan?,
 the command's JSON, what the start of the command found, the witness of the
 operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is
-`recheck`, `sync` or `schedule`), as `arca` runs them on every start, and what
+`recheck`, `sync`, `hand_over_forfeits` or `schedule`), as `arca` runs them on every start, and what
 each cost (`cost.start` and `cost.command`, each `{ms, node, operator}`: the
 milliseconds and the requests made of the node and of the operator; the
 re-check's own parts are under `start.recheck.ms`, and a `sync` answers what
@@ -196,7 +196,12 @@ broadcasts only on those fees. A quote signs, asks and broadcasts nothing, and a
 `shown` that no longer holds is refused before anything is written or
 broadcast. `schedule` is
 `Wallet::sync_schedule`: when `sync` must run next and why. A page runs `sync`
-when it is due.
+when it is due. `hand_over_forfeits` hands over the forfeits of every round
+the operator holds for them before broadcasting it, and does nothing else (the
+CLI README's `hand-over-forfeits`): a held round is dropped, and the
+participation voided, when they have not come within the operator's window
+(`info.fills.forfeit_window_seconds`), so a program whose `sync` runs longer
+or comes less often than that runs it on a short timer of its own.
 
 A refusal is thrown as the JSON `arca` prints, `{"error": {"kind",
 "message"}}`, with the server's `code` and `status` when the server refused.
@@ -215,7 +220,8 @@ spends nothing it does not have to on reading the chain again.
 
 - **At the start of every command:** the re-check of every coin the wallet
   holds against the chain (`start.recheck`, except for `recheck`, `sync` and
-  `schedule`, which run it themselves): each coin's round or board read where
+  `schedule`, which run it themselves, and `hand_over_forfeits`, which signs
+  only forfeits of coins already given up, against a round it validates): each coin's round or board read where
   the chain holds it now, a round that another transaction replaced checked
   again with the five checks and the wallet's bounds (a failure takes the coin
   on the chain at once), every round and board's finality, each coin's dates,

@@ -28,9 +28,10 @@
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
 //! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]); answered at a bounded rate of their own ([`Limiter`]) |
 //! | `bind_mailbox` | POST | by each leaf's owner key's signature over its binding; at the reads' rate |
+//! | `holding_back` | POST | by a challenge signed with each key named, answering only for the coins served to them ([`crate::auth`]); at the reads' rate |
 //! | `witness` | POST | no: the heads it hands over are the signer's, signed, and at most four without a valid signature; answered at a bounded rate of its own, for each source and overall ([`Limiter`]) |
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -55,6 +56,7 @@ use crate::api;
 use crate::auth;
 use crate::boards::{BoardError, BoardStatus, Boards};
 use crate::chain::{Certification, Finality};
+use crate::fresh::{Fresh, Turn};
 use crate::cosign::{CosignError, Cosigner, InputRequest, OutputRequest, TransferRequest};
 use crate::params::{FeeSchedule, Params};
 use crate::forfeits::{AuthsRequest, ForfeitError, ForfeitLeaves, ForfeitRequest, Forfeits, ReleaseRequest};
@@ -89,6 +91,9 @@ pub struct App {
 	pub anchor_depth: u32,
 	pub max_request: usize,
 	pub challenge_ttl: Duration,
+	/// Whether `holding_back` answers a request that proves no key
+	/// (`Config::holding_back_unauthenticated`).
+	pub holding_back_unauthenticated: bool,
 	/// Bounds the operator nonces handed out.
 	pub nonces: Limiter,
 	/// Bounds the witnesses answered: each reads the signer's record under
@@ -104,16 +109,12 @@ pub struct App {
 	/// The addresses of the reverse proxies whose forwarded address names a
 	/// request's source.
 	pub trusted_proxies: Vec<IpAddr>,
-	/// The floors `info` last published, and when: asked of the node at most
-	/// once every [`FLOORS_FOR`].
-	pub floors: tokio::sync::Mutex<Option<(Instant, Vec<api::FloorInfo>)>>,
-	/// The signer's record head `info` last published, signed, and when.
-	pub record_head: tokio::sync::Mutex<Option<(Instant, crate::signer::SignedHead)>>,
+	/// What `info` publishes that is read from the node, the signer or the
+	/// database, each kept so that `info` answers from memory and never
+	/// waits on the read ([`crate::fresh`]).
+	pub info_parts: InfoParts,
 	/// The operator's equivocation bond, when the configuration names one.
 	pub bond: Option<crate::bond::Bond>,
-	/// Where `info` last read the bond to stand, and when: read from the
-	/// node at most once every [`BOND_FOR`].
-	pub bond_view: tokio::sync::Mutex<Option<(Instant, crate::bond::View)>>,
 	/// The keepers the signer's record names, as `info` publishes them: the
 	/// set the server pinned in its database, which the signer named at
 	/// start. Read from the signer again whenever `info` asks it for its
@@ -130,6 +131,58 @@ pub struct App {
 	pub sends: Arc<crate::lightning::send::Sends>,
 	pub receives: Arc<crate::lightning::receive::Receives>,
 }
+
+/// What `info` publishes that is read from the node, the signer or the
+/// database. Each part is read again, in the background, once older than its
+/// own age ([`FLOORS_FOR`], [`RECORD_HEAD_FOR`], [`BOND_FOR`],
+/// [`crate::rounds::FUNDABLE_FOR`], [`OWED_FOR`]); `info` only waits on a part
+/// never read yet.
+#[derive(Default)]
+pub struct InfoParts {
+	/// The node's floor in every asset served; `None` when the node did not
+	/// answer.
+	pub floors: Arc<Fresh<Option<Vec<api::FloorInfo>>>>,
+	/// The signer's record head, signed; `None` when the signer did not
+	/// answer.
+	pub record_head: Arc<Fresh<Option<crate::signer::SignedHead>>>,
+	/// Where the bond stands on the chain.
+	pub bond_view: Arc<Fresh<crate::bond::View>>,
+	/// What a round can pay now of each asset.
+	pub fundable: Arc<Fresh<Option<BTreeMap<AssetId, u64>>>>,
+	/// What is owed for swept coins, per asset: total and coins.
+	pub owed: Arc<Fresh<Option<BTreeMap<[u8; 32], (u64, u64)>>>>,
+	/// What is in flight of each asset.
+	pub in_flight: Arc<Fresh<Option<BTreeMap<[u8; 32], u64>>>>,
+}
+
+/// What `cell` holds, read again with `read` once older than `max_age`: in a
+/// task of its own when the cell holds a value, which is handed out
+/// meanwhile, so the caller never waits on the read; in this call only when
+/// nothing was read yet.
+async fn served<T, F, Fut>(cell: &Arc<Fresh<T>>, max_age: Duration, read: F) -> T
+where
+	T: Clone + Send + Sync + 'static,
+	F: FnOnce() -> Fut,
+	Fut: std::future::Future<Output = T> + Send + 'static,
+{
+	match cell.turn(max_age) {
+		Turn::Fresh(v) | Turn::Reading(v) => v,
+		Turn::Stale(v) => {
+			let (cell, read) = (cell.clone(), read());
+			tokio::spawn(async move { cell.put(read.await) });
+			v
+		},
+		Turn::Empty => {
+			let v = read().await;
+			cell.put(v.clone());
+			v
+		},
+	}
+}
+
+/// How long `info` publishes what is owed for swept coins before it reads it
+/// again.
+pub const OWED_FOR: Duration = Duration::from_secs(5);
 
 /// Asks the signer which keepers its record names and compares them with
 /// `pinned`, the set the server pinned at its first start: a signer naming
@@ -179,14 +232,14 @@ async fn serving(State(app): State<Arc<App>>, req: axum::extract::Request, next:
 pub const FLOORS_FOR: Duration = Duration::from_secs(5);
 
 /// The operator's node's floor in every asset served, as `info` publishes
-/// it; `None` when the node does not answer.
-async fn floors(app: &App) -> Option<Vec<api::FloorInfo>> {
-	let mut cached = app.floors.lock().await;
-	if let Some((at, f)) = cached.as_ref() {
-		if at.elapsed() < FLOORS_FOR {
-			return Some(f.clone());
-		}
-	}
+/// it, read from the node at most once every [`FLOORS_FOR`]; `None` when the
+/// node does not answer.
+async fn floors(app: &Arc<App>) -> Option<Vec<api::FloorInfo>> {
+	let app2 = app.clone();
+	served(&app.info_parts.floors, FLOORS_FOR, move || async move { read_floors(&app2).await }).await
+}
+
+async fn read_floors(app: &App) -> Option<Vec<api::FloorInfo>> {
 	let mut out = vec![];
 	for asset in app.params.assets.ids() {
 		match crate::fees::floor_per_kvb(app.cosigner.finality(), asset).await {
@@ -197,7 +250,6 @@ async fn floors(app: &App) -> Option<Vec<api::FloorInfo>> {
 			},
 		}
 	}
-	*cached = Some((Instant::now(), out.clone()));
 	Some(out)
 }
 
@@ -573,17 +625,52 @@ async fn head_with_acks(app: &App, entry: u64, hash: &[u8; 32], sig: Option<&[u8
 
 /// The signer's record's latest entry and running hash, with the signer's
 /// signature over them, as `info` publishes it: asked of the signer at most
-/// once every [`RECORD_HEAD_FOR`], and again at once when the database has
-/// been given a later entry since; `None` while the signer does not answer
-/// (the database's latest may lag the record by an entry after a crash, and
-/// would read as a rollback), or is stopped.
-async fn record_head(app: &App) -> Option<api::RecordHead> {
-	let known = app.store.signer_head().await.ok().flatten().map(|h| h.0).unwrap_or(0);
-	let mut cached = app.record_head.lock().await;
-	if let Some((at, h)) = cached.as_ref() {
-		if at.elapsed() < RECORD_HEAD_FOR && known <= h.entry {
-			return Some(record_head_json(h));
-		}
+/// once every [`RECORD_HEAD_FOR`], in the background. When the server has
+/// handed out a later head since ([`crate::Store::signer_head_latest`]), that
+/// head, signed as it went out: a wallet holding an entry takes a latest one
+/// below it for an older head replayed. `None` while the signer does not
+/// answer (the database's latest may lag the record by an entry after a
+/// crash, and would read as a rollback), or is stopped.
+async fn record_head(app: &Arc<App>) -> Option<api::RecordHead> {
+	let cell = &app.info_parts.record_head;
+	let app2 = app.clone();
+	let read = move || async move { read_record_head(&app2).await };
+	let handed_out = app.store.signer_head_latest();
+	let cached = cell.peek().flatten();
+	match handed_out {
+		Some(h) if cached.as_ref().is_some_and(|c| c.entry < h.entry) => {
+			// Behind a head the server handed out: that head, signed as it
+			// went out, from memory, the signer asked again meanwhile.
+			if let Turn::Stale(_) = cell.turn(Duration::ZERO) {
+				let (cell, read) = (cell.clone(), read());
+				tokio::spawn(async move { cell.put(read.await) });
+			}
+			match h.signature.and_then(|s| Signature::from_slice(&s).ok()) {
+				Some(sig) => Some(record_head_json(&crate::signer::SignedHead { entry: h.entry, hash: h.hash, signature: Some(sig),
+					acks: vec![] })),
+				// Handed out unsigned (as at a start, before the signer's
+				// next signature): asked of the signer, in this call.
+				None => {
+					let h = read_record_head(app).await;
+					cell.put(h.clone());
+					h.as_ref().map(record_head_json)
+				},
+			}
+		},
+		_ => served(cell, RECORD_HEAD_FOR, read).await.as_ref().map(record_head_json),
+	}
+}
+
+async fn read_record_head(app: &App) -> Option<crate::signer::SignedHead> {
+	// The keepers the record names, as the signer reads them from it,
+	// against the set the server pinned: another set stops the server. Asked
+	// first, so a swapped signer is found one signer round trip after the
+	// `info` that asked.
+	keepers_replaced(app.cosigner.signer(), &app.keepers, &app.replaced).await;
+	// The latest entry handed out, by this server or another on the same
+	// database, is known from here on without a read.
+	if let Err(e) = app.store.signer_head().await {
+		log::warn!("info: the latest entry of the signer's record handed out: {}", e);
 	}
 	let head = match app.cosigner.signer().signed_head().await {
 		Ok(h) => Some(h),
@@ -592,13 +679,7 @@ async fn record_head(app: &App) -> Option<api::RecordHead> {
 			None
 		},
 	};
-	// The keepers the record names, as the signer reads them from it,
-	// against the set the server pinned: another set stops the server.
-	keepers_replaced(app.cosigner.signer(), &app.keepers, &app.replaced).await;
-	if let Some(h) = &head {
-		*cached = Some((Instant::now(), h.clone()));
-	}
-	head.as_ref().map(record_head_json)
+	head
 }
 
 /// How long `info` keeps the bond's state it read from the node.
@@ -606,34 +687,31 @@ pub const BOND_FOR: Duration = Duration::from_secs(10);
 
 /// The bond as `info` names it: read from the node at most once every
 /// [`BOND_FOR`]; `None` when the configuration names no bond.
-async fn bond_info(app: &App) -> Option<api::BondInfo> {
+async fn bond_info(app: &Arc<App>) -> Option<api::BondInfo> {
 	let bond = app.bond.as_ref()?;
-	let view = {
-		let mut cached = app.bond_view.lock().await;
-		match cached.as_ref() {
-			Some((at, v)) if at.elapsed() < BOND_FOR => v.clone(),
-			_ => {
-				let v = match crate::bond::view(app.cosigner.finality(), bond).await {
-					Ok(v) => v,
-					Err(e) => {
-						log::warn!("info: the bond: {}", e);
-						crate::bond::View { state: "missing", asset: None, value: None, final_: false, withdrawable_at: None,
-							why: format!("the node did not answer: {}", e) }
-					},
-				};
-				*cached = Some((Instant::now(), v.clone()));
-				v
+	let app2 = app.clone();
+	let view = served(&app.info_parts.bond_view, BOND_FOR, move || async move {
+		let bond = app2.bond.as_ref().expect("a bond named");
+		match crate::bond::view(app2.cosigner.finality(), bond).await {
+			Ok(v) => v,
+			Err(e) => {
+				log::warn!("info: the bond: {}", e);
+				crate::bond::View { state: "missing", asset: None, value: None, final_: false, withdrawable_at: None,
+					why: format!("the node did not answer: {}", e) }
 			},
 		}
-	};
+	}).await;
 	let p = &bond.policy;
 	let rate = view.asset.and_then(|a| app.params.rates.view(&a, crate::rates::unix_now())).and_then(|r| r.rate);
+	let reference = view.value.zip(rate).map(|(v, r)| crate::rates::value_of(v, r));
 	Some(api::BondInfo {
 		state: view.state.into(),
 		outpoint: bond.outpoint.as_ref().map(crate::bond::outpoint_text),
 		asset: view.asset.map(|a| a.to_string()),
 		value: view.value.map(|v| v.to_string()),
-		reference_value: view.value.zip(rate).map(|(v, r)| crate::rates::value_of(v, r).to_string()),
+		reference_value: reference.map(|v| v.to_string()),
+		instant_budget_ppm: bond.instant_budget_ppm,
+		instant_budget: reference.zip(bond.instant_budget_ppm).map(|(v, ppm)| (v as u128 * ppm as u128 / 1_000_000).to_string()),
 		operator: hex(&p.operator.serialize()),
 		withdraw_key: hex(&p.withdraw.serialize()),
 		notice_units: p.notice.units(),
@@ -694,16 +772,29 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 	}))
 }
 
+/// What the operator serves and how, every wallet's and maker's first read:
+/// answered from memory ([`InfoParts`]), whatever the node, the signer or the
+/// database are doing.
 async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 	let floors = floors(&app).await;
 	let signer_record = record_head(&app).await;
 	let bond = bond_info(&app).await;
-	let fundable = app.rounds.fundable_now().await.map_err(|e| log::warn!("what a round can pay now: {}", e)).ok();
-	let owed = app.store.owed_totals().await.map_err(|e| log::warn!("what is owed for swept coins: {}", e)).ok();
+	let parts = &app.info_parts;
+	let a = app.clone();
+	let fundable = served(&parts.fundable, crate::rounds::FUNDABLE_FOR, move || async move {
+		a.rounds.fundable_now().await.map_err(|e| log::warn!("what a round can pay now: {}", e)).ok()
+	}).await;
+	let a = app.clone();
+	let owed = served(&parts.owed, OWED_FOR, move || async move {
+		a.store.owed_totals().await.map_err(|e| log::warn!("what is owed for swept coins: {}", e)).ok()
+	}).await;
 	let owed_of = |a: &AssetId| owed.as_ref().and_then(|o| o.get(&a.into_inner().to_byte_array()).copied());
 	let p = &app.params;
 	let in_flight = if p.assets.ids().iter().any(|a| p.in_flight_cap(a).is_some()) {
-		app.store.in_flight().await.map_err(|e| log::warn!("what is in flight: {}", e)).ok()
+		let a = app.clone();
+		served(&parts.in_flight, crate::rounds::FUNDABLE_FOR, move || async move {
+			a.rounds.in_flight_now().await.map_err(|e| log::warn!("what is in flight: {}", e)).ok()
+		}).await
 	} else {
 		None
 	};
@@ -1364,6 +1455,49 @@ async fn participation_status_call(State(app): State<Arc<App>>, body: Result<Byt
 	Ok(Json(participation_status(&app.participations.status(&id).await?)))
 }
 
+/// `POST /v1/holding_back`: of the coins asked after, the ones that alone
+/// keep their lowest node's fronted value from coming back
+/// ([`Rounds::holding_back`]). Each key named is proven over a fresh
+/// challenge, as for `owed`, and only the coins served to one of them (owned
+/// by it, bound to it as a mailbox, or posted to it) are asked after: the
+/// answer tells whether the other holders of a node have refreshed, which is
+/// for its holders alone to learn. A read, bounded like the others.
+async fn holding_back(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::HoldingBack>, Refusal>
+{
+	let req: api::HoldingBackRequest = parse(body, app.max_request)?;
+	app.reads.refusal("a read of coins holding back a node", app.source(peer.ip(), &headers))?;
+	if req.leaf_ids.len() > api::HOLDING_BACK_ASKED {
+		return Err(Refusal::malformed(format!("at most {} coins are asked after at once", api::HOLDING_BACK_ASKED)));
+	}
+	if req.keys.len() > owed::MAX_OWED_KEYS {
+		return Err(Refusal::malformed(format!("{} keys; a holding_back read names at most {}", req.keys.len(), owed::MAX_OWED_KEYS)));
+	}
+	let mut ids = req.leaf_ids.iter().map(|l| unhex32(l)).collect::<Result<Vec<_>, _>>().map_err(Refusal::malformed)?;
+	if req.keys.is_empty() {
+		if !app.holding_back_unauthenticated {
+			return Err(Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated",
+				"a holding_back read names the keys whose coins it asks after, each signing a fresh challenge".to_string()));
+		}
+		// The form older libraries ask, and all it is kept for: coins that are
+		// batch leaves themselves. A payment's coins (the payee's, the payer's
+		// change) tell whose coins share a node, which is for proven keys only.
+		ids = app.store.batch_leaves_among(&ids).await?;
+	} else {
+		let challenge = req.challenge.clone().ok_or_else(|| Refusal::malformed("a holding_back read that names keys names their challenge"))?;
+		let mut keys = Vec::with_capacity(req.keys.len());
+		for k in &req.keys {
+			let a = api::Auth { key: k.key.clone(), challenge: challenge.clone(), signature: k.signature.clone() };
+			keys.push(authenticate(&app, "holding_back", &a, &[]).await?.serialize());
+		}
+		let served: HashSet<[u8; 32]> = app.store.served_among(&keys, &ids).await?.into_iter().collect();
+		ids.retain(|l| served.contains(l));
+	}
+	let leaves = app.rounds.holding_back(&ids).await?.into_iter()
+		.map(|(l, back)| api::HoldingBackLeaf { leaf_id: hex(&l), back: back.to_string() }).collect();
+	Ok(Json(api::HoldingBack { leaves }))
+}
+
 /// `POST /v1/withdraw_participation`: the owners of the coins a pending
 /// participation gives up take it back before a round takes it
 /// ([`part::Participations::withdraw`]).
@@ -1575,7 +1709,7 @@ async fn witness(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Soc
 	if let Some(why) = &w.stopped {
 		log::error!("the signer is stopped: {}", why);
 		// `info` shows no head of a stopped signer's record from now on.
-		*app.record_head.lock().await = None;
+		app.info_parts.record_head.clear();
 	}
 	let wire = |h: crate::signer::WireEntryRef| api::RecordHead { entry: h.entry, hash: h.hash, signature: h.signature, acks: vec![] };
 	Ok(Json(api::Witness {
@@ -1943,6 +2077,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/lightning_preimage", post(lightning_preimage))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
+		.route("/v1/holding_back", post(holding_back))
 		.route("/v1/withdraw_participation", post(withdraw_participation))
 		.route("/v1/transfer_status", post(transfer_status))
 		.route("/v1/take_order", post(take_order))

@@ -790,6 +790,39 @@ impl Store {
 		r.as_ref().map(batch_leaf_row).transpose()
 	}
 
+	/// Of the coins `ids`, the ones that are batch leaves themselves, in the
+	/// order asked.
+	pub async fn batch_leaves_among(&self, ids: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let asked: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query("SELECT leaf_id FROM batch_leaf WHERE leaf_id = ANY($1::bytea[])", &[&asked]).await?;
+		let found: std::collections::HashSet<[u8; 32]> = rows.iter().map(|r| array32(r.get(0), "coin id")).collect::<Result<_, _>>()?;
+		Ok(ids.iter().copied().filter(|i| found.contains(i)).collect())
+	}
+
+	/// The batch leaves each coin of `ids` rests on: itself when it is one,
+	/// else each batch leaf up its lineage of reassignments (a payment out of
+	/// round, a swap), eight steps at most as in flight is counted. Each with
+	/// the coin of `ids` it was found for.
+	pub async fn batch_leaves_under(&self, ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], BatchLeafRow)>, StoreError> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query(&format!(
+			"WITH RECURSIVE up (root, lid, depth) AS (
+			   SELECT x, x, 0 FROM unnest($1::bytea[]) AS x
+			   UNION
+			   SELECT u.root, ti.leaf_id, u.depth + 1 FROM up u JOIN transfer_output o ON o.leaf_id = u.lid
+			   JOIN transfer_input ti ON ti.transfer_id = o.transfer_id WHERE u.depth < 8)
+			 SELECT DISTINCT {}, up.root FROM up JOIN batch_leaf ON batch_leaf.leaf_id = up.lid", LEAF_COLUMNS), &[&ids]).await?;
+		rows.iter().map(|r| Ok((array32(r.get(16), "coin id")?, batch_leaf_row(r)?))).collect()
+	}
+
 	/// The leaves of batches of the round `round_id`.
 	pub async fn round_leaves(&self, round_id: i64) -> Result<Vec<BatchLeafRow>, StoreError> {
 		let conn = self.conn().await?;

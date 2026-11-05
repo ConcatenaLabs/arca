@@ -44,7 +44,7 @@ async fn refresh_all(r: &Running, ws: &[&Arca]) {
 		let s = w.ok(&["sync"]);
 		let ps = s["participations"].as_array().unwrap();
 		println!("wallet {} before broadcast: {}", i, ps.iter().map(|p| format!("{} {}", p["state"], p["note"])).collect::<Vec<_>>().join("; "));
-		assert!(ps.iter().all(|p| p["state"] == "forfeiting"), "{}", s);
+		assert!(common::cli::handed_over(&s), "{}", s);
 	}
 	r.server.rounds.pass().await.unwrap();
 	for b in &built {
@@ -126,7 +126,7 @@ async fn wallets_sign_before_broadcast_and_a_silent_one_is_left_out() {
 	println!("round {} built: {}", dropped.txid(), built[0].broadcast);
 	for w in [&a, &b] {
 		let s = w.ok(&["sync"]);
-		assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] == "forfeiting"), "{}", s);
+		assert!(common::cli::handed_over(&s), "{}", s);
 	}
 	let sch = a.ok(&["schedule"]);
 	println!("A's schedule while its round waits: {}", sch["why"]);
@@ -153,7 +153,7 @@ async fn wallets_sign_before_broadcast_and_a_silent_one_is_left_out() {
 	assert_eq!(again[0].participations, 2);
 	for w in [&a, &b] {
 		let s = w.ok(&["sync"]);
-		assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] == "forfeiting"), "{}", s);
+		assert!(common::cli::handed_over(&s), "{}", s);
 	}
 	r.server.rounds.pass().await.unwrap();
 	r.produce().await;
@@ -520,7 +520,7 @@ async fn older_wallets_get_a_tree_beside_the_accumulator_slots() {
 		let s = w.ok(&["sync"]);
 		let ps = s["participations"].as_array().unwrap();
 		println!("{} before broadcast: {}", w.name, ps.iter().map(|p| format!("{} {}", p["state"], p["note"])).collect::<Vec<_>>().join("; "));
-		assert!(ps.iter().all(|p| p["state"] == "forfeiting"), "{}: {}", w.name, s);
+		assert!(common::cli::handed_over(&s), "{}: {}", w.name, s);
 	}
 	r.server.rounds.pass().await.unwrap();
 	assert_eq!(round_of(&r, &txid).await, RoundState::Broadcast, "out once every forfeit is in, held back by nobody");
@@ -564,4 +564,90 @@ async fn older_wallets_get_a_tree_beside_the_accumulator_slots() {
 		println!("{} second sync: mailbox {}", updated.name, again["mailbox"]);
 		assert!(again["mailbox"]["accepted"].as_array().unwrap().is_empty(), "read again once only: {}", again["mailbox"]);
 	}
+}
+
+/// A program whose `sync` comes less often than the operator's forfeit
+/// window, as a market maker's does while it rests and reprices orders
+/// between syncs, keeps its held rounds by running `hand-over-forfeits` on a
+/// short timer of its own. M2 and W refresh: W syncs, M2 only hands its
+/// forfeits over, and their round goes out and completes; M2's next
+/// `hand-over-forfeits` sends nothing again. M1 and V refresh the same way,
+/// but M1's next call is its `sync`, after the window: their round is
+/// dropped and M1's refresh voided.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_that_syncs_less_often_than_the_window_keeps_its_round_by_handing_over_its_forfeits() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x_id = r.x;
+	r.fund_server(x_id, 100_000_000).await;
+	r.fund_server(x_id, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	let (m1, v, m2, w) = (Arca::new("M1 slow"), Arca::new("V prompt"), Arca::new("M2 hands over"), Arca::new("W prompt"));
+	for x in [&m1, &v, &m2, &w] {
+		x.ok(&create);
+	}
+	boarded(&mut r, &[&m1, &v, &m2, &w], x_id, 2_000_000).await;
+
+	// M2 and W: M2 hands its forfeits over and syncs no more meanwhile.
+	for x in [&m2, &w] {
+		let p = x.ok(&["participate"]);
+		assert!(p["participations"].as_array().unwrap().iter().all(|p| p["state"] == "pending"), "{}", p);
+	}
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.len(), 1);
+	assert_eq!(built[0].participations, 2);
+	let kept = built[0].tx.txid();
+	assert!(built[0].broadcast.starts_with("held"), "{}", built[0].broadcast);
+	let s = w.ok(&["sync"]);
+	assert!(common::cli::handed_over(&s), "{}", s);
+	let h = m2.ok(&["hand-over-forfeits"]);
+	println!("M2 hands over: {}", h["held"]);
+	let held = h["held"].as_array().unwrap();
+	assert_eq!(held.len(), 1, "{}", h);
+	assert_eq!(held[0]["state"], "forfeiting", "{}", h);
+	let again = m2.ok(&["hand-over-forfeits"]);
+	println!("M2 again while the round is held: {}", again["held"]);
+	// Nothing is signed again: the round still held reads as handed over,
+	// or the server's runner has broadcast it already and nothing is held.
+	let held_again = again["held"].as_array().unwrap();
+	assert!(held_again.is_empty() || held_again[0]["note"].as_str().unwrap_or("").starts_with("the forfeits are in before the round is \
+		broadcast"), "{}", again);
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(round_of(&r, &kept).await, RoundState::Broadcast, "every forfeit is in: the round goes out");
+	let after = m2.ok(&["hand-over-forfeits"]);
+	assert_eq!(after["held"].as_array().map(|a| a.len()), Some(0), "nothing is held now: {}", after);
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&kept, RoundState::Final).await;
+	for x in [&m2, &w] {
+		let s = x.ok(&["sync"]);
+		assert!(s["participations"].as_array().unwrap().iter().all(|p| p["state"] == "released"), "{}", s);
+	}
+	println!("round {} kept: M2 handed its forfeits over without a sync", kept);
+
+	// M1 and V: M1's next call is its sync, past the window.
+	for x in [&m1, &v] {
+		let p = x.ok(&["participate"]);
+		assert!(p["participations"].as_array().unwrap().iter().all(|p| p["state"] == "pending"), "{}", p);
+	}
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.len(), 1);
+	assert_eq!(built[0].participations, 2);
+	let dropped = built[0].tx.txid();
+	let s = v.ok(&["sync"]);
+	assert!(common::cli::handed_over(&s), "{}", s);
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(round_of(&r, &dropped).await, RoundState::Built, "held for M1's forfeits");
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 700));
+	r.synced().await;
+	r.server.rounds.pass().await.unwrap();
+	assert_eq!(round_of(&r, &dropped).await, RoundState::Lost, "M1's forfeits did not come within the window");
+	let s = m1.ok(&["sync"]);
+	println!("M1's sync past the window: {}", s["participations"]);
+	assert_eq!(s["participations"][0]["state"], "void", "{}", s);
+	println!("round {} dropped: M1 synced only after the window", dropped);
 }

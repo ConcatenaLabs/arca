@@ -6,8 +6,8 @@
 //!     arcad bond-key <file>
 //!     arcad <config.toml> bond-address
 //!     arcad <config.toml> bond-post <node wallet> <asset> <atoms> [<fee asset>]
-//!     arcad <config.toml> bond-notice <withdrawal key file>
-//!     arcad <config.toml> bond-withdraw <withdrawal key file> <address>
+//!     arcad <config.toml> bond-notice <withdrawal key file> [<bond coin>]
+//!     arcad <config.toml> bond-withdraw <withdrawal key file> <address> [<bond coin> <notice output>]
 //!     arcad <config.toml> withdraw <asset> <atoms> <address> [<fee asset>]
 //!
 //! The configuration is `server::server::Config`; `server/arcad.example.toml`
@@ -35,7 +35,9 @@
 //! reserve's, a bridge's, an escrow's or another service's, and prints the
 //! `outpoint` line for `[bond]`. `bond-notice` gives the notice and prints the
 //! `notice` line; `bond-withdraw` takes the bond to an address once the
-//! notice's delay has run. Those two sign with `W`'s key from its file and
+//! notice's delay has run. Each acts on the configured bond, or on the
+//! other coin at the bond's script that it names (a bond the configuration
+//! named before, retired once a new one stands). Those two sign with `W`'s key from its file and
 //! pay their fee from the operator's on-chain wallet; they need the
 //! database, the mnemonic file, the node and the signer.
 //!
@@ -59,7 +61,7 @@ use std::str::FromStr;
 use server::server::{bond_address, bond_notice, bond_post, bond_withdraw, expired_salts, receive_address, withdraw, Config, Server};
 
 const USAGE: &str = "usage: arcad <config.toml> [address | expired-salts | bond-address | bond-post <node wallet> <asset> <atoms> \
-	[<fee asset>] | bond-notice <key file> | bond-withdraw <key file> <address> | withdraw <asset> <atoms> <address> [<fee asset>]], or arcad bond-key <file>";
+	[<fee asset>] | bond-notice <key file> [<bond coin>] | bond-withdraw <key file> <address> [<bond coin> <notice output>] | withdraw <asset> <atoms> <address> [<fee asset>]], or arcad bond-key <file>";
 
 /// Prints `r` as JSON, or the error, and exits.
 fn done(r: Result<serde_json::Value, String>) -> ! {
@@ -152,14 +154,17 @@ async fn main() {
 			}
 		},
 		Some("bond-notice") => match args.get(3) {
-			Some(k) => done(bond_notice(&config, std::path::Path::new(k)).await.map_err(|e| e.to_string())),
+			Some(k) => done(bond_notice(&config, std::path::Path::new(k), args.get(4).map(String::as_str)).await.map_err(|e| e.to_string())),
 			None => {
 				eprintln!("{}", USAGE);
 				std::process::exit(2);
 			},
 		},
 		Some("bond-withdraw") => match (args.get(3), args.get(4)) {
-			(Some(k), Some(to)) => done(bond_withdraw(&config, std::path::Path::new(k), to).await.map_err(|e| e.to_string())),
+			(Some(k), Some(to)) if args.len() == 5 || args.len() == 7 => {
+				let coins = args.get(5).map(String::as_str).zip(args.get(6).map(String::as_str));
+				done(bond_withdraw(&config, std::path::Path::new(k), to, coins).await.map_err(|e| e.to_string()))
+			},
 			_ => {
 				eprintln!("{}", USAGE);
 				std::process::exit(2);

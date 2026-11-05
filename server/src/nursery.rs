@@ -52,7 +52,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use sequentia_ext::AssetAmount;
 
-use crate::chain::{ChainEvent, FinalityService};
+use crate::chain::{Certification, ChainEvent, FinalityService};
 use crate::store::{NurseryRow, NurseryState, Store, StoreError};
 use crate::wallet::Wallet;
 
@@ -198,7 +198,15 @@ impl Nursery {
 	/// documentation](self).
 	pub async fn pass(&self) -> Result<(), NurseryError> {
 		let mut rows = self.store.nursery_in(NurseryState::Pending).await?;
-		rows.extend(self.store.nursery_in(NurseryState::Final).await?);
+		// A transaction final while the tip's anchor is ok stays final until
+		// its block leaves the chain: only those the store no longer places
+		// final are looked at, unless the anchor is not ok, when none is.
+		if self.finality.anchor_ok() {
+			let c = self.finality.config();
+			rows.extend(self.store.nursery_final_not_final(c.certification == Certification::Required, c.anchor_depth as u64).await?);
+		} else {
+			rows.extend(self.store.nursery_in(NurseryState::Final).await?);
+		}
 		for row in rows {
 			let txid = Txid::from_byte_array(row.txid);
 			let status = self.finality.status(&txid).await.map_err(|e| NurseryError::Finality(e.to_string()))?;
@@ -386,17 +394,22 @@ impl Nursery {
 		let mut rx = self.finality.subscribe();
 		tokio::spawn(async move {
 			loop {
-				let r = match rx.recv().await {
-					Ok(ChainEvent::Synced { .. }) => me.pass().await,
-					Ok(e) => me.on_chain_event(&e).await,
-					Err(broadcast::error::RecvError::Lagged(n)) => {
-						log::warn!("nursery: {} chain events missed; checking everything", n);
-						me.pass().await
-					},
-					Err(broadcast::error::RecvError::Closed) => return,
-				};
-				if let Err(e) = r {
-					log::warn!("nursery: {}", e);
+				let d = crate::chain::drain(&mut rx).await;
+				for e in &d.events {
+					if let Err(e) = me.on_chain_event(e).await {
+						log::warn!("nursery: {}", e);
+					}
+				}
+				if d.lagged > 0 {
+					log::warn!("nursery: {} chain events missed; checking everything", d.lagged);
+				}
+				if d.synced || d.lagged > 0 {
+					if let Err(e) = me.pass().await {
+						log::warn!("nursery: {}", e);
+					}
+				}
+				if d.closed {
+					return;
 				}
 			}
 		})

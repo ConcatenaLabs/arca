@@ -616,8 +616,10 @@ impl Wallet {
 	/// coin the store holds as spendable, marking spent those another device
 	/// spent. A coin of a board still in flight on another device is posted to
 	/// the mailbox once that device registers the board, and is found by the
-	/// next call after that. Coins the store knows are never imported again, so
-	/// a coin locked here by an action in progress stays as it is.
+	/// next call after that; one whose device was lost before it registered
+	/// is found on the chain by [Wallet::recover_boards]. Coins the store
+	/// knows are never imported again, so a coin locked here by an action in
+	/// progress stays as it is.
 	pub async fn catch_up_from_server(&self) -> anyhow::Result<CatchUpReport> {
 		let mut out = CatchUpReport::default();
 

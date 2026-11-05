@@ -13,8 +13,14 @@ so the phrase restores it anywhere Bark runs (the Arca client's Bitcoin side
 is the same wallet). A wallet made anew from a phrase that held coins in the
 ark takes back what the server's recovery mailbox kept for it. A store made
 before, on a second device, learns what the phrase's other wallets did since
-with `catch_up`: the coins they made or received (a board once its wallet has
-registered it), and which of its own coins they spent.
+with `catch_up`: the coins they made or received, and which of its own coins
+they spent. A board is posted to the recovery mailbox only once the wallet that
+made it registers it, after its funding's confirmations; one whose wallet was
+lost before that is found on the chain instead: `catch_up` reads the
+transactions the phrase's own Bitcoin account paid from, rebuilds each board
+script the phrase's keys could have made with the server's current coin
+lifetime, and takes in every unspent board it matches, cosigned again by the
+server and registered as the lost wallet would have.
 
 Boarding takes the funding from whoever holds the coins: `board_address`
 answers the address under a fresh key of the wallet's, the holder builds the
@@ -43,12 +49,24 @@ delegated refresh scheduled for 72 blocks before the coin's expiry (Bark's
 refresh threshold, if that is more): the server runs it in its first round from
 that height, with the page closed, and the wallet takes the new coin in at its
 next sync, after the old coin's expiry too. Coins sharing an expiry go in one
-refresh, for one base fee. A coin spent before its refresh runs drops it on the
+refresh, for one base fee, as long as they fit in one coin of the server's: a
+refresh makes one coin, and the server refuses a coin above its largest
+(`max_vtxo_amount`, which `info` shows as `max_vtxo_sat`), so coins that hold
+more in all are split into refreshes that each fit. A coin spent before its refresh runs drops it on the
 server, and the next call schedules one for what replaced it. While a refresh
 is scheduled, `refresh` and the daemon leave that coin to the server, until six
 blocks past its height. A page calls it when it opens and after each sync,
 after `tower_plan`, with `except` set to that plan's `no_refresh`: a coin a
 Bitcoin ark watchtower covers gets no delegated refresh (see below).
+
+`refresh` takes the same care: one call refreshes the coins due that fit in one
+coin of the server's, soonest expiry first, and the next call the rest. A coin
+alone above the server's largest, made before the server lowered it, cannot be
+refreshed at all: `refresh` first offboards it, with the server, to the
+holder's own Bitcoin address (`m/84'/coin'/0'/0/0`), its offboard fee taken from
+the coin, and lists it under `offboarded`. The BTC is at that address after a
+Bitcoin block, and a wallet that boards by itself boards it again in coins the
+server takes.
 
 ## Leaving the ark alone
 
@@ -146,7 +164,7 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `refresh` | | `refreshed` (coins whose refresh is scheduled are left to the server) |
 | `schedule_refreshes` | `except`? (coin ids: `tower_plan`'s `no_refresh`) | `scheduled`: each refresh scheduled now, its `height`, `vtxos` (ids) and `amount` |
 | `sync` | | |
-| `catch_up` | | `recovered` (ids), `recovered_sat`, `spent_elsewhere` (ids), `failed` (ids), `complete` |
+| `catch_up` | | `recovered` (ids), `recovered_sat`, `spent_elsewhere` (ids), `failed` (ids), `complete`, `boards`: each board found on the chain, its `funding` (outpoint), `amount`, `vtxo` and `outcome` (`adopted`, `recovered`, `spent`, `expired`, or why not), or an `error` |
 | `history` | | the wallet's movements |
 | `coins` | | `tip`, each coin's `id`, `amount`, `expiry_height`, `refresh_height` (its scheduled refresh, or null), `state` |
 | `exit_estimate` | `vtxos`? (ids) | `tip`, `address` (where a claim goes), `fee_rate` (sat/vB), `funding_confirmed`, each coin's `id`, `amount`, `expiry_height`, `blocks_left`, `cost`, `worth`, `why_not`; `worth`: the worthwhile coins together, their `fees`, `claim_fee`, `cost`, `transactions`, `fundable` |

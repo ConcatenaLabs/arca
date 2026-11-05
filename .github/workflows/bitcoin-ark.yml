@@ -4,12 +4,18 @@ on:
   push:
     branches: [master]
     paths:
+      - 'bark/**'
       - 'bark-cli/**'
+      - 'bark-wasm/**'
+      - 'lib/**'
       - 'contrib/bitcoin-ark-regtest/**'
       - '.github/workflows/bitcoin-ark.yml'
   pull_request:
     paths:
+      - 'bark/**'
       - 'bark-cli/**'
+      - 'bark-wasm/**'
+      - 'lib/**'
       - 'contrib/bitcoin-ark-regtest/**'
       - '.github/workflows/bitcoin-ark.yml'
   workflow_dispatch:
@@ -99,6 +105,24 @@ jobs:
 
       - name: The wallet's Bitcoin side
         run: cargo test --locked -p arca-cli --test arca_bitcoin_ark -- --nocapture
+
+      - name: The browser wallet's library, natively (bark-wasm's regtest_drive)
+        working-directory: bark-wasm
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: cargo build --locked --features native --example regtest_drive
+
+      - name: Limits lowered under coins made before
+        run: |
+          H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh \
+            DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
+            contrib/bitcoin-ark-regtest/limits-drive.sh
+
+      - name: A board of a lost wallet, found from the phrase
+        run: |
+          ARK_SH=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
+            contrib/bitcoin-ark-regtest/board-recovery.sh
 
       - name: The harness's logs
         if: failure()

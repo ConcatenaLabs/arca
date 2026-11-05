@@ -84,7 +84,8 @@ fi
 # The equivocation bond ($0 bond): its withdrawal key, drawn on another
 # machine; its asset and size; the notice before a withdrawal; and the node
 # wallet it is paid from. With a withdrawal key set, the node's wallet is on.
-: "${BOND_WITHDRAW_KEY:=}" "${BOND_ASSET:=}" "${BOND_ATOMS:=}" "${BOND_NOTICE_UNITS:=5232}" "${BOND_WALLET:=operating}"
+: "${BOND_WITHDRAW_KEY:=}" "${BOND_ASSET:=}" "${BOND_ATOMS:=}" "${BOND_NOTICE_UNITS:=5232}" "${BOND_WALLET:=operating}" "${BOND_INSTANT_BUDGET:=}"
+[ -z "$BOND_INSTANT_BUDGET" ] || [[ $BOND_INSTANT_BUDGET =~ ^(0\.[0-9]*[1-9][0-9]*|1\.0+)$ ]] || die "BOND_INSTANT_BUDGET is a share of the bond, more than 0 and at most 1, written like 0.1 or 1.0"
 [ -z "$BOND_WITHDRAW_KEY" ] || [[ $BOND_WITHDRAW_KEY =~ ^[0-9a-f]{64}$ ]] || die "BOND_WITHDRAW_KEY is the withdraw_key arcad bond-key prints (64 hex characters)"
 [ -z "$BOND_ASSET" ] || [[ $BOND_ASSET =~ ^[0-9a-f]{64}$ ]] || die "BOND_ASSET is an asset id (64 hex characters)"
 [ -z "$BOND_ATOMS" ] || [[ $BOND_ATOMS =~ ^[1-9][0-9]*$ ]] || die "BOND_ATOMS is a whole number of atoms"
@@ -570,6 +571,8 @@ notice_units = $BOND_NOTICE_UNITS"
 outpoint = \"$(cat "$ETC/bond.outpoint")\""
   [ -s "$ETC/bond.notice" ] && bond_toml+="
 notice = \"$(cat "$ETC/bond.notice")\""
+  [ -n "$BOND_INSTANT_BUDGET" ] && bond_toml+="
+instant_budget_fraction = $BOND_INSTANT_BUDGET"
 fi
 write_conf arcad 600 "$ETC/arcad.toml" <<EOF
 # arcad's configuration, written by install.sh from $BUNDLE_ENV. Every

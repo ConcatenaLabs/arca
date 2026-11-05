@@ -110,12 +110,25 @@ impl Store {
 		r.map(|r| array32(r.get(0), "mailbox key")).transpose()
 	}
 
-	/// Up to `limit` leaves served to `key` after cursor `after`, in the
-	/// order the server learned of them: those it owns, those whose owner
-	/// key is bound to it, and the transfer outputs posted to it. A batch
-	/// leaf's record holds its participation's preimage, so it is served
-	/// empty until that preimage went out, as [`Store::leaves_by_owner`]
-	/// serves it.
+	/// Of the leaves `ids`, those served to one of `keys`, as
+	/// [`Store::served_leaves`] serves them: owned by it, their owner key
+	/// bound to it as a mailbox, or a transfer output posted to it.
+	pub async fn served_among(&self, keys: &[[u8; 32]], ids: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
+		if keys.is_empty() || ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let keys: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query(
+			"SELECT l.leaf_id FROM leaf l WHERE l.leaf_id = ANY($2) AND (l.owner_key = ANY($1)
+			   OR l.owner_key IN (SELECT owner_key FROM leaf_mailbox WHERE mailbox_key = ANY($1))
+			   OR l.leaf_id IN (SELECT leaf_id FROM transfer_output WHERE mailbox_key = ANY($1)))",
+			&[&keys, &ids],
+		).await?;
+		rows.iter().map(|r| array32(r.get(0), "leaf id")).collect()
+	}
+
 	/// The outputs on the chain the leaves `ids` lie at: each round leaf's
 	/// round txid and batch output, and each board's output, those the server
 	/// holds (a leaf it does not know, or that is neither, adds nothing).
@@ -133,6 +146,12 @@ impl Store {
 		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, r.get::<_, i32>(1) as u32))).collect()
 	}
 
+	/// Up to `limit` leaves served to `key` after cursor `after`, in the
+	/// order the server learned of them: those it owns, those whose owner
+	/// key is bound to it, and the transfer outputs posted to it. A batch
+	/// leaf's record holds its participation's preimage, so it is served
+	/// empty until that preimage went out, as [`Store::leaves_by_owner`]
+	/// serves it.
 	pub async fn served_leaves(&self, key: &[u8; 32], after: i64, limit: i64) -> Result<Vec<ServedLeaf>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(

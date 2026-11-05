@@ -248,6 +248,14 @@ pub struct BondInfo {
 	/// Whether the coin that stands is final: certified, its anchor buried.
 	#[serde(rename = "final")]
 	pub final_: bool,
+	/// The share of the bond's value, in millionths, the operator suggests
+	/// a counterparty take on out of round at once (`[bond]
+	/// instant_budget_fraction`); absent when it suggests none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub instant_budget_ppm: Option<u32>,
+	/// That share of `reference_value`, in atoms of the reference unit.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub instant_budget: Option<String>,
 	/// What the state rests on.
 	pub why: String,
 }
@@ -2034,6 +2042,40 @@ pub struct TransferOutputStatus {
 pub struct WithdrawParticipation {
 	pub participation_id: String,
 	pub signatures: Vec<String>,
+}
+
+/// `POST /v1/holding_back`: of a wallet's coins ([`HOLDING_BACK_ASKED`] at
+/// most), whether on a batch leaf or paid on out of round from one, the ones
+/// that alone keep a lowest node's fronted value from coming back. `keys`
+/// prove the keys the coins are served to (a wallet's mailbox key, or a
+/// coin's owner key), each signing the authentication digest of the call
+/// `holding_back`, the challenge and the key, with an empty request
+/// ([`crate::auth`]); coins served to none of them are not asked after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HoldingBackRequest {
+	pub leaf_ids: Vec<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub challenge: Option<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub keys: Vec<KeyProof>,
+}
+
+/// The most coins one `holding_back` call asks after.
+pub const HOLDING_BACK_ASKED: usize = 64;
+
+/// The answer to `POST /v1/holding_back`: each coin asked after that, once
+/// refreshed and released with the others asked after on its node, brings
+/// the node back, with what the node's other slots hold (`back`, atoms).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldingBack {
+	pub leaves: Vec<HoldingBackLeaf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldingBackLeaf {
+	pub leaf_id: String,
+	pub back: String,
 }
 
 /// `POST /v1/participation_status`.
