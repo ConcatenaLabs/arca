@@ -13,6 +13,18 @@ use common::db::TestDb;
 use common::node;
 use server::chain::{ChainEvent, ChainSource, Finality, FinalityConfig, FinalityService, NodeSource};
 
+/// What `status` says of `txid`, checked against `statuses`, which reads
+/// many at once and must answer the same; an unknown txid beside it is not
+/// in the chain.
+async fn status_both(f: &FinalityService, txid: &elements::Txid) -> Finality {
+	let one = f.status(txid).await.unwrap();
+	let unknown = elements::Txid::from_raw_hash(elements::hashes::Hash::all_zeros());
+	let many = f.statuses(&[*txid, unknown]).await.unwrap();
+	assert_eq!(many[txid], one, "statuses answers as status");
+	assert_eq!(many[&unknown], Finality::NotInChain);
+	one
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn finality_on_regtest() {
 	let db = TestDb::new().await;
@@ -26,25 +38,25 @@ async fn finality_on_regtest() {
 	let tx = node::spend_op_true(&coin, vec![], 10_000);
 	let txid = rt.client().send_raw_transaction(&tx).unwrap();
 	assert_eq!(f.watch(txid, "board").await.unwrap(), Finality::NotInChain);
-	println!("in the mempool: {}", f.status(&txid).await.unwrap().name());
+	println!("in the mempool: {}", status_both(&f, &txid).await.name());
 
 	let b1 = tokio::task::block_in_place(|| rt.produce_block()).unwrap();
 	f.sync().await.unwrap();
-	let s = f.status(&txid).await.unwrap();
+	let s = status_both(&f, &txid).await;
 	assert_eq!(s, Finality::Settled { height: 1, block: b1, depth: 0 });
 	println!("in certified block 1: {:?}", s);
 
 	tokio::task::block_in_place(|| rt.mine_parent(1)).unwrap();
 	tokio::task::block_in_place(|| rt.anchor_to_parent_tip()).unwrap();
 	f.sync().await.unwrap();
-	let s = f.status(&txid).await.unwrap();
+	let s = status_both(&f, &txid).await;
 	assert!(matches!(s, Finality::Settled { depth: 1, .. }), "{:?}", s);
 	println!("one parent block later: {:?}", s);
 
 	tokio::task::block_in_place(|| rt.mine_parent(1)).unwrap();
 	tokio::task::block_in_place(|| rt.anchor_to_parent_tip()).unwrap();
 	f.sync().await.unwrap();
-	let s = f.status(&txid).await.unwrap();
+	let s = status_both(&f, &txid).await;
 	assert!(matches!(s, Finality::Final { height: 1, depth: 2, .. }), "{:?}", s);
 	println!("two parent blocks later: {:?}", s);
 	while rx.try_recv().is_ok() {}
@@ -59,19 +71,19 @@ async fn finality_on_regtest() {
 		}
 	}
 	assert_eq!(disconnected.last().unwrap(), &(1, vec![(txid, "board".to_string())]), "{:?}", disconnected);
-	assert_eq!(f.status(&txid).await.unwrap(), Finality::NotInChain);
+	assert_eq!(status_both(&f, &txid).await, Finality::NotInChain);
 	assert!(node::in_mempool(&rt, &txid), "the node put it back in its mempool");
 	println!("after invalidateblock {}: {} block(s) disconnected, the last holding it; {}", b1,
-		disconnected.len(), f.status(&txid).await.unwrap().name());
+		disconnected.len(), status_both(&f, &txid).await.name());
 
 	// It confirms again in a new block, and is final again once buried.
 	let c1 = tokio::task::block_in_place(|| rt.produce_block()).unwrap();
 	f.sync().await.unwrap();
-	assert!(matches!(f.status(&txid).await.unwrap(), Finality::Settled { height: 1, block, depth: 0 } if block == c1));
+	assert!(matches!(status_both(&f, &txid).await, Finality::Settled { height: 1, block, depth: 0 } if block == c1));
 	tokio::task::block_in_place(|| rt.mine_parent(2)).unwrap();
 	tokio::task::block_in_place(|| rt.anchor_to_parent_tip()).unwrap();
 	f.sync().await.unwrap();
-	let s = f.status(&txid).await.unwrap();
+	let s = status_both(&f, &txid).await;
 	assert!(matches!(s, Finality::Final { height: 1, depth: 2, block } if block == c1), "{:?}", s);
 	println!("in block {} again: {:?}", c1, s);
 }

@@ -282,6 +282,31 @@ impl Store {
 		Ok(r.get(0))
 	}
 
+	/// [`Store::tx_location`] for each of `txids` at once: the lowest block
+	/// of the followed chain holding each one that a block holds. One
+	/// statement for any number of transactions.
+	pub async fn tx_locations(&self, txids: &[[u8; 32]]) -> Result<std::collections::HashMap<[u8; 32], BlockRow>, StoreError> {
+		if txids.is_empty() {
+			return Ok(Default::default());
+		}
+		let conn = self.conn().await?;
+		let columns = BLOCK_COLUMNS.split(", ").map(|c| format!("b.{}", c)).collect::<Vec<_>>().join(", ");
+		let ids: Vec<&[u8]> = txids.iter().map(|t| &t[..]).collect();
+		let rows = conn.query(
+			&format!("SELECT DISTINCT ON (t.txid) {}, t.txid FROM block b JOIN tx_block t ON t.block_hash = b.hash
+				WHERE t.txid = ANY($1) ORDER BY t.txid, b.height", columns),
+			&[&ids],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(7), "txid")?, block_row(r)?))).collect()
+	}
+
+	/// The height of the highest certified block the store follows, if any.
+	pub async fn highest_certified(&self) -> Result<Option<u64>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_one("SELECT max(height) FROM block WHERE certified", &[]).await?;
+		Ok(r.get::<_, Option<i64>>(0).map(|h| h.max(0) as u64))
+	}
+
 	/// Watches `txid` for `kind`. Watching it again changes nothing.
 	pub async fn watch_tx(&self, txid: &[u8; 32], kind: &str) -> Result<(), StoreError> {
 		let conn = self.conn().await?;

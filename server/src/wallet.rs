@@ -301,6 +301,23 @@ impl Wallet {
 		})
 	}
 
+	/// The coins of `coins` spendable under the configuration, in their
+	/// order, by one reading of finality for all of them
+	/// ([`FinalityService::statuses`]): [`Self::spendable`] costs three
+	/// queries a coin, and the wallet holds thousands.
+	async fn spendable_of(&self, coins: Vec<WalletCoin>) -> Result<Vec<WalletCoin>, WalletError> {
+		let mut txids: Vec<Txid> = coins.iter().filter(|c| c.in_chain && c.spent_by.is_none()).map(|c| Txid::from_byte_array(c.txid)).collect();
+		txids.sort();
+		txids.dedup();
+		let statuses = self.finality.statuses(&txids).await.map_err(|e| WalletError::Finality(e.to_string()))?;
+		Ok(coins.into_iter().filter(|c| c.in_chain && c.spent_by.is_none() && statuses.get(&Txid::from_byte_array(c.txid)).is_some_and(|s| {
+			match self.config.spend_from {
+				SpendFrom::Final => s.is_final(),
+				SpendFrom::Confirmed => s.in_chain(),
+			}
+		})).collect())
+	}
+
 	/// Whether the coin `c` is spendable now under the configuration.
 	pub async fn spendable_now(&self, c: &WalletCoin) -> Result<bool, WalletError> {
 		self.spendable(c).await
@@ -309,10 +326,8 @@ impl Wallet {
 	/// What the wallet can spend now, per asset.
 	pub async fn balance(&self) -> Result<BTreeMap<AssetId, u64>, WalletError> {
 		let mut b = BTreeMap::new();
-		for c in self.store.wallet_coins(None).await? {
-			if self.spendable(&c).await? {
-				*b.entry(AssetId::from_byte_array(c.asset)).or_insert(0) += c.value;
-			}
+		for c in self.spendable_of(self.store.wallet_coins(None).await?).await? {
+			*b.entry(AssetId::from_byte_array(c.asset)).or_insert(0) += c.value;
 		}
 		Ok(b)
 	}
@@ -384,12 +399,9 @@ impl Wallet {
 	/// `n` batches needs `n` of them.
 	pub async fn issuing_coins(&self, exclude: Option<AssetId>) -> Result<usize, WalletError> {
 		let connectors = self.store.connector_assets().await?;
-		let mut coins = vec![];
-		for c in self.store.wallet_coins(None).await? {
-			if !connectors.contains(&c.asset) && !exclude.is_some_and(|x| x.into_inner().to_byte_array() == c.asset) && self.spendable(&c).await? {
-				coins.push(c);
-			}
-		}
+		let candidates: Vec<WalletCoin> = self.store.wallet_coins(None).await?.into_iter()
+			.filter(|c| !connectors.contains(&c.asset) && !exclude.is_some_and(|x| x.into_inner().to_byte_array() == c.asset)).collect();
+		let coins = self.spendable_of(candidates).await?;
 		let named = self.store.tokens_naming_batches(&coins.iter().map(|c| token_of(c).into_inner().to_byte_array()).collect::<Vec<_>>())
 			.await?;
 		Ok(coins.iter().filter(|c| !named.contains(&token_of(c).into_inner().to_byte_array())).count())
@@ -424,15 +436,12 @@ impl Wallet {
 		// A connector asset's atom is the watcher's, for its claims and
 		// reclaims: it never issues a token.
 		let connectors = self.store.connector_assets().await?;
-		let mut coins = vec![];
 		// An asset the round mints is never paid from the wallet's coins: an
 		// issuer-operated asset's operator keeps none of it.
 		let excluded = |c: &WalletCoin| exclude.is_some_and(|x| x.into_inner().to_byte_array() == c.asset);
-		for c in self.store.wallet_coins(None).await? {
-			if !connectors.contains(&c.asset) && !tied(&c) && !excluded(&c) && self.spendable(&c).await? {
-				coins.push(c);
-			}
-		}
+		let candidates: Vec<WalletCoin> = self.store.wallet_coins(None).await?.into_iter()
+			.filter(|c| !connectors.contains(&c.asset) && !tied(c) && !excluded(c)).collect();
+		let mut coins = self.spendable_of(candidates).await?;
 		if coins.len() < batches {
 			return Err(WalletError::TooFewCoins { need: batches, have: coins.len() });
 		}
@@ -510,13 +519,9 @@ impl Wallet {
 		let taken: Vec<([u8; 32], u32)> = issuers.iter().chain(forced).map(|c| (c.txid, c.vout)).collect();
 		let mut available: BTreeMap<AssetId, Vec<WalletCoin>> = BTreeMap::new();
 		for a in need.keys() {
-			let mut coins = vec![];
-			for c in self.store.wallet_coins(Some(&a.into_inner().to_byte_array())).await? {
-				if !taken.contains(&(c.txid, c.vout)) && self.spendable(&c).await? {
-					coins.push(c);
-				}
-			}
-			available.insert(*a, coins);
+			let candidates: Vec<WalletCoin> = self.store.wallet_coins(Some(&a.into_inner().to_byte_array())).await?.into_iter()
+				.filter(|c| !taken.contains(&(c.txid, c.vout))).collect();
+			available.insert(*a, self.spendable_of(candidates).await?);
 		}
 
 		// The share of each asset's pool its change is paid in: the pool as
@@ -788,12 +793,9 @@ impl Wallet {
 					pending.push(c);
 				}
 			}
-			let mut finals = vec![];
-			for c in self.store.wallet_coins(Some(&a)).await? {
-				if !pending.iter().any(|k| (k.txid, k.vout) == (c.txid, c.vout)) && self.spendable(&c).await? {
-					finals.push(c);
-				}
-			}
+			let candidates: Vec<WalletCoin> = self.store.wallet_coins(Some(&a)).await?.into_iter()
+				.filter(|c| !pending.iter().any(|k| (k.txid, k.vout) == (c.txid, c.vout))).collect();
+			let mut finals = self.spendable_of(candidates).await?;
 			let order = |v: &mut Vec<WalletCoin>| v.sort_by(|a, b| a.value.cmp(&b.value).then(a.txid.cmp(&b.txid)).then(a.vout.cmp(&b.vout)));
 			order(&mut pending);
 			order(&mut finals);
@@ -836,8 +838,8 @@ impl Wallet {
 		let a = asset.into_inner().to_byte_array();
 		let mut total = 0u64;
 		let mut seen = std::collections::HashSet::new();
-		for c in self.store.wallet_coins(Some(&a)).await? {
-			if self.spendable(&c).await? && seen.insert((c.txid, c.vout)) {
+		for c in self.spendable_of(self.store.wallet_coins(Some(&a)).await?).await? {
+			if seen.insert((c.txid, c.vout)) {
 				total = total.saturating_add(c.value);
 			}
 		}
