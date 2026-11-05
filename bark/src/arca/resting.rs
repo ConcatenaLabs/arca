@@ -354,7 +354,9 @@ impl Wallet {
 		use arca_covenant::transfer::FillLeaf;
 		let mut done: BTreeSet<String> = self.store.meta(FILLS_DELEGATED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
 		let mut out = vec![];
-		for row in self.store.coins()? {
+		// A fill coin's row names its kind (the kind of its record): only
+		// those are read.
+		for row in self.store.coins_of_kind("fill")? {
 			let Ok(CoinRecord::Fill(f)) = CoinRecord::from_bytes(&row.record) else { continue };
 			if !matches!(f.leaf, FillLeaf::Credit { .. } | FillLeaf::Rest { .. }) {
 				continue;

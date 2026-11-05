@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS coin (
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS coin_state ON coin(state);
+CREATE INDEX IF NOT EXISTS coin_kind ON coin(kind);
 CREATE TABLE IF NOT EXISTS tx (txid TEXT PRIMARY KEY, raw BLOB NOT NULL, role TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS participation (
 	id TEXT PRIMARY KEY,
@@ -743,6 +744,16 @@ impl Store {
 		Ok(rows)
 	}
 
+	/// The coins of `kind` (`board`, `batch`, `transfer`, `fill`: the kind
+	/// of the coin's record), in the order [`Self::coins`] gives, read by
+	/// the kind's index.
+	pub fn coins_of_kind(&self, kind: &str) -> Result<Vec<CoinRow>, Error> {
+		let mut st = self.conn.prepare(&format!("SELECT {} FROM coin INDEXED BY coin_kind WHERE kind = ?1 ORDER BY created_at, leaf_id",
+			Self::COIN_COLS)).map_err(db)?;
+		let rows = st.query_map(params![kind], Self::coin_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
 	/// The coins in none of `states`, in the order [`Self::coins`] gives:
 	/// found through the state's index, so that a coin in one of `states`
 	/// (one the wallet spent long ago, say) is not read, nor its record.
@@ -1312,6 +1323,8 @@ mod tests {
 		let held = ids(s.coins_not_in(&GONE).unwrap());
 		assert_eq!(held, all.iter().filter(|l| ["leaf1", "leaf3", "leaf4", "leaf6"].contains(&l.as_str())).cloned().collect::<Vec<_>>());
 		assert_eq!(ids(s.coins_not_in(&[]).unwrap()), all);
+		assert_eq!(ids(s.coins_of_kind("transfer").unwrap()), all);
+		assert!(s.coins_of_kind("fill").unwrap().is_empty());
 	}
 
 	/// Participations by id and by state, and the forfeits of one, read
