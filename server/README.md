@@ -3606,7 +3606,11 @@ signer signs every input.
   transparent at its boundary. A coin whose block is disconnected is out of
   the chain until its transaction returns.
 - **Final coins only**, by default: the wallet spends a coin once the finality
-  service says its transaction is final.
+  service says its transaction is final. It reads the finality of all its
+  coins at once, in three queries whatever their number
+  (`FinalityService::statuses`, by the same rule as a single status), so
+  what it can spend, the coins a round is built from and the fee coins are
+  read in milliseconds even when it holds thousands of coins.
 - **The pool in many coins.** A transaction spends whole coins, and its
   change is spendable again only once it is final, so each transaction takes
   the smallest coin that pays it alone, or else the largest and so on for

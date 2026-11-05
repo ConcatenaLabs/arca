@@ -560,6 +560,51 @@ impl FinalityService {
 		Ok(Some(certified && depth >= self.config.anchor_depth as u64 && self.anchor_ok.load(Ordering::SeqCst)))
 	}
 
+	/// [`Self::status`] for each of `txids`, by the same rule, in three
+	/// queries whatever their number, where a status costs three each: what
+	/// reads the finality of thousands of coins at once (the wallet's coin
+	/// selection) asks here.
+	pub async fn statuses(&self, txids: &[Txid]) -> Result<std::collections::HashMap<Txid, Finality>, FinalityError> {
+		let ids: Vec<[u8; 32]> = txids.iter().map(|t| t.to_byte_array()).collect();
+		let located = self.store.tx_locations(&ids).await?;
+		let mut out = std::collections::HashMap::with_capacity(txids.len());
+		if located.is_empty() {
+			for t in txids {
+				out.insert(*t, Finality::NotInChain);
+			}
+			return Ok(out);
+		}
+		let highest = match self.config.certification {
+			Certification::NotOnThisChain => None,
+			Certification::Required => self.store.highest_certified().await?,
+		};
+		let tip = self.store.tip_block().await?.ok_or_else(|| StoreError::Corrupt("a located block with no tip".into()))?;
+		let anchor_ok = self.anchor_ok.load(Ordering::SeqCst);
+		for t in txids {
+			let Some(block) = located.get(&t.to_byte_array()) else {
+				out.insert(*t, Finality::NotInChain);
+				continue;
+			};
+			let hash = BlockHash::from_byte_array(block.hash);
+			let certified = match self.config.certification {
+				Certification::NotOnThisChain => true,
+				Certification::Required => highest.is_some_and(|h| h >= block.height),
+			};
+			let f = if !certified {
+				Finality::Unsettled { height: block.height, block: hash }
+			} else {
+				let depth = tip.anchor_height.saturating_sub(block.anchor_height);
+				if depth >= self.config.anchor_depth as u64 && anchor_ok {
+					Finality::Final { height: block.height, block: hash, depth }
+				} else {
+					Finality::Settled { height: block.height, block: hash, depth }
+				}
+			};
+			out.insert(*t, f);
+		}
+		Ok(out)
+	}
+
 	/// Where the watched transaction `txid` stands. A transaction never
 	/// watched is reported as not in the chain.
 	pub async fn status(&self, txid: &Txid) -> Result<Finality, FinalityError> {

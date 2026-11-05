@@ -16,9 +16,13 @@
 //! RUST_LOG=info ROUND_LATENCY_MINUTES=60 cargo test -p arca-server --test round_latency -- --ignored --nocapture
 //! ```
 //!
-//! Beside X, whose refreshes flow, an asset Y is over its in-flight cap
-//! throughout, as tSEQ is on the public testnet: eight refreshes of it wait,
-//! and every round interval reads the cap for them again.
+//! The operator serves `ROUND_LATENCY_ASSETS` assets (6 by default, as the
+//! public testnet's does), two of them with channel leaves, and its wallet
+//! holds `ROUND_LATENCY_WALLET_COINS` coins of each (1,500 by default; the
+//! testnet's holds 1,600 to 2,100 of each of five). Y is over its in-flight
+//! cap throughout, as tSEQ is on the public testnet: eight refreshes of it
+//! wait, and every round interval reads the cap for them again. The others'
+//! refreshes flow, one every 20 s, each asset in turn.
 //!
 //! `ROUND_LATENCY_HISTORY` scales the batches of the history (1 by default:
 //! 50 rounds of 8 boards, then rounds of 30 giving up 300 of their leaves);
@@ -125,9 +129,46 @@ async fn refreshes_wait_on_rounds_with_a_history_behind_them() {
 			r.produce().await;
 		}
 	}
+	// The other assets, the first two with channel leaves.
+	let mut others = vec![];
+	for k in 0..env("ROUND_LATENCY_ASSETS", 6).saturating_sub(2) {
+		let a = tokio::task::block_in_place(|| r.purse.issue(&r.rt, &format!("asset O{}", k), 100_000_000_000));
+		let mut sec = AssetSection::new(a, MIN_LEAF);
+		sec.in_flight_cap = Some(CAP.to_string());
+		if k < 2 {
+			sec.channel_capacity = Some("500000".into());
+		}
+		r.config.assets.push(sec);
+		others.push(a);
+	}
+	r.restart_server().await;
 	r.produce().await;
 	r.bury().await;
 	r.synced().await;
+	// The wallet's coins: as many of each asset as the testnet's holds.
+	let per = env("ROUND_LATENCY_WALLET_COINS", 1_500) as usize;
+	let mut paid = 0;
+	for a in [x, y].iter().chain(others.iter()) {
+		let mut left = per;
+		while left > 0 {
+			let n = left.min(250);
+			let mut outs = vec![];
+			for _ in 0..n {
+				let to = r.server.wallet.receive_script().await.unwrap();
+				outs.push(sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(*a, 2_000_000), to));
+			}
+			tokio::task::block_in_place(|| r.purse.pay(&r.rt, outs));
+			left -= n;
+			paid += 1;
+			if paid % 5 == 0 {
+				r.produce().await;
+			}
+		}
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	println!("history: {} assets, {} wallet coins of each", 2 + others.len(), per);
 
 	// The history: 50 rounds of 8 boards each, then 10 rounds giving up 300
 	// of their leaves, which leaves their nodes holding fronted value.
@@ -149,6 +190,35 @@ async fn refreshes_wait_on_rounds_with_a_history_behind_them() {
 		let pairs: Vec<(&Coin, &_)> = chunk.iter().zip(keys.iter()).collect();
 		for x in refresh(&mut r, &pairs).await {
 			flow.push(x.new);
+		}
+	}
+	// Leaves of the other assets for the flow: 5 rounds of 8 boards each.
+	let mut other_leaves: Vec<Vec<Coin>> = vec![];
+	for (k, a) in others.iter().enumerate() {
+		let mut mine = vec![];
+		for b in 0..5 {
+			let coins = boards(&mut r, *a, 8, &format!("O{} {}", k, b)).await;
+			let keys: Vec<_> = (0..coins.len()).map(|i| keypair(&format!("O{} {} leaf {}", k, b, i))).collect();
+			let pairs: Vec<(&Coin, &_)> = coins.iter().zip(keys.iter()).collect();
+			for x in refresh(&mut r, &pairs).await {
+				mine.push(x.new);
+			}
+		}
+		other_leaves.push(mine);
+	}
+	// The flow takes each flowing asset in turn.
+	let mut lanes: Vec<std::vec::IntoIter<Coin>> = vec![flow.into_iter()];
+	lanes.extend(other_leaves.into_iter().map(|v| v.into_iter()));
+	let mut flow = vec![];
+	loop {
+		let before = flow.len();
+		for l in lanes.iter_mut() {
+			if let Some(c) = l.next() {
+				flow.push(c);
+			}
+		}
+		if flow.len() == before {
+			break;
 		}
 	}
 	let p: Value = r.http.get("chain").json["pool"][x.to_string()].clone();
@@ -199,7 +269,8 @@ async fn refreshes_wait_on_rounds_with_a_history_behind_them() {
 		if now >= next_submit && now < end {
 			if let Some(c) = coins.next() {
 				let k = keypair(&format!("F {}", c.held.id));
-				let (w, _) = want_leaf(&k, x, VALUE);
+				let asset = c.valid(&r).asset;
+				let (w, _) = want_leaf(&k, asset, VALUE);
 				let (body, id) = participation_body(&[&c.held], &[w], &[], None, xonly(&r.s), r.chain);
 				let a = r.http.post("submit_participation", &body).ok();
 				assert_eq!(a["state"], "pending", "{}", a);
