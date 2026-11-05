@@ -828,6 +828,12 @@ async fn d64_unclaimed_receives_are_capped_and_a_refresh_runs() {
 	let x = r.x;
 	let xs = x.to_string();
 	let (ox, px) = leg_in_x(&lnd, &mut r, "d64").await;
+	// One payment may use the whole of the node's channels here: the cap on
+	// receives held, not the operator's limit on one payment, is what refuses.
+	let mut config = r.config.clone();
+	config.assets.iter_mut().find(|a| a.asset == x.to_string()).unwrap().lightning.as_mut().unwrap().payment_share_ppm = 1_000_000;
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
 	let pool0 = r.server.wallet.balance().await.unwrap().get(&x).copied().unwrap_or(0);
 	println!("D64 the operator's pool in X: {}", pool0);
 	let url = r.url();
