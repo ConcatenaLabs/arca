@@ -1894,7 +1894,7 @@ impl Server {
 				delegated_reclaim: config.batches.delegated_reclaim,
 				no_sweep: params.no_sweep,
 				..RoundConfig::default()
-			});
+			}, participations.active());
 		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());
 		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,
 			rounds.clone(), WatcherConfig {

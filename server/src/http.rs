@@ -1492,6 +1492,9 @@ async fn holding_back(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInf
 		}
 		let served: HashSet<[u8; 32]> = app.store.served_among(&keys, &ids).await?.into_iter().collect();
 		ids.retain(|l| served.contains(l));
+		// Their holder is at hand: a node waiting on these and on another
+		// holder's coins is named to that holder too.
+		app.rounds.active.mark(ids.iter().copied(), &keys);
 	}
 	let leaves = app.rounds.holding_back(&ids).await?.into_iter()
 		.map(|(l, back)| api::HoldingBackLeaf { leaf_id: hex(&l), back: back.to_string() }).collect();

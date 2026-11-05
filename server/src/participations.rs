@@ -581,6 +581,9 @@ pub struct Participations {
 	finality: Arc<FinalityService>,
 	params: Arc<Params>,
 	signer: SignerClient,
+	/// The coins whose holders are at hand ([`crate::rounds::ActiveCoins`]),
+	/// shared with the rounds.
+	active: Arc<crate::rounds::ActiveCoins>,
 }
 
 /// A signature of the right length for sizing a transaction.
@@ -674,7 +677,13 @@ pub async fn order_on_chain(finality: &FinalityService, order: &OutPoint, terms:
 
 impl Participations {
 	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, signer: SignerClient) -> Arc<Participations> {
-		Arc::new(Participations { store, finality, params, signer })
+		Arc::new(Participations { store, finality, params, signer, active: Default::default() })
+	}
+
+	/// The coins whose holders are at hand, which the rounds share
+	/// ([`crate::rounds::ActiveCoins`]).
+	pub fn active(&self) -> Arc<crate::rounds::ActiveCoins> {
+		self.active.clone()
 	}
 
 	async fn now(&self) -> Result<MedianTime, ParticipationError> {
@@ -946,7 +955,7 @@ impl Participations {
 		let fees: Vec<u64> = coins.iter().zip(&expiries).zip(&shares).map(|((_, e), s)| schedule.refresh(*s, *e, now)).collect();
 		let named: HashSet<[u8; 32]> = if fees.iter().any(|f| *f > 0) {
 			let ids: Vec<[u8; 32]> = req.inputs.iter().map(|i| i.leaf_id.0).collect();
-			crate::rounds::holding_back(&self.store, &ids).await?.into_iter().map(|(l, _)| l).collect()
+			crate::rounds::holding_back(&self.store, &ids, &self.active).await?.into_iter().map(|(l, _)| l).collect()
 		} else {
 			HashSet::new()
 		};
@@ -1024,6 +1033,10 @@ impl Participations {
 			Err(e) => return Err(e.into()),
 		}
 		log::info!("participation {} accepted: {} coin(s) given up for {} output(s)", crate::signer::hex(&id), n, m);
+		// Their holder is at hand: a node waiting on these and on another
+		// holder's coins is named to that holder too (`holding_back`).
+		let owners: Vec<[u8; 32]> = coins.iter().map(|c| c.leaf.owner.serialize()).collect();
+		self.active.mark(req.inputs.iter().map(|i| i.leaf_id.0), &owners);
 		self.status(&id).await
 	}
 
