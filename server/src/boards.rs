@@ -34,7 +34,7 @@ use elements::{Transaction, Txid};
 
 use arca_covenant::{BoardRecord, CoinRecord, LeafId, MedianTime, RecordError};
 
-use crate::chain::{ChainEvent, Finality, FinalityService};
+use crate::chain::{Certification, ChainEvent, Finality, FinalityService};
 use crate::nursery::{Nursery, NurseryKind};
 use crate::params::Params;
 use crate::store::{BoardRow, BoardState, LeafKind, LeafState, NewCoin, NewScript, NurseryState, ScriptKind, Store, StoreError};
@@ -263,13 +263,24 @@ impl Boards {
 		Ok(())
 	}
 
-	/// One pass over every board not lost; then each board never credited
+	/// One pass over every board pending and every board credited the store
+	/// no longer places final; then each board never credited
 	/// whose transaction is still in no block `unconfirmed` after it was
 	/// registered is dropped: marked lost, its transaction no longer
 	/// broadcast.
 	pub async fn pass(&self) -> Result<(), BoardError> {
 		let mut rows = self.store.boards_in(BoardState::Pending).await?;
-		rows.extend(self.store.boards_in(BoardState::Credited).await?);
+		// A board credited while the tip's anchor is ok stays final until its
+		// block leaves the chain (a disconnection uncredits it at once,
+		// [`Self::on_chain_event`]): of those, only the ones the store no
+		// longer places final are looked at, unless the anchor is not ok,
+		// when none is final, as the nursery does.
+		if self.finality.anchor_ok() {
+			let c = self.finality.config();
+			rows.extend(self.store.boards_credited_not_final(c.certification == Certification::Required, c.anchor_depth as u64).await?);
+		} else {
+			rows.extend(self.store.boards_in(BoardState::Credited).await?);
+		}
 		for b in rows {
 			self.check_row(&b).await?;
 		}
