@@ -3684,7 +3684,13 @@ impl Wallet {
 				}).collect::<Result<_, Error>>()?;
 				let scripts: Vec<Script> = window.iter().map(|(_, s, _)| s.clone()).collect();
 				let mut last_used = None;
-				for (op, o, h) in self.chain.coins_at(&scripts)? {
+				let found = self.chain.coins_at(&scripts)?;
+				// Whether each is spent in the mempool, read ahead in a few
+				// requests rather than one a coin.
+				if found.len() > 1 {
+					self.chain.read_ahead_of(&[], &found.iter().map(|(op, _, _)| *op).collect::<Vec<_>>());
+				}
+				for (op, o, h) in found {
 					let Some((i, _, k)) = window.iter().find(|(_, s, _)| *s == o.script_pubkey) else { continue };
 					last_used = last_used.max(Some(*i));
 					if self.chain.unspent(&op)? {
@@ -3741,7 +3747,13 @@ impl Wallet {
 			let window: Vec<(u32, Script)> = (from..end).map(|i| Ok((i, self.keys.order_script(i)?))).collect::<Result<_, Error>>()?;
 			let scripts: Vec<Script> = window.iter().map(|(_, s)| s.clone()).collect();
 			let mut last_used = None;
-			for (op, o, h) in self.chain.coins_at(&scripts)? {
+			let found = self.chain.coins_at(&scripts)?;
+			// Whether each is spent in the mempool, read ahead in a few
+			// requests rather than one a coin.
+			if found.len() > 1 {
+				self.chain.read_ahead_of(&[], &found.iter().map(|(op, _, _)| *op).collect::<Vec<_>>());
+			}
+			for (op, o, h) in found {
 				let Some((i, _)) = window.iter().find(|(_, s)| *s == o.script_pubkey) else { continue };
 				last_used = last_used.max(Some(*i));
 				if self.chain.unspent(&op)? {
