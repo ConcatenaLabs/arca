@@ -39,8 +39,9 @@ pub struct PoolFlow {
 	/// have not come back: each coin given up in a round broadcast or final,
 	/// while a batch leaf of its asset it rests on (its own, or one up its
 	/// lineage of reassignments) is in a batch neither reclaimed there nor
-	/// swept. A coin resting on boards alone is not counted: its forfeit
-	/// pays the operator back at once.
+	/// swept, and its own forfeit not final on the chain. A coin resting on
+	/// boards alone is not counted: its forfeit pays the operator back at
+	/// once.
 	pub in_flight: u64,
 }
 
@@ -74,13 +75,20 @@ const IN_FLIGHT_WITH: &str = "
 	   SELECT bl.leaf_id FROM batch_leaf bl JOIN batch b ON b.round_id = bl.round_id AND b.vout = bl.vout
 	   JOIN watcher_tx w ON w.kind = 'forfeit' AND w.subject = bl.leaf_id JOIN nursery_tx n ON n.txid = w.txid
 	   WHERE b.collect_mtp IS NOT NULL AND n.state = 'final'),
+	 -- A coin given up whose own forfeit is final on the chain: the
+	 -- collection brought it down to its leaf, through its lineage's
+	 -- reassignments when it was paid on out of round, and forfeited it.
+	 forfeited AS MATERIALIZED (
+	   SELECT g.leaf_id FROM given g JOIN watcher_tx w ON w.kind = 'forfeit' AND w.subject = g.leaf_id
+	   JOIN nursery_tx n ON n.txid = w.txid WHERE n.state = 'final'),
 	 held AS MATERIALIZED (
 	   SELECT u.root, bl.leaf_id, bl.round_id, bl.vout, bl.record FROM up u
 	   JOIN batch_leaf bl ON bl.leaf_id = u.leaf_id JOIN batch b ON b.round_id = bl.round_id AND b.vout = bl.vout
 	   JOIN round r ON r.round_id = b.round_id
 	   WHERE b.asset = u.asset AND r.state IN ('broadcast', 'final')
 	     AND NOT EXISTS (SELECT 1 FROM swept s WHERE s.round_id = bl.round_id AND s.vout = bl.vout)
-	     AND NOT EXISTS (SELECT 1 FROM back k WHERE k.leaf_id = bl.leaf_id))";
+	     AND NOT EXISTS (SELECT 1 FROM back k WHERE k.leaf_id = bl.leaf_id)
+	     AND NOT EXISTS (SELECT 1 FROM forfeited f WHERE f.leaf_id = u.root))";
 
 /// The value in flight, by asset: each coin given up counted once, however
 /// many of its batch leaves still hold value.

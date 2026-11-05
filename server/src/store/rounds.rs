@@ -636,7 +636,8 @@ impl Store {
 			"SELECT b.round_id, b.vout, b.collect_mtp, o.claim FROM batch b
 			   JOIN batch_leaf l ON l.round_id = b.round_id AND l.vout = b.vout
 			   JOIN participation_output o ON o.participation_id = l.participation_id AND o.idx = l.output_idx
-			  WHERE b.collect_mtp IS NOT NULL AND o.claim IS NOT NULL", &[]).await?;
+			  WHERE b.collect_mtp IS NOT NULL AND o.claim IS NOT NULL AND b.token = $1",
+			&[&&arca_covenant::clock::no_sweep_token().into_inner().to_byte_array()[..]]).await?;
 		let mut out: std::collections::BTreeMap<(i64, i32), (u32, u32)> = std::collections::BTreeMap::new();
 		for r in rows {
 			let d = super::participations::claim_of(&r.get::<_, Vec<u8>>(3))?.deadline.to_consensus_u32();
@@ -644,6 +645,44 @@ impl Store {
 			e.1 = e.1.max(d);
 		}
 		Ok(out.into_iter().map(|((round, vout), (at, d))| (round, vout, at, d)).collect())
+	}
+
+	/// Gives the batches with a sweep collected early their service horizon,
+	/// and takes it off every other batch with a sweep
+	/// (`[batches] collect_sweep_batches_before`): with `early` =
+	/// `Some((before, after))`, each tree batch with a sweep, not burn-only,
+	/// of a round broadcast or final made before median time `before` and
+	/// before the first round that built a batch without a sweep, gets the
+	/// horizon `after` seconds after its round; with `None`, none does. A
+	/// batch with a sweep has a horizon only from here. Returns how many
+	/// horizons were set or moved, how many taken off, and the cut applied
+	/// (`before`, or the first such round's median time if earlier).
+	pub async fn sweep_batch_horizons(&self, early: Option<(u32, u32)>) -> Result<(u64, u64, Option<u32>), StoreError> {
+		let token = arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
+		let mut conn = self.conn().await?;
+		let tx = conn.transaction().await?;
+		let first: Option<i64> = tx.query_one(
+			"SELECT min(r.created_mtp) FROM round r WHERE EXISTS (SELECT 1 FROM batch b WHERE b.round_id = r.round_id AND b.token = $1)",
+			&[&&token[..]]).await?.get(0);
+		let (cut, after) = match early {
+			Some((before, after)) => (first.map_or(before as i64, |f| f.min(before as i64)), after as i64),
+			None => (0, 0),
+		};
+		let set = if early.is_some() {
+			tx.execute(
+				"UPDATE batch b SET collect_mtp = r.created_mtp + $3 FROM round r
+				  WHERE r.round_id = b.round_id AND b.token <> $1 AND b.kind = 'tree' AND NOT b.burn
+				    AND r.state IN ('broadcast', 'final') AND r.created_mtp < $2
+				    AND b.collect_mtp IS DISTINCT FROM r.created_mtp + $3",
+				&[&&token[..], &cut, &after]).await?
+		} else { 0 };
+		let cleared = tx.execute(
+			"UPDATE batch b SET collect_mtp = NULL FROM round r
+			  WHERE r.round_id = b.round_id AND b.token <> $1 AND b.collect_mtp IS NOT NULL
+			    AND NOT ($3 AND b.kind = 'tree' AND NOT b.burn AND r.state IN ('broadcast', 'final') AND r.created_mtp < $2)",
+			&[&&token[..], &cut, &early.is_some()]).await?;
+		tx.commit().await?;
+		Ok((set, cleared, early.map(|_| cut as u32)))
 	}
 
 	/// Moves the service horizon of the batch at output `vout` of round

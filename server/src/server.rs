@@ -160,6 +160,22 @@ pub struct BatchesSection {
 	/// absent.
 	#[serde(default)]
 	pub collect_after_seconds: Option<u32>,
+	/// Collects early the batches with a sweep that rounds made before
+	/// this median time (Unix seconds), as a batch without a sweep is
+	/// collected past its horizon ([`crate::watcher`]): each tree batch with
+	/// a sweep, not burn-only, of a round made before it and before the
+	/// first round that built a batch without a sweep, is given the service
+	/// horizon `collect_sweep_batches_after_seconds` after its round. Its
+	/// collection brings on the chain only the coins its holders gave up,
+	/// and claims their forfeits; it never lands a live coin and never
+	/// sweeps. Off when absent, and every such horizon is then taken off
+	/// again at start. Needs `no_sweep`.
+	#[serde(default)]
+	pub collect_sweep_batches_before: Option<u32>,
+	/// The service horizon of such a batch, in seconds after its round:
+	/// `collect_after_seconds` when absent.
+	#[serde(default)]
+	pub collect_sweep_batches_after_seconds: Option<u32>,
 }
 
 /// How takes of on-chain orders are bounded.
@@ -1792,6 +1808,29 @@ impl Server {
 				log::info!("the batch at output {} of round {} holds claims to median time {}: served until {} (was {})",
 					vout, round_id, deadline, due, at);
 			}
+		}
+		// Batches with a sweep made before no sweep went live, collected
+		// early (`[batches] collect_sweep_batches_before`); without it, any
+		// horizon such a batch was given is taken off again.
+		let early = match config.batches.collect_sweep_batches_before {
+			Some(_) if !params.no_sweep =>
+				return Err(StartError("batches.collect_sweep_batches_before needs batches.no_sweep: it collects only the batches \
+					with a sweep built before batches without one".into())),
+			Some(before) => {
+				let after = config.batches.collect_sweep_batches_after_seconds.unwrap_or(params.collect_after_seconds);
+				if after == 0 {
+					return Err(StartError("batches.collect_sweep_batches_after_seconds is at least 1".into()));
+				}
+				Some((before, after))
+			},
+			None => None,
+		};
+		let (set, cleared, cut) = store.sweep_batch_horizons(early).await.map_err(err("the database"))?;
+		if let Some((before, after)) = early {
+			log::info!("batches with a sweep of rounds made before median time {} are collected {} s after their round: {} horizon(s) \
+				set or moved, {} taken off", cut.unwrap_or(before), after, set, cleared);
+		} else if cleared > 0 {
+			log::info!("batches with a sweep are no longer collected early: {} horizon(s) taken off", cleared);
 		}
 		let nursery = Nursery::new(store.clone(), finality.clone(), Some(wallet.clone()), Duration::from_secs(30));
 		let boards = Boards::new(store.clone(), finality.clone(), nursery.clone(), params.clone(),

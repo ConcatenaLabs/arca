@@ -376,6 +376,16 @@ What it changes for the operator:
   included) lands through its lineage, and each `htlc-1` coin whose payment
   is decided in the operator's favour is refunded or claimed. Keep the wallet able to pay those fees (the reserves pay them where
   the node takes the batch's asset).
+- **Batches with a sweep built before.** Their capital comes back by RECLAIM,
+  RECLAIM-D or at their expiry. To have it back sooner, set
+  `[batches] collect_sweep_batches_before` to a median time at or before
+  the first round without a sweep, and
+  `[batches] collect_sweep_batches_after_seconds` to how long after its
+  round such a batch waits: past that, the watcher brings on the chain the
+  coins their owners gave up and claims their forfeits, and lands no
+  holder's coin (see Batches with a sweep collected early, in the server's
+  README). Move the time forward a few days at a time to collect in
+  tranches, and remove the setting once their expiry has passed.
 - **No plans.** The server refuses offline-refresh plans, and stops an open
   one before its next step.
 - **Accumulator batches without a sweep.** With `accumulator_exit_rate_ppm`
