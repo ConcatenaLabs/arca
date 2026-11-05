@@ -4142,7 +4142,7 @@ impl Wallet {
 	/// wallet's own reading of the chain.
 	pub fn boards(&self) -> Result<Value, Error> {
 		let mut out = vec![];
-		for c in self.store.coins()?.into_iter().filter(|c| c.kind == "board") {
+		for c in self.store.coins_of_kind("board")?.into_iter().filter(|c| c.kind == "board") {
 			let server = self.server.post("board_status", &json!({"leaf_id": c.leaf_id})).unwrap_or_else(|e| json!({"error": e.to_string()}));
 			let own = match c.bases.first().map(|t| Txid::from_str(t)) {
 				Some(Ok(t)) => self.chain.finality(&t)?.word().to_string(),
