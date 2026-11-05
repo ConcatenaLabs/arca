@@ -308,12 +308,40 @@ pub struct LightningLegInfo {
 	/// What it can send and receive over them, in the asset's atoms.
 	pub spendable: String,
 	pub receivable: String,
+	/// The most one payment may move over it now, each way, in the asset's
+	/// atoms: `payment_limit`'s share of `spendable` (a payment out of the
+	/// tree) or `receivable` (one into it), less its reserve. A payment
+	/// above it is refused `out_of_bounds`; `0` while the node is down.
+	pub max_payment: MaxPaymentInfo,
+	/// How the operator sets `max_payment`.
+	pub payment_limit: PaymentLimitInfo,
 	/// Whether it can take a payment into a leaf: it runs the hold-invoice
 	/// plugin.
 	pub receives: bool,
 	/// Why it is down.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub reason: Option<String>,
+}
+
+/// The most one payment may move over a Lightning node, each way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaxPaymentInfo {
+	/// A payment out of the tree (the node sends it), in atoms.
+	pub send: String,
+	/// A payment into the tree (the node receives it), in atoms.
+	pub receive: String,
+}
+
+/// The operator's limit on one payment over a Lightning node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentLimitInfo {
+	/// The share of what the node can carry, less `reserve`, one payment may
+	/// use, in parts per million.
+	pub share_ppm: u32,
+	/// What the node keeps for swaps' legs in each direction, in atoms.
+	pub reserve: String,
 }
 
 /// The Lightning side `info` shows beside the assets.

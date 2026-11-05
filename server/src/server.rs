@@ -24,7 +24,7 @@ use crate::params::{Amount, AssetFees, AssetParams, FeeSchedule, Params};
 use crate::rates::{RateConfig, RateSource};
 use crate::participations::Participations;
 use crate::forfeits::Forfeits;
-use crate::lightning::{BitcoinLegConfig, Gateway, GatewayConfig};
+use crate::lightning::{BitcoinLegConfig, Gateway, GatewayConfig, LegConfig};
 use crate::rounds::{RoundConfig, Rounds};
 use crate::signer::{parse_amount, SignerClient};
 use crate::store::Store;
@@ -325,6 +325,32 @@ fn default_lightning_poll() -> u64 {
 pub struct LegSection {
 	/// The node's `lightning-rpc` socket.
 	pub rpc: PathBuf,
+	/// The share of what the node can send or receive, less `swap_reserve`,
+	/// one payment over it may use, in parts per million: 100,000 (a tenth)
+	/// when absent. `info` publishes the result (`max_payment`), and a
+	/// payment above it is refused.
+	#[serde(default = "default_payment_share")]
+	pub payment_share_ppm: u32,
+	/// What the node keeps in each direction for swaps' legs, in the asset's
+	/// atoms: no payment uses it. 0 when absent.
+	#[serde(default)]
+	pub swap_reserve: u64,
+}
+
+impl LegSection {
+	/// A node at `rpc`, under the default limit.
+	pub fn at(rpc: impl Into<PathBuf>) -> LegSection {
+		LegSection { rpc: rpc.into(), payment_share_ppm: default_payment_share(), swap_reserve: 0 }
+	}
+
+	/// The limit it sets on one payment.
+	pub fn limit(&self) -> crate::lightning::PaymentLimit {
+		crate::lightning::PaymentLimit { share_ppm: self.payment_share_ppm, reserve: self.swap_reserve }
+	}
+}
+
+fn default_payment_share() -> u32 {
+	crate::lightning::DEFAULT_PAYMENT_SHARE_PPM
 }
 
 /// The Bitcoin side: the Lightning node on Bitcoin, and the Bitcoin ark the
@@ -338,6 +364,22 @@ pub struct BitcoinLightningSection {
 	/// operator runs none.
 	#[serde(default)]
 	pub ark: Option<String>,
+	/// As an asset's node's (`LegSection`): the share one payment over it
+	/// may use, in parts per million, 100,000 when absent.
+	#[serde(default = "default_payment_share")]
+	pub payment_share_ppm: u32,
+	/// What the node keeps in each direction for the BTC legs of swaps, in
+	/// satoshis: no payment uses it. 0 when absent.
+	#[serde(default)]
+	pub swap_reserve: u64,
+}
+
+impl BitcoinLightningSection {
+	/// A node at `rpc`, serving the Bitcoin ark `ark`, under the default
+	/// limit.
+	pub fn at(rpc: impl Into<PathBuf>, ark: Option<String>) -> BitcoinLightningSection {
+		BitcoinLightningSection { rpc: rpc.into(), ark, payment_share_ppm: default_payment_share(), swap_reserve: 0 }
+	}
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -1673,11 +1715,15 @@ fn issuers_on(list: &[(AssetId, AssetParams)], fee_assets: &Option<Vec<AssetId>>
 }
 
 /// Each served asset's Lightning node, as `config` names it.
-fn legs_of(config: &Config) -> Result<Vec<(AssetId, PathBuf)>, StartError> {
+fn legs_of(config: &Config) -> Result<Vec<LegConfig>, StartError> {
 	let mut out = vec![];
 	for a in &config.assets {
 		if let Some(l) = &a.lightning {
-			out.push((AssetId::from_str(&a.asset).map_err(err("assets.asset"))?, l.rpc.clone()));
+			if l.payment_share_ppm == 0 || l.payment_share_ppm > 1_000_000 {
+				return Err(StartError(format!("asset {}: lightning.payment_share_ppm is {}; it is above 0 and at most 1,000,000",
+					a.asset, l.payment_share_ppm)));
+			}
+			out.push(LegConfig { asset: AssetId::from_str(&a.asset).map_err(err("assets.asset"))?, rpc: l.rpc.clone(), limit: l.limit() });
 		}
 	}
 	Ok(out)
@@ -1902,9 +1948,16 @@ impl Server {
 				.map_err(err("the node"))?.ok()
 				.and_then(|v| v["pegged_asset"].as_str().and_then(|a| AssetId::from_str(a).ok()))
 		};
+		if let Some(b) = &config.lightning.bitcoin {
+			if b.payment_share_ppm == 0 || b.payment_share_ppm > 1_000_000 {
+				return Err(StartError(format!("lightning.bitcoin.payment_share_ppm is {}; it is above 0 and at most 1,000,000",
+					b.payment_share_ppm)));
+			}
+		}
 		let gateway = Gateway::new(&GatewayConfig {
 			legs: legs_of(config)?,
-			bitcoin: config.lightning.bitcoin.as_ref().map(|b| BitcoinLegConfig { rpc: b.rpc.clone(), ark: b.ark.clone() }),
+			bitcoin: config.lightning.bitcoin.as_ref().map(|b| BitcoinLegConfig { rpc: b.rpc.clone(), ark: b.ark.clone(),
+				limit: crate::lightning::PaymentLimit { share_ppm: b.payment_share_ppm, reserve: b.swap_reserve } }),
 			poll: Duration::from_secs(config.lightning.poll_seconds.max(1)),
 			policy_asset,
 		});

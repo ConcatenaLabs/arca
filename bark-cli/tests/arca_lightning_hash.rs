@@ -158,7 +158,7 @@ async fn a_receive_under_a_given_hash_waits_for_its_preimage_and_is_claimed_with
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut() {
 		if a.asset == xs {
-			a.lightning = Some(LegSection { rpc: ox.rpc_path() });
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
 		}
 	}
 	r.server.reload(&config).await.unwrap();
@@ -396,7 +396,7 @@ async fn a_claim_answered_only_when_posted_again_names_its_leaf() {
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut() {
 		if a.asset == xs {
-			a.lightning = Some(LegSection { rpc: ox.rpc_path() });
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
 		}
 	}
 	r.server.reload(&config).await.unwrap();

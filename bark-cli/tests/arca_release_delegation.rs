@@ -241,7 +241,7 @@ async fn a_lightning_send_carries_the_payers_delegation() {
 	r.synced().await;
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut().filter(|a| a.asset == x) {
-		a.lightning = Some(server::server::LegSection { rpc: ox.rpc_path() });
+		a.lightning = Some(server::server::LegSection::at(ox.rpc_path()));
 	}
 	r.server.reload(&config).await.unwrap();
 	r.config = config;

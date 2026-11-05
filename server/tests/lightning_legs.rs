@@ -69,12 +69,17 @@ async fn each_asset_has_its_own_node_and_info_names_it() {
 	// X and Y each with its node, Z with none; checked every second.
 	let mut config = r.config.clone();
 	if let Some((_, ob, _)) = &btc {
-		config.lightning.bitcoin = Some(BitcoinLightningSection { rpc: ob.rpc_path(), ark: Some("https://ark.example.org".into()) });
+		// The BTC legs of swaps run over the Bitcoin node: 1,000,000 sat kept
+		// for them, and a fifth of the rest for one payment.
+		let mut b = BitcoinLightningSection::at(ob.rpc_path(), Some("https://ark.example.org".into()));
+		b.swap_reserve = 1_000_000;
+		b.payment_share_ppm = 200_000;
+		config.lightning.bitcoin = Some(b);
 	}
 	let mut sx = AssetSection::new(x, MIN_LEAF);
-	sx.lightning = Some(LegSection { rpc: dirs[0].clone() });
+	sx.lightning = Some(LegSection::at(dirs[0].clone()));
 	let mut sy = AssetSection::new(y, MIN_LEAF);
-	sy.lightning = Some(LegSection { rpc: dirs[1].clone() });
+	sy.lightning = Some(LegSection::at(dirs[1].clone()));
 	config.assets = vec![sx, sy, AssetSection::new(z, MIN_LEAF)];
 	config.lightning.poll_seconds = 1;
 	r.config = config;
@@ -100,6 +105,14 @@ async fn each_asset_has_its_own_node_and_info_names_it() {
 			assert_eq!((b["node"]["state"].as_str(), b["node"]["node"].as_str()), (Some("up"), Some(ob.id.as_str())), "{}", b);
 			assert_eq!((b["node"]["network"].as_str(), b["node"]["channels"].as_u64()), (Some("regtest"), Some(1)));
 			assert_eq!(b["ark"], "https://ark.example.org");
+			// Its limit: (capacity − 1,000,000 sat) × 0.2, each way.
+			let n = |v: &serde_json::Value| v.as_str().unwrap().parse::<u64>().unwrap();
+			let (sp, rv) = (n(&b["node"]["spendable"]), n(&b["node"]["receivable"]));
+			println!("the Bitcoin node: spendable {} receivable {}, max_payment {}, payment_limit {}", sp, rv, b["node"]["max_payment"],
+				b["node"]["payment_limit"]);
+			assert_eq!(b["node"]["payment_limit"], serde_json::json!({"share_ppm": 200_000, "reserve": "1000000"}));
+			assert_eq!(n(&b["node"]["max_payment"]["send"]), (sp - 1_000_000) / 5);
+			assert_eq!(n(&b["node"]["max_payment"]["receive"]), rv.saturating_sub(1_000_000) / 5);
 			assert!(r.server.gateway.bitcoin_leg().is_ok());
 			// A Bitcoin invoice never goes through an asset's leg: its node
 			// does not take it, so no Sequentia leaf ever pays it.
@@ -133,6 +146,7 @@ async fn each_asset_has_its_own_node_and_info_names_it() {
 	let i = info(&r);
 	println!("info, Y's leg with its node stopped: {}", leg(&i, &y));
 	assert!(leg(&i, &y)["reason"].as_str().unwrap().contains("could not be reached"));
+	assert_eq!(leg(&i, &y)["max_payment"], serde_json::json!({"send": "0", "receive": "0"}), "a leg that is down takes no payment");
 	let e = r.server.gateway.leg(&y, true).unwrap_err();
 	println!("Y: {} [{}]", e, e.code());
 	assert_eq!(e.code(), "lightning_unavailable");
@@ -142,7 +156,7 @@ async fn each_asset_has_its_own_node_and_info_names_it() {
 	// Y named a node that holds channels in X only, by a reload: down, and
 	// the reason names the assets its channels are in.
 	let mut config = r.config.clone();
-	config.assets[1].lightning = Some(LegSection { rpc: dirs[2].clone() });
+	config.assets[1].lightning = Some(LegSection::at(dirs[2].clone()));
 	let changed = r.server.reload(&config).await.unwrap();
 	assert_eq!(changed.changed, vec![y]);
 	let i = info(&r);

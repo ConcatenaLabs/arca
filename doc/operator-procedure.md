@@ -236,6 +236,14 @@ Then, for each asset that receives:
   channel in the asset with room to receive, and runs the hold-invoice
   plugin (`contrib/holdinvoice-seq`). Check `info`: the asset's
   `assets[].lightning` is `up`, and `receives` is `true`.
+- **`[assets.lightning] payment_share_ppm` and `swap_reserve`** set the most
+  one payment over the node may move: a tenth of what it can send or
+  receive, with nothing kept back, unless set. Where swaps' legs run over the
+  node (on the Bitcoin node, `[lightning.bitcoin]`, for every BTC leg), set
+  `swap_reserve` to the room the swaps need in each direction, in the node's
+  atoms. Check `info`: the leg's `max_payment` shows `send` and `receive`.
+  Wallets read it and pay on the chain above it; publish the limit there
+  rather than asking wallets to hold one of their own.
 - **`[lightning]`** keeps `operator_delay_units` below `owner_delay_units`;
   `block_seconds` at the chain's block interval (60); `receive_window_seconds`
   at its default (six hours) or longer, the time a holder has to claim its

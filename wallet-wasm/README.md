@@ -179,7 +179,13 @@ the margins of the coins it spends), the coins it spends (`gives`) and the
 change it leaves (`change`), and `lightning_pay` with `shown` set to
 that answer pays only on it. `lightning_receive_quote` answers what a receive's
 leaf will hold once claimed (`claimed`: the amount less the operator's fee and
-the margins of the claim), asking the operator nothing. A receive under a hash
+the margins of the claim), asking the operator nothing. Both quotes carry the
+operator's limit on one payment over its node in the asset (`max_payment`, in
+atoms, null when it publishes none), the figure `info` shows under
+`server_info.assets[].lightning.max_payment` (`send`, `receive`): the operator
+refuses a payment out of the tree above it, and makes no invoice above it, so a
+wallet pays on the chain instead. `lightning_receive` above it is refused
+before the operator is asked. A receive under a hash
 the wallet did not make (`lightning_receive` with `hash`, its preimage someone
 else's) is claimed only once `lightning_receive_preimage` hands the preimage
 over; `lightning_receive_ready` says when its leaf is held for good enough to

@@ -81,7 +81,7 @@ async fn a_wallet_pays_and_receives_in_each_asset_from_and_into_its_leaves_in_it
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut() {
 		let n = if a.asset == x.to_string() { &ox } else { &oy };
-		a.lightning = Some(LegSection { rpc: n.rpc_path() });
+		a.lightning = Some(LegSection::at(n.rpc_path()));
 	}
 	r.server.reload(&config).await.unwrap();
 	r.config = config;
@@ -314,7 +314,7 @@ async fn leg_in_x(lnd: &std::path::PathBuf, r: &mut Running, tag: &str)
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut() {
 		if a.asset == x.to_string() {
-			a.lightning = Some(LegSection { rpc: ox.rpc_path() });
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
 		}
 	}
 	r.server.reload(&config).await.unwrap();
