@@ -16,6 +16,15 @@
 //! asset's leg and its state. A request in an asset the operator does not
 //! serve, in a served asset with no node, or in one whose node is down is
 //! refused at every entry with the reason ([`LegRefusal`]).
+//!
+//! Each node's channels are shared by every holder's payments and by the
+//! legs of swaps, so one payment may use only part of them: at most
+//! [`PaymentLimit::share_ppm`] of what the node can send (for a payment out
+//! of the tree) or receive (for one into it), less a reserve kept for swaps
+//! ([`PaymentLimit::reserve`]). `info` publishes the figure per asset and
+//! direction (`max_payment`), and a payment above it is refused at its entry:
+//! a send out of the tree, an invoice to receive into it. The Bitcoin node's
+//! figure is published too, for the wallets that pay native BTC over it.
 
 pub mod bolt11;
 pub mod cln;
@@ -42,11 +51,49 @@ pub const SEQUENTIA_NETWORKS: &[&str] = &["sequentia", "sequentia-testnet", "seq
 /// The networks the Bitcoin node may run on.
 pub const BITCOIN_NETWORKS: &[&str] = &["bitcoin", "testnet4", "testnet", "signet", "regtest"];
 
+/// How much of a node's channels one payment may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaymentLimit {
+	/// The share of what the node can carry, in a direction, less the
+	/// reserve, one payment may use: in parts per million.
+	pub share_ppm: u32,
+	/// What the node keeps for swaps' legs in each direction, in the asset's
+	/// atoms (satoshis for the Bitcoin node): no payment uses it.
+	pub reserve: u64,
+}
+
+/// The share one payment may use where the configuration names none: a
+/// tenth.
+pub const DEFAULT_PAYMENT_SHARE_PPM: u32 = 100_000;
+
+impl Default for PaymentLimit {
+	fn default() -> PaymentLimit {
+		PaymentLimit { share_ppm: DEFAULT_PAYMENT_SHARE_PPM, reserve: 0 }
+	}
+}
+
+impl PaymentLimit {
+	/// The most one payment may move over `capacity`: (capacity − reserve) ×
+	/// share, rounded down.
+	pub fn of(&self, capacity: u64) -> u64 {
+		(capacity.saturating_sub(self.reserve) as u128 * self.share_ppm as u128 / 1_000_000) as u64
+	}
+}
+
+/// An asset's node as the gateway is configured with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegConfig {
+	pub asset: AssetId,
+	/// The path of its `lightning-rpc` socket.
+	pub rpc: PathBuf,
+	pub limit: PaymentLimit,
+}
+
 /// What the gateway is configured with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayConfig {
-	/// Each asset's node, by the path of its `lightning-rpc` socket.
-	pub legs: Vec<(AssetId, PathBuf)>,
+	/// Each asset's node.
+	pub legs: Vec<LegConfig>,
 	/// The Bitcoin node, by its socket, and the Bitcoin ark it serves, if any.
 	pub bitcoin: Option<BitcoinLegConfig>,
 	/// How often every node is checked.
@@ -59,6 +106,7 @@ pub struct GatewayConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitcoinLegConfig {
 	pub rpc: PathBuf,
+	pub limit: PaymentLimit,
 	/// The Bitcoin ark the operator runs for native BTC, which wallets join
 	/// with Bark; none when the operator runs none.
 	pub ark: Option<String>,
@@ -95,15 +143,45 @@ pub struct Leg {
 	pub asset: Option<AssetId>,
 	pub cln: Arc<Cln>,
 	state: RwLock<LegState>,
+	limit: RwLock<PaymentLimit>,
+}
+
+/// The most one payment may move over a node now, each way, in its atoms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxPayment {
+	/// A payment out of the tree: the node sends it.
+	pub send: u64,
+	/// A payment into the tree: the node receives it.
+	pub receive: u64,
 }
 
 impl Leg {
-	fn new(asset: Option<AssetId>, rpc: PathBuf) -> Arc<Leg> {
-		Arc::new(Leg { asset, cln: Arc::new(Cln::new(rpc)), state: RwLock::new(LegState::Unknown) })
+	fn new(asset: Option<AssetId>, rpc: PathBuf, limit: PaymentLimit) -> Arc<Leg> {
+		Arc::new(Leg { asset, cln: Arc::new(Cln::new(rpc)), state: RwLock::new(LegState::Unknown), limit: RwLock::new(limit) })
 	}
 
 	pub fn state(&self) -> LegState {
 		self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
+	}
+
+	pub fn limit(&self) -> PaymentLimit {
+		*self.limit.read().unwrap_or_else(|e| e.into_inner())
+	}
+
+	fn set_limit(&self, l: PaymentLimit) {
+		*self.limit.write().unwrap_or_else(|e| e.into_inner()) = l;
+	}
+
+	/// The most one payment may move over the node, each way, at its last
+	/// check: none while it is down.
+	pub fn max_payment(&self) -> MaxPayment {
+		match self.state() {
+			LegState::Up(v) => {
+				let l = self.limit();
+				MaxPayment { send: l.of(v.spendable), receive: l.of(v.receivable) }
+			},
+			_ => MaxPayment { send: 0, receive: 0 },
+		}
 	}
 
 	fn set(&self, s: LegState) {
@@ -228,10 +306,10 @@ pub struct Gateway {
 
 impl Gateway {
 	pub fn new(config: &GatewayConfig) -> Arc<Gateway> {
-		let legs = config.legs.iter().map(|(a, p)| (*a, Leg::new(Some(*a), p.clone()))).collect();
+		let legs = config.legs.iter().map(|l| (l.asset, Leg::new(Some(l.asset), l.rpc.clone(), l.limit))).collect();
 		Arc::new(Gateway {
 			legs: RwLock::new(legs),
-			bitcoin: config.bitcoin.as_ref().map(|b| Leg::new(None, b.rpc.clone())),
+			bitcoin: config.bitcoin.as_ref().map(|b| Leg::new(None, b.rpc.clone(), b.limit)),
 			ark: config.bitcoin.as_ref().and_then(|b| b.ark.clone()),
 			poll: config.poll,
 			policy_asset: config.policy_asset,
@@ -239,21 +317,22 @@ impl Gateway {
 	}
 
 	/// Takes the assets' nodes anew: a leg whose socket is unchanged keeps its
-	/// state; a new or changed one is checked at once.
-	pub async fn reconfigure(&self, legs: &[(AssetId, PathBuf)]) {
+	/// state and takes its new limit; a new or changed one is checked at once.
+	pub async fn reconfigure(&self, legs: &[LegConfig]) {
 		let fresh: Vec<Arc<Leg>> = {
 			let mut cur = self.legs.write().unwrap_or_else(|e| e.into_inner());
 			let mut next = BTreeMap::new();
 			let mut fresh = vec![];
-			for (a, p) in legs {
-				match cur.get(a) {
-					Some(l) if l.cln.path() == p.as_path() => {
-						next.insert(*a, l.clone());
+			for c in legs {
+				match cur.get(&c.asset) {
+					Some(l) if l.cln.path() == c.rpc.as_path() => {
+						l.set_limit(c.limit);
+						next.insert(c.asset, l.clone());
 					},
 					_ => {
-						let l = Leg::new(Some(*a), p.clone());
+						let l = Leg::new(Some(c.asset), c.rpc.clone(), c.limit);
 						fresh.push(l.clone());
-						next.insert(*a, l);
+						next.insert(c.asset, l);
 					},
 				}
 			}
@@ -344,18 +423,23 @@ impl Gateway {
 }
 
 fn leg_info(leg: &Leg) -> crate::api::LightningLegInfo {
+	let m = leg.max_payment();
+	let max_payment = crate::api::MaxPaymentInfo { send: m.send.to_string(), receive: m.receive.to_string() };
+	let limit = leg.limit();
+	let payment_limit = crate::api::PaymentLimitInfo { share_ppm: limit.share_ppm, reserve: limit.reserve.to_string() };
 	match leg.state() {
 		LegState::Up(v) => crate::api::LightningLegInfo {
 			state: "up".into(), node: Some(v.node_id), network: Some(v.network), channels: v.channels,
-			spendable: v.spendable.to_string(), receivable: v.receivable.to_string(), receives: v.holds, reason: None,
+			spendable: v.spendable.to_string(), receivable: v.receivable.to_string(), max_payment, payment_limit, receives: v.holds,
+			reason: None,
 		},
 		LegState::Down(why) => crate::api::LightningLegInfo {
-			state: "down".into(), node: None, network: None, channels: 0, spendable: "0".into(), receivable: "0".into(),
-			receives: false, reason: Some(why),
+			state: "down".into(), node: None, network: None, channels: 0, spendable: "0".into(), receivable: "0".into(), max_payment,
+			payment_limit, receives: false, reason: Some(why),
 		},
 		LegState::Unknown => crate::api::LightningLegInfo {
-			state: "down".into(), node: None, network: None, channels: 0, spendable: "0".into(), receivable: "0".into(),
-			receives: false, reason: Some("not checked yet".into()),
+			state: "down".into(), node: None, network: None, channels: 0, spendable: "0".into(), receivable: "0".into(), max_payment,
+			payment_limit, receives: false, reason: Some("not checked yet".into()),
 		},
 	}
 }

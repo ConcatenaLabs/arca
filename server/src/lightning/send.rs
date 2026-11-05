@@ -121,6 +121,9 @@ pub enum SendError {
 	Fee(String),
 	#[error("{0}")]
 	InUse(String),
+	/// Above the operator's limit on one payment over its node.
+	#[error("{0}")]
+	OverLimit(String),
 	#[error(transparent)]
 	Cosign(#[from] CosignError),
 	#[error(transparent)]
@@ -150,6 +153,7 @@ impl SendError {
 			SendError::Htlc(_) => "htlc",
 			SendError::Fee(_) => "fee",
 			SendError::InUse(_) => "in_use",
+			SendError::OverLimit(_) => "out_of_bounds",
 			SendError::Cosign(c) => c.code(),
 			SendError::Store(_) => "internal",
 			SendError::NotSynced => "not_synced",
@@ -367,6 +371,16 @@ impl Sends {
 						}
 					},
 					None => {
+						// Over the operator's channels, which every holder and
+						// every swap shares: one payment takes its share only.
+						let max = leg.max_payment().send;
+						if amount > max {
+							let l = leg.limit();
+							return Err(SendError::OverLimit(format!("the invoice asks {} of asset {}, above the most one payment over \
+								Lightning may move out of the tree here now, {}: {} ppm of what the operator's node can send{}. Pay it on \
+								the chain instead", amount, asset, max, l.share_ppm,
+								if l.reserve > 0 { format!(", less {} kept for swaps", l.reserve) } else { String::new() })));
+						}
 						let room = lock_bound(t, now, self.config.block_seconds, self.config.stall_margin_seconds);
 						if inv.min_final_cltv > room as u64 {
 							return Err(SendError::Invoice(format!("the invoice takes a final lock time of {} blocks; a payment whose leaf times \

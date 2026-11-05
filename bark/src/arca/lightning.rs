@@ -255,6 +255,10 @@ impl Wallet {
 		json!({"payment_hash": hex(&p.inv.payment_hash), "asset": p.asset.to_string(), "amount": p.value.to_string(),
 			"fee": p.fee.to_string(), "margins": (checkpoints + margin).to_string(), "spends": total.saturating_sub(change).to_string(),
 			"expires_at": p.inv.timestamp.saturating_add(p.inv.expiry), "description": p.inv.description,
+			// The most one payment out of the tree may move over the operator's node in the asset
+			// now, as it publishes it: above it, it refuses the payment (unless the invoice is its
+			// own, paid inside it). Null when it publishes none.
+			"max_payment": max_payment(&p.info, p.asset, "send"),
 			// The coins it would spend and the change it would leave: a program that settles that
 			// change in the operator's next round prices it from these.
 			"gives": inputs.iter().map(|i| i.row.leaf_id.clone()).collect::<Vec<_>>(), "change": change.to_string()})
@@ -721,7 +725,9 @@ impl Wallet {
 		let claimed = value.checked_sub(claim).filter(|v| *v > 0)
 			.ok_or_else(|| Error::Refused(format!("the leaf's {} do not cover the margins of its claim, {}", value, claim)))?;
 		Ok(json!({"asset": asset.to_string(), "amount": amount.to_string(), "fee": fee.to_string(), "value": value.to_string(),
-			"claim_margins": claim.to_string(), "claimed": claimed.to_string()}))
+			"claim_margins": claim.to_string(), "claimed": claimed.to_string(),
+			// The most one payment into the tree may move over the operator's node in the asset now.
+			"max_payment": max_payment(&info, asset, "receive")}))
 	}
 
 	/// The margins of the claim of a leaf of `value` received over Lightning,
@@ -771,6 +777,14 @@ impl Wallet {
 		if leg["receives"] != true {
 			return Err(Error::Refused(format!("the operator's Lightning node in asset {} does not receive (it runs no hold-invoice \
 				plugin)", asset)));
+		}
+		// The operator makes no invoice above its limit on one payment into the tree: said here
+		// before anything is asked.
+		if let Some(max) = max_payment(&info, asset, "receive").as_str().and_then(|m| m.parse::<u64>().ok()) {
+			if amount > max {
+				return Err(Error::Refused(format!("{} of asset {} is above the most the operator takes in one payment over Lightning \
+					now, {}: receive it on the chain instead", amount, asset, max)));
+			}
 		}
 		let fee = fee_of(&info, asset, amount)?;
 		let bound = max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM);
@@ -1336,6 +1350,15 @@ pub fn receive_participation_id(hash: &[u8; 32]) -> [u8; 32] {
 
 /// What [`Wallet::pay_checks`] read of an invoice, and the operator's
 /// terms for paying it.
+/// The most one payment over the operator's node in `asset` may move in
+/// `direction` (`send`, out of the tree; `receive`, into it), in atoms, as
+/// its `info` publishes it (`assets[].lightning.max_payment`); null when it
+/// publishes none.
+pub fn max_payment(info: &Value, asset: AssetId, direction: &str) -> Value {
+	info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
+		.map(|a| a["lightning"]["max_payment"][direction].clone()).filter(|v| v.is_string()).unwrap_or(Value::Null)
+}
+
 struct PayChecks {
 	inv: Invoice,
 	asset: AssetId,

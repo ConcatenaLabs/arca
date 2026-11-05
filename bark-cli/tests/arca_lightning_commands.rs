@@ -102,7 +102,7 @@ async fn a_payment_under_a_hash_through_the_commands_moves_exactly_what_its_quot
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut() {
 		if a.asset == xs {
-			a.lightning = Some(LegSection { rpc: ox.rpc_path() });
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
 		}
 	}
 	r.server.reload(&config).await.unwrap();

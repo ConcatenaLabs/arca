@@ -773,6 +773,8 @@ the receive's least lock, so such a payment needs a timeout that far out.
 `lightning receive ASSET AMOUNT` asks for an invoice for `AMOUNT` of `ASSET`
 paid into a leaf of the wallet's own, refused before anything is asked when
 the asset has no Lightning node at the operator that receives, the
+amount is above the most the operator takes in one payment over that node
+(`info`'s `max_payment.receive` for the asset), the
 operator's fee (out of the amount) is above the wallet's bound
 (`--max-fee-ppm` raises it), or the leaf would be below the operator's
 smallest. The invoice is under a payment hash whose preimage the wallet

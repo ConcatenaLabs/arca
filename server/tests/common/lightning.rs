@@ -93,10 +93,10 @@ pub async fn gateway<F: FnOnce(&mut server::server::Config, AssetId)>(test: &str
 	let mut config = r.server.config();
 	for a in config.assets.iter_mut() {
 		if a.asset == x.to_string() {
-			a.lightning = Some(LegSection { rpc: ox.rpc_path() });
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
 		}
 		if a.asset == y.to_string() {
-			a.lightning = Some(LegSection { rpc: oy.rpc_path() });
+			a.lightning = Some(LegSection::at(oy.rpc_path()));
 		}
 	}
 	r.server.reload(&config).await.unwrap();

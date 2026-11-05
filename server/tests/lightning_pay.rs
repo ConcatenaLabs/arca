@@ -275,7 +275,7 @@ async fn pays_invoices_in_each_asset_from_leaves_in_it() {
 	let leg_of = |c: &mut server::server::Config, l: Option<LegSection>| {
 		c.assets.iter_mut().find(|a| a.asset == y.to_string()).unwrap().lightning = l;
 	};
-	leg_of(&mut config, Some(LegSection { rpc: std::path::PathBuf::from("/nonexistent/lightning-rpc") }));
+	leg_of(&mut config, Some(LegSection::at(std::path::PathBuf::from("/nonexistent/lightning-rpc"))));
 	g.r.server.reload(&config).await.unwrap();
 	let gw = g.r.server.gateway.clone();
 	g.r.wait("Y's leg down", || gw.leg(&y, true).is_err()).await;
@@ -288,7 +288,7 @@ async fn pays_invoices_in_each_asset_from_leaves_in_it() {
 	leg_of(&mut config, None);
 	g.r.server.reload(&config).await.unwrap();
 	refused("Y's invoice with Y served by no node", send(&g, &payment(&g, &ny, y, v, terms(&g, hy), &inv_y, |_| {})), "no_lightning");
-	leg_of(&mut config, Some(LegSection { rpc: g.oy.rpc_path() }));
+	leg_of(&mut config, Some(LegSection::at(g.oy.rpc_path())));
 	g.r.server.reload(&config).await.unwrap();
 	g.r.config = config;
 	g.r.wait("Y's leg up", || gw.leg(&y, true).is_ok()).await;
@@ -347,6 +347,59 @@ async fn pays_invoices_in_each_asset_from_leaves_in_it() {
 	let pre: [u8; 32] = unhex(status(&g, h).ok()["preimage"].as_str().unwrap()).try_into().unwrap();
 	assert!(claim.input[i].witness.script_witness.iter().any(|w| w[..] == pre[..]), "the claim reveals the preimage");
 	println!("the claim {} spends {} with the preimage", claim.txid(), at);
+}
+
+/// The operator's limit on one payment out of the tree, read from what
+/// `info` publishes now for `asset`: (`max_payment.send`, `spendable`).
+fn send_limit(g: &Gateway, asset: AssetId) -> (u64, u64) {
+	let info = g.r.http.get("info").ok();
+	let a = info["assets"].as_array().unwrap().iter().find(|a| a["asset"] == json!(asset.to_string())).unwrap().clone();
+	let n = |v: &Value| v.as_str().unwrap().parse::<u64>().unwrap();
+	(n(&a["lightning"]["max_payment"]["send"]), n(&a["lightning"]["spendable"]))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_payment_out_takes_at_most_the_operators_share_of_its_channels() {
+	let Some(mut g) = gateway("one_payment_out_takes_at_most_the_operators_share_of_its_channels", tune).await else { return };
+	let x = g.r.x;
+	// The default: a tenth of what the node can send, nothing kept back.
+	let info = g.r.http.get("info").ok();
+	let leg = info["assets"].as_array().unwrap().iter().find(|a| a["asset"] == json!(x.to_string())).unwrap()["lightning"].clone();
+	println!("X's leg as info publishes it: {}", leg);
+	assert_eq!(leg["payment_limit"], json!({"share_ppm": 100_000, "reserve": "0"}));
+	let (max, spendable) = send_limit(&g, x);
+	assert_eq!(max, spendable / 10, "a tenth of {}", spendable);
+
+	// A swap reserve that leaves 1,000,000 atoms above it: the limit is a
+	// tenth of that, 100,000, taken at a reload.
+	let mut config = g.r.config.clone();
+	let reserve = spendable - 1_000_000;
+	config.assets.iter_mut().find(|a| a.asset == x.to_string()).unwrap().lightning.as_mut().unwrap().swap_reserve = reserve;
+	g.r.server.reload(&config).await.unwrap();
+	g.r.config = config;
+	let (max, spendable2) = send_limit(&g, x);
+	println!("with a swap reserve of {}: spendable {}, max_payment.send {}", reserve, spendable2, max);
+	assert_eq!(spendable2, spendable, "nothing moved");
+	assert_eq!(max, 100_000);
+
+	// One atom over: refused at the entry, nothing signed, nothing recorded.
+	let c = coin(&mut g, x).await;
+	let (inv, h) = invoice(&g.px, x, max + 1, "x-over");
+	let p = payment(&g, &c, x, max + 1 + fee(max + 1), terms(&g, h), &inv, |_| {});
+	let m = refused("one atom over the limit", g.r.http.post("lightning_send", &p.body), "out_of_bounds");
+	assert!(m.contains("above the most one payment over Lightning may move out of the tree here now, 100000"), "{}", m);
+	assert!(m.contains(&format!("less {} kept for swaps", reserve)) && m.contains("Pay it on the chain instead"), "{}", m);
+	assert!(g.r.server.store.send(&h).await.unwrap().is_none(), "no payment recorded");
+
+	// At the limit: paid, from the same coin.
+	let (inv, h) = invoice(&g.px, x, max, "x-at-limit");
+	let p = payment(&g, &c, x, max + fee(max), terms(&g, h), &inv, |_| {});
+	let answer = g.r.http.post("lightning_send", &p.body).ok();
+	assert_eq!(answer["payment"]["state"], "paying");
+	let st = decided(&g, &h).await;
+	println!("x-at-limit: {}", st);
+	assert_eq!(st["state"], "paid");
+	assert_eq!(invoice_on(&g.px, "x-at-limit")["amount_received_msat"].as_u64(), Some(max * 1000));
 }
 
 /// The service horizon of the batch without a sweep below: five days.

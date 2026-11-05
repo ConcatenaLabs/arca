@@ -652,7 +652,7 @@ async fn with_lightning() -> (Running, Vec<sequentia_ext::lightning::LightningNo
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut() {
 		if a.asset == x.to_string() {
-			a.lightning = Some(server::server::LegSection { rpc: ox.rpc_path() });
+			a.lightning = Some(server::server::LegSection::at(ox.rpc_path()));
 		}
 	}
 	r.server.reload(&config).await.unwrap();
@@ -683,7 +683,7 @@ async fn legs_in(r: &mut Running, nodes: &[LightningNode], more: &[AssetId]) {
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut() {
 		if more.iter().any(|m| a.asset == m.to_string()) {
-			a.lightning = Some(server::server::LegSection { rpc: ox.rpc_path() });
+			a.lightning = Some(server::server::LegSection::at(ox.rpc_path()));
 		}
 	}
 	r.server.reload(&config).await.unwrap();

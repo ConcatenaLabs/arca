@@ -230,6 +230,13 @@ max_margin_multiple = 25
 # refused no_lightning. The node is checked every [lightning] poll_seconds;
 # while it does not answer, or holds no open channel in the asset, info shows
 # its leg down with the reason and a request is refused lightning_unavailable.
+# One payment over the node may move at most payment_share_ppm (a tenth when
+# absent) of what it can send (a payment out of the tree) or receive (one
+# into it), less swap_reserve atoms kept for swaps' legs (none when absent):
+# info publishes the result as the leg's max_payment, and a payment above it
+# is refused out_of_bounds, before anything is signed or invoiced. The node's
+# channels are shared by every holder and every swap; the limit keeps one
+# payment from draining a side of them.
 #
 # [assets.issuer] serves the asset issuer-operated: each round mints what it
 # pays of the asset through the asset's mint limiter, which holds its
@@ -267,6 +274,8 @@ min_leaf = "1000"
 # max_age_seconds = 3600
 # [assets.lightning]
 # rpc = "/var/lib/seqln/<asset id>/sequentia/lightning-rpc"
+# payment_share_ppm = 100000
+# swap_reserve = 0
 # [assets.issuer]
 # limiter = "/etc/arca/<asset id>.limiter.json"
 # entropy = "<the asset's issuance entropy>"
@@ -401,7 +410,14 @@ receive_cap_ppm = 100000
 # The operator's Lightning node on Bitcoin, for native BTC, by its JSON-RPC
 # socket, and the Bitcoin ark it runs, which wallets join with Bark. Native
 # BTC never enters a Sequentia leaf: its payments go over this node and the
-# Bitcoin ark. info names both; neither when absent.
+# Bitcoin ark. info names both; neither when absent. payment_share_ppm and
+# swap_reserve (in satoshis) set the max_payment info publishes for the node,
+# as for an asset's: the BTC legs of swaps run over it, so swap_reserve keeps
+# their room out of what one payment may take. The server carries no payment
+# over this node itself; wallets that pay native BTC over Lightning read the
+# figure and pay on the chain above it.
 # [lightning.bitcoin]
 # rpc = "/var/lib/lightning/bitcoin/lightning-rpc"
 # ark = "https://ark.example.org"
+# payment_share_ppm = 100000
+# swap_reserve = 0

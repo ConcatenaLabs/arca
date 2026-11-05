@@ -258,7 +258,7 @@ async fn receives_in_each_asset_into_leaves_claimed_with_the_preimage() {
 	config.assets.iter_mut().find(|a| a.asset == y.to_string()).unwrap().lightning = None;
 	g.r.server.reload(&config).await.unwrap();
 	refused("receiving in Y with no node", Receiving::new(y, 100_000).ask(&g), "no_lightning");
-	config.assets.iter_mut().find(|a| a.asset == y.to_string()).unwrap().lightning = Some(LegSection { rpc: g.oy.rpc_path() });
+	config.assets.iter_mut().find(|a| a.asset == y.to_string()).unwrap().lightning = Some(LegSection::at(g.oy.rpc_path()));
 	g.r.server.reload(&config).await.unwrap();
 	g.r.config = config;
 }
@@ -450,6 +450,51 @@ async fn a_receive_in_an_asset_whose_rate_is_stale_is_refused() {
 
 /// The service horizon of the batches without a sweep below: five days.
 const HORIZON: u32 = 5 * 86_400;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_invoice_is_made_above_the_operators_share_of_its_channels() {
+	let Some(mut g) = gateway("no_invoice_is_made_above_the_operators_share_of_its_channels", tune).await else { return };
+	let y = g.r.y;
+	let leg = |g: &Gateway| {
+		let info = g.r.http.get("info").ok();
+		info["assets"].as_array().unwrap().iter().find(|a| a["asset"] == json!(y.to_string())).unwrap()["lightning"].clone()
+	};
+	let n = |v: &Value| v.as_str().unwrap().parse::<u64>().unwrap();
+	let l = leg(&g);
+	println!("Y's leg as info publishes it: {}", l);
+	let receivable = n(&l["receivable"]);
+	assert_eq!(n(&l["max_payment"]["receive"]), receivable / 10, "a tenth of {}", receivable);
+
+	// A share of a half, and a swap reserve that leaves 200,000 atoms above
+	// it: the limit is 100,000.
+	let mut config = g.r.config.clone();
+	let reserve = receivable - 200_000;
+	let s = config.assets.iter_mut().find(|a| a.asset == y.to_string()).unwrap().lightning.as_mut().unwrap();
+	s.swap_reserve = reserve;
+	s.payment_share_ppm = 500_000;
+	g.r.server.reload(&config).await.unwrap();
+	g.r.config = config;
+	let l = leg(&g);
+	println!("with a share of 500000 ppm and a swap reserve of {}: {}", reserve, l);
+	assert_eq!(l["payment_limit"], json!({"share_ppm": 500_000, "reserve": reserve.to_string()}));
+	let max = n(&l["max_payment"]["receive"]);
+	assert_eq!(max, 100_000);
+
+	// One atom over: no invoice, nothing recorded.
+	let over = Receiving::new(y, max + 1);
+	let m = refused("one atom over the limit", over.ask(&g), "out_of_bounds");
+	assert!(m.contains("above the most one payment over Lightning may move into the tree here now, 100000"), "{}", m);
+	assert!(m.contains("Receive it on the chain instead"), "{}", m);
+	assert!(g.r.server.store.receive(&over.hash).await.unwrap().is_none(), "no receive recorded");
+
+	// At the limit: the invoice is made, for that amount, in Y.
+	let at = Receiving::new(y, max);
+	let r = at.ask(&g).ok();
+	let inv = r["invoice"].as_str().unwrap().to_string();
+	let d = g.oy.ok("decode", json!({ "string": inv }));
+	println!("at the limit: invoice for {} msat in {}", d["amount_msat"], d["asset"]);
+	assert_eq!(d["amount_msat"].as_u64(), Some(max * 1000));
+}
 
 fn tune_no_sweep(c: &mut server::server::Config, y: AssetId) {
 	tune(c, y);

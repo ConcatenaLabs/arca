@@ -339,6 +339,15 @@ impl Receives {
 			return Err(ReceiveError::InUse(format!("a payment into the tree under hash {} is asked for already", hex(&req.payment_hash))));
 		}
 		let leg = self.gateway.receiving_leg(&req.asset, p.assets.contains(&req.asset))?;
+		// Over the operator's channels, which every holder and every swap
+		// shares: one payment takes its share only.
+		let max = leg.max_payment().receive;
+		if req.amount > max {
+			let l = leg.limit();
+			return Err(ReceiveError::OutOfBounds(format!("{} of asset {} is above the most one payment over Lightning may move into the \
+				tree here now, {}: {} ppm of what the operator's node can receive{}. Receive it on the chain instead", req.amount, req.asset,
+				max, l.share_ppm, if l.reserve > 0 { format!(", less {} kept for swaps", l.reserve) } else { String::new() })));
+		}
 		// A payment into the tree is new work in its asset (the operator funds
 		// its leaf from the asset's pool and prices its fee at the asset's
 		// rate): refused while the rate is stale, as a board is.

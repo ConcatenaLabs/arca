@@ -73,7 +73,7 @@ async fn native_btc_goes_through_barks_leg_on_the_wallets_bitcoin_ark() {
 	// An operator naming its Bitcoin ark and its Lightning node on Bitcoin.
 	let ark = "https://ark.example.org";
 	let mut r = Running::start_with(|c, _, _| {
-		c.lightning.bitcoin = Some(BitcoinLightningSection { rpc: dir.join("no-node"), ark: Some(ark.into()) });
+		c.lightning.bitcoin = Some(BitcoinLightningSection::at(dir.join("no-node"), Some(ark.into())));
 	}).await;
 	let x = r.x.to_string();
 	let (url, nurl) = (r.url(), r.node_url());

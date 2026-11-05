@@ -521,6 +521,24 @@ other assets), `lightning_unavailable`, a 503, since the request may be taken
 once the node is back. A reload (SIGHUP) takes each asset's node anew; one
 whose socket changed is checked at once.
 
+A node's channels are shared by every holder's payments and by the legs of
+swaps, so one payment over it may use only part of them. The most one payment
+may move is `(capacity − swap_reserve) × payment_share_ppm / 1,000,000`,
+rounded down, where the capacity is what the node can send (a payment out of
+the tree) or receive (one into it) at its last check. `payment_share_ppm` is
+100,000 (a tenth) and `swap_reserve` 0 unless `[assets.lightning]` sets them;
+`[lightning.bitcoin]` takes the same two for the Bitcoin node, its reserve in
+satoshis. `info` publishes the figure with each leg, in the leg's atoms
+(`max_payment`: `send` and `receive`, `0` while the node is down), and the
+settings it comes from (`payment_limit`: `share_ppm`, `reserve`). Above it a
+payment out of the tree is refused `out_of_bounds` before anything is signed,
+and no invoice is made for a payment into it; the refusal names the limit and
+says to pay on the chain instead. A payment of the operator's own invoice,
+settled inside the operator, moves nothing over a channel and is not held to
+it. The server carries no payment over the Bitcoin node itself: its figure is
+for the wallets that pay native BTC over Lightning, which read it and pay on
+the chain above it. A reload takes an asset's new settings at once.
+
 ### Paying an invoice out of the tree
 
 A wallet pays a BOLT11 invoice in asset A out of its coins in A

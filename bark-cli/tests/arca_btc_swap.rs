@@ -178,7 +178,7 @@ async fn operator_with(lnd: &PathBuf, tag: &str, invoice_expiry: u32) -> (Runnin
 	let mut config = r.config.clone();
 	for a in config.assets.iter_mut() {
 		if a.asset == x.to_string() {
-			a.lightning = Some(LegSection { rpc: ox.rpc_path() });
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
 		}
 	}
 	r.server.reload(&config).await.unwrap();
