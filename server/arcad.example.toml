@@ -357,6 +357,10 @@ collect_after_seconds = 2419200
 # the coins their owners gave up are brought on the chain.
 # collect_sweep_batches_before = 1793509238
 # collect_sweep_batches_after_seconds = 259200
+# This long after its round, a tree batch without a sweep has the coins its
+# owners gave up brought on the chain, forfeited and claimed, beside holders
+# who stay away; no holder's coin lands before collect_after_seconds.
+# collect_owed_after_seconds = 259200
 
 # The Lightning gateway beside each asset's own node.
 [lightning]
