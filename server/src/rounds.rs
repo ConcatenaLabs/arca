@@ -1851,7 +1851,9 @@ impl Rounds {
 					if dropped == 0 {
 						return Err(RoundError::Refused(reason));
 					}
-					chosen = kept;
+					// A take dropped here may have been a member of a set the
+					// cap took together: the rest of it waits.
+					chosen = self.whole_sets(kept, &sets).await?;
 				},
 				other => return other,
 			}
@@ -2635,7 +2637,8 @@ impl Rounds {
 
 	/// Of `chosen`, every participation but those of a set the in-flight cap
 	/// took together ([`Rounds::within_cap`]) that has lost a member since
-	/// (to the wallet's funds, a re-run's tie, the batch): the cap credited
+	/// (to the wallet's funds, a re-run's tie, the batch, a take the node
+	/// refused in a fill round): the cap credited
 	/// each member with a node that comes back only once all of them run,
 	/// so the rest of the set waits for a round that takes it whole, and
 	/// none of it is fronted on a return that does not come.
