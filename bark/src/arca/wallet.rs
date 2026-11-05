@@ -64,6 +64,10 @@ pub const REDOING: &str = "being redone after a Bitcoin reorganisation; ";
 /// The store's key for the anchor depth the operator last published, empty
 /// when it published none.
 const ANCHOR_DEPTH_META: &str = "anchor_depth";
+/// The store's key for the rounds of released participations found final at
+/// the last complete re-check (a JSON list), not looked at again while the
+/// chain only grows.
+const FINAL_ROUNDS: &str = "final_rounds";
 
 /// How many unused on-chain scripts past the last one in use the wallet looks at.
 const GAP: u32 = 20;
@@ -2823,13 +2827,29 @@ impl Wallet {
 		// A round a participation was released in that can never return,
 		// whatever became of its new leaves (one paid on, say): the
 		// operator runs the participation again, and the wallet follows it.
-		// Where each such round is, read ahead together.
+		// Where each such round is, read ahead together. A round found final
+		// at an earlier complete re-check stays final while the chain has
+		// only grown since (`grown`: no rollback, the node's anchor status the
+		// same), so it is not looked at again until one of those changes: a
+		// wallet that releases a participation at every trade holds hundreds
+		// of rounds, each one read of the node a re-check, once a block.
+		let known_final: BTreeSet<String> = if grown {
+			self.store.meta(FINAL_ROUNDS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default()
+		} else {
+			BTreeSet::new()
+		};
 		let mut parts = vec![];
+		let mut still_final: BTreeSet<String> = BTreeSet::new();
 		for p in self.store.participations()? {
 			if p.4 == "released" && p.6.is_some() && !self.new_leaves_expired(&p.0)? {
+				if let Some(r) = p.6.as_deref().filter(|r| known_final.contains(*r)) {
+					still_final.insert(r.to_string());
+					continue;
+				}
 				parts.push(p);
 			}
 		}
+		let skipped_final = still_final.len();
 		let released: Vec<Txid> = parts.iter().filter_map(|p| p.6.as_deref()).filter_map(|r| Txid::from_str(r).ok())
 			.collect::<BTreeSet<_>>().into_iter().collect();
 		self.chain.read_ahead_of(&released, &[]);
@@ -2843,8 +2863,13 @@ impl Wallet {
 			if self.chain.gone(&round)? {
 				let back = self.round_lost(&round.txid())?;
 				changes.push(json!({"round": r, "can_never_return": true, "participations": back}));
+			} else if self.chain.finality(&round.txid())?.is_final() {
+				still_final.insert(r);
 			}
 		}
+		// Kept for the next complete re-check: only the rounds of
+		// participations still followed, so the list never outgrows them.
+		self.store.set_meta(FINAL_ROUNDS, &serde_json::to_string(&still_final).map_err(|e| Error::Store(e.to_string()))?)?;
 		lap("participations", &mut at);
 		// Each participation follows the one of its rounds that stands.
 		changes.extend(self.follow_standing_rounds()?);
@@ -2863,7 +2888,8 @@ impl Wallet {
 		*self.rechecked_at.borrow_mut() = Some(tip.hash.to_string());
 		Ok(json!({"tip": {"height": tip.height, "hash": tip.hash.to_string()}, "reorganised": reorg, "changes": changes, "ms": ms,
 			"read_again": if grown { json!(coins.iter().filter(|c| matches!(c.state.as_str(), "pending" | "live")).count() - skip.len()) }
-				else { json!("all") }}))
+				else { json!("all") },
+			"rounds_final_skipped": skipped_final}))
 	}
 
 	/// Whether the chain's tip is the one the last complete re-check ran at,

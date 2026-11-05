@@ -175,6 +175,14 @@ async fn an_offboard_pays_an_address_on_the_chain_and_a_refused_one_gives_the_co
 	}
 	println!("buried: {}", o);
 	assert_eq!(o["final"], true, "{}", o);
+	// A round found final at a complete re-check is not looked at again while
+	// the chain only grows: the next re-check, a block later, skips it.
+	let first = a.ok(&["recheck"]);
+	r.produce().await;
+	r.synced().await;
+	let next = a.ok(&["recheck"]);
+	println!("re-checks: rounds skipped as final {} then {}", first["rounds_final_skipped"], next["rounds_final_skipped"]);
+	assert!(next["rounds_final_skipped"].as_u64().unwrap_or(0) >= 1, "{}", next);
 	// The change, a leaf of the round, is the wallet's: the release is taken
 	// whole. Asking a tree for the offboard's output, in no batch, was refused
 	// ("invalid type: null, expected u32"), and the coin given up stayed
