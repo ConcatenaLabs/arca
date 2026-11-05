@@ -192,6 +192,12 @@ to an older state:
   that fails this check is older than the chain; restore it to its latest
   commit rather than start it.
 
+The server opens its connections with JIT compilation off (`-c jit=off`,
+added to whatever the connection string's `options` carry). PostgreSQL
+overestimates the cost of the server's recursive lineage walks by hundreds of
+times and would compile them on every call, which takes several times as long
+as the query itself.
+
 ## Finality
 
 The server never counts confirmations. One component, the finality service
@@ -801,7 +807,11 @@ credited again when final again. A board whose transaction can no longer
 confirm is lost, and so is one never credited whose transaction is still in
 no block a set time after it was registered (`board_unconfirmed_seconds`, six
 hours by default): its transaction lost its parent, say. The nursery then
-stops broadcasting it.
+stops broadcasting it. Each pass over the boards, after each of the finality
+service's passes, reads the boards pending and, of those credited, only the
+ones the store no longer places final, in one statement (every one while the
+node reports its tip's anchor as anything but `ok`): a disconnection the
+boards missed is found there.
 
 ## Out-of-round transfers
 
@@ -1629,7 +1639,10 @@ switch and the service horizon (`no_sweep`, `collect_after_seconds`).
 Such a round takes every forfeit before it is broadcast, as a round that
 fills on-chain orders does (below): built, recorded and held, it goes out
 only once every participation in it that gives up a coin has handed over the
-owner's half of each forfeit. Without that, a participant that never hands
+owner's half of each forfeit. It goes out as soon as the last of them is in:
+`forfeit_leaves` taking forfeits for a round not yet broadcast asks for a
+pass over the rounds at once, rather than at the next block or round
+interval. Without that, a participant that never hands
 its forfeit over would leave a new leaf whose value the operator fronted
 and nothing could ever take back, while it took its old coin home as well.
 The participation's status serves the round's transaction without its
@@ -2058,6 +2071,27 @@ disconnection or at a restart, until the round is restored.
 The nursery does not call a round lost when its input's own transaction is
 reorganised away and never returns: such a round stays broadcast, its
 participations issued and its leaves uncredited.
+
+A pass over the rounds runs after each of the finality service's passes,
+after each round interval's building, and when a held round's last forfeit
+comes in. It credits every broadcast round the finality service calls
+final. Of the rounds already final it reads only those the store no longer
+places final (their block out of the chain, the certification gone, or their
+anchor buried less than the rule), in one statement, and every one while the
+node reports its tip's anchor as anything but `ok`, as the nursery does: a
+pass costs what is pending, not every round the operator ever ran. A
+disconnection uncredits a round's leaves as soon as the rounds hear of it;
+one they missed is found by that statement on the next pass.
+
+A step of the rounds that takes longer than two seconds (the building at a
+round interval, a pass, one round's building, the in-flight cap's reading) is
+logged at info as `rounds: slow …`, with what each of its parts took: the
+check of the participations' coins, the cap, the funding, the building, and
+within a pass the rounds going out, the lost rounds, the rounds followed and
+the releases. At debug (`RUST_LOG=server::rounds=debug`) every such step is
+logged the same way, `rounds: took …`. The in-flight cap reads only the lowest nodes the coins of the
+participations at hand rest on, so a round's building does not grow with the
+operator's batches.
 
 ## Issuer-operated assets
 
@@ -4043,6 +4077,24 @@ releases it: `/v1/chain`'s `pool` shows the locked value growing by the
 users' leaves alone and what reclaims paid back; with `holder_batches` 0
 every round strands the maker's four leaves. A maker leaf paid on out of
 round is counted `transferred`.
+
+`tests/rounds_on_time.rs` runs the server's own loop over the rounds, no
+pass run by hand: a round held for its forfeits stays built while one of
+them is missing and reaches the node within seconds of the last, with the
+chain polled every two minutes and no round interval; a final, credited
+round whose Bitcoin anchor is orphaned is uncredited at once, stays
+uncredited while mined again but not final, and is credited once buried;
+and a disconnection the rounds missed (the round set final and its leaf
+credited by hand while out of the chain) is found by the next pass.
+`tests/round_latency.rs` (ignored by default; `-- --ignored`, with
+`RUST_LOG=info`) measures how long refreshes wait on the rounds when the
+operator has a history behind it: batches whose lowest nodes hold fronted
+value, 5,000 rounds final and 300 lost, an asset over its cap whose
+refreshes wait, and refreshes of another coming every 20 s, with a round
+interval and a block every 60 s. Its log carries the lines a reading of
+arcad's journal takes each round's times from, and `rounds: slow` lines;
+`ROUND_LATENCY_MINUTES` and `ROUND_LATENCY_HISTORY` set the flow's length
+and the history's size.
 
 `tests/held_cap.rs` runs the in-flight cap beside a round held for its
 forfeits: a refresh judged while an earlier round of its asset is held waits

@@ -761,6 +761,30 @@ impl Store {
 		r.as_ref().map(round_row).transpose()
 	}
 
+	/// The rounds held as final that are not final as the store follows the
+	/// chain: the transaction in no block, in one no certified block is at or
+	/// above (when `certification` is required), or with the anchor of its
+	/// block buried fewer than `anchor_depth` Bitcoin blocks under the tip's
+	/// ([`crate::chain::FinalityService::status`] while the tip's anchor is
+	/// ok), oldest first. One statement, where a lookup per round costs a pass
+	/// over the rounds time in proportion to every round ever final.
+	pub async fn rounds_final_not_final(&self, certification: bool, anchor_depth: u64) -> Result<Vec<RoundRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			&format!("WITH tip AS (SELECT anchor_height FROM block ORDER BY height DESC LIMIT 1),
+			  cert AS (SELECT max(height) AS h FROM block WHERE certified),
+			  loc AS (SELECT DISTINCT ON (t.txid) t.txid, b.height, b.anchor_height FROM tx_block t
+			          JOIN block b ON b.hash = t.block_hash JOIN round f ON f.txid = t.txid AND f.state = 'final'
+			          ORDER BY t.txid, b.height),
+			  still AS (SELECT loc.txid FROM loc, tip, cert
+			            WHERE (NOT $1 OR loc.height <= cert.h) AND GREATEST(tip.anchor_height - loc.anchor_height, 0) >= $2)
+			 SELECT {} FROM round r JOIN connector_output c ON c.round_id = r.round_id
+			 WHERE r.state = 'final' AND r.txid NOT IN (SELECT txid FROM still) ORDER BY r.round_id", ROUND_COLUMNS),
+			&[&certification, &i64::try_from(anchor_depth).unwrap_or(i64::MAX)],
+		).await?;
+		rows.iter().map(round_row).collect()
+	}
+
 	/// The rounds in `state`, oldest first.
 	pub async fn rounds_in(&self, state: RoundState) -> Result<Vec<RoundRow>, StoreError> {
 		let conn = self.conn().await?;

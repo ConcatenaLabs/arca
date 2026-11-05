@@ -1647,6 +1647,11 @@ async fn forfeit_leaves(State(app): State<Arc<App>>, body: Result<Bytes, BytesRe
 		leaves.push(AuthsRequest { leaf_id: leaf_id(&l.leaf_id)?, auths });
 	}
 	let done = app.forfeits.forfeit_leaves(&ForfeitLeaves { participation_id, forfeits, leaves }).await?;
+	// Forfeits in before their round is broadcast: a round held for them
+	// goes out at the next pass, which runs now.
+	if done.preimage.is_none() {
+		app.rounds.wake();
+	}
 	Ok(Json(api::Forfeited {
 		participation_id: hex(&done.participation_id),
 		state: done.state.as_str().into(),

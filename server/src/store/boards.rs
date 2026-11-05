@@ -105,6 +105,30 @@ impl Store {
 		rows.iter().map(board_row).collect()
 	}
 
+	/// The boards credited whose transaction is not final as the store
+	/// follows the chain: in no block, in one no certified block is at or
+	/// above (when `certification` is required), or with the anchor of its
+	/// block buried fewer than `anchor_depth` Bitcoin blocks under the tip's
+	/// ([`crate::chain::FinalityService::status`] while the tip's anchor is
+	/// ok), oldest first. One statement, where a lookup per board costs a pass
+	/// over the boards time in proportion to every board ever credited.
+	pub async fn boards_credited_not_final(&self, certification: bool, anchor_depth: u64) -> Result<Vec<BoardRow>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			&format!("WITH tip AS (SELECT anchor_height FROM block ORDER BY height DESC LIMIT 1),
+			  cert AS (SELECT max(height) AS h FROM block WHERE certified),
+			  loc AS (SELECT DISTINCT ON (t.txid) t.txid, b.height, b.anchor_height FROM tx_block t
+			          JOIN block b ON b.hash = t.block_hash JOIN board d ON d.txid = t.txid AND d.state = 'credited'
+			          ORDER BY t.txid, b.height),
+			  still AS (SELECT loc.txid FROM loc, tip, cert
+			            WHERE (NOT $1 OR loc.height <= cert.h) AND GREATEST(tip.anchor_height - loc.anchor_height, 0) >= $2)
+			 SELECT {} FROM board WHERE state = 'credited' AND txid NOT IN (SELECT txid FROM still) ORDER BY created_at",
+				BOARD_COLUMNS),
+			&[&certification, &i64::try_from(anchor_depth).unwrap_or(i64::MAX)],
+		).await?;
+		rows.iter().map(board_row).collect()
+	}
+
 	/// Credits a pending board: its leaf becomes live, unless spent already.
 	/// Returns whether it was pending.
 	pub async fn credit_board(&self, leaf_id: &[u8; 32]) -> Result<bool, StoreError> {

@@ -282,7 +282,7 @@ use arca_covenant::{
 use elements::Script;
 use sequentia_ext::AssetAmount;
 
-use crate::chain::{ChainEvent, FinalityService};
+use crate::chain::{Certification, ChainEvent, FinalityService};
 
 /// Whether `what` is new for participation `id` under `topic`: a reason a
 /// participation is held is logged when it starts or changes, not on every
@@ -1092,6 +1092,9 @@ pub struct Rounds {
 	holders: Mutex<std::collections::HashMap<[u8; 32], Option<[u8; 32]>>>,
 	/// The coins whose holders are at hand ([`ActiveCoins`]).
 	pub active: Arc<ActiveCoins>,
+	/// Rung when something a pass acts on has come in between the chain's
+	/// events and the round interval ([`Rounds::wake`]).
+	wake: tokio::sync::Notify,
 }
 
 /// A batch a round builds: its asset, its leaves (each a participation's
@@ -1178,6 +1181,51 @@ pub const WITHDRAWN: &str = "withdrawn by the owners of its coins before a round
 /// How long [`Rounds::fundable_now`] serves what it last read.
 pub const FUNDABLE_FOR: Duration = Duration::from_secs(10);
 
+/// A step of the rounds ([`Rounds::run_rounds`], [`Rounds::pass`], one
+/// round's building, the in-flight cap's reading) that takes longer than this
+/// is logged at info, `rounds: slow …`, with what each of its parts took.
+pub const SLOW_STEP: Duration = Duration::from_secs(2);
+
+/// Times the parts of one step of the rounds, for its `slow` line
+/// ([`SLOW_STEP`]).
+pub struct Laps {
+	what: String,
+	start: std::time::Instant,
+	last: std::time::Instant,
+	parts: Vec<(String, Duration)>,
+}
+
+impl Laps {
+	pub fn start(what: impl Into<String>) -> Laps {
+		let now = std::time::Instant::now();
+		Laps { what: what.into(), start: now, last: now, parts: vec![] }
+	}
+
+	/// Ends the part `part`, which ran since the last part ended.
+	pub fn lap(&mut self, part: impl Into<String>) {
+		let now = std::time::Instant::now();
+		self.parts.push((part.into(), now - self.last));
+		self.last = now;
+	}
+
+	/// Ends the step: logged at info when it took longer than [`SLOW_STEP`],
+	/// at debug otherwise (`rounds: took …`), each part that took a
+	/// millisecond or more named. Returns how long it took.
+	pub fn done(self) -> Duration {
+		let took = self.start.elapsed();
+		let parts = || -> String {
+			self.parts.iter().filter(|(_, d)| d.as_millis() > 0).map(|(p, d)| format!("{} {} ms", p, d.as_millis()))
+				.collect::<Vec<_>>().join(", ")
+		};
+		if took > SLOW_STEP {
+			log::info!("rounds: slow {}: {} ms ({})", self.what, took.as_millis(), parts());
+		} else if log::log_enabled!(log::Level::Debug) {
+			log::debug!("rounds: took {}: {} ms ({})", self.what, took.as_millis(), parts());
+		}
+		took
+	}
+}
+
 /// How the orders of a fill round not yet broadcast stand at the node, each
 /// checked again ([`Rounds::orders_now`]).
 enum OrdersNow {
@@ -1207,7 +1255,15 @@ impl Rounds {
 	{
 		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
 			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), in_flight_seen: Mutex::new(None), holders: Mutex::new(Default::default()),
-			active })
+			active, wake: tokio::sync::Notify::new() })
+	}
+
+	/// Asks for a pass over the rounds now ([`Self::pass`]) rather than at
+	/// the next chain event or round interval: the last forfeit of a round
+	/// held for its forfeits is in, so it goes out at once. One pass serves
+	/// every wake that came while another ran.
+	pub fn wake(&self) {
+		self.wake.notify_one();
 	}
 
 	/// The finality service this operator follows the chain with.
@@ -1615,14 +1671,20 @@ impl Rounds {
 	pub async fn run_rounds(&self) -> Result<(Vec<Built>, Vec<(AssetId, RoundError)>), RoundError> {
 		let mut built = vec![];
 		let mut failed = vec![];
+		let mut laps = Laps::start("run_rounds");
 		self.plans_due().await?;
-		for asset in self.assets_waiting().await? {
+		laps.lap("plans");
+		let assets = self.assets_waiting().await?;
+		laps.lap("assets waiting");
+		for asset in assets {
+			let short = asset.to_string()[..8].to_string();
 			for kind in 0..3 {
 				let run = match kind {
 					0 => self.run_free_round_of(asset).await,
 					1 => self.run_round_of(asset).await,
 					_ => self.run_solo_round_of(asset).await,
 				};
+				laps.lap(format!("{} {}", ["free", "shared", "solo"][kind], short));
 				match run {
 					Ok(Some(b)) => built.push(b),
 					Ok(None) => {},
@@ -1633,9 +1695,13 @@ impl Rounds {
 				}
 			}
 		}
-		for asset in self.takes_waiting().await? {
+		let takes = self.takes_waiting().await?;
+		laps.lap("takes waiting");
+		for asset in takes {
 			for solo in [false, true] {
-				match if solo { self.run_solo_fill_round_of(asset).await } else { self.run_fill_round_of(asset).await } {
+				let run = if solo { self.run_solo_fill_round_of(asset).await } else { self.run_fill_round_of(asset).await };
+				laps.lap(format!("{} {}", if solo { "solo fill" } else { "fill" }, &asset.to_string()[..8]));
+				match run {
 					Ok(Some(b)) => built.push(b),
 					Ok(None) => {},
 					Err(e) => {
@@ -1645,6 +1711,7 @@ impl Rounds {
 				}
 			}
 		}
+		laps.done();
 		Ok((built, failed))
 	}
 
@@ -2187,6 +2254,15 @@ impl Rounds {
 	/// Builds a round of `asset` from the pending participations `ids`, in
 	/// order, whole, within the batch size.
 	async fn round_from(&self, asset: AssetId, now: MedianTime, ids: &[[u8; 32]]) -> Result<Option<Built>, RoundError> {
+		let mut laps = Laps::start(format!("round of {} from {} participation(s)", &asset.to_string()[..8], ids.len()));
+		let r = self.round_from_timed(asset, now, ids, &mut laps).await;
+		laps.done();
+		r
+	}
+
+	async fn round_from_timed(&self, asset: AssetId, now: MedianTime, ids: &[[u8; 32]], laps: &mut Laps)
+		-> Result<Option<Built>, RoundError>
+	{
 		let mut chosen: Vec<ParticipationRow> = vec![];
 		let mut count = 0usize;
 		for id in ids {
@@ -2225,10 +2301,13 @@ impl Rounds {
 			count += adds;
 			chosen.push(row);
 		}
+		laps.lap("check");
 		// What the wallet can fund: a participation whose outputs do not fit
 		// waits, saying why, and delays no other.
 		let (chosen, sets) = self.within_cap(chosen, now).await?;
+		laps.lap("cap");
 		let chosen = self.fundable(chosen, now).await?;
+		laps.lap("fund");
 		let chosen = self.whole_sets(chosen, &sets).await?;
 		// A re-run spends a coin that keeps it apart from every lost round of
 		// its participation's; one with no such coin is never taken.
@@ -2242,11 +2321,14 @@ impl Rounds {
 			}
 			(chosen, ties) = self.tie_reruns(kept).await?;
 		}
+		laps.lap("sets and ties");
 		loop {
 			if chosen.is_empty() {
 				return Ok(None);
 			}
-			match self.build_from(&chosen, &[], now, &ties).await {
+			let built = self.build_from(&chosen, &[], now, &ties).await;
+			laps.lap("build");
+			match built {
 				// Short of an asset once the round's own fee and connector are
 				// counted: the last participation wanting that asset waits.
 				// The fee asset may be another than the round's: then every
@@ -2517,8 +2599,26 @@ impl Rounds {
 		if caps.is_empty() || chosen.is_empty() {
 			return Ok((chosen, vec![]));
 		}
+		let mut laps = Laps::start(format!("in-flight cap over {} participation(s)", chosen.len()));
 		let flight: BTreeMap<AssetId, u64> = self.store.in_flight().await?.into_iter()
 			.map(|(a, v)| (AssetId::from_byte_array(a), v)).collect();
+		laps.lap("in flight");
+		// The lowest nodes the coins `chosen` gives up rest on: the only
+		// ones whose standing can change what the cap makes of them. The
+		// judgement reads a node's slots only where one of them is a coin
+		// given up here ([`CapJudge::touches`], [`CapJudge::brings_back`]),
+		// and whether a node can come back only for a coin given up here
+		// (`completes` below), so reading every node holding fronted value,
+		// a few queries for each, costs a round time in proportion to all of
+		// the operator's batches and changes nothing.
+		let mut relevant: HashSet<[u8; 32]> = HashSet::new();
+		for row in &chosen {
+			for i in row.inputs.iter().filter(|i| !i.returned && caps.contains_key(&AssetId::from_byte_array(i.asset))) {
+				let Some(l) = self.store.leaf(&i.leaf_id).await? else { continue };
+				let Ok(record) = CoinRecord::from_bytes(&l.record) else { continue };
+				relevant.extend(lowest_nodes(&record).unwrap_or_default());
+			}
+		}
 		// The lowest nodes already holding fronted value, and each coin given
 		// up that is in flight with the lowest nodes it waits on (`None` for
 		// a slot with no lowest node, an accumulator's).
@@ -2527,15 +2627,17 @@ impl Rounds {
 		let mut in_flight: BTreeMap<[u8; 32], (AssetId, u64, Vec<Option<[u8; 32]>>)> = BTreeMap::new();
 		for s in self.store.in_flight_slots().await? {
 			let low = lowest_of(&s.record);
-			if let Some(h) = low {
+			if let Some(h) = low.filter(|h| relevant.contains(h)) {
 				open.insert(h);
 				batches.insert((s.round_id, s.vout));
 			}
 			in_flight.entry(s.given).or_insert_with(|| (AssetId::from_byte_array(s.asset), s.value, vec![])).2.push(low);
 		}
-		// Each open node's slots in owner order, its asset, its value and
-		// whether its batch has RECLAIM-D.
+		laps.lap(format!("{} slot(s)", in_flight.len()));
+		// Each open node of those, its slots in owner order, its asset, its
+		// value and whether its batch has RECLAIM-D.
 		let mut nodes: BTreeMap<[u8; 32], OpenNode> = BTreeMap::new();
+		let batches_read = batches.len();
 		for (round_id, vout) in batches {
 			let Some(round) = self.store.round(round_id).await? else { continue };
 			let Some((batch, leaves)) = self.store.batch(&round.txid, vout).await? else { continue };
@@ -2554,6 +2656,7 @@ impl Rounds {
 		// (a coin on it moved without a delegation, say) holds its value
 		// until expiry whatever runs, so a refresh on it is held by the cap
 		// like any other.
+		laps.lap(format!("{} batch(es)", batches_read));
 		let mut completable: HashSet<[u8; 32]> = HashSet::new();
 		let mut missing: BTreeMap<[u8; 32], Lacking> = BTreeMap::new();
 		for (h, n) in &nodes {
@@ -2580,6 +2683,7 @@ impl Rounds {
 				missing.insert(*h, Lacking { asset: n.asset, slots: lacks });
 			}
 		}
+		laps.lap(format!("{} node(s)", nodes.len()));
 		// What each participation gives up of every capped asset, what of it
 		// opens something new, and whether the cap holds it at all.
 		let mut asks = Vec::with_capacity(chosen.len());
@@ -2618,7 +2722,10 @@ impl Rounds {
 			ask.exempt |= row.outputs.iter().any(|o| matches!(o.kind, WantedKind::Offboard { .. }));
 			asks.push(ask);
 		}
+		laps.lap("asks");
 		let (judged, sets) = CapJudge::new(&caps, flight, &in_flight, &missing).judge_sets(&asks);
+		laps.lap("judge");
+		laps.done();
 		let sets: Vec<Vec<[u8; 32]>> = sets.into_iter().map(|s| s.into_iter().map(|i| chosen[i].id).collect()).collect();
 		let mut out = Vec::with_capacity(chosen.len());
 		for (row, verdict) in chosen.into_iter().zip(judged) {
@@ -3192,7 +3299,9 @@ impl Rounds {
 	/// whose forfeits are overdue expires, and every pending participation
 	/// with a coin past its exit deadline is voided.
 	pub async fn pass(&self) -> Result<(), RoundError> {
+		let mut laps = Laps::start("pass");
 		let going_out = self.going_out.lock().await;
+		laps.lap("wait to go out");
 		for r in self.store.rounds_in(RoundState::Built).await? {
 			let fills = !self.store.round_fills(r.round_id).await?.is_empty();
 			let held = fills || self.store.round_held(r.round_id).await?;
@@ -3240,6 +3349,7 @@ impl Rounds {
 			}
 		}
 		drop(going_out);
+		laps.lap("go out");
 		// A round held as lost that is final again, before anything is
 		// retired: the parent chain decides which round stands.
 		for r in self.store.rounds_in(RoundState::Lost).await? {
@@ -3259,8 +3369,19 @@ impl Rounds {
 				}
 			}
 		}
+		laps.lap("lost");
+		// A round final while the tip's anchor is ok stays final until its
+		// block leaves the chain (a disconnection uncredits it at once,
+		// [`Self::on_chain_event`]): of those, only the ones the store no
+		// longer places final are looked at, unless the anchor is not ok,
+		// when none is final, as the nursery does.
 		let mut rows = self.store.rounds_in(RoundState::Broadcast).await?;
-		rows.extend(self.store.rounds_in(RoundState::Final).await?);
+		if self.finality.anchor_ok() {
+			let c = self.finality.config();
+			rows.extend(self.store.rounds_final_not_final(c.certification == Certification::Required, c.anchor_depth as u64).await?);
+		} else {
+			rows.extend(self.store.rounds_in(RoundState::Final).await?);
+		}
 		for r in rows {
 			// A fill round the node refused, because another transaction
 			// took an order of it, is resolved from the node's view of its
@@ -3274,6 +3395,7 @@ impl Rounds {
 			}
 			self.check_round(&r).await?;
 		}
+		laps.lap("follow");
 		// A step of an offline-refresh plan in a final round is done: released
 		// without forfeits (its refund stands in their place), its leaf credited.
 		crate::plans::finish(&self.store).await?;
@@ -3281,8 +3403,12 @@ impl Rounds {
 		// A plan whose coin its holder gave up in a participation of its own,
 		// now released, ends.
 		crate::plans::release_given_up(&self.store).await?;
+		laps.lap("release");
 		self.expire().await?;
+		laps.lap("expire");
 		self.void_overdue().await?;
+		laps.lap("void overdue");
+		laps.done();
 		Ok(())
 	}
 
@@ -4205,7 +4331,9 @@ impl Rounds {
 	}
 
 	/// Follows the finality service's events, and builds a round every
-	/// `interval` when one is given, until the task is dropped.
+	/// `interval` when one is given, until the task is dropped. A pass runs
+	/// after each of the service's passes, after each round interval's
+	/// building, and when woken ([`Self::wake`]).
 	pub fn spawn(self: &Arc<Self>, interval: Option<Duration>) -> tokio::task::JoinHandle<()> {
 		let me = self.clone();
 		let mut rx = self.finality.subscribe();
@@ -4234,6 +4362,7 @@ impl Rounds {
 							Err(e) => Err(e),
 						}
 					},
+					_ = me.wake.notified() => me.pass().await,
 				};
 				if let Err(e) = r {
 					log::warn!("rounds: {}", e);

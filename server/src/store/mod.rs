@@ -252,6 +252,38 @@ impl StoreError {
 
 type Conn<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
 
+/// Turns JIT compilation off for every connection of `config`, beside
+/// whatever options it carries. The planner overestimates the recursive
+/// lineage walks (the in-flight reading's estimate is hundreds of times its
+/// row count), so PostgreSQL compiles them each time, and the compiling takes
+/// seven times as long as the query (1.8 s against 0.26 s on the public
+/// testnet's operator), on a path the rounds take for every round they build.
+fn without_jit(config: &mut tokio_postgres::Config) {
+	let options = match config.get_options() {
+		Some(o) if !o.trim().is_empty() => format!("{} -c jit=off", o),
+		_ => "-c jit=off".to_string(),
+	};
+	config.options(&options);
+}
+
+#[cfg(test)]
+mod jit_tests {
+	use super::without_jit;
+
+	#[test]
+	fn every_connection_string_form_gets_jit_off() {
+		for (url, want) in [
+			("host=/var/run/postgresql port=5432 user=arca dbname=arca", "-c jit=off"),
+			("postgres://arca@127.0.0.1:5432/arca", "-c jit=off"),
+			("host=/tmp user=arca dbname=arca options='-c statement_timeout=5000'", "-c statement_timeout=5000 -c jit=off"),
+		] {
+			let mut c: tokio_postgres::Config = url.parse().unwrap();
+			without_jit(&mut c);
+			assert_eq!(c.get_options(), Some(want), "{}", url);
+		}
+	}
+}
+
 /// The server's database.
 #[derive(Clone)]
 pub struct Store {
@@ -275,7 +307,8 @@ impl Store {
 	/// `postgres://user@host:port/db` or the key-value form) and brings its
 	/// schema up to date.
 	pub async fn connect(url: &str) -> Result<Store, StoreError> {
-		let config: tokio_postgres::Config = url.parse()?;
+		let mut config: tokio_postgres::Config = url.parse()?;
+		without_jit(&mut config);
 		let manager = PostgresConnectionManager::new(config, NoTls);
 		let pool = Pool::builder()
 			.max_size(16)
