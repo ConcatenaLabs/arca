@@ -167,6 +167,10 @@ pub struct ChainSource {
 	memo: Arc<Mutex<Memo>>,
 	/// The anchor depth finality counts ([`ChainSource::anchor_depth`]).
 	anchor_depth: Arc<AtomicU64>,
+	/// The most scripts one scan carries here: [`SCAN_WHOLE`] until the
+	/// node's route refuses a scan of that many, then [`SCAN_MOST`]
+	/// ([`ChainSource::coins_at`]).
+	scan_most: Arc<AtomicU64>,
 }
 
 /// How long a view stands, at most, before the source looks at the node again.
@@ -317,10 +321,32 @@ const LOOK: [&str; 3] = ["getblockchaininfo", "getanchorstatus", "getrawmempool"
 /// batch of more.
 pub const BATCH_MOST: usize = 64;
 
-/// The most scripts one scan of the set of unspent outputs carries: the
-/// testnet's public node proxy refuses a `scantxoutset` of more descriptors
-/// (`-32602`), so a scan of more is made in parts ([`ChainSource::coins_at`]).
+/// The most scripts one scan of the set of unspent outputs carries where the
+/// node's route takes no more: the testnet's public node proxy refuses a
+/// `scantxoutset` of more descriptors (`-32602`), so there a scan of more is
+/// made in parts ([`ChainSource::coins_at`]).
 pub const SCAN_MOST: usize = 256;
+
+/// The most scripts one scan carries where the node's route takes them: a
+/// node's own RPC (a program next to its node) reads its whole set of
+/// unspent outputs once for any number of scripts, so a wallet of thousands
+/// of on-chain scripts scans in one request rather than one a
+/// [`SCAN_MOST`]. Each scan holds the node's one scan slot, which every
+/// client of the node waits on. A request of this many descriptors is about
+/// a megabyte.
+pub const SCAN_WHOLE: usize = 20_000;
+
+/// Whether `e` is a route's refusal of a scan for its size (the public
+/// proxy's `-32602`, or an HTTP refusal of the request), after which the scan
+/// is made again in parts of [`SCAN_MOST`]. The node itself refuses no
+/// number of scripts; a node busy with another scan is not a refusal.
+fn scan_too_large(e: &RpcError) -> bool {
+	match e {
+		RpcError::Rpc { code, message } => !busy(*code, message) && matches!(*code, -32602 | -32600),
+		RpcError::Http { status, .. } => (400..500).contains(status) && *status != 401,
+		_ => false,
+	}
+}
 
 /// How a read is kept.
 enum Keep {
@@ -449,6 +475,7 @@ impl ChainSource {
 		ChainSource {
 			client: Client::new(url, auth).with_timeout(60), memo: Arc::new(Mutex::new(Memo::default())),
 			anchor_depth: Arc::new(AtomicU64::new(ANCHOR_DEPTH)),
+			scan_most: Arc::new(AtomicU64::new(SCAN_WHOLE as u64)),
 		}
 	}
 
@@ -1220,6 +1247,12 @@ impl ChainSource {
 		Ok(!v.is_null())
 	}
 
+	/// The most scripts one scan carries now ([`SCAN_WHOLE`], or
+	/// [`SCAN_MOST`] once the node's route refused that many).
+	pub fn scan_most(&self) -> u64 {
+		self.scan_most.load(Ordering::SeqCst)
+	}
+
 	/// The unspent outputs of the active chain paying any of `scripts`, each
 	/// with its height, read from the node's UTXO set.
 	///
@@ -1242,12 +1275,25 @@ impl ChainSource {
 			};
 			if !missing.is_empty() {
 				let mut by: HashMap<Script, Vec<(OutPoint, u64)>> = missing.iter().map(|s| (s.clone(), vec![])).collect();
-				// In parts of at most SCAN_MOST scripts, each part a scan of
-				// its own; every part's answer is taken only if the view
-				// stood through all of them (below).
-				for part in missing.chunks(SCAN_MOST) {
+				// In parts of at most `scan_most` scripts, each part a scan of
+				// its own: all in one where the node's route takes it, else
+				// SCAN_MOST a part, from the first refusal on. Every part's
+				// answer is taken only if the view stood through all of them
+				// (below).
+				let mut parts: std::collections::VecDeque<&[Script]> = missing.chunks(self.scan_most() as usize).collect();
+				while let Some(part) = parts.pop_front() {
 					let descs: Vec<Value> = part.iter().map(|s| json!(format!("raw({})", hex(s.as_bytes())))).collect();
-					let v: Value = self.call("scantxoutset", &[json!("start"), Value::Array(descs)]).map_err(node)?;
+					let v: Value = match self.call("scantxoutset", &[json!("start"), Value::Array(descs)]) {
+						Ok(v) => v,
+						Err(e) if part.len() > SCAN_MOST && scan_too_large(&e) => {
+							self.scan_most.store(SCAN_MOST as u64, Ordering::SeqCst);
+							for p in part.chunks(SCAN_MOST).rev() {
+								parts.push_front(p);
+							}
+							continue;
+						},
+						Err(e) => return Err(node(e)),
+					};
 					for u in v["unspents"].as_array().cloned().unwrap_or_default() {
 						let txid = Txid::from_str(u["txid"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?;
 						let vout = u["vout"].as_u64().unwrap_or(0) as u32;
@@ -1779,13 +1825,25 @@ mod test {
 	/// A node on a local port that answers the view's three reads the same
 	/// every time and refuses the first `busy` scans of its set of unspent
 	/// outputs as a node does while another client's scan runs; it counts
-	/// the scans it was asked for.
+	/// the scans it was asked for. In front of it, a route that refuses a
+	/// scan of more than SCAN_MOST descriptors, as the testnet's public proxy
+	/// does.
 	fn busy_node(busy: u64) -> (String, Arc<AtomicU64>) {
+		let (url, scans, _) = scan_node(busy, Some(SCAN_MOST));
+		(url, scans)
+	}
+
+	/// [`busy_node`], behind a route that refuses a scan of more than
+	/// `bound` descriptors (none: a node's own RPC); also counts those
+	/// refusals.
+	fn scan_node(busy: u64, bound: Option<usize>) -> (String, Arc<AtomicU64>, Arc<AtomicU64>) {
 		use std::io::{BufRead, BufReader, Read, Write};
 		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 		let url = format!("http://{}/", listener.local_addr().unwrap());
 		let scans = Arc::new(AtomicU64::new(0));
 		let counted = scans.clone();
+		let refusals = Arc::new(AtomicU64::new(0));
+		let refused = refusals.clone();
 		std::thread::spawn(move || {
 			let answer = |call: &Value| -> Value {
 				let (id, method) = (call["id"].clone(), call["method"].as_str().unwrap_or(""));
@@ -1794,8 +1852,9 @@ mod test {
 					"getanchorstatus" => json!({"validateanchor": true, "anchorstatus": "ok"}),
 					"getrawmempool" => json!([]),
 					"scantxoutset" => {
-						// As the testnet's public proxy: no more than SCAN_MOST descriptors.
-						if call["params"][1].as_array().is_some_and(|d| d.len() > SCAN_MOST) {
+						// As the testnet's public proxy: no more than its bound.
+						if call["params"][1].as_array().is_some_and(|d| bound.is_some_and(|b| d.len() > b)) {
+							refused.fetch_add(1, Ordering::SeqCst);
 							return json!({"id": id, "result": null, "error": {"code": -32602, "message": "scantxoutset: arguments not allowed here"}});
 						}
 						if counted.fetch_add(1, Ordering::SeqCst) < busy {
@@ -1834,7 +1893,7 @@ mod test {
 					out.len(), out);
 			}
 		});
-		(url, scans)
+		(url, scans, refusals)
 	}
 
 	/// The node runs one scan of its set of unspent outputs at a time, for
@@ -1906,18 +1965,43 @@ mod test {
 
 	/// A scan of more scripts than a proxy takes in one ([`SCAN_MOST`]) is
 	/// made in parts, each answered, and kept for the view as one scan is.
+	/// The proxy's refusal comes once: every later scan goes in parts at once.
 	#[test]
 	fn a_scan_of_many_scripts_goes_in_parts() {
-		let (url, scans) = busy_node(0);
+		let (url, scans, refusals) = scan_node(0, Some(SCAN_MOST));
 		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
 		let scripts: Vec<Script> = (0..600u32).map(|i| Script::from(i.to_be_bytes().to_vec())).collect();
 		assert!(chain.coins_at(&scripts).is_ok(), "600 scripts answered");
 		assert_eq!(scans.load(Ordering::SeqCst), 3, "256, 256 and 88");
+		assert_eq!(refusals.load(Ordering::SeqCst), 1, "the whole scan, refused once");
+		assert_eq!(chain.scan_most(), SCAN_MOST as u64);
 		assert!(chain.coins_at(&scripts[100..400]).is_ok());
 		assert_eq!(scans.load(Ordering::SeqCst), 3, "kept for the view");
+		let more: Vec<Script> = (600..1200u32).map(|i| Script::from(i.to_be_bytes().to_vec())).collect();
+		assert!(chain.coins_at(&more).is_ok());
+		assert_eq!(scans.load(Ordering::SeqCst), 6, "in parts at once");
+		assert_eq!(refusals.load(Ordering::SeqCst), 1, "not refused again");
 		// The mock refuses a scan past the bound, as the proxy does.
 		let one = Value::Array((0..=SCAN_MOST).map(|i| json!(format!("raw({:04x})", i))).collect());
 		assert!(chain.call::<Value>("scantxoutset", &[json!("start"), one]).is_err());
+	}
+
+	/// Where the node's route takes any number of scripts (a node's own
+	/// RPC), a wallet's thousands of on-chain scripts are one scan, not one a
+	/// SCAN_MOST: each scan reads the node's whole set of unspent outputs,
+	/// and holds the one scan every client of the node waits on.
+	#[test]
+	fn a_node_that_takes_every_script_scans_once() {
+		let (url, scans, refusals) = scan_node(0, None);
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let scripts: Vec<Script> = (0..14_000u32).map(|i| Script::from(i.to_be_bytes().to_vec())).collect();
+		assert!(chain.coins_at(&scripts).is_ok());
+		assert_eq!(scans.load(Ordering::SeqCst), 1, "14,000 scripts in one scan");
+		let more: Vec<Script> = (14_000..39_000u32).map(|i| Script::from(i.to_be_bytes().to_vec())).collect();
+		assert!(chain.coins_at(&more).is_ok());
+		assert_eq!(scans.load(Ordering::SeqCst), 3, "25,000 more: SCAN_WHOLE, then the rest");
+		assert_eq!(refusals.load(Ordering::SeqCst), 0);
+		assert_eq!(chain.scan_most(), SCAN_WHOLE as u64);
 	}
 
 	/// A transaction spending `from` (an output at a bare `OP_TRUE` of

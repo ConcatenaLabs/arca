@@ -525,10 +525,14 @@ impl Wallet {
 
 	/// How the wallet's resting orders stand, as the operator shows them, and
 	/// with `ids` other orders by their ids; each of the wallet's own with
-	/// the credits and the remainders the wallet holds of it.
-	pub fn resting_orders(&self, ids: &[String]) -> Result<Value, Error> {
+	/// the credits and the remainders the wallet holds of it. With `brief`,
+	/// the wallet's own as its store holds them (`order`, `rested_by`, `state`,
+	/// `amount`), and the operator asked of `ids` alone: a maker that rests
+	/// orders all day has thousands of its own, long filled or cancelled, and
+	/// follows the few it keeps resting by their ids.
+	pub fn resting_orders(&self, ids: &[String], brief: bool) -> Result<Value, Error> {
 		let mine = self.store.restings()?;
-		let mut ask: Vec<String> = mine.iter().filter_map(|r| r.order_leaf.clone()).collect();
+		let mut ask: Vec<String> = if brief { vec![] } else { mine.iter().filter_map(|r| r.order_leaf.clone()).collect() };
 		ask.extend(ids.iter().cloned());
 		// Every order the wallet ever rested is asked after, so a busy maker
 		// soon names more than one read may: they are read a chunk at a time.
@@ -540,6 +544,10 @@ impl Wallet {
 		let mut out = vec![];
 		for r in &mine {
 			let mut v = json!({"order": r.order_leaf, "rested_by": r.id, "state": r.state, "amount": r.amount.to_string()});
+			if brief {
+				out.push(v);
+				continue;
+			}
 			if let Some(leaf) = &r.order_leaf {
 				if let Some(s) = served.as_array().into_iter().flatten().find(|s| s["order"].as_str() == Some(leaf)) {
 					v["operator"] = json!({"state": s["state"], "coin": s["coin"], "value": s["value"], "fills_left": s["fills_left"],

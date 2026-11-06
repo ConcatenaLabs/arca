@@ -32,8 +32,11 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   holds no node credential worth having, so a site serves its wallets a proxy
   that allows exactly these calls, adds the node's credential itself and
   limits each caller, and the wallet is created with `node_url` alone.
-  `scantxoutset` reads the whole UTXO set. A scan carries at most 256
-  descriptors, which a proxy may hold it to; more are scanned in parts. The
+  `scantxoutset` reads the whole UTXO set, whatever number of scripts it
+  looks for. A scan carries every script the wallet looks for at once (up to
+  20,000) where the node's route takes them, as a node's own RPC does; a
+  proxy that refuses a scan of more than 256 descriptors is asked in parts of
+  256 from its first refusal on. The
   wallet scans once for each
   window of on-chain scripts and each output it looks for when the chain has
   moved since its last command (a few, among some fifty calls, for a wallet of
@@ -105,7 +108,7 @@ const { result, start } = JSON.parse(w.run('board', JSON.stringify({ asset, amou
 `run(command, args)` is the library's `bark::arca::command::run`, which every
 program that embeds the library calls, and takes the command line's commands, each with its
 arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`, `openamp_key`,
-`balance`, `coins {held?}`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
+`balance`, `coins {held?, brief?}`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
 `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?,
@@ -119,11 +122,11 @@ shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 `offboards`); a take of an on-chain order and an order placed from
 leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
 `order_refund`); an order resting in the tree (`order_rest_quote`,
-`order_rest`, `order_resting {orders?}`, `order_fill_resting_quote {order,
+`order_rest`, `order_resting {orders?, brief?}`, `order_fill_resting_quote {order,
 amount?}`, `order_fill_resting {order, amount?, shown?}`,
 `order_cancel_resting_quote {order}`, `order_cancel_resting {order, shown?}`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
 want}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
-{accept}`, `swap_cancel {swap}`, `swaps`); the swap of BTC in a Bitcoin
+{accept}`, `swap_cancel {swap}`, `swaps {swaps?}`); the swap of BTC in a Bitcoin
 ark (`btc_swap_*`); payments over Lightning in and out of the tree
 (`lightning_pay_quote {invoice, asset?, max_fee_ppm?}`, `lightning_pay {invoice,
 asset?, max_fee_ppm?, timeout?, shown?}`, `lightning_payments`,
@@ -162,7 +165,18 @@ the same way, and for a step over a second `operator_ms` and `operator_calls`,
 A program that holds many coins asks for what it needs. `coins` with `"held":
 true` lists only the coins the wallet holds, leaving out those it spent, exited
 or lost, which a wallet that trades all day counts by the thousand and which are
-then not read at all. `sync` with `"catch_up": false` leaves out the catch-up
+then not read at all. With `"brief": true` each coin is listed as the store
+holds it (`leaf_id`, `kind`, `asset`, `value`, `state`, `standing`, `expiry`,
+`exit_deadline`, `spent_by`, `template`) and nothing else is read: no dates,
+notes, freezes or exit fees, whose reads of the chain (the exit fee of a board
+reads every on-chain script the wallet ever drew) a program that counts its
+coins many times a minute does not need. `order_resting` with `"brief": true`
+lists the wallet's own resting orders as its store holds them (`order`,
+`rested_by`, `state`, `amount`) and asks the operator only of the `orders`
+named: a maker that rests orders all day has thousands of its own, long filled
+or cancelled, and follows the few still resting by their ids. `swaps` with
+`"swaps": [id, …]` reads only those swaps, each by its id, rather than every
+offer the wallet ever made with its coins' records. `sync` with `"catch_up": false` leaves out the catch-up
 between stores of one mnemonic: a program that is the only store of its mnemonic
 (a service wallet on one machine) has no other store to catch up with, and the
 catch-up reads every coin ever served to its mailbox key to find that out. With

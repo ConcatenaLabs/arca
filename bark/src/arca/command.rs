@@ -24,7 +24,7 @@ use super::keys::Keys;
 use super::{Config, Error, Wallet};
 
 /// Every command [`run`] takes, with its arguments.
-pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
+pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, brief?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?}, deposits, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
@@ -33,7 +33,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?}, 
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
 	by the name an order's side goes by), swap_offer {give_asset, give, want_asset, want}, swap_read {offer, accept_near_deadline?}, \
-	swap_accept {offer, accept_near_deadline?, shown?}, swap_complete {accept, accept_near_deadline?}, swap_cancel {swap}, swaps, btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
+	swap_accept {offer, accept_near_deadline?, shown?}, swap_complete {accept, accept_near_deadline?}, swap_cancel {swap}, swaps {swaps?}, btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
 	{swap, result}, btc_swaps, btc_swap_cancel {swap}, lightning_pay_quote {invoice, asset?, max_fee_ppm?}, lightning_pay {invoice, \
 	asset?, max_fee_ppm?, timeout?, shown?}, lightning_payments, lightning_receive_quote {asset, amount, max_fee_ppm?}, lightning_receive \
@@ -42,7 +42,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?}, 
 	return_address?, shown?, deadline?, vest?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, owed, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
-	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?}, order_fill_resting_quote {order, amount?}, \
+	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?, brief?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
 	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
@@ -256,7 +256,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"address" => w.address(),
 		"openamp_key" => w.openamp_key().map(|k| json!({"key": k.to_string(), "path": "m/5/0"})),
 		"balance" => w.balance(),
-		"coins" => w.coins_listed(a["held"].as_bool() == Some(true)),
+		"coins" => w.coins_listed(a["held"].as_bool() == Some(true), a["brief"].as_bool() == Some(true)),
 		"record" => w.record(req_str(&a["leaf_id"], "the coin")?),
 		"board" => {
 			let amount = opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?;
@@ -386,7 +386,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		},
 		"order_resting" => {
 			let ids: Vec<String> = a["orders"].as_array().into_iter().flatten().filter_map(|o| o.as_str().map(String::from)).collect();
-			w.resting_orders(&ids)
+			w.resting_orders(&ids, a["brief"].as_bool() == Some(true))
 		},
 		"order_fill_resting_quote" => w.order_fill_resting_quote(req_str(&a["order"], "the order")?, opt_u64(&a["amount"], "the amount")?),
 		"order_fill_resting" => {
@@ -417,7 +417,10 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		},
 		"swap_complete" => w.swap_complete(req_str(&a["accept"], "the acceptance")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
 		"swap_cancel" => w.swap_cancel(req_str(&a["swap"], "the swap")?),
-		"swaps" => w.swaps(),
+		"swaps" => {
+			let ids: Option<Vec<String>> = a["swaps"].as_array().map(|v| v.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+			w.swaps_of(ids.as_deref())
+		},
 		"order_refund" => w.order_refund(req_str(&a["order"], "the order")?, opt_asset(&a["fee_asset"])?),
 		// A swap of BTC in a Bitcoin ark for an asset here (`super::btc_swap`):
 		// `bitcoin` is what the program that runs Bark hands in (`ark_info`,

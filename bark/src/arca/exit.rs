@@ -1722,11 +1722,14 @@ impl Wallet {
 			},
 		};
 		let home = self.home(true, &why).map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		steps.lap(self, "home");
 		let exits = self.progress_exits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		steps.lap(self, "exits");
 		// A coin kept safe on the chain while the wallet was away, its claim
 		// final: boarded back.
 		let reboards = if talk { self.progress_reboards().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
 			else { Value::Array(vec![]) };
+		steps.lap(self, "reboards");
 		if let Ok(now) = self.now() {
 			self.store.set_meta(super::wallet::LAST_EXITS, &now.to_consensus_u32().to_string())?;
 		}
@@ -1734,7 +1737,7 @@ impl Wallet {
 		let mut out = json!({"witness": witness, "boards": boards, "recheck": recheck, "transfers": transfers, "mailbox": mailbox,
 			"caught_up": caught_up,
 			"participations": participations, "forfeits": forfeits, "exits": exits, "schedule": schedule});
-		steps.lap(self, "home and schedule");
+		steps.lap(self, "schedule");
 		out["cost_by_step"] = steps.done();
 		if refresh.as_array().is_none_or(|r| !r.is_empty()) {
 			out["refresh"] = refresh;
