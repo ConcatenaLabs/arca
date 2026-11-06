@@ -21,6 +21,10 @@
 //! Silent Payments), `pay` (BIP 351), and `bc`/`tb` (segwit address
 //! HRPs). All of these may appear multiple times.
 //!
+//! A `lightning` value that is an LNURL (LUD-01, `lnurl1…`) rather than an
+//! invoice is kept as an [`Lnurl`] (see [`Bip321Uri::lnurl`]): Lightning
+//! wallets write a LNURL-pay link there when the payer picks the amount.
+//!
 //! Parsing `lightning` and `lno` into their proper invoice and offer
 //! types requires the `lightning` compile feature (enabled by default).
 //! Without it, these parameters are treated like any other unknown
@@ -40,9 +44,11 @@
 
 mod error;
 mod extension;
+mod lnurl;
 
 pub use error::Bip321Error;
 pub use extension::{ExtensionHandler, NoExtensions};
+pub use lnurl::{Lnurl, LnurlParseError};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write};
@@ -187,6 +193,9 @@ pub struct Bip321Uri<E: ExtensionHandler = NoExtensions> {
 	/// Core additional payment instructions.
 	#[cfg(feature = "lightning")]
 	lightning: Vec<FieldWithAttributes<Bolt11Invoice>>,
+	/// `lightning` values that are an LNURL rather than an invoice.
+	#[cfg(feature = "lightning")]
+	lnurl: Vec<FieldWithAttributes<Lnurl>>,
 	#[cfg(feature = "lightning")]
 	lno: Vec<FieldWithAttributes<Offer>>,
 	sp: Vec<FieldWithAttributes<String>>,
@@ -215,6 +224,8 @@ impl<E: ExtensionHandler> Bip321Uri<E> {
 
 			#[cfg(feature = "lightning")]
 			lightning: Vec::new(),
+			#[cfg(feature = "lightning")]
+			lnurl: Vec::new(),
 			#[cfg(feature = "lightning")]
 			lno: Vec::new(),
 			sp: Vec::new(),
@@ -301,6 +312,24 @@ impl<E: ExtensionHandler> Bip321Uri<E> {
 	#[cfg(feature = "lightning")]
 	pub fn clear_lightning(&mut self) {
 		self.lightning.clear();
+	}
+
+	/// Get the LNURLs set in the URI's `lightning` parameters.
+	#[cfg(feature = "lightning")]
+	pub fn lnurl(&self) -> &[FieldWithAttributes<Lnurl>] {
+		&self.lnurl
+	}
+
+	/// Push an LNURL to the URI, written as a `lightning` parameter.
+	#[cfg(feature = "lightning")]
+	pub fn push_lnurl(&mut self, lnurl: Lnurl, required: bool) {
+		self.lnurl.push(FieldWithAttributes::new(lnurl, required));
+	}
+
+	/// Clear the LNURLs from the URI.
+	#[cfg(feature = "lightning")]
+	pub fn clear_lnurl(&mut self) {
+		self.lnurl.clear();
 	}
 
 	/// Get the LNO offers set in the URI.
@@ -407,7 +436,7 @@ impl<E: ExtensionHandler> Bip321Uri<E> {
 	/// Whether any standard payment instruction is present.
 	pub fn has_payment_instruction(&self) -> bool {
 		#[cfg(feature = "lightning")]
-		if !self.lightning.is_empty() || !self.lno.is_empty() {
+		if !self.lightning.is_empty() || !self.lnurl.is_empty() || !self.lno.is_empty() {
 			return true;
 		}
 
@@ -562,11 +591,21 @@ impl<E: ExtensionHandler> FromStr for Bip321Uri<E> {
 						// Standard payment instructions (may appear multiple times)
 						#[cfg(feature = "lightning")]
 						key if key == "lightning" => {
-							let invoice = Bolt11Invoice::from_str(&raw_value)
-								.map_err(|e| Bip321Error::PaymentInstructionParseError {
-									key: key.to_string(), error: e.to_string(),
-								})?;
-							uri.lightning.push(FieldWithAttributes::new(invoice, required));
+							match Bolt11Invoice::from_str(&raw_value) {
+								Ok(invoice) => {
+									uri.lightning.push(FieldWithAttributes::new(invoice, required));
+								},
+								// Not an invoice: an LNURL is kept as one, anything
+								// else is refused with the invoice's own error.
+								Err(e) => match Lnurl::from_str(&percent_decode(raw_value)?) {
+									Ok(lnurl) => {
+										uri.lnurl.push(FieldWithAttributes::new(lnurl, required));
+									},
+									Err(_) => return Err(Bip321Error::PaymentInstructionParseError {
+										key: key.to_string(), error: e.to_string(),
+									}),
+								},
+							}
 						}
 						#[cfg(feature = "lightning")]
 						key if key == "lno" => {
@@ -725,6 +764,10 @@ impl<E: ExtensionHandler> fmt::Display for Bip321Uri<E> {
 		#[cfg(feature = "lightning")]
 		for field in &self.lightning {
 			write_query_param(&mut query_buf, "lightning", &field.inner().to_string(), field.required())?;
+		}
+		#[cfg(feature = "lightning")]
+		for field in &self.lnurl {
+			write_query_param(&mut query_buf, "lightning", field.inner().encoded(), field.required())?;
 		}
 		#[cfg(feature = "lightning")]
 		for field in &self.lno {
@@ -1233,6 +1276,86 @@ mod tests {
 	fn reject_malformed_lightning_invoice() {
 		let err = parse("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?lightning=notaninvoice").unwrap_err();
 		assert!(matches!(err, Bip321Error::PaymentInstructionParseError { .. }));
+	}
+
+	// The LNURL-pay of `alice@sequentiatestnet.com`
+	// (https://sequentiatestnet.com/.well-known/lnurlp/alice), as a receive code writes it.
+	#[cfg(feature = "lightning")]
+	const ALICE_LNURL: &str = "LNURL1DP68GURN8GHJ7UM9W96K2MN5D9SHGETNW3HX2APWVDHK6TEWWAJKCMPDDDHX7AMW9AKXUATJD3CZ7CTVD93K2Y93MNY";
+
+	#[cfg(feature = "lightning")]
+	const ALICE_URL: &str = "https://sequentiatestnet.com/.well-known/lnurlp/alice";
+
+	#[cfg(feature = "lightning")]
+	#[test]
+	fn lightning_lnurl_kept_beside_other_instructions() {
+		// A receive code: the address, an LNURL-pay where the payer picks the
+		// amount, and an `ark=` the extension does not know (kept as custom).
+		let input = format!(
+			"BITCOIN:BC1QAR0SRRR7XFKVY5L643LYDNW9RE59GTZZWF5MDQ?lightning={}&ark=TARK1QQQQ",
+			ALICE_LNURL,
+		);
+		let uri = parse(&input).unwrap();
+		assert!(uri.address().is_some());
+		assert!(uri.lightning().is_empty());
+		assert_eq!(uri.lnurl().len(), 1);
+		assert_eq!(uri.lnurl()[0].inner().url(), ALICE_URL);
+		assert_eq!(uri.custom().get("ark").unwrap()[0].inner(), "TARK1QQQQ");
+
+		// A testnet code puts its address in `tb`, as BIP 321 asks.
+		let input = format!(
+			"bitcoin:?tb=tb1qghfhmd4zh7ncpmxl3qzhmq566jk8ckq4gafnmg&lightning={}",
+			ALICE_LNURL.to_lowercase(),
+		);
+		let uri = parse(&input).unwrap();
+		assert_eq!(uri.tb().len(), 1);
+		assert_eq!(uri.lnurl()[0].inner().url(), ALICE_URL);
+
+		// On its own, an LNURL is a payment destination.
+		let uri = parse(&format!("bitcoin:?lightning={}", ALICE_LNURL)).unwrap();
+		assert!(uri.has_payment_instruction());
+
+		// With its `lightning:` prefix, plain or percent-encoded.
+		for v in [format!("lightning:{}", ALICE_LNURL), format!("lightning%3A{}", ALICE_LNURL)] {
+			let uri = parse(&format!("bitcoin:?lightning={}", v)).unwrap();
+			assert_eq!(uri.lnurl()[0].inner().url(), ALICE_URL);
+		}
+	}
+
+	#[cfg(feature = "lightning")]
+	#[test]
+	fn lightning_lnurl_roundtrips() {
+		let input = format!("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?lightning={}", ALICE_LNURL);
+		let uri = parse(&input).unwrap();
+		let out = uri.to_string();
+		assert_eq!(out, input.replace(ALICE_LNURL, &ALICE_LNURL.to_lowercase()));
+		assert_eq!(parse(&out).unwrap(), uri);
+
+		let mut uri = Bip321Uri::<NoExtensions>::new();
+		uri.set_address(Address::from_str("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq").unwrap()).unwrap();
+		uri.push_lnurl(Lnurl::from_str(ALICE_LNURL).unwrap(), false);
+		let upper = uri.checked_uppercase().unwrap();
+		assert!(upper.contains(&format!("LIGHTNING={}", ALICE_LNURL)), "{}", upper);
+		assert_eq!(parse(&upper).unwrap(), uri);
+	}
+
+	#[cfg(feature = "lightning")]
+	#[test]
+	fn reject_lnurl_with_broken_checksum() {
+		let mut broken = ALICE_LNURL.to_string();
+		let last = broken.pop().unwrap();
+		broken.push(if last == 'Q' { 'P' } else { 'Q' });
+		let err = parse(&format!("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?lightning={}", broken)).unwrap_err();
+		assert!(matches!(err, Bip321Error::PaymentInstructionParseError { ref key, .. } if key == "lightning"), "{:?}", err);
+	}
+
+	#[cfg(feature = "lightning")]
+	#[test]
+	fn invoice_still_parsed_as_invoice() {
+		let input = "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?lightning=lnbc20m1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygshp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqfp4qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q9qrsgq9vlvyj8cqvq6ggvpwd53jncp9nwc47xlrsnenq2zp70fq83qlgesn4u3uyf4tesfkkwwfg3qs54qe426hp3tz7z6sweqdjg05axsrjqp9yrrwc";
+		let uri = parse(input).unwrap();
+		assert_eq!(uri.lightning().len(), 1);
+		assert!(uri.lnurl().is_empty());
 	}
 
 	#[cfg(feature = "lightning")]
