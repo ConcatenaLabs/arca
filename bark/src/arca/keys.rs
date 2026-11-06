@@ -47,7 +47,10 @@
 //!   its own outpoint, never by a pair of rebindable signatures, so no
 //!   signature made for one credit spends another of the same value.
 
-use elements::bitcoin::bip32::{ChildNumber, DerivationPath};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use elements::bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use elements::hashes::{hash160, sha256, Hash};
 use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use elements::Script;
@@ -109,6 +112,16 @@ pub struct Keys {
 	account: u32,
 	coin_type: u32,
 	secp: Secp256k1<elements::secp256k1_zkp::All>,
+	/// The on-chain and order keys derived so far, by purpose, branch and
+	/// index, and the extended key of each branch they were derived under
+	/// (`m/purpose'/coin'/0'/branch`). The wallet reads its on-chain coins by
+	/// every script up to the last index in use, and a wallet that boards or
+	/// pays often uses thousands: derived from the root each time, as five
+	/// steps of BIP32, those keys cost seconds of every command that reads
+	/// them. A key is what its path names, so keeping it changes nothing but
+	/// that cost; the branch's key gives a new one in one step.
+	derived: Mutex<HashMap<(u32, u32, u32), Keypair>>,
+	branches: Mutex<HashMap<(u32, u32), Xpriv>>,
 }
 
 impl Keys {
@@ -116,7 +129,7 @@ impl Keys {
 	/// coin type `coin_type` (0 on the main chain, 1 elsewhere).
 	pub fn new(mnemonic: &str, account: u32, coin_type: u32) -> Result<Keys, Error> {
 		let signer = SwSigner::new(mnemonic, false).map_err(|e| Error::Keys(e.to_string()))?;
-		Ok(Keys { signer, account, coin_type, secp: Secp256k1::new() })
+		Ok(Keys { signer, account, coin_type, secp: Secp256k1::new(), derived: Mutex::default(), branches: Mutex::default() })
 	}
 
 	fn keypair_at(&self, path: &DerivationPath) -> Result<Keypair, Error> {
@@ -140,11 +153,35 @@ impl Keys {
 		self.leaf(&mailbox_nonce())
 	}
 
+	/// The key at `m/purpose'/coin'/0'/branch/index`, derived once
+	/// ([`Keys::derived`]).
+	fn branch_key(&self, purpose: u32, branch: u32, index: u32) -> Result<Keypair, Error> {
+		if let Some(k) = self.derived.lock().expect("the keys memo").get(&(purpose, branch, index)) {
+			return Ok(*k);
+		}
+		let normal = |i: u32| ChildNumber::from_normal_idx(i).map_err(|_| Error::Keys(format!("{} is not a normal index", i)));
+		let parent = {
+			let mut b = self.branches.lock().expect("the keys memo");
+			match b.get(&(purpose, branch)) {
+				Some(x) => *x,
+				None => {
+					let path = DerivationPath::from(vec![hardened(purpose)?, hardened(self.coin_type)?, hardened(0)?, normal(branch)?]);
+					let x = self.signer.derive_xprv(&path).map_err(|e| Error::Keys(e.to_string()))?;
+					b.insert((purpose, branch), x);
+					x
+				},
+			}
+		};
+		let xprv = parent.derive_priv(&self.secp, &[normal(index)?]).map_err(|e| Error::Keys(e.to_string()))?;
+		let secret = SecretKey::from_slice(&xprv.private_key.secret_bytes()).map_err(|e| Error::Keys(e.to_string()))?;
+		let k = Keypair::from_secret_key(&self.secp, &secret);
+		self.derived.lock().expect("the keys memo").insert((purpose, branch, index), k);
+		Ok(k)
+	}
+
 	/// The on-chain key at `m/84'/coin'/0'/chain/index`.
 	pub fn onchain(&self, chain: u32, index: u32) -> Result<Keypair, Error> {
-		let normal = |i: u32| ChildNumber::from_normal_idx(i).map_err(|_| Error::Keys(format!("{} is not a normal index", i)));
-		let path = DerivationPath::from(vec![hardened(84)?, hardened(self.coin_type)?, hardened(0)?, normal(chain)?, normal(index)?]);
-		self.keypair_at(&path)
+		self.branch_key(84, chain, index)
 	}
 
 	/// The landing key: the first on-chain key, `m/84'/coin'/0'/0/0`.
@@ -177,9 +214,7 @@ impl Keys {
 	/// The order key at `index`, `m/86'/coin'/0'/0/index`: an order's REFUND
 	/// key, untweaked.
 	pub fn order(&self, index: u32) -> Result<Keypair, Error> {
-		let normal = |i: u32| ChildNumber::from_normal_idx(i).map_err(|_| Error::Keys(format!("{} is not a normal index", i)));
-		let path = DerivationPath::from(vec![hardened(86)?, hardened(self.coin_type)?, hardened(0)?, normal(0)?, normal(index)?]);
-		self.keypair_at(&path)
+		self.branch_key(86, 0, index)
 	}
 
 	/// The key that signs a key-path spend of the order key's output: the
@@ -288,6 +323,27 @@ mod tests {
 			"Bitcoin's BIP86 output key: Elements tags its tweak otherwise");
 		assert_ne!(keys.order(1).unwrap().x_only_public_key().0, internal);
 		assert_ne!(Keys::new(MNEMONIC, 0, 1).unwrap().order(0).unwrap().x_only_public_key().0, internal, "per coin type");
+	}
+
+	#[test]
+	fn a_kept_key_is_the_key_its_path_names() {
+		// Derived from the branch's key and kept: the same as derived from the
+		// root by the whole path, the first time and every time after.
+		let keys = Keys::new(MNEMONIC, 0, 1).unwrap();
+		let normal = |i: u32| ChildNumber::from_normal_idx(i).unwrap();
+		let h = |i: u32| ChildNumber::from_hardened_idx(i).unwrap();
+		for _ in 0..2 {
+			for (chain, index) in [(RECEIVE, 0), (RECEIVE, 7), (CHANGE, 0), (CHANGE, 3000)] {
+				let path = DerivationPath::from(vec![h(84), h(1), h(0), normal(chain), normal(index)]);
+				assert_eq!(keys.onchain(chain, index).unwrap().secret_bytes(), keys.keypair_at(&path).unwrap().secret_bytes());
+			}
+			for index in [0, 1, 500] {
+				let path = DerivationPath::from(vec![h(86), h(1), h(0), normal(0), normal(index)]);
+				assert_eq!(keys.order(index).unwrap().secret_bytes(), keys.keypair_at(&path).unwrap().secret_bytes());
+			}
+		}
+		assert_ne!(keys.onchain(RECEIVE, 1).unwrap().secret_bytes(), keys.onchain(CHANGE, 1).unwrap().secret_bytes());
+		assert_ne!(keys.onchain(RECEIVE, 1).unwrap().secret_bytes(), keys.order(1).unwrap().secret_bytes());
 	}
 
 	#[test]

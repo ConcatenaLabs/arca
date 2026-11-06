@@ -49,6 +49,7 @@
 //! transaction outside it has cut (the operator's sweep of the batch it
 //! rests on), once that transaction is final, is lost, and shown so.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use elements::secp256k1_zkp::Keypair;
@@ -1807,20 +1808,36 @@ struct Steps {
 	at: web_time::Instant,
 	node: u64,
 	operator: u64,
+	by: BTreeMap<String, u64>,
+	op: BTreeMap<String, (u64, u64)>,
 	out: serde_json::Map<String, Value>,
 }
 
 impl Steps {
 	fn start(w: &Wallet) -> Steps {
-		Steps { at: web_time::Instant::now(), node: w.chain.calls().0, operator: super::chain::gaps(), out: serde_json::Map::new() }
+		Steps { at: web_time::Instant::now(), node: w.chain.calls().0, operator: super::chain::gaps(), by: w.chain.asked_by_method(),
+			op: super::chain::operator_calls(), out: serde_json::Map::new() }
 	}
 
-	/// The step `name` ends here.
+	/// The step `name` ends here; where it made many requests of the node one
+	/// read at a time, with their methods (`alone`).
 	fn lap(&mut self, w: &Wallet, name: &str) {
-		let (node, operator) = (w.chain.calls().0, super::chain::gaps());
-		self.out.insert(name.to_string(), json!({"ms": self.at.elapsed().as_millis() as u64, "node": node - self.node,
-			"operator": operator - self.operator}));
-		*self = Steps { at: web_time::Instant::now(), node, operator, out: std::mem::take(&mut self.out) };
+		let (node, operator, by) = (w.chain.calls().0, super::chain::gaps(), w.chain.asked_by_method());
+		let mut step = json!({"ms": self.at.elapsed().as_millis() as u64, "node": node - self.node, "operator": operator - self.operator});
+		let alone = super::command::cost_by_method(&self.by, &by);
+		if alone.as_object().is_some_and(|o| !o.is_empty()) {
+			step["alone"] = alone;
+		}
+		// A step over a second says how long of it was spent waiting for the
+		// operator, and on which calls.
+		let op = super::chain::operator_calls();
+		if step["ms"].as_u64().unwrap_or(0) >= 1000 {
+			let (waited, calls) = super::chain::operator_between(&self.op, &op);
+			step["operator_ms"] = json!(waited);
+			step["operator_calls"] = calls;
+		}
+		self.out.insert(name.to_string(), step);
+		*self = Steps { at: web_time::Instant::now(), node, operator, by, op, out: std::mem::take(&mut self.out) };
 	}
 
 	fn done(self) -> Value {
