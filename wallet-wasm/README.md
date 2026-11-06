@@ -27,8 +27,10 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   `getfeeexchangerates` with `dumpassetlabels` (the node keys its rates by
   label), and `sendrawtransaction`, the one that writes. Reads that do not
   depend on each other go together in one JSON-RPC batch where the node or
-  its proxy takes one; a proxy that refuses a batch is asked one call at a
-  time from then on. A page
+  its proxy takes one; a proxy that refuses batches is asked one call at a
+  time, and tried with a batch again every ten minutes. A proxy that is busy,
+  restarting or out of time refuses nothing: that batch's reads are made one
+  at a time and the next batch is sent as before. A page
   holds no node credential worth having, so a site serves its wallets a proxy
   that allows exactly these calls, adds the node's credential itself and
   limits each caller, and the wallet is created with `node_url` alone.
