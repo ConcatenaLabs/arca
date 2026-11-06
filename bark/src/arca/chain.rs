@@ -63,8 +63,11 @@
 //! is answered without a look. A node behind a proxy that takes one call at
 //! a time refuses the first batch, and the source makes each read on its own
 //! from then on; one that refuses only some methods in a batch has those
-//! asked on their own. A read ahead changes no answer, only the number of
-//! requests that make it.
+//! asked on their own. Both are learnt only from an answer that says so,
+//! and tried again after ten minutes ([`BATCH_AGAIN_AFTER`]): a route that
+//! is busy, restarting or out of time has that batch's reads made alone and
+//! the next batch sent as before. A read ahead changes no answer, only the
+//! number of requests that make it.
 //!
 //! **A busy node.** The node runs one scan of its set of unspent outputs at
 //! a time for all its clients, and refuses a scan while another runs (two
@@ -284,10 +287,15 @@ struct Memo {
 	last_command: HashMap<String, Kept>,
 	/// Whether the node takes a batch of calls in one request: unknown until
 	/// one is tried; a proxy that takes one call at a time is asked one by one.
+	/// Learnt only from an answer that says so ([`refuses_batch`]): a route
+	/// that is busy, restarting or slow says nothing of batches.
 	batch: Option<bool>,
 	/// Methods the node refused in a batch although it takes batches (a
 	/// proxy that allows some methods only on their own): asked alone.
 	unbatched: std::collections::HashSet<String>,
+	/// When the route last refused a batch or a method in one: after
+	/// [`BATCH_AGAIN_AFTER`], batches are tried again ([`ChainSource::batch_again`]).
+	refused_batch: Option<web_time::Instant>,
 	/// Requests made of the node, and reads answered from what was kept.
 	asked: u64,
 	kept: u64,
@@ -339,14 +347,51 @@ pub const SCAN_WHOLE: usize = 20_000;
 /// Whether `e` is a route's refusal of a scan for its size (the public
 /// proxy's `-32602`, or an HTTP refusal of the request), after which the scan
 /// is made again in parts of [`SCAN_MOST`]. The node itself refuses no
-/// number of scripts; a node busy with another scan is not a refusal.
+/// number of scripts; a node busy with another scan is not a refusal, nor is
+/// a route that is busy, restarting or out of time ([`transient_status`]).
 fn scan_too_large(e: &RpcError) -> bool {
 	match e {
 		RpcError::Rpc { code, message } => !busy(*code, message) && matches!(*code, -32602 | -32600),
-		RpcError::Http { status, .. } => (400..500).contains(status) && *status != 401,
+		RpcError::Http { status, .. } => (400..500).contains(status) && !transient_status(*status),
 		_ => false,
 	}
 }
+
+/// Whether an HTTP status says the route could not answer now, not what it
+/// makes of the request: a gateway or a proxy restarting or out of upstream
+/// slots (5xx), a rate limit (429), a request that ran out of time (408), a
+/// credential refused while a restarted node's cookie is read again (401).
+fn transient_status(status: i32) -> bool {
+	status >= 500 || matches!(status, 401 | 408 | 429)
+}
+
+/// Whether a batch's failure says that the route takes no batch, or not one
+/// carrying these calls: a well-formed answer that is not a list (a proxy
+/// that takes one call at a time answers a list with one error, `-32600`; one
+/// that allows a method only alone, `-32601`), or a refusal of the request
+/// itself (4xx). A route that is busy, restarting, rate limited or out of
+/// time ([`transient_status`]), or unreachable, says nothing of batches: that
+/// batch's reads are made alone, and the next batch is tried as before.
+fn refuses_batch(e: &RpcError) -> bool {
+	match e {
+		RpcError::Http { status, body } => {
+			if transient_status(*status) {
+				return false;
+			}
+			if (400..500).contains(status) {
+				return true;
+			}
+			serde_json::from_str::<Value>(body).is_ok()
+		},
+		_ => false,
+	}
+}
+
+/// How long a route's refusal of batches is taken as its answer: a proxy
+/// can change, and a refusal learnt from an answer that only looked like one
+/// should not cost a wallet its batches until it restarts. A route that does
+/// refuse them costs one request a period.
+pub const BATCH_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How a read is kept.
 enum Keep {
@@ -400,9 +445,13 @@ fn pooled(k: &str, a: &Kept) -> bool {
 
 /// Whether the node refused a read only because it is busy: it runs one scan
 /// of its set of unspent outputs at a time, for every client it has, and
-/// refuses another while one runs. That says nothing of the chain.
+/// refuses another while one runs; a proxy in front of it refuses a call
+/// while its upstream slots are full or the scans before it run long ("…;
+/// try again", HTTP 503), or for its rate limit. That says nothing of the
+/// chain.
 fn busy(code: i64, message: &str) -> bool {
 	(code == -8 && message.starts_with("Scan already in progress")) || slow_down(code, message)
+		|| (code == -32000 && message.ends_with("try again"))
 }
 
 /// Whether a proxy in front of the node refused a call for its rate limit,
@@ -412,12 +461,14 @@ fn slow_down(code: i64, message: &str) -> bool {
 	code == -32000 && message.contains("slow down")
 }
 
-/// Whether a batch was refused for the proxy's rate limit (answered with
-/// one error for the whole batch).
-fn batch_slowed(e: &RpcError) -> bool {
+/// Whether a batch was refused whole because the node or the proxy in front
+/// of it is busy ([`busy`]: its rate limit, its upstream slots full),
+/// answered with one error for the whole batch.
+fn batch_busy(e: &RpcError) -> bool {
 	match e {
-		RpcError::Rpc { code, message } => slow_down(*code, message),
-		RpcError::Http { body, .. } => body.contains("slow down"),
+		RpcError::Rpc { code, message } => busy(*code, message),
+		RpcError::Http { body, .. } => body.contains("slow down") || serde_json::from_str::<Value>(body).is_ok_and(|v|
+			busy(v["error"]["code"].as_i64().unwrap_or(0), v["error"]["message"].as_str().unwrap_or(""))),
 		_ => false,
 	}
 }
@@ -576,6 +627,7 @@ impl ChainSource {
 		let mut calls: Vec<(String, Vec<Value>)> = LOOK.map(|c| (c.to_string(), vec![])).to_vec();
 		calls.extend(reads.iter().cloned());
 		let mut extra = None;
+		Self::batch_again(m);
 		let batched = match m.batch {
 			Some(false) => None,
 			_ => match self.batch_patiently(&calls) {
@@ -590,6 +642,13 @@ impl ChainSource {
 					Some((info, anchors, pool))
 				},
 				Err(RpcError::Transport(e)) => return Err(RpcError::Transport(e)),
+				// A route busy, restarting or out of time: this look is made
+				// alone, the reads are the caller's to ask, and what is known
+				// of batches stands.
+				Err(e) if !refuses_batch(&e) => {
+					m.asked += 1;
+					None
+				},
 				// The node took the look alone before: what it carried was
 				// refused. One read carried alone is a method the node takes
 				// only on its own, asked so from now on; the look is made
@@ -598,12 +657,14 @@ impl ChainSource {
 					m.asked += 1;
 					if reads.len() == 1 {
 						m.unbatched.insert(reads[0].0.clone());
+						m.refused_batch = Some(web_time::Instant::now());
 					}
 					return self.look_with(m, &[]).map(|_| None);
 				},
 				_ => {
 					m.asked += 1;
 					m.batch = Some(false);
+					m.refused_batch = Some(web_time::Instant::now());
 					None
 				},
 			},
@@ -742,14 +803,14 @@ impl ChainSource {
 	}
 
 	/// One batch of calls to the node; while a proxy in front of it refuses
-	/// the batch for its rate limit, the batch waits and is sent again, for
-	/// [`BUSY_PATIENCE`] at most, as [`Self::ask`] does for one call.
+	/// the batch as busy ([`batch_busy`]), the batch waits and is sent again,
+	/// for [`BUSY_PATIENCE`] at most, as [`Self::ask`] does for one call.
 	fn batch_patiently(&self, calls: &[(String, Vec<Value>)]) -> Result<Vec<Result<Value, RpcError>>, RpcError> {
 		let start = web_time::Instant::now();
 		let mut pause = std::time::Duration::from_millis(250);
 		loop {
 			match self.client.batch(calls) {
-				Err(e) if batch_slowed(&e) && start.elapsed() < BUSY_PATIENCE => {
+				Err(e) if batch_busy(&e) && start.elapsed() < BUSY_PATIENCE => {
 					sequentia_ext::platform::sleep(pause);
 					pause = (pause * 2).min(std::time::Duration::from_secs(2));
 				},
@@ -783,6 +844,7 @@ impl ChainSource {
 	/// comes: a read ahead changes no answer, only how many requests make it.
 	fn read_ahead(&self, reads: Vec<(String, Vec<Value>)>) {
 		let mut m = self.memo.lock().expect("the chain memo");
+		Self::batch_again(&mut m);
 		if m.batch == Some(false) {
 			drop(m);
 			let _ = self.look(&mut self.memo.lock().expect("the chain memo"));
@@ -830,11 +892,26 @@ impl ChainSource {
 					m.batch = Some(true);
 					Self::keep_all(&mut m, chunk, answers);
 				},
-				Err(RpcError::Transport(_)) => return,
+				// A route busy, restarting or out of time: the reads are made
+				// alone as they come, and the next read ahead batches again.
+				Err(e) if !refuses_batch(&e) => return,
 				Err(_) => {
 					m.batch = Some(false);
+					m.refused_batch = Some(web_time::Instant::now());
 					return;
 				},
+			}
+		}
+	}
+
+	/// Forgets a route's refusal of batches, and of methods in one, once it
+	/// is [`BATCH_AGAIN_AFTER`] old: the next look tries a batch again.
+	fn batch_again(m: &mut Memo) {
+		if m.refused_batch.is_some_and(|t| t.elapsed() >= BATCH_AGAIN_AFTER) {
+			m.refused_batch = None;
+			m.unbatched.clear();
+			if m.batch == Some(false) {
+				m.batch = None;
 			}
 		}
 	}
@@ -2029,6 +2106,18 @@ mod test {
 	/// a time; it counts the requests it was sent, and the calls of each
 	/// method that came alone (not in a batch).
 	fn mempool_node(txs: Vec<Transaction>) -> (String, Arc<AtomicU64>, Arc<Mutex<HashMap<String, u64>>>) {
+		mempool_route(txs, Arc::new(|_, _| None))
+	}
+
+	/// How a route answers a batch instead of passing it on: given how many
+	/// batches of more than a look's three calls came before it and how many
+	/// calls it carries, an HTTP status and a body, or `None` to answer it.
+	type Refusal = Arc<dyn Fn(u64, usize) -> Option<(u16, String)> + Send + Sync>;
+
+	/// [`mempool_node`], behind a route that answers some batches with
+	/// `refuse`; the calls that came alone are counted by method, and the
+	/// batches it was sent under `"batch"`.
+	fn mempool_route(txs: Vec<Transaction>, refuse: Refusal) -> (String, Arc<AtomicU64>, Arc<Mutex<HashMap<String, u64>>>) {
 		use std::io::{BufRead, BufReader, Read, Write};
 		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 		let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -2037,6 +2126,7 @@ mod test {
 		let (counted, single) = (requests.clone(), alone.clone());
 		let by_id: HashMap<String, String> = txs.iter().map(|t| (t.txid().to_string(), hex(&elements::encode::serialize(t)))).collect();
 		std::thread::spawn(move || {
+			let mut big = 0u64;
 			let answer = |call: &Value| -> Value {
 				let (id, method) = (call["id"].clone(), call["method"].as_str().unwrap_or(""));
 				let result = match method {
@@ -2072,18 +2162,142 @@ mod test {
 				}
 				counted.fetch_add(1, Ordering::SeqCst);
 				let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-				let out = match &req {
-					Value::Array(calls) => Value::Array(calls.iter().map(|c| answer(c)).collect()),
+				let (status, out) = match &req {
+					Value::Array(calls) => {
+						*single.lock().unwrap().entry("batch".into()).or_default() += 1;
+						let refusal = refuse(big, calls.len());
+						if calls.len() > LOOK.len() {
+							big += 1;
+						}
+						match refusal {
+							Some(r) => r,
+							None => (200, Value::Array(calls.iter().map(|c| answer(c)).collect()).to_string()),
+						}
+					},
 					call => {
 						*single.lock().unwrap().entry(call["method"].as_str().unwrap_or("").to_string()).or_default() += 1;
-						answer(call)
+						(200, answer(call).to_string())
 					},
-				}.to_string();
-				let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-					out.len(), out);
+				};
+				let _ = write!(stream, "HTTP/1.1 {} Answer\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					status, out.len(), out);
 			}
 		});
 		(url, requests, alone)
+	}
+
+	/// The proxy's refusal of a request as a whole (`node-rpc-proxy`'s own).
+	fn proxy_refusal(status: u16, code: i64, message: &str) -> (u16, String) {
+		(status, json!({"result": null, "error": {"code": code, "message": message}, "id": null}).to_string())
+	}
+
+	/// A route that fails a wallet's first batch of more than a look's three
+	/// calls as a busy or restarting one does, and answers every request after
+	/// it, keeps the wallet's batches: that batch's reads are made alone, and
+	/// later reads go in batches again. Before, any such failure turned
+	/// batching off until the process restarted, and every later read was a
+	/// request of its own. Each failure is met first by the read ahead of a
+	/// mempool's transactions (a sync's forfeits step), then by a look that
+	/// carries one read.
+	#[test]
+	fn a_route_busy_once_keeps_its_batches() {
+		let _serial = serial();
+		let asset = AssetId::from_slice(&[7; 32]).unwrap();
+		let txs: Vec<Transaction> = (0..40u8).map(|i| spend_to(OutPoint::new(Txid::from_str(&format!("{:02x}", i + 1).repeat(32)).unwrap(), 0),
+			asset, 100_000, Script::from(vec![0x51, i]))).collect();
+		let wanted = txs[17].output[0].clone();
+		let ops: Vec<OutPoint> = (0..40u32).map(|i| OutPoint::new(Txid::from_str(&format!("{:064x}", i + 1)).unwrap(), 0)).collect();
+		let failures: Vec<(&str, (u16, String))> = vec![
+			("the proxy's upstream slots full", proxy_refusal(503, -32000, "the node is busy; try again")),
+			("the node behind the proxy not answering", proxy_refusal(502, -32000, "the node did not answer: TimeoutError")),
+			("Caddy while the proxy restarts", (502, String::new())),
+			("a gateway's own page", (504, "<html><body>Gateway Timeout</body></html>".into())),
+			("a rate limit with no JSON", (429, "Too Many Requests".into())),
+		];
+		for (what, failure) in failures {
+			// The read ahead of the mempool's 40 transactions fails once.
+			let first = failure.clone();
+			let (url, _, alone) = mempool_route(txs.clone(), Arc::new(move |big, n| (big == 0 && n > LOOK.len()).then(|| first.clone())));
+			let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+			let asked = |m: &str| alone.lock().unwrap().get(m).copied().unwrap_or(0);
+			assert_eq!(chain.locate(std::slice::from_ref(&wanted)).unwrap(), vec![Some(OutPoint::new(txs[17].txid(), 0))], "{}", what);
+			let (lone, outputs) = (asked("getrawtransaction"), asked("gettxout"));
+			assert!(lone <= 40, "{}: the failed batch's reads made alone, at most once each: {}", what, lone);
+			chain.new_command();
+			assert!(chain.unspent_many(&ops).unwrap().iter().all(|u| *u), "{}", what);
+			assert_eq!(asked("gettxout"), outputs, "{}: a later command's 40 outputs read in a batch", what);
+			chain.new_command();
+			let more: Vec<TxOut> = txs[20..30].iter().map(|t| t.output[0].clone()).collect();
+			assert!(chain.locate(&more).unwrap().iter().all(|o| o.is_some()), "{}", what);
+			assert_eq!(asked("getrawtransaction"), lone, "{}: the mempool read in batches again", what);
+
+			// A look carrying one read fails once: the method stays batched.
+			let first = failure.clone();
+			let (url, _, alone) = mempool_route(txs.clone(), Arc::new(move |big, n| (big == 0 && n > LOOK.len()).then(|| first.clone())));
+			let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+			let asked = |m: &str| alone.lock().unwrap().get(m).copied().unwrap_or(0);
+			assert!(chain.validates_anchors().unwrap(), "{}", what);
+			chain.new_command();
+			assert!(chain.unspent(&ops[0]).unwrap(), "{}", what);
+			chain.new_command();
+			assert!(chain.unspent_many(&ops).unwrap().iter().all(|u| *u), "{}", what);
+			assert!(asked("gettxout") <= 1, "{}: gettxout still carried in batches: {} asked alone", what, asked("gettxout"));
+		}
+	}
+
+	/// A route that takes no batch at all (a proxy that takes one call at a
+	/// time answers a list with one error) is asked one call at a time after
+	/// its first refusal, and asked for a batch again only after
+	/// [`BATCH_AGAIN_AFTER`].
+	#[test]
+	fn a_route_that_takes_no_batch_is_asked_one_call_at_a_time() {
+		let _serial = serial();
+		let asset = AssetId::from_slice(&[7; 32]).unwrap();
+		let txs: Vec<Transaction> = (0..10u8).map(|i| spend_to(OutPoint::new(Txid::from_str(&format!("{:02x}", i + 1).repeat(32)).unwrap(), 0),
+			asset, 100_000, Script::from(vec![0x51, i]))).collect();
+		let ops: Vec<OutPoint> = (0..20u32).map(|i| OutPoint::new(Txid::from_str(&format!("{:064x}", i + 1)).unwrap(), 0)).collect();
+		let refusals: Vec<(&str, (u16, String))> = vec![
+			("a list refused as no call", proxy_refusal(400, -32600, "a call is a JSON object")),
+			("a server answering an object", (200, json!({"result": null, "error": {"code": -32700, "message": "Parse error"}, "id": null}).to_string())),
+		];
+		for (what, refusal) in refusals {
+			let (url, requests, alone) = mempool_route(txs.clone(), Arc::new(move |_, _| Some(refusal.clone())));
+			let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+			let asked = |m: &str| alone.lock().unwrap().get(m).copied().unwrap_or(0);
+			assert_eq!(chain.mempool_txs().unwrap().len(), 10, "{}", what);
+			chain.new_command();
+			assert!(chain.unspent_many(&ops).unwrap().iter().all(|u| *u), "{}", what);
+			assert_eq!(asked("batch"), 1, "{}: one batch tried, then none", what);
+			assert_eq!((asked("getrawtransaction"), asked("gettxout")), (10, 20), "{}: each read alone", what);
+			let n = requests.load(Ordering::SeqCst);
+			// Ten minutes on, a batch is tried once again.
+			chain.memo.lock().unwrap().refused_batch = Some(web_time::Instant::now() - BATCH_AGAIN_AFTER);
+			chain.new_command();
+			assert!(chain.unspent_many(&ops).unwrap().iter().all(|u| *u), "{}", what);
+			assert_eq!(asked("batch"), 2, "{}: tried again after a while", what);
+			assert_eq!(requests.load(Ordering::SeqCst), n + 4, "{}: the batch and the look alone; the outputs are kept for the view", what);
+		}
+	}
+
+	/// What tells a refusal of batches from a route that could not answer.
+	#[test]
+	fn a_batch_refused_is_told_from_a_route_that_could_not_answer() {
+		let http = |status: i32, body: &str| RpcError::Http { status, body: body.into() };
+		let (_, busy) = proxy_refusal(503, -32000, "the node is busy; try again");
+		for e in [http(503, &busy), http(502, ""), http(504, "<html></html>"), http(429, "slow down"), http(408, ""), http(401, ""),
+			RpcError::Transport("timed out".into())] {
+			assert!(!refuses_batch(&e), "{:?}", e);
+			assert!(!scan_too_large(&e), "{:?}", e);
+		}
+		let (_, list) = proxy_refusal(400, -32600, "a call is a JSON object");
+		let (_, only_alone) = proxy_refusal(403, -32601, "in a batch: getsupervisedassets is taken one call at a time");
+		for e in [http(400, &list), http(403, &only_alone), http(200, "{\"result\": 1}"), http(404, "")] {
+			assert!(refuses_batch(&e), "{:?}", e);
+		}
+		assert!(batch_busy(&http(503, &busy)), "the proxy's busy refusal is waited out");
+		assert!(!batch_busy(&http(502, "")));
+		assert!(kept_of(Err(RpcError::Rpc { code: -32000, message: "the node is busy; try again".into() })).is_err(),
+			"a busy route's refusal is no answer of the view");
 	}
 
 	/// Locating an output reads the mempool's transactions in batches, not
