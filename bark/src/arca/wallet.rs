@@ -3253,6 +3253,23 @@ impl Wallet {
 		if c.kind == "transfer" && c.state == "live" { "operator-confirmed" } else { &c.state }
 	}
 
+	/// A coin as the store holds it, for a program ([`Self::coins_listed`]
+	/// `brief`): its id, kind, asset, value, state and standing, its expiry
+	/// (median time; null for none yet) and exit deadline, and the template
+	/// of its leaf (`order-…` for a resting order's coin). Nothing else is
+	/// read.
+	fn coin_brief(c: &CoinRow) -> Value {
+		let (expiry, deadline) = if c.expiry == u32::MAX { (Value::Null, Value::Null) } else {
+			(json!(c.expiry), json!(c.expiry.saturating_sub(WalletPolicy::EXIT_DEADLINE)))
+		};
+		let mut v = json!({"leaf_id": c.leaf_id, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
+			"standing": Self::standing(c), "expiry": expiry, "exit_deadline": deadline, "spent_by": c.spent_by});
+		if let Some(t) = CoinRecord::from_bytes(&c.record).ok().as_ref().and_then(template_of) {
+			v["template"] = json!(t.to_string());
+		}
+		v
+	}
+
 	/// A coin for people: its dates (median times) are its expiry and its
 	/// exit deadline, three days before; a coin resting on a board carries
 	/// the board's ([`BOARD_LIFETIME`]).
@@ -3284,13 +3301,23 @@ impl Wallet {
 	/// coin says which asset would pay, or that it cannot come home until the
 	/// wallet holds one.
 	pub fn coins(&self) -> Result<Value, Error> {
-		self.coins_listed(false)
+		self.coins_listed(false, false)
 	}
 
 	/// [`Self::coins`], or with `held` only the coins the wallet holds: not
 	/// those it spent, exited or lost, which a wallet that trades all day
 	/// counts by the thousand, and whose rows are then not read at all.
-	pub fn coins_listed(&self, held: bool) -> Result<Value, Error> {
+	/// With `brief`, each coin as the store holds it and nothing read beside
+	/// ([`Self::coin_brief`]): for a program that counts and picks its coins
+	/// many times a minute (a maker), and shows no one their dates, notes or
+	/// exit fees. Those take reads of the chain and of the wallet's other
+	/// records: an exit fee of a board reads every on-chain script the
+	/// wallet ever drew.
+	pub fn coins_listed(&self, held: bool, brief: bool) -> Result<Value, Error> {
+		if brief {
+			let rows = if held { self.store.coins_not_in(&GONE)? } else { self.store.coins()? };
+			return Ok(Value::Array(rows.iter().map(Self::coin_brief).collect()));
+		}
 		let alone = self.keepers()?.0.is_empty();
 		let stopped = self.rolled_back()?.is_some();
 		let unreachable = self.unreachable()?;
@@ -4421,6 +4448,51 @@ mod tests {
 			store.set_meta(k, v).unwrap();
 		}
 		dir
+	}
+
+	/// A program's brief reads (`coins {held, brief}`, `order_resting
+	/// {orders, brief}`, `swaps {swaps}`) read the store alone: they answer
+	/// with the node and the operator out of reach, where the full answers,
+	/// which read them, cannot.
+	#[test]
+	fn a_brief_read_reads_the_store_alone() {
+		let dir = bare_wallet("brief");
+		let store = Store::open(&dir.join(DB_FILE)).unwrap();
+		let row = |id: &str, kind: &str, state: &str, nonce: [u8; 32]| CoinRow {
+			leaf_id: id.into(), owner_nonce: nonce, kind: kind.into(), asset: AssetId::from_slice(&[7; 32]).unwrap().to_string(),
+			value: 1_000, record: vec![], salt: [nonce[0]; 32], state: state.into(), note: String::new(), expiry: 2_000_000_000, bases: vec![],
+			spent_by: None,
+		};
+		for (id, kind, state, n) in [("b", "board", "live", 1u8), ("t", "transfer", "live", 2), ("s", "batch", "spent", 3)] {
+			store.put_nonce(&[n; 32], &key(n + 1).x_only_public_key().0.serialize(), "receive").unwrap();
+			store.put_coin(&row(id, kind, state, [n; 32])).unwrap();
+		}
+		store.put_resting(&crate::arca::store::RestingRow { id: "r1".into(), nonce: [9; 32], terms: "{}".into(), amount: 5,
+			credit_nonces: vec![], order_leaf: Some("o1".into()), state: "published".into() }).unwrap();
+		store.put_swap("w1", "maker", "{\"give\": \"1\", \"want\": \"2\"}").unwrap();
+		store.put_swap("w2", "maker", "{\"give\": \"3\", \"want\": \"4\"}").unwrap();
+		drop(store);
+		let w = Wallet::open(&dir).unwrap();
+		let coins = w.coins_listed(true, true).unwrap();
+		let ids: Vec<&str> = coins.as_array().unwrap().iter().map(|c| c["leaf_id"].as_str().unwrap()).collect();
+		assert_eq!(ids.len(), 2, "the held coins only: {:?}", ids);
+		assert!(ids.contains(&"b") && ids.contains(&"t"));
+		let b = coins.as_array().unwrap().iter().find(|c| c["leaf_id"] == "b").unwrap();
+		assert_eq!((b["kind"].as_str(), b["value"].as_str(), b["state"].as_str(), b["expiry"].as_u64()), (Some("board"), Some("1000"), Some("live"), Some(2_000_000_000)));
+		assert!(b.get("exit_fee").is_none());
+		// The full answer reads the node for the board's exit fee: out of reach here.
+		assert!(w.coins_listed(true, false).is_err(), "the full listing reads the node");
+		let r = w.resting_orders(&[], true).unwrap();
+		assert_eq!(r["orders"][0]["order"], "o1");
+		assert_eq!(r["orders"][0]["rested_by"], "r1");
+		assert!(r["orders"][0].get("operator").is_none());
+		assert!(w.resting_orders(&[], false).is_err(), "the full answer asks the operator after every order the wallet rested");
+		let sw = w.swaps_of(Some(&["w2".to_string(), "nope".to_string()])).unwrap();
+		assert_eq!(sw.as_array().unwrap().len(), 1);
+		assert_eq!(sw[0]["swap"], "w2");
+		assert_eq!(sw[0]["gives"], "3");
+		assert_eq!(w.swaps().unwrap().as_array().unwrap().len(), 2);
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	/// F1 of R7i: a receive request carries its lapse, and is waiting until

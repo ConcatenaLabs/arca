@@ -1863,8 +1863,28 @@ impl Wallet {
 	/// `cancelled`), what the wallet gives and gets, and, for an open offer of
 	/// the wallet's, the offer's text to hand to a taker again.
 	pub fn swaps(&self) -> Result<Value, Error> {
+		self.swaps_of(None)
+	}
+
+	/// [`Self::swaps`], or with `ids` only those swaps, each read by its id
+	/// (one the wallet does not know is left out): a maker follows its few
+	/// open offers among the thousands it made, each of whose rows holds its
+	/// coins' records.
+	pub fn swaps_of(&self, ids: Option<&[String]>) -> Result<Value, Error> {
+		let rows = match ids {
+			None => self.store.swaps()?,
+			Some(ids) => {
+				let mut rows = vec![];
+				for id in ids {
+					if let Some((role, offer, _, state)) = self.store.swap(id)? {
+						rows.push((id.clone(), role, offer, state));
+					}
+				}
+				rows
+			},
+		};
 		let mut out = vec![];
-		for (id, role, offer_json, state) in self.store.swaps()? {
+		for (id, role, offer_json, state) in rows {
 			let offer: Value = serde_json::from_str(&offer_json).map_err(|e| Error::Store(e.to_string()))?;
 			let (gives, gets) = if role == "maker" { (&offer["give"], &offer["want"]) } else { (&offer["want"], &offer["give"]) };
 			let mut v = json!({"swap": id, "role": role, "state": state, "gives": gives, "gets": gets});

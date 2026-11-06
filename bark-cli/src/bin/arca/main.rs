@@ -1572,7 +1572,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 				.map_err(|e| bark::arca::Error::Parse(format!("the order shown: {}", e)))).transpose()?;
 			w.order_rest(&ask, max_fee_ppm, shown.as_ref())
 		},
-		Cmd::Order(OrderCmd::Resting { orders }) => w.resting_orders(&orders),
+		Cmd::Order(OrderCmd::Resting { orders }) => w.resting_orders(&orders, false),
 		Cmd::Order(OrderCmd::FillResting { order, amount, quote, shown }) => {
 			if quote {
 				return w.order_fill_resting_quote(&order, amount);
