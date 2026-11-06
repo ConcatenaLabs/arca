@@ -1384,17 +1384,21 @@ impl ChainSource {
 		let mut scripts: Vec<Script> = outputs.iter().map(|o| o.script_pubkey.clone()).collect();
 		scripts.sort();
 		scripts.dedup();
-		for (op, o, _) in self.coins_at(&scripts)? {
+		// Whether each output found is spent in the mempool, a batch at a
+		// time; and the mempool's transactions read ahead in batches
+		// ([`Self::mempool_txs`]), not one request each: a wallet following
+		// many forfeits locates each, and a busy mempool holds dozens.
+		let paying: Vec<(OutPoint, TxOut)> = self.coins_at(&scripts)?.into_iter().map(|(op, o, _)| (op, o)).collect();
+		let unspent = self.unspent_many(&paying.iter().map(|(op, _)| *op).collect::<Vec<_>>())?;
+		for ((op, o), unspent) in paying.into_iter().zip(unspent) {
 			if let Some(i) = outputs.iter().enumerate().position(|(i, w)| *w == o && found[i].is_none()) {
-				if self.unspent(&op)? {
+				if unspent {
 					found[i] = Some(op);
 				}
 			}
 		}
-		let ids: Vec<String> = self.call("getrawmempool", &[]).map_err(node)?;
-		for id in ids {
-			let txid = Txid::from_str(&id).map_err(|e| Error::Node(e.to_string()))?;
-			let Some(tx) = self.transaction(&txid)? else { continue };
+		for tx in self.mempool_txs()? {
+			let txid = tx.txid();
 			for (j, o) in tx.output.iter().enumerate() {
 				if let Some(i) = outputs.iter().enumerate().position(|(i, w)| w == o && found[i].is_none()) {
 					let op = OutPoint::new(txid, j as u32);
@@ -2019,6 +2023,88 @@ mod test {
 				TxOut::new_fee(fee, asset),
 			],
 		}
+	}
+
+	/// A node whose mempool holds `txs`, served by id, in batches or one at
+	/// a time; it counts the requests it was sent, and the calls of each
+	/// method that came alone (not in a batch).
+	fn mempool_node(txs: Vec<Transaction>) -> (String, Arc<AtomicU64>, Arc<Mutex<HashMap<String, u64>>>) {
+		use std::io::{BufRead, BufReader, Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}/", listener.local_addr().unwrap());
+		let requests = Arc::new(AtomicU64::new(0));
+		let alone: Arc<Mutex<HashMap<String, u64>>> = Default::default();
+		let (counted, single) = (requests.clone(), alone.clone());
+		let by_id: HashMap<String, String> = txs.iter().map(|t| (t.txid().to_string(), hex(&elements::encode::serialize(t)))).collect();
+		std::thread::spawn(move || {
+			let answer = |call: &Value| -> Value {
+				let (id, method) = (call["id"].clone(), call["method"].as_str().unwrap_or(""));
+				let result = match method {
+					"getblockchaininfo" => json!({"bestblockhash": "11".repeat(32), "blocks": 1}),
+					"getanchorstatus" => json!({"validateanchor": true, "anchorstatus": "ok"}),
+					"getrawmempool" => json!(by_id.keys().collect::<Vec<_>>()),
+					"getrawtransaction" => match by_id.get(call["params"][0].as_str().unwrap_or("")) {
+						Some(h) => json!(h),
+						None => return json!({"id": id, "result": null, "error": {"code": -5, "message": "No such mempool or blockchain transaction"}}),
+					},
+					"gettxout" => json!({"value": 1}),
+					"scantxoutset" => json!({"success": true, "unspents": []}),
+					_ => return json!({"id": id, "result": null, "error": {"code": -32601, "message": "Method not found"}}),
+				};
+				json!({"id": id, "result": result, "error": null})
+			};
+			for stream in listener.incoming() {
+				let Ok(mut stream) = stream else { continue };
+				let mut reader = BufReader::new(stream.try_clone().unwrap());
+				let mut length = 0usize;
+				loop {
+					let mut line = String::new();
+					if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+						break;
+					}
+					if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+						length = v.trim().parse().unwrap_or(0);
+					}
+				}
+				let mut body = vec![0u8; length];
+				if reader.read_exact(&mut body).is_err() {
+					continue;
+				}
+				counted.fetch_add(1, Ordering::SeqCst);
+				let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+				let out = match &req {
+					Value::Array(calls) => Value::Array(calls.iter().map(|c| answer(c)).collect()),
+					call => {
+						*single.lock().unwrap().entry(call["method"].as_str().unwrap_or("").to_string()).or_default() += 1;
+						answer(call)
+					},
+				}.to_string();
+				let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					out.len(), out);
+			}
+		});
+		(url, requests, alone)
+	}
+
+	/// Locating an output reads the mempool's transactions in batches, not
+	/// one request each: a wallet's sync locates the output of every forfeit
+	/// it follows, and before this a busy mempool's few dozen transactions
+	/// were as many requests in a row (seconds over a phone's link). The
+	/// output paid in the mempool is found there.
+	#[test]
+	fn locating_an_output_reads_the_mempool_in_batches() {
+		let _serial = serial();
+		let asset = AssetId::from_slice(&[7; 32]).unwrap();
+		let txs: Vec<Transaction> = (0..40u8).map(|i| spend_to(OutPoint::new(Txid::from_str(&format!("{:02x}", i + 1).repeat(32)).unwrap(), 0),
+			asset, 100_000, Script::from(vec![0x51, i]))).collect();
+		let wanted = txs[17].output[0].clone();
+		let (url, requests, alone) = mempool_node(txs.clone());
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let found = chain.locate(std::slice::from_ref(&wanted)).unwrap();
+		assert_eq!(found, vec![Some(OutPoint::new(txs[17].txid(), 0))]);
+		let alone = alone.lock().unwrap().clone();
+		assert_eq!(alone.get("getrawtransaction"), None, "no transaction asked alone: {:?}", alone);
+		assert!(requests.load(Ordering::SeqCst) <= 5, "{} requests for 40 transactions", requests.load(Ordering::SeqCst));
 	}
 
 	/// A node behind a proxy that takes batches but refuses `getsupervisedassets`
