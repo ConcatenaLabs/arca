@@ -108,7 +108,7 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
 `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, shown}`, `participations`, `settle_quote {asset,
-value, expiry}`, `sync {catch_up?}`, `hand_over_forfeits`, `schedule`,
+value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?}`, `withdraw_participation {participation}`, `refusals`; a payment to an address on the chain from leaves
@@ -163,7 +163,10 @@ or lost, which a wallet that trades all day counts by the thousand and which are
 then not read at all. `sync` with `"catch_up": false` leaves out the catch-up
 between stores of one mnemonic: a program that is the only store of its mnemonic
 (a service wallet on one machine) has no other store to catch up with, and the
-catch-up reads every coin ever served to its mailbox key to find that out. A
+catch-up reads every coin ever served to its mailbox key to find that out. With
+`"deposits": false` it leaves out the watchtowers' step too, which the program
+runs next as the command `deposits`: a program that answers others from the
+wallet then finds it free between the two. A
 command that only reads, run as one of a burst, answers from the look at the
 chain another made within three seconds when asked with `"shared_view": true`.
 

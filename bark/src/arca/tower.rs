@@ -119,8 +119,16 @@ pub const WITHDRAW_TAG: &[u8] = b"Arca/watchtower-withdraw";
 /// expiry, by the release's own lock time) and not before.
 pub const DEPOSIT_LEAD: u32 = 3_600;
 
-/// The largest deposit a watchtower takes, in bytes of its JSON body.
+/// The largest deposit a watchtower takes, in bytes of its JSON body: the
+/// largest request it takes, a many-item one included.
 pub const MAX_DEPOSIT_BYTES: usize = 512 * 1024;
+
+/// The most items a many-item call (`deposits`, `withdrawals`) carries.
+pub const TOWER_BATCH_MOST: usize = 64;
+
+/// The most bytes a wallet packs into one many-item call, under
+/// [`MAX_DEPOSIT_BYTES`].
+pub const TOWER_BATCH_BYTES: usize = 384 * 1024;
 
 /// The most deposits one watchtower holds.
 pub const MAX_DEPOSITS: u64 = 100_000;
@@ -475,6 +483,7 @@ impl Wallet {
 				}
 			}
 		}
+		let mut to_send: BTreeMap<String, Vec<(String, Value)>> = BTreeMap::new();
 		if !towers.is_empty() {
 			for row in self.store.coins_in_states(&["live"])? {
 				let sent = self.store.deposit_sent_to(&row.leaf_id)?;
@@ -508,23 +517,34 @@ impl Wallet {
 				};
 				let v: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
 				for t in todo {
-					match ServerClient::new(t).and_then(|c| c.post("deposit", &v)) {
-						Ok(a) => {
-							self.store.put_deposit_sent(&row.leaf_id, t)?;
-							out.push(json!({"leaf_id": row.leaf_id, "watchtower": t, "deposited": a["deposit"]}));
-						},
-						Err(e) => out.push(json!({"leaf_id": row.leaf_id, "watchtower": t, "error": e.to_string()})),
-					}
+					to_send.entry(t.clone()).or_default().push((row.leaf_id.clone(), v.clone()));
 				}
 			}
 		}
-		// Withdrawals: every deposit whose coin is no longer the wallet's.
+		// Every deposit for a watchtower in as few requests as it takes
+		// ([`Self::tower_calls`]).
+		for (t, items) in to_send {
+			let bodies: Vec<Value> = items.iter().map(|(_, v)| v.clone()).collect();
+			for ((leaf, _), a) in items.iter().zip(self.tower_calls(&t, "deposit", &bodies)) {
+				match a {
+					Ok(a) => {
+						self.store.put_deposit_sent(leaf, &t)?;
+						out.push(json!({"leaf_id": leaf, "watchtower": t, "deposited": a["deposit"]}));
+					},
+					Err(e) => out.push(json!({"leaf_id": leaf, "watchtower": t, "error": e.to_string()})),
+				}
+			}
+		}
+		// Withdrawals: every deposit whose coin is no longer the wallet's,
+		// signed first, then sent in as few requests as each watchtower takes.
+		let mut withdrawals: BTreeMap<String, Vec<(String, Value)>> = BTreeMap::new();
+		let mut leaves: Vec<String> = vec![];
 		for (leaf, id) in self.store.deposits()? {
 			let row = self.store.coin(&leaf)?;
 			if row.as_ref().is_some_and(|r| !DONE.contains(&r.state.as_str())) {
 				continue;
 			}
-			let mut left = 0;
+			let mut pending = 0;
 			// A sealed deposit is withdrawn with the key derived for it, a
 			// plain one with the coin's own.
 			let salt = self.store.deposit(&leaf)?.and_then(|(_, b)| serde_json::from_str::<Value>(&b).ok())
@@ -543,24 +563,124 @@ impl Wallet {
 				let did = unhex32(&id)?;
 				let sig = sign(key, &withdraw_digest(&self.genesis, &owner, &did));
 				let body = json!({"deposit": id, "owner": owner.to_string(), "signature": hex(sig.as_ref())});
-				match ServerClient::new(&t).and_then(|c| c.post("withdraw", &body)) {
+				withdrawals.entry(t).or_default().push((leaf.clone(), body));
+				pending += 1;
+			}
+			if pending > 0 {
+				leaves.push(leaf);
+			} else {
+				self.store.delete_deposit(&leaf)?;
+			}
+		}
+		let mut left: BTreeMap<String, usize> = BTreeMap::new();
+		for (t, items) in withdrawals {
+			let bodies: Vec<Value> = items.iter().map(|(_, b)| b.clone()).collect();
+			for ((leaf, body), a) in items.iter().zip(self.tower_calls(&t, "withdraw", &bodies)) {
+				match a {
 					Ok(_) | Err(Error::Server { .. }) => {
-						self.store.delete_deposit_sent(&leaf, &t)?;
-						out.push(json!({"leaf_id": leaf, "watchtower": t, "withdrawn": id}));
+						self.store.delete_deposit_sent(leaf, &t)?;
+						out.push(json!({"leaf_id": leaf, "watchtower": t, "withdrawn": body["deposit"]}));
 					},
 					Err(e) => {
-						left += 1;
+						*left.entry(leaf.clone()).or_default() += 1;
 						out.push(json!({"leaf_id": leaf, "watchtower": t, "error": e.to_string()}));
 					},
 				}
 			}
-			if left == 0 {
+		}
+		for leaf in leaves {
+			if !left.contains_key(&leaf) {
 				self.store.delete_deposit(&leaf)?;
 			}
 		}
 		Ok(out)
 	}
 
+	/// The answers of watchtower `t` to `call` (`deposit` or `withdraw`) of
+	/// each of `bodies`, in order. Asked in as few requests as it takes: the
+	/// many-item call (`deposits`, `withdrawals`: [`TOWER_BATCH_MOST`] items and
+	/// [`TOWER_BATCH_BYTES`] at most a request, an answer an item). A
+	/// watchtower that does not know it (refused `malformed`, no such call) is
+	/// asked one item a request, as before, by this process from then on.
+	/// Each answer is what that one call would have answered: its result,
+	/// or its refusal as [`Error::Server`], or [`Error::Unreachable`] when the
+	/// watchtower could not answer it.
+	pub(crate) fn tower_calls(&self, t: &str, call: &str, bodies: &[Value]) -> Vec<Result<Value, Error>> {
+		tower_calls(&self.towers_one_at_a_time, t, call, bodies)
+	}
+}
+
+/// [`Wallet::tower_calls`], the watchtowers asked one item a request kept
+/// in `one_at_a_time`.
+pub(crate) fn tower_calls(one_at_a_time: &std::cell::RefCell<BTreeSet<String>>, t: &str, call: &str, bodies: &[Value])
+	-> Vec<Result<Value, Error>> {
+	let many = if call == "deposit" { "deposits" } else { "withdrawals" };
+	let mut out: Vec<Result<Value, Error>> = Vec::with_capacity(bodies.len());
+	let client = ServerClient::new(t);
+	let mut i = 0;
+	while i < bodies.len() {
+		let single = bodies.len() - i == 1 || one_at_a_time.borrow().contains(t);
+		if !single {
+			// The next pack: up to the most items, and the bytes a request takes.
+			let mut j = i;
+			let mut bytes = 0usize;
+			while j < bodies.len() && j - i < TOWER_BATCH_MOST {
+				let n = bodies[j].to_string().len() + 1;
+				if j > i && bytes + n > TOWER_BATCH_BYTES {
+					break;
+				}
+				bytes += n;
+				j += 1;
+			}
+			let asked = client.as_ref().map_err(|e| Error::Unreachable(e.to_string()))
+				.and_then(|c| c.post(many, &json!({ many: bodies[i..j].to_vec() })));
+			match asked {
+				Ok(v) if v["answers"].as_array().is_some_and(|a| a.len() == j - i) => {
+					for a in v["answers"].as_array().cloned().unwrap_or_default() {
+						out.push(match (&a["error"], a.get("ok")) {
+							(Value::Null, Some(ok)) => Ok(ok.clone()),
+							(e, _) => {
+								let code = e["code"].as_str().unwrap_or("").to_string();
+								let message = e["message"].as_str().unwrap_or("").to_string();
+								if super::client::REFUSALS.contains(&code.as_str()) {
+									Err(Error::Server { call: call.to_string(), status: 422, code, message })
+								} else {
+									Err(Error::Unreachable(format!("{}: {}", call, message)))
+								}
+							},
+						});
+					}
+					i = j;
+					continue;
+				},
+				// A watchtower without the many-item call: one at a time.
+				Err(Error::Server { code, message, .. }) if code == "malformed" && message.contains("no call") => {
+					one_at_a_time.borrow_mut().insert(t.to_string());
+					continue;
+				},
+				Ok(_) => {
+					for _ in i..j {
+						out.push(Err(Error::Unreachable(format!("{}: the watchtower answered another number of items than it was asked", many))));
+					}
+					i = j;
+					continue;
+				},
+				Err(e) => {
+					for _ in i..j {
+						out.push(Err(Error::Unreachable(e.to_string())));
+					}
+					i = j;
+					continue;
+				},
+			}
+		}
+		out.push(client.as_ref().map_err(|e| Error::Unreachable(e.to_string())).and_then(|c| c.post(call, &bodies[i])));
+		i += 1;
+	}
+	out
+}
+
+impl Wallet {
 	// -----------------------------------------------------------------------
 	// The watchtower's side
 	// -----------------------------------------------------------------------
@@ -926,11 +1046,42 @@ impl Wallet {
 
 	/// A watchtower's answer to `call` (`info`, `deposit`, `withdraw`) with
 	/// `body`, for the program that serves it over HTTP.
+	/// A many-item call (`{"<key>": [item, …]}`, [`TOWER_BATCH_MOST`] items at
+	/// most): `one` of each item, in order, answered `{"answers": [{"ok":
+	/// answer} | {"error": {"code", "message"}}, …]}`, an item's refusal coded
+	/// as the one-item call's would be. Each item is taken or refused on its
+	/// own, exactly as when it comes alone.
+	fn tower_many(&mut self, body: &Value, key: &str, one: fn(&mut Wallet, &Value) -> Result<Value, Error>) -> Result<Value, Error> {
+		let items = body[key].as_array().ok_or_else(|| Error::Refused(format!("malformed: {} names no list", key)))?;
+		if items.len() > TOWER_BATCH_MOST {
+			return Err(Error::Refused(format!("request_too_large: at most {} items a request", TOWER_BATCH_MOST)));
+		}
+		let mut answers = vec![];
+		for item in items {
+			answers.push(match one(self, item) {
+				Ok(v) => json!({"ok": v}),
+				Err(e) => {
+					let code = match &e {
+						Error::Refused(m) | Error::Parse(m) => {
+							let c = m.split(':').next().unwrap_or("").trim();
+							if super::client::REFUSALS.contains(&c) { c.to_string() } else { "malformed".to_string() }
+						},
+						_ => "unavailable".to_string(),
+					};
+					json!({"error": {"code": code, "message": e.to_string()}})
+				},
+			});
+		}
+		Ok(json!({"answers": answers}))
+	}
+
 	pub fn tower_call(&mut self, call: &str, body: &Value) -> Result<Value, Error> {
 		match call {
 			"info" => self.tower_info(),
 			"deposit" => self.tower_deposit(body),
 			"withdraw" => self.tower_withdraw(body),
+			"deposits" => self.tower_many(body, "deposits", Self::tower_deposit),
+			"withdrawals" => self.tower_many(body, "withdrawals", Self::tower_withdraw),
 			_ => Err(Error::Refused(format!("malformed: no call {}", call))),
 		}
 	}
@@ -1000,6 +1151,93 @@ impl Wallet {
 mod tests {
 	use super::*;
 	use elements::hashes::Hash as _;
+
+	/// A watchtower on a local port that counts its requests by call. With
+	/// `many`, it answers the many-item calls, each item `ok` but one whose
+	/// `deposit` is "refused" (`bad_signature`) or "broken" (`unavailable`);
+	/// without, it refuses them as a watchtower that does not know them.
+	fn mock_tower(many: bool) -> (String, std::sync::Arc<std::sync::Mutex<BTreeMap<String, u64>>>) {
+		use std::io::{BufRead, BufReader, Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}", listener.local_addr().unwrap());
+		let counts: std::sync::Arc<std::sync::Mutex<BTreeMap<String, u64>>> = Default::default();
+		let counted = counts.clone();
+		std::thread::spawn(move || {
+			for stream in listener.incoming() {
+				let Ok(mut stream) = stream else { continue };
+				let mut reader = BufReader::new(stream.try_clone().unwrap());
+				let (mut length, mut path) = (0usize, String::new());
+				loop {
+					let mut line = String::new();
+					if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+						break;
+					}
+					if path.is_empty() {
+						path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+					}
+					if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+						length = v.trim().parse().unwrap_or(0);
+					}
+				}
+				let mut body = vec![0u8; length];
+				if reader.read_exact(&mut body).is_err() {
+					continue;
+				}
+				let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+				let call = path.rsplit('/').next().unwrap_or("").to_string();
+				*counted.lock().unwrap().entry(call.clone()).or_default() += 1;
+				let item = |b: &Value| match b["deposit"].as_str() {
+					Some("refused") => json!({"error": {"code": "bad_signature", "message": "bad_signature: not the owner's"}}),
+					Some("broken") => json!({"error": {"code": "unavailable", "message": "the store"}}),
+					d => json!({"ok": {"deposit": d}}),
+				};
+				let (status, out) = match call.as_str() {
+					"deposit" | "withdraw" => match item(&body) {
+						v if v.get("ok").is_some() => (200, v["ok"].clone()),
+						v => (422, v),
+					},
+					"deposits" | "withdrawals" if many => (200, json!({"answers": body[&call].as_array().unwrap().iter().map(item).collect::<Vec<_>>()})),
+					c => (422, json!({"error": {"code": "malformed", "message": format!("malformed: no call {}", c)}})),
+				};
+				let out = out.to_string();
+				let _ = write!(stream, "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					status, out.len(), out);
+			}
+		});
+		(url, counts)
+	}
+
+	/// Many deposits go to a watchtower in as few requests as it takes, each
+	/// answered as its own call would be; a watchtower without the many-item
+	/// call is asked one at a time, and is not offered it again.
+	#[test]
+	fn deposits_go_many_to_a_request_and_one_by_one_to_an_older_watchtower() {
+		let bodies: Vec<Value> = (0..70).map(|i| json!({"deposit": match i { 3 => "refused".to_string(), 5 => "broken".to_string(), _ => format!("d{}", i) }}))
+			.collect();
+		let none = std::cell::RefCell::new(BTreeSet::new());
+		let (url, counts) = mock_tower(true);
+		let a = tower_calls(&none, &url, "deposit", &bodies);
+		assert_eq!(a.len(), 70);
+		assert_eq!(a[0].as_ref().unwrap()["deposit"], "d0");
+		assert_eq!(a[69].as_ref().unwrap()["deposit"], "d69");
+		assert!(matches!(&a[3], Err(Error::Server { code, .. }) if code == "bad_signature"), "a refusal stays a refusal: {:?}", a[3]);
+		assert!(matches!(&a[5], Err(Error::Unreachable(_))), "a watchtower that could not answer an item: {:?}", a[5]);
+		assert_eq!(counts.lock().unwrap().clone(), BTreeMap::from([("deposits".to_string(), 2)]), "64 and 6, in two requests");
+		let w = tower_calls(&none, &url, "withdraw", &bodies[..10]);
+		assert_eq!(w.iter().filter(|x| x.is_ok()).count(), 8);
+		assert_eq!(counts.lock().unwrap().get("withdrawals").copied(), Some(1));
+
+		let (old, counts) = mock_tower(false);
+		let a = tower_calls(&none, &old, "deposit", &bodies[..10]);
+		assert_eq!(a.len(), 10);
+		assert_eq!(a[9].as_ref().unwrap()["deposit"], "d9");
+		assert!(matches!(&a[3], Err(Error::Server { code, .. }) if code == "bad_signature"));
+		assert_eq!(counts.lock().unwrap().clone(), BTreeMap::from([("deposit".to_string(), 10), ("deposits".to_string(), 1)]));
+		assert!(none.borrow().contains(&old) && !none.borrow().contains(&url));
+		let _ = tower_calls(&none, &old, "deposit", &bodies[..10]);
+		assert_eq!(counts.lock().unwrap().get("deposits").copied(), Some(1), "not offered the many-item call again");
+		assert_eq!(counts.lock().unwrap().get("deposit").copied(), Some(20));
+	}
 
 	fn chain(b: u8) -> Chain {
 		Chain::new(elements::BlockHash::from_byte_array([b; 32]))

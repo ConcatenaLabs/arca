@@ -1522,6 +1522,15 @@ impl Wallet {
 	/// catch-up can find nothing, and reads every coin ever served to the
 	/// mailbox key to find it. Every other step runs as in [`Self::sync`].
 	pub fn sync_catching_up(&mut self, catch_up: bool) -> Result<Value, Error> {
+		self.sync_parts(catch_up, true)
+	}
+
+	/// [`Self::sync_catching_up`]; with `deposits` false, without the
+	/// watchtowers' step ([`Self::progress_deposits`]), which the program runs
+	/// on its own as the command `deposits` after it: a program that answers
+	/// others from the wallet (a maker's firm offer) then finds the library
+	/// free between the two. The deposits answer nothing anyone waits on.
+	pub fn sync_parts(&mut self, catch_up: bool, deposits: bool) -> Result<Value, Error> {
 		// The schedule's relative times count from this sync.
 		let start = self.now()?.to_consensus_u32();
 		self.store.set_meta(super::wallet::LAST_SYNC, &start.to_string())?;
@@ -1532,7 +1541,7 @@ impl Wallet {
 		let (mut early_home, mut early_exits) = self.exit_steps();
 		*self.exit_watch.borrow_mut() = Some(start);
 		*self.exits_done.borrow_mut() = (vec![], vec![]);
-		let out = self.sync_asking(recheck, catch_up);
+		let out = self.sync_asking(recheck, catch_up, deposits);
 		*self.exit_watch.borrow_mut() = None;
 		let (h, e) = std::mem::take(&mut *self.exits_done.borrow_mut());
 		early_home.extend(h);
@@ -1557,7 +1566,7 @@ impl Wallet {
 
 	/// The part of [`Self::sync`] that asks the operator, with every exit step
 	/// whose date comes meanwhile taken at once ([`Self::exits_meanwhile`]).
-	fn sync_asking(&mut self, recheck: Value, catch_up: bool) -> Result<Value, Error> {
+	fn sync_asking(&mut self, recheck: Value, catch_up: bool, with_deposits: bool) -> Result<Value, Error> {
 		// What each step cost (milliseconds, and requests of the node and of
 		// the operator): `cost_by_step`, for a program that logs a slow sync.
 		let mut steps = Steps::start(self);
@@ -1677,7 +1686,9 @@ impl Wallet {
 		// every deposit of a coin no longer the wallet's withdrawn: none of
 		// it needs the operator.
 		self.exits_meanwhile();
-		let deposits = self.progress_deposits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		let deposits = if with_deposits {
+			self.progress_deposits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
+		} else { json!({"note": "left to the command deposits"}) };
 		steps.lap(self, "deposits");
 		// D57: a coin the wallet cannot have refreshed goes home before its
 		// date, whatever the reason: every coin whose refresh has not

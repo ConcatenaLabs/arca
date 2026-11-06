@@ -2245,6 +2245,20 @@ impl Wallet {
 		for state in FOLLOWED {
 			followed.extend(self.store.forfeits_in(state)?);
 		}
+		// Where each followed forfeit's output is, one scan of the node's set
+		// of unspent outputs for them all: each forfeit's own reading below
+		// is answered from it in this view ([`super::chain::ChainSource::coins_at`]).
+		let mut scripts = vec![];
+		for f in &followed {
+			if let Some(row) = self.store.coin(&f.leaf_id)? {
+				if let Ok(forfeit) = self.forfeit_of(&row, f) {
+					scripts.push(forfeit.output().txout().script_pubkey);
+				}
+			}
+		}
+		if scripts.len() > 1 {
+			self.chain.coins_at(&scripts)?;
+		}
 		for f in followed {
 			match self.watch_forfeit(&f) {
 				Ok(Some(v)) => out.push(v),
