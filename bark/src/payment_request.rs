@@ -541,6 +541,16 @@ impl Wallet {
 			options.push(details);
 		}
 
+		// An LNURL in `lightning=` is not an invoice: it is paid as LNURL-pay,
+		// in an amount the payer chooses.
+		for extension in uri.lnurl() {
+			let details = LnUrl::from_str(extension.inner().encoded()).ok()
+				.and_then(|lnurl| Self::details_for_lnurl(&lnurl));
+			if let Some(details) = details {
+				options.push(details);
+			}
+		}
+
 		for extension in uri.lno() {
 			let details = Self::details_for_offer(extension.inner(), network, amount);
 			options.push(details);
@@ -876,6 +886,28 @@ mod test {
 
 		assert!(request(vec![ark_option(err.clone()), onchain_option(err)]).default_option().is_none());
 		assert!(request(vec![]).default_option().is_none());
+	}
+
+	/// A receive code whose `lightning=` is an LNURL-pay (a payment name the
+	/// payer pays in an amount it picks) keeps its `ark=` and its address,
+	/// and its LNURL is offered as LNURL-pay, never as an invoice.
+	#[test]
+	fn lnurl_in_lightning_param() {
+		let ark = ArkAddressType::Bark(dummy_ark_address(true));
+		let lnurl = "LNURL1DP68GURN8GHJ7UM9W96K2MN5D9SHGETNW3HX2APWVDHK6TEWWAJKCMPDDDHX7AMW9AKXUATJD3CZ7CTVD93K2Y93MNY";
+		let input = format!(
+			"bitcoin:?tb=tb1qghfhmd4zh7ncpmxl3qzhmq566jk8ckq4gafnmg&lightning={}&ark={}", lnurl, ark,
+		);
+		let uri = BarkBip321Uri::from_str(&input).unwrap();
+		assert_eq!(uri.tb().len(), 1);
+		assert_eq!(uri.extensions().ark()[0].inner(), &ark);
+		assert!(uri.lightning().is_empty());
+		assert_eq!(uri.lnurl()[0].inner().url(), "https://sequentiatestnet.com/.well-known/lnurlp/alice");
+
+		let parsed = LnUrl::from_str(uri.lnurl()[0].inner().encoded()).unwrap();
+		let option = Wallet::details_for_lnurl(&parsed).unwrap();
+		assert!(matches!(option.method, PaymentMethod::Lnurl(_)));
+		assert!(option.errors.is_empty());
 	}
 
 	/// The upper-cased URI must parse back to an equal URI, which only holds
