@@ -2,7 +2,8 @@
 //!
 //! The wallet in the data directory is the watchtower's: its on-chain coins
 //! pay the fees no reserve covers. It answers `GET /v1/info`, `POST
-//! /v1/deposit` and `POST /v1/withdraw` (the last segment after `/v1/`
+//! /v1/deposit` and `POST /v1/withdraw`, and the same many to a request as
+//! `POST /v1/deposits` and `POST /v1/withdrawals` (the last segment after `/v1/`
 //! names the call, so it serves under any path prefix a proxy adds), one
 //! request a connection, and passes over its deposits every `interval`
 //! seconds ([`bark::arca::Wallet::tower_pass`]). Requests wait while a pass

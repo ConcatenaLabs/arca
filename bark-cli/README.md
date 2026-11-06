@@ -1457,7 +1457,11 @@ Any wallet can be a watchtower for other wallets' coins:
 `arca --datadir DIR watchtower serve --listen ADDR`, run on a wallet created
 against the operator (it checks every deposit as a receiver checks a coin,
 against that operator's key), takes deposits over HTTP (`POST /v1/deposit`,
-`POST /v1/withdraw`, `GET /v1/info`; the segment after `/v1/` names the
+`POST /v1/withdraw`, `GET /v1/info`, and `POST /v1/deposits` and `POST
+/v1/withdrawals`, which carry up to 64 of them, `{"deposits": […]}`, and answer
+each, `{"answers": [{"ok": …} | {"error": {"code", "message"}}]}`, as its own call
+would; a wallet sends its deposits and withdrawals for a watchtower that way,
+and one at a time to a watchtower that does not know the call; the segment after `/v1/` names the
 call, so it serves behind any path a proxy gives it; every answer allows any
 origin, so a wallet in a browser deposits with it from any page) and passes over them
 every `--interval` seconds. It leaves a coin alone until a batch it rests on

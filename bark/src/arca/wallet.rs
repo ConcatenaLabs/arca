@@ -2,7 +2,7 @@
 //! holds against the chain, the re-check after a rollback, its on-chain coins
 //! and the board.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -195,6 +195,9 @@ pub struct Wallet {
 	/// participation and round, read from its news once: its leaves in a
 	/// round never change ([`Wallet::new_leaves_expired`]).
 	pub(crate) expiry_cache: std::cell::RefCell<std::collections::HashMap<(String, String), u32>>,
+	/// The watchtowers that do not know the many-item calls: asked one item
+	/// a request by this process ([`Wallet::tower_calls`]).
+	pub(crate) towers_one_at_a_time: std::cell::RefCell<BTreeSet<String>>,
 	/// The tip the last complete re-check ran at ([`Wallet::recheck`]): a
 	/// command that starts on the same tip needs none ([`Wallet::tip_rechecked`]).
 	pub(crate) rechecked_at: std::cell::RefCell<Option<String>>,
@@ -835,7 +838,7 @@ impl Wallet {
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
-			unlock_cache: Default::default(), expiry_cache: Default::default() })
+			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
 	}
 
 	/// Whether the wallet asks for `vtxo-2` leaves for itself: in a refresh,
@@ -2993,13 +2996,10 @@ impl Wallet {
 		}
 		all.sort();
 		all.dedup();
-		self.chain.read_ahead_of(&[], &all);
+		let unspent: HashMap<OutPoint, bool> = all.iter().copied().zip(self.chain.unspent_many(&all)?).collect();
 		for (id, roots) in by_coin {
-			for r in roots {
-				if !self.chain.unspent(&r)? {
-					moved.insert(id);
-					break;
-				}
+			if roots.iter().any(|r| !unspent.get(r).copied().unwrap_or(false)) {
+				moved.insert(id);
 			}
 		}
 		Ok(moved)
@@ -3673,6 +3673,7 @@ impl Wallet {
 	/// handed that index out or the chain shows it used, as after a restore;
 	/// an index found in use is never handed out again.
 	pub(crate) fn onchain_coins(&self) -> Result<Vec<(OutPoint, TxOut, Keypair, u64)>, Error> {
+		self.scan_onchain_windows()?;
 		let mut out = vec![];
 		for chain in [RECEIVE, CHANGE] {
 			let mut from = 0u32;
@@ -3685,15 +3686,14 @@ impl Wallet {
 				let scripts: Vec<Script> = window.iter().map(|(_, s, _)| s.clone()).collect();
 				let mut last_used = None;
 				let found = self.chain.coins_at(&scripts)?;
-				// Whether each is spent in the mempool, read ahead in a few
-				// requests rather than one a coin.
-				if found.len() > 1 {
-					self.chain.read_ahead_of(&[], &found.iter().map(|(op, _, _)| *op).collect::<Vec<_>>());
-				}
-				for (op, o, h) in found {
-					let Some((i, _, k)) = window.iter().find(|(_, s, _)| *s == o.script_pubkey) else { continue };
-					last_used = last_used.max(Some(*i));
-					if self.chain.unspent(&op)? {
+				// Whether each is spent in the mempool, read a batch at a time
+				// rather than one a coin.
+				let unspent = self.chain.unspent_many(&found.iter().map(|(op, _, _)| *op).collect::<Vec<_>>())?;
+				let at: HashMap<&Script, (u32, &Keypair)> = window.iter().map(|(i, s, k)| (s, (*i, k))).collect();
+				for ((op, o, h), unspent) in found.into_iter().zip(unspent) {
+					let Some((i, k)) = at.get(&o.script_pubkey).copied() else { continue };
+					last_used = last_used.max(Some(i));
+					if unspent {
 						out.push((op, o, *k, h));
 					}
 				}
@@ -3705,6 +3705,25 @@ impl Wallet {
 			}
 		}
 		Ok(out)
+	}
+
+	/// Every script of the wallet's on-chain windows (receive, change and
+	/// order keys, each to a gap of [`GAP`] past its last index in use),
+	/// scanned for in one scan of the node's set of unspent outputs: the
+	/// readings of each window that follow are answered from it, in this
+	/// view ([`ChainSource::coins_at`]). A window found used near its end
+	/// is scanned on past it, as before.
+	fn scan_onchain_windows(&self) -> Result<(), Error> {
+		let mut scripts = vec![];
+		for chain in [RECEIVE, CHANGE] {
+			for i in 0..self.store.indices(chain)? + GAP {
+				scripts.push(self.keys.onchain_script(chain, i)?);
+			}
+		}
+		for i in 0..self.store.indices(ORDERS)? + GAP {
+			scripts.push(self.keys.order_script(i)?);
+		}
+		self.chain.coins_at(&scripts).map(|_| ())
 	}
 
 	/// The coins among `coins` (on-chain, single-owner) that a freeze binds
@@ -3740,6 +3759,7 @@ impl Wallet {
 	/// spend, and its height. The programs looked at run to a gap of [`GAP`]
 	/// past the last order key in use, as after a restore.
 	pub(crate) fn order_coins(&self) -> Result<Vec<(OutPoint, TxOut, Keypair, u64)>, Error> {
+		self.scan_onchain_windows()?;
 		let mut out = vec![];
 		let mut from = 0u32;
 		let mut end = self.store.indices(ORDERS)? + GAP;
@@ -3748,16 +3768,15 @@ impl Wallet {
 			let scripts: Vec<Script> = window.iter().map(|(_, s)| s.clone()).collect();
 			let mut last_used = None;
 			let found = self.chain.coins_at(&scripts)?;
-			// Whether each is spent in the mempool, read ahead in a few
-			// requests rather than one a coin.
-			if found.len() > 1 {
-				self.chain.read_ahead_of(&[], &found.iter().map(|(op, _, _)| *op).collect::<Vec<_>>());
-			}
-			for (op, o, h) in found {
-				let Some((i, _)) = window.iter().find(|(_, s)| *s == o.script_pubkey) else { continue };
-				last_used = last_used.max(Some(*i));
-				if self.chain.unspent(&op)? {
-					out.push((op, o, self.keys.order_spend_key(*i)?, h));
+			// Whether each is spent in the mempool, read a batch at a time
+			// rather than one a coin.
+			let unspent = self.chain.unspent_many(&found.iter().map(|(op, _, _)| *op).collect::<Vec<_>>())?;
+			let at: HashMap<&Script, u32> = window.iter().map(|(i, s)| (s, *i)).collect();
+			for ((op, o, h), unspent) in found.into_iter().zip(unspent) {
+				let Some(i) = at.get(&o.script_pubkey).copied() else { continue };
+				last_used = last_used.max(Some(i));
+				if unspent {
+					out.push((op, o, self.keys.order_spend_key(i)?, h));
 				}
 			}
 			from = end;

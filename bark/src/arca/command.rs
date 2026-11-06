@@ -195,7 +195,7 @@ fn reads_only(command: &str) -> bool {
 fn start(w: &mut Wallet, command: &str, coins_only: bool) -> Value {
 	// `hand_over_forfeits` witnesses itself, as it signs.
 	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "speed_up" | "schedule"
-		| "hand_over_forfeits"
+		| "hand_over_forfeits" | "deposits"
 		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards");
 	// A command that reads only, of the operator or an offer, skips the
 	// witness: it guards the coins the wallet takes and the spends it signs
@@ -210,7 +210,7 @@ fn start(w: &mut Wallet, command: &str, coins_only: bool) -> Value {
 				no coin and signs no spend through the operator until a witness succeeds", e)}}),
 		};
 	}
-	if !matches!(command, "recheck" | "sync" | "schedule" | "hand_over_forfeits") {
+	if !matches!(command, "recheck" | "sync" | "schedule" | "hand_over_forfeits" | "deposits") {
 		// Every coin's bases once a tip; the lineage watch, which a spend in
 		// the mempool calls for, before every command.
 		if let Ok(Some(tip)) = w.tip_rechecked() {
@@ -320,7 +320,10 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		},
 		// `"catch_up": false` from a program that is the only store of its
 		// mnemonic ([`super::Wallet::sync_catching_up`]).
-		"sync" => w.sync_catching_up(a["catch_up"].as_bool() != Some(false)),
+		// `"deposits": false` leaves the watchtowers' step to the command
+		// `deposits` ([`super::Wallet::sync_parts`]).
+		"sync" => w.sync_parts(a["catch_up"].as_bool() != Some(false), a["deposits"].as_bool() != Some(false)),
+		"deposits" => w.progress_deposits().map(Value::Array),
 		"hand_over_forfeits" => w.hand_over_forfeits(),
 		"schedule" => w.sync_schedule(),
 		"recheck" => w.recheck(),

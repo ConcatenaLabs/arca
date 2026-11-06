@@ -294,6 +294,16 @@ struct Memo {
 	/// (by height, in [`ChainSource::finality`]), so a reorganisation of any
 	/// depth is seen as before; only the header's re-read is spared.
 	certified: std::collections::HashSet<BlockHash>,
+	/// What each script scanned for in this view's set of unspent outputs
+	/// pays there (outpoint and height), whether found or not. A scan reads
+	/// the set at the tip, so its answer for a script stands until the tip
+	/// or the anchor status moves, when it is dropped with every answer of
+	/// the view: a later scan for scripts all scanned before is answered
+	/// from here, and one for some new ones scans only those.
+	scanned: HashMap<Script, Vec<(OutPoint, u64)>>,
+	/// Counts each drop of the view's answers: what tells a scan answered in
+	/// one view from one answered in the next.
+	view_drops: u64,
 }
 
 /// The reads a look at the view makes.
@@ -592,6 +602,8 @@ impl ChainSource {
 			Some(k) if k.tip == key.tip && k.anchors == key.anchors => if k.mempool != key.mempool { m.pool.clear(); m.gone.clear() },
 			_ => {
 				m.view.clear();
+				m.scanned.clear();
+				m.view_drops += 1;
 				m.pool.clear();
 				m.gone.clear();
 			},
@@ -1201,19 +1213,91 @@ impl ChainSource {
 
 	/// The unspent outputs of the active chain paying any of `scripts`, each
 	/// with its height, read from the node's UTXO set.
+	///
+	/// Scripts scanned for before in this view are answered from what that
+	/// scan found ([`Memo::scanned`]); only the others are scanned for.
 	pub fn coins_at(&self, scripts: &[Script]) -> Result<Vec<(OutPoint, TxOut, u64)>, Error> {
 		if scripts.is_empty() {
 			return Ok(vec![]);
 		}
-		let descs: Vec<Value> = scripts.iter().map(|s| json!(format!("raw({})", hex(s.as_bytes())))).collect();
-		let v: Value = self.call("scantxoutset", &[json!("start"), Value::Array(descs)]).map_err(node)?;
+		let found = loop {
+			// The view as it stands now: a look that is due is made first, and
+			// drops what an earlier view scanned.
+			let (drops, missing) = {
+				let mut m = self.memo.lock().expect("the chain memo");
+				self.look(&mut m).map_err(node)?;
+				let mut missing: Vec<Script> = scripts.iter().filter(|s| !m.scanned.contains_key(*s)).cloned().collect();
+				missing.sort();
+				missing.dedup();
+				(m.view_drops, missing)
+			};
+			if !missing.is_empty() {
+				let descs: Vec<Value> = missing.iter().map(|s| json!(format!("raw({})", hex(s.as_bytes())))).collect();
+				let v: Value = self.call("scantxoutset", &[json!("start"), Value::Array(descs)]).map_err(node)?;
+				let mut by: HashMap<Script, Vec<(OutPoint, u64)>> = missing.iter().map(|s| (s.clone(), vec![])).collect();
+				for u in v["unspents"].as_array().cloned().unwrap_or_default() {
+					let txid = Txid::from_str(u["txid"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?;
+					let vout = u["vout"].as_u64().unwrap_or(0) as u32;
+					let script = Script::from(unhex(u["scriptPubKey"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?);
+					if let Some(e) = by.get_mut(&script) {
+						e.push((OutPoint::new(txid, vout), u["height"].as_u64().unwrap_or(0)));
+					}
+				}
+				let mut m = self.memo.lock().expect("the chain memo");
+				// The view moved while the scan ran: what it found may be of
+				// the next view, the rest of the last. Read again.
+				if m.view_drops != drops {
+					continue;
+				}
+				m.scanned.extend(by);
+			}
+			let m = self.memo.lock().expect("the chain memo");
+			if m.view_drops != drops {
+				continue;
+			}
+			let mut seen = std::collections::HashSet::new();
+			let mut found = vec![];
+			for s in scripts {
+				if seen.insert(s) {
+					found.extend(m.scanned.get(s).cloned().unwrap_or_default());
+				}
+			}
+			break found;
+		};
+		// The transactions that pay them, read ahead: a wallet's on-chain
+		// coins can number thousands, and each transaction is kept by its id.
+		let mut txids: Vec<Txid> = found.iter().map(|(op, _)| op.txid).collect();
+		txids.sort();
+		txids.dedup();
+		if txids.len() > 1 {
+			self.read_ahead(txids.iter().map(|t| ("getrawtransaction".to_string(), vec![json!(t.to_string())])).collect());
+		}
 		let mut out = vec![];
-		for u in v["unspents"].as_array().cloned().unwrap_or_default() {
-			let txid = Txid::from_str(u["txid"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?;
-			let vout = u["vout"].as_u64().unwrap_or(0) as u32;
-			let Some(tx) = self.transaction(&txid)? else { continue };
-			let Some(o) = tx.output.get(vout as usize) else { continue };
-			out.push((OutPoint::new(txid, vout), o.clone(), u["height"].as_u64().unwrap_or(0)));
+		for (op, height) in found {
+			let Some(tx) = self.transaction(&op.txid)? else { continue };
+			let Some(o) = tx.output.get(op.vout as usize) else { continue };
+			out.push((op, o.clone(), height));
+		}
+		Ok(out)
+	}
+
+	/// Whether each of `outpoints` is unspent ([`Self::unspent`]), read a
+	/// batch at a time where the node takes one, each batch's answers used
+	/// at once: read ahead all together, a few thousand of them take longer
+	/// than a view stands, and the next look on a busy chain drops the
+	/// answers that depend on the mempool before they are used.
+	pub fn unspent_many(&self, outpoints: &[OutPoint]) -> Result<Vec<bool>, Error> {
+		let mut out = Vec::with_capacity(outpoints.len());
+		for chunk in outpoints.chunks(BATCH_MOST - LOOK.len()) {
+			if chunk.len() > 1 {
+				// A look of its own, carried in the same request as the chunk:
+				// the view then stands while the chunk's answers are used.
+				self.memo.lock().expect("the chain memo").looked = None;
+				self.read_ahead(chunk.iter().map(|o| ("gettxout".to_string(), vec![json!(o.txid.to_string()), json!(o.vout), json!(true)])).collect());
+			}
+			for o in chunk {
+				out.push(self.unspent(o)?);
+			}
 		}
 		Ok(out)
 	}
@@ -1744,6 +1828,55 @@ mod test {
 		assert_eq!(scans.load(Ordering::SeqCst), 4);
 	}
 
+	/// Scripts scanned for once in a view are answered from that scan: a
+	/// later scan for a subset asks the node nothing, and one with new
+	/// scripts asks only for those; a new tip drops them all
+	/// ([`Memo::scanned`]).
+	#[test]
+	fn a_script_is_scanned_for_once_a_view() {
+		let (url, scans) = busy_node(0);
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let (a, b, c) = (Script::from(vec![0x51]), Script::from(vec![0x52]), Script::from(vec![0x53]));
+		chain.coins_at(&[a.clone(), b.clone()]).unwrap();
+		assert_eq!(scans.load(Ordering::SeqCst), 1);
+		for _ in 0..3 {
+			chain.new_command();
+			chain.coins_at(std::slice::from_ref(&a)).unwrap();
+			chain.coins_at(&[b.clone(), a.clone()]).unwrap();
+		}
+		assert_eq!(scans.load(Ordering::SeqCst), 1, "every script already scanned for in this view");
+		chain.coins_at(&[b.clone(), c.clone()]).unwrap();
+		assert_eq!(scans.load(Ordering::SeqCst), 2, "the new script only");
+		chain.coins_at(&[a, b, c]).unwrap();
+		assert_eq!(scans.load(Ordering::SeqCst), 2);
+		// A new view (here: the memo dropped as a new tip drops it).
+		{
+			let mut m = chain.memo.lock().unwrap();
+			m.scanned.clear();
+			m.view_drops += 1;
+		}
+		chain.coins_at(&[Script::from(vec![0x51])]).unwrap();
+		assert_eq!(scans.load(Ordering::SeqCst), 3);
+	}
+
+	/// What a scan found is not kept past the view it was read in: at a new
+	/// tip (a block, or a reorganisation of any depth) the same scripts are
+	/// scanned for again.
+	#[test]
+	fn a_new_tip_scans_again() {
+		let _serial = serial();
+		let (url, counts) = moving_tip();
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let asked = |m: &str| counts.lock().unwrap().get(m).copied().unwrap_or(0);
+		let a = Script::from(vec![0x51]);
+		for n in 1..=3 {
+			chain.new_command();
+			chain.coins_at(std::slice::from_ref(&a)).unwrap();
+			chain.coins_at(std::slice::from_ref(&a)).unwrap();
+			assert_eq!(asked("scantxoutset"), n, "once in each view, each at a new tip");
+		}
+	}
+
 	/// A transaction spending `from` (an output at a bare `OP_TRUE` of
 	/// `asset` holding `value`) into one output at `script`, less a fee.
 	fn spend_to(from: OutPoint, asset: AssetId, value: u64, script: Script) -> Transaction {
@@ -1853,6 +1986,11 @@ mod test {
 	/// A node whose mempool changes at every look and whose tip does not; it
 	/// counts the calls of each method it was asked.
 	fn busy_mempool() -> (String, Arc<Mutex<HashMap<String, u64>>>) {
+		busy_mempool_slow(0)
+	}
+
+	/// [`busy_mempool`], answering each request after `ms` milliseconds.
+	fn busy_mempool_slow(ms: u64) -> (String, Arc<Mutex<HashMap<String, u64>>>) {
 		use std::io::{BufRead, BufReader, Read, Write};
 		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 		let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -1878,6 +2016,7 @@ mod test {
 					continue;
 				}
 				let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+				std::thread::sleep(std::time::Duration::from_millis(ms));
 				let mut answer = |call: &Value| -> Value {
 					let (id, method) = (call["id"].clone(), call["method"].as_str().unwrap_or("").to_string());
 					*counted.lock().unwrap().entry(method.clone()).or_default() += 1;
@@ -1964,6 +2103,7 @@ mod test {
 						"getrawmempool" => json!([]),
 						"getblockheader" if !verbose => json!(HEADER_HEX),
 						"getblockheader" => json!({"confirmations": 1, "height": 1, "poscertified": call["params"][0] == json!(CERTIFIED)}),
+						"scantxoutset" => json!({"success": true, "unspents": []}),
 						_ => return json!({"id": id, "result": null, "error": {"code": -32601, "message": "Method not found"}}),
 					};
 					json!({"id": id, "result": result, "error": null})
@@ -2008,6 +2148,33 @@ mod test {
 		let after = chain.asked_by_method();
 		let alone = after.get("getblockheader").copied().unwrap_or(0) - before.get("getblockheader").copied().unwrap_or(0);
 		assert!(alone >= 1 && alone <= 2 + 1 + 3, "{} of the headers asked alone", alone);
+	}
+
+	/// Hundreds of outputs looked up unspent, on a slow node whose mempool
+	/// changes at every look: read ahead all at once, most answers are
+	/// dropped by the next look (a second later) before they are used, and
+	/// each is asked again alone; read a batch at a time and used at once
+	/// ([`ChainSource::unspent_many`]), none is.
+	#[test]
+	fn many_outputs_are_read_unspent_a_batch_at_a_time() {
+		let _serial = serial();
+		let ops: Vec<OutPoint> = (0..600u32).map(|i| OutPoint::new(Txid::from_str(&format!("{:064x}", i + 1)).unwrap(), i % 3)).collect();
+		let alone = |c: &ChainSource| c.asked_by_method().get("gettxout").copied().unwrap_or(0);
+		// As before: one read ahead, then each looked up.
+		let (url, _) = busy_mempool_slow(40);
+		let before = ChainSource::new(&url, Some("u"), Some("p"), None);
+		before.new_command();
+		before.read_ahead_of(&[], &ops);
+		for o in &ops {
+			assert!(before.unspent(o).unwrap());
+		}
+		assert!(alone(&before) > 300, "the read ahead lost to the next look: {} asked alone", alone(&before));
+		let (url, counts) = busy_mempool_slow(40);
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		chain.new_command();
+		assert!(chain.unspent_many(&ops).unwrap().iter().all(|u| *u));
+		assert_eq!(alone(&chain), 0, "every answer used in the view it was read in");
+		assert_eq!(counts.lock().unwrap().get("gettxout").copied(), Some(600), "each asked once");
 	}
 
 	/// What a receiver asks of the chain for a coin's lineage, on a regtest
