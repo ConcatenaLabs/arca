@@ -3723,7 +3723,10 @@ impl Wallet {
 		for i in 0..self.store.indices(ORDERS)? + GAP {
 			scripts.push(self.keys.order_script(i)?);
 		}
-		self.chain.coins_at(&scripts).map(|_| ())
+		// Only a hint: a scan refused or failed leaves each window to be
+		// scanned on its own, as without it.
+		let _ = self.chain.coins_at(&scripts);
+		Ok(())
 	}
 
 	/// The coins among `coins` (on-chain, single-owner) that a freeze binds

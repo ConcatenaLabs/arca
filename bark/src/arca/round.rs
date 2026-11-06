@@ -2256,8 +2256,10 @@ impl Wallet {
 				}
 			}
 		}
+		// Only a hint: a scan refused or failed leaves each forfeit to read
+		// its own output below, as it does without the hint.
 		if scripts.len() > 1 {
-			self.chain.coins_at(&scripts)?;
+			let _ = self.chain.coins_at(&scripts);
 		}
 		for f in followed {
 			match self.watch_forfeit(&f) {
