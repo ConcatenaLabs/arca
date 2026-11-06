@@ -149,9 +149,13 @@ operator's signer's record (unless the command stays on the machine and the
 node) and the re-check of every coin against the chain (unless the command is
 `recheck`, `sync`, `hand_over_forfeits` or `schedule`), as `arca` runs them on every start, and what
 each cost (`cost.start` and `cost.command`, each `{ms, node, operator}`: the
-milliseconds and the requests made of the node and of the operator; the
-re-check's own parts are under `start.recheck.ms`, and a `sync` answers what
-each of its steps cost under `cost_by_step`).
+milliseconds and the requests made of the node and of the operator; a part that
+asked the node more than fifty reads one at a time adds `alone`, those reads by
+method; `cost.operator_ms` is the milliseconds the command waited for the
+operator's answers; the re-check's own parts are under `start.recheck.ms`, and
+a `sync` answers what each of its steps cost under `cost_by_step`, with `alone`
+the same way, and for a step over a second `operator_ms` and `operator_calls`,
+`[count, ms]` by call).
 
 A program that holds many coins asks for what it needs. `coins` with `"held":
 true` lists only the coins the wallet holds, leaving out those it spent, exited

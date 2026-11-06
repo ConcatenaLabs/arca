@@ -1698,6 +1698,10 @@ impl Wallet {
 		// Each offboard, found in the round where the status says, paying its
 		// destination exactly under the participation's unlock hash.
 		let mut offboards: Vec<(OffboardPolicy, u32)> = vec![];
+		// Each batch's published tree, read, witnessed and rebuilt once for
+		// every new leaf it holds: a refresh of many coins has all its new
+		// leaves in one batch, and the tree is the whole batch's.
+		let mut batches: std::collections::HashMap<String, Batch> = std::collections::HashMap::new();
 		for (j, (o, w)) in outputs.iter().zip(&wanted).enumerate() {
 			if let Some(ow) = w.get("offboard") {
 				let policy = self.offboard_shown(j, o, ow, &unlock_hash, &round)?;
@@ -1709,12 +1713,16 @@ impl Wallet {
 					o["kind"], o["value"], o["asset"], w["value"], w["asset"])));
 			}
 			let nonce = unhex32(w["nonce"].as_str().unwrap_or(""))?;
-			let tree = self.server.post("tree", &json!({"txid": round_txid.to_string(), "vout": o["batch_vout"]}))?;
-			if tree["round_txid"].as_str() != Some(&round_txid.to_string()) {
-				return Err(Error::Refused("the server published the tree of another round".into()));
+			let vout = o["batch_vout"].to_string();
+			if !batches.contains_key(&vout) {
+				let tree = self.server.post("tree", &json!({"txid": round_txid.to_string(), "vout": o["batch_vout"]}))?;
+				if tree["round_txid"].as_str() != Some(&round_txid.to_string()) {
+					return Err(Error::Refused("the server published the tree of another round".into()));
+				}
+				self.witness_record(&tree["signer_record"], false)?;
+				batches.insert(vout.clone(), rebuild_batch(&tree)?);
 			}
-			self.witness_record(&tree["signer_record"], false)?;
-			let batch = rebuild_batch(&tree)?;
+			let batch = &batches[&vout];
 			let index = o["leaf_index"].as_u64().ok_or_else(|| Error::Parse("no leaf_index".into()))? as usize;
 			if index >= batch.len() {
 				return Err(Error::Refused("the server names a leaf the published batch does not have".into()));
@@ -2121,6 +2129,9 @@ impl Wallet {
 			}
 		}
 		let mut kept = vec![];
+		// The fee assets the wallet holds on the chain, read once for every
+		// new leaf's exit fee: they are the same for each.
+		let mut fee_view = None;
 		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
 			let record = NewRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?).map_err(Error::Store)?;
 			let nonce = unhex32(n["nonce"].as_str().unwrap_or(""))?;
@@ -2162,7 +2173,7 @@ impl Wallet {
 			}
 			let mut k = json!({"leaf_id": row.leaf_id, "asset": record.asset().to_string(), "value": record.value().to_string(),
 				"expiry": first});
-			if let Some(f) = self.exit_fee(&row, &mut None)? {
+			if let Some(f) = self.exit_fee(&row, &mut fee_view)? {
 				k["exit_fee"] = f;
 			}
 			kept.push(k);

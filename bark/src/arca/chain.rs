@@ -194,6 +194,40 @@ pub fn gaps() -> u64 {
 	GAPS.load(Ordering::SeqCst)
 }
 
+/// The requests made of the operator since the program started, by call:
+/// how many, and the milliseconds spent waiting for their answers. What tells
+/// a slow step's wait for the operator from its own work.
+static OPERATOR_CALLS: Mutex<BTreeMap<String, (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// A request to the operator's `call` took `took`.
+pub fn operator_call(call: &str, took: std::time::Duration) {
+	let mut m = OPERATOR_CALLS.lock().expect("the operator's calls");
+	let e = m.entry(call.to_string()).or_default();
+	e.0 += 1;
+	e.1 += took.as_millis() as u64;
+}
+
+/// [`operator_call`]'s counts so far.
+pub fn operator_calls() -> BTreeMap<String, (u64, u64)> {
+	OPERATOR_CALLS.lock().expect("the operator's calls").clone()
+}
+
+/// The requests to the operator between `before` and `after`
+/// ([`operator_calls`]): the milliseconds waited in all, and by call `[count,
+/// ms]`.
+pub fn operator_between(before: &BTreeMap<String, (u64, u64)>, after: &BTreeMap<String, (u64, u64)>) -> (u64, Value) {
+	let mut total = 0;
+	let mut by = serde_json::Map::new();
+	for (k, (n, ms)) in after {
+		let (n0, ms0) = before.get(k).copied().unwrap_or((0, 0));
+		if n > &n0 {
+			total += ms - ms0;
+			by.insert(k.clone(), json!([n - n0, ms - ms0]));
+		}
+	}
+	(total, Value::Object(by))
+}
+
 /// What fixes every answer kept for a view: the tip, the node's anchor
 /// status, and the mempool's transactions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +283,17 @@ struct Memo {
 	/// Requests made of the node, and reads answered from what was kept.
 	asked: u64,
 	kept: u64,
+	/// The requests made of the node one read at a time, by method: what a
+	/// command's cost names when it made many ([`ChainSource::asked_by_method`]).
+	alone: BTreeMap<String, u64>,
+	/// Blocks the node reported certified by the committee, by hash. A block's
+	/// certificate is judged against the stake state its parent leaves, so every
+	/// node answers alike for that hash, and the committee's countersignatures
+	/// it counts are only ever added: once certified, a block of that hash stays
+	/// certified. Whether it is still in the active chain is read in each view
+	/// (by height, in [`ChainSource::finality`]), so a reorganisation of any
+	/// depth is seen as before; only the header's re-read is spared.
+	certified: std::collections::HashSet<BlockHash>,
 }
 
 /// The reads a look at the view makes.
@@ -444,6 +489,12 @@ impl ChainSource {
 		(m.asked, m.kept)
 	}
 
+	/// The requests made of the node one read at a time since the source was
+	/// made, by method (a batch, a look and a broadcast are not among them).
+	pub fn asked_by_method(&self) -> BTreeMap<String, u64> {
+		self.memo.lock().expect("the chain memo").alone.clone()
+	}
+
 	/// Whether the view is to be looked at again before the next answer: the
 	/// command has just started (unless it shares the view and the last look
 	/// is younger than [`BURST_VIEW_FOR`]), a gap came, or a second passed
@@ -627,6 +678,7 @@ impl ChainSource {
 		let a = kept_of(self.ask(method, params))?;
 		let mut m = self.memo.lock().expect("the chain memo");
 		m.asked += 1;
+		*m.alone.entry(method.to_string()).or_default() += 1;
 		Self::keep(&mut m, &keep, k, &a);
 		answer_of(&a)
 	}
@@ -873,8 +925,16 @@ impl ChainSource {
 	fn header(&self, hash: &BlockHash) -> Result<(u64, Option<bool>), Error> {
 		let hex: String = self.call("getblockheader", &[json!(hash.to_string()), json!(false)]).map_err(node)?;
 		let raw: BlockHeader = decode("block header", &hex).map_err(node)?;
+		// A block found certified stays so ([`Memo::certified`]).
+		if self.memo.lock().expect("the chain memo").certified.contains(hash) {
+			return Ok((raw.bitcoin_anchor().height as u64, Some(true)));
+		}
 		let v: Value = self.call("getblockheader", &[json!(hash.to_string()), json!(true)]).map_err(node)?;
-		Ok((raw.bitcoin_anchor().height as u64, v["poscertified"].as_bool()))
+		let certified = v["poscertified"].as_bool();
+		if certified == Some(true) {
+			self.memo.lock().expect("the chain memo").certified.insert(*hash);
+		}
+		Ok((raw.bitcoin_anchor().height as u64, certified))
 	}
 
 	/// Where `txid` stands now. See the [module documentation](self).
@@ -1863,6 +1923,91 @@ mod test {
 		assert!(asked("getrawmempool") >= 3, "a look in each command, the mempool another each time");
 		assert_eq!(asked("getblockheader"), 1, "the header is read once: the tip did not move");
 		assert_eq!(asked("gettxout"), 3, "the output with the mempool's spends is read again in each view");
+	}
+
+	/// A node whose tip moves at every look, so nothing the view keeps
+	/// outlives a command, with two blocks: CERTIFIED, which it reports
+	/// certified, and the other, which it does not. Counts each method asked.
+	fn moving_tip() -> (String, Arc<Mutex<HashMap<String, u64>>>) {
+		use std::io::{BufRead, BufReader, Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}/", listener.local_addr().unwrap());
+		let counts: Arc<Mutex<HashMap<String, u64>>> = Default::default();
+		let counted = counts.clone();
+		std::thread::spawn(move || {
+			let mut looks = 0u64;
+			for stream in listener.incoming() {
+				let Ok(mut stream) = stream else { continue };
+				let mut reader = BufReader::new(stream.try_clone().unwrap());
+				let mut length = 0usize;
+				loop {
+					let mut line = String::new();
+					if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+						break;
+					}
+					if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+						length = v.trim().parse().unwrap_or(0);
+					}
+				}
+				let mut body = vec![0u8; length];
+				if reader.read_exact(&mut body).is_err() {
+					continue;
+				}
+				let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+				let mut answer = |call: &Value| -> Value {
+					let (id, method) = (call["id"].clone(), call["method"].as_str().unwrap_or("").to_string());
+					let verbose = call["params"][1] == json!(true);
+					*counted.lock().unwrap().entry(format!("{}{}", method, if verbose { " verbose" } else { "" })).or_default() += 1;
+					let result = match method.as_str() {
+						"getblockchaininfo" => { looks += 1; json!({"bestblockhash": format!("{:064x}", looks), "blocks": looks}) },
+						"getanchorstatus" => json!({"validateanchor": true, "anchorstatus": "ok"}),
+						"getrawmempool" => json!([]),
+						"getblockheader" if !verbose => json!(HEADER_HEX),
+						"getblockheader" => json!({"confirmations": 1, "height": 1, "poscertified": call["params"][0] == json!(CERTIFIED)}),
+						_ => return json!({"id": id, "result": null, "error": {"code": -32601, "message": "Method not found"}}),
+					};
+					json!({"id": id, "result": result, "error": null})
+				};
+				let out = match &req {
+					Value::Array(calls) => Value::Array(calls.iter().map(|c| answer(c)).collect()),
+					call => answer(call),
+				}.to_string();
+				let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+					out.len(), out);
+			}
+		});
+		(url, counts)
+	}
+
+	/// A testnet block header (height 200,000), as the node serialises it.
+	const HEADER_HEX: &str = "00000020f3618ae0c56f9a5ab4c159d69e139f9e70c73074294609b020041a3b74dc6c46ddaddc61d69d046efbbe8e990c42ddc121e6672fa7ec23cecc8ee0daad8be39b0183ec6a400d0300be6d02003cfa44d44b51f6006b0923d068b931ac204c1f303703dce70016f20a00000000235221020cde0a7aa5dbfeadfecfce3a125ad2973ab5e6d6da85a2fc3ebff21369904b52ac463044022034b82df0d37459d534ba489758a92c35062d7be40c6154601e8afd5901da6da502207433c92b91b8771767124a81c0a77d0017d1a4088fd001b1eba68fbd01f478694c608544a9782ca886fda71d6c80344df162aff5515373f714fe011c27f4f7e6f0f08d56eedf4ab956e6ecffa68c423478aa1634e59a17f7d890094224cb20e052287e39c6f5799bf2cecb9918bc7b75f78250c5db92fba96ed12043e947b5859c74010559";
+	const CERTIFIED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+	/// A block found certified is not asked again in a later view, whatever
+	/// the tip; a block not certified is asked again in every view, as a
+	/// certificate may come for it. Requests made one at a time are counted
+	/// by method.
+	#[test]
+	fn a_certified_block_is_not_asked_again() {
+		let _serial = serial();
+		let (url, counts) = moving_tip();
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let asked = |m: &str| counts.lock().unwrap().get(m).copied().unwrap_or(0);
+		let (yes, no) = (BlockHash::from_str(CERTIFIED).unwrap(), BlockHash::from_str(&"bb".repeat(32)).unwrap());
+		let before = chain.asked_by_method();
+		for _ in 0..3 {
+			chain.new_command();
+			assert_eq!(chain.header(&yes).unwrap().1, Some(true));
+			assert_eq!(chain.header(&no).unwrap().1, Some(false));
+		}
+		assert!(asked("getblockchaininfo") >= 3, "a look in each command, at a new tip each time");
+		assert_eq!(asked("getblockheader"), 2, "each header's bytes once: named by its hash");
+		assert_eq!(asked("getblockheader verbose"), 1 + 3, "the certified block once, the other in each view");
+		// Those not carried in a look's batch were asked one at a time, and
+		// counted so, by method.
+		let after = chain.asked_by_method();
+		let alone = after.get("getblockheader").copied().unwrap_or(0) - before.get("getblockheader").copied().unwrap_or(0);
+		assert!(alone >= 1 && alone <= 2 + 1 + 3, "{} of the headers asked alone", alone);
 	}
 
 	/// What a receiver asks of the chain for a coin's lineage, on a regtest

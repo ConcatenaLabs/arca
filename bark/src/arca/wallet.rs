@@ -4136,7 +4136,15 @@ impl Wallet {
 	/// it took, whatever answer the wallet saw.
 	fn lost_boards_credited(&self) -> Result<Vec<CoinRow>, Error> {
 		let mut out = vec![];
-		for c in self.store.coins_in("lost")?.into_iter().filter(|c| c.kind == "board") {
+		let lost: Vec<CoinRow> = self.store.coins_in("lost")?.into_iter().filter(|c| c.kind == "board").collect();
+		// Where each lost board's transaction is, read ahead in a few requests:
+		// a wallet that boards often holds hundreds of lost boards, and this
+		// runs at every re-check of the coins.
+		let txids: Vec<Txid> = lost.iter().filter_map(|c| c.bases.first().and_then(|t| Txid::from_str(t).ok())).collect();
+		if txids.len() > 1 {
+			self.chain.read_ahead_of(&txids, &[]);
+		}
+		for c in lost {
 			let Some(Ok(txid)) = c.bases.first().map(|t| Txid::from_str(t)) else { continue };
 			let (in_chain, in_mempool) = self.chain.whereabouts(&txid)?;
 			if !in_chain && !in_mempool {

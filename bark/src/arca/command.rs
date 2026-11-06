@@ -137,17 +137,44 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 	// a program logs of a slow command.
 	let t0 = web_time::Instant::now();
 	let (n0, _) = w.chain.calls();
+	let by0 = w.chain.asked_by_method();
+	let op0 = super::chain::operator_calls();
 	let g0 = super::chain::gaps();
 	let start = start(w, command, args["recheck"].as_str() == Some("coins"));
 	let (t1, (n1, _), g1) = (web_time::Instant::now(), w.chain.calls(), super::chain::gaps());
+	let by1 = w.chain.asked_by_method();
 	let result = command_of(w, command, args)?;
 	let (n2, _) = w.chain.calls();
-	let cost = json!({
+	let mut cost = json!({
 		"start": {"ms": (t1 - t0).as_millis() as u64, "node": n1 - n0, "operator": g1 - g0},
 		"command": {"ms": t1.elapsed().as_millis() as u64, "node": n2 - n1, "operator": super::chain::gaps() - g1},
 	});
+	// The milliseconds the command waited for the operator's answers.
+	cost["operator_ms"] = json!(super::chain::operator_between(&op0, &super::chain::operator_calls()).0);
+	// Where a part made many requests of the node one read at a time, the
+	// methods it made them with: what names the read to batch or keep.
+	for (part, before, after) in [("start", &by0, &by1), ("command", &by1, &w.chain.asked_by_method())] {
+		let alone = cost_by_method(before, after);
+		if alone.as_object().is_some_and(|o| !o.is_empty()) {
+			cost[part]["alone"] = alone;
+		}
+	}
 	Ok(json!({"result": result, "start": start, "cost": cost}))
 }
+
+/// The requests made one read at a time between `before` and `after`
+/// ([`super::chain::ChainSource::asked_by_method`]), by method, when they number
+/// more than [`ALONE_NAMED`]; else nothing.
+pub(crate) fn cost_by_method(before: &std::collections::BTreeMap<String, u64>, after: &std::collections::BTreeMap<String, u64>) -> Value {
+	let by: serde_json::Map<String, Value> = after.iter()
+		.map(|(m, n)| (m.clone(), n - before.get(m).copied().unwrap_or(0)))
+		.filter(|(_, n)| *n > 0).map(|(m, n)| (m, json!(n))).collect();
+	if by.values().filter_map(Value::as_u64).sum::<u64>() > ALONE_NAMED { Value::Object(by) } else { json!({}) }
+}
+
+/// How many requests made one read at a time a part of a command makes
+/// before its cost names them by method.
+pub(crate) const ALONE_NAMED: u64 = 50;
 
 /// The commands that only read, of the wallet, the node, the operator or an
 /// offer, and take no coin, sign nothing and broadcast nothing.

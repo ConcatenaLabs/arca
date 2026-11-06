@@ -433,7 +433,9 @@ impl ServerClient {
 			Some(b) => minreq::post(url).with_header("Content-Type", "application/json").with_body(b.to_string()),
 		};
 		// The operator may broadcast on a request: the chain is looked at again.
+		let t = web_time::Instant::now();
 		let r = request.with_timeout(self.timeout).send().map_err(|e| e.to_string());
+		super::chain::operator_call(call, t.elapsed());
 		super::chain::gap();
 		let r = r?;
 		Ok((i32::from(r.status_code), r.as_str().unwrap_or("").to_string()))
@@ -453,7 +455,9 @@ impl ServerClient {
 			timeout_secs: self.timeout,
 		};
 		// The operator may broadcast on a request: the chain is looked at again.
+		let t = web_time::Instant::now();
 		let r = sequentia_ext::platform::http(&request);
+		super::chain::operator_call(call, t.elapsed());
 		super::chain::gap();
 		let r = r?;
 		Ok((r.status, r.body))
