@@ -1125,7 +1125,14 @@ rests after the fourth is the maker's to cancel.
 
 `arca order rest` gives up leaves of the asset the order sells for one leaf of
 exactly the amount, paying their refresh fees (`--quote` shows them, and
-`--shown` rests on that very fee and those coins). The wallet checks the leaf
+`--shown` rests on that very fee and those coins). Of the coins that can pay
+it, it gives up those that leave the least change, then the fewest: the
+operator fronts every coin a round makes until the coins given up for it come
+back, so the change of a large coin given up for a small order is capital it
+fronts for nothing the order needs, again at every order rested from it. A
+maker that cancels an order and rests it again so rests it from the cancelled
+order's coin (the order's value less the cancel's fee, with another small
+coin when that alone falls short), not from its largest coin. The wallet checks the leaf
 the operator's round makes against exactly the terms it asked for before it
 signs a forfeit: a leaf of other terms, or a resting order where it asked for
 none, is refused. Once the round is final, `sync` hands over the forfeit and
@@ -2161,6 +2168,16 @@ resting` shows both fills. It cancels what rests, as quoted, and a fill after
 is refused.
 A second maker's order is brought on with `arca exit`, lands after the exit
 delay as SeqDEX's order, and a taker on the chain fills it with no signature.
+
+`tests/arca_resting_capital.rs` runs a maker's resting desk at the shape the
+testnet's leaf maker runs, against an operator building batches without a
+sweep with RECLAIM-D: one coin of 2,000,000,000 X, refreshed into a round's
+leaf, rests a ladder of four orders (100,000,000 to 274,400,000 X), one round
+each, then three times cancels the four and rests each again at what its coin
+came back with, as the leaf maker's resting desk does. It prints what each
+rest gives up and what is in flight after each pass, and checks that no rest
+after the first pass leaves change. Last, a merge that names the orders' coins
+ends every order, and the ladder is rested again from other coins.
 
 `tests/arca_owed.rs` runs a swept coin with the `arca` binary: A boards X
 under an operator charging a refresh fee of 5,000 parts per million,

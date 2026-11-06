@@ -4,7 +4,12 @@
 //!
 //! **Resting.** [`Wallet::order_rest`] gives up leaves of the asset the order
 //! sells in a participation that wants one `order-3` leaf of exactly the
-//! order's amount (and a change leaf where the coins hold more). The leaf's
+//! order's amount (and a change leaf where the coins hold more). It gives up
+//! the coins that leave the least change ([`least_change`]): the operator
+//! fronts every coin a round makes until the old ones come back, so a maker
+//! that rests a ladder from one large coin would have it fronted again, whole,
+//! at every level it rests, where a cancelled order's own coin rests the order
+//! again with none. The leaf's
 //! terms are SeqDEX's (the asset it is paid in, the rate, the lot), the
 //! order it lands as on the chain (its fills on the chain pay the order key's
 //! output, which the wallet scans, and its REFUND key is the order key), and
@@ -112,6 +117,64 @@ struct RestPlan {
 	change: u64,
 }
 
+/// The coins to give up for an order of `amount`, as indices into `coins`
+/// (each its value and its refresh fee), in their order there: of the sets of
+/// at most `max` coins that hold the amount and their fees with no change or
+/// change of at least `min`, the one leaving the least change, then the one
+/// of fewest coins. `walked` is the set the wallet's own walk found, the first
+/// `walked` coins, which is a candidate too. Candidates: each coin alone, each
+/// pair (up to 256 coins), the walk, and the largest coins first with the last
+/// of them swapped for the smallest coin that still covers. None when none
+/// holds enough.
+pub(crate) fn least_change(coins: &[(u64, u64)], amount: u64, min: u64, max: usize, walked: usize) -> Option<Vec<usize>> {
+	let change = |set: &[usize]| -> Option<u64> {
+		if set.is_empty() || set.len() > max {
+			return None;
+		}
+		let total: u64 = set.iter().map(|&i| coins[i].0).fold(0u64, |a, v| a.saturating_add(v));
+		let fee: u64 = set.iter().map(|&i| coins[i].1).fold(0u64, |a, v| a.saturating_add(v));
+		total.checked_sub(amount.saturating_add(fee)).filter(|c| *c == 0 || *c >= min)
+	};
+	let mut best: Option<(u64, usize, Vec<usize>)> = None;
+	let mut offer = |mut set: Vec<usize>| {
+		set.sort_unstable();
+		set.dedup();
+		if let Some(c) = change(&set) {
+			if best.as_ref().is_none_or(|(bc, bn, bs)| (c, set.len(), &set) < (*bc, *bn, bs)) {
+				best = Some((c, set.len(), set));
+			}
+		}
+	};
+	offer((0..walked.min(coins.len())).collect());
+	for i in 0..coins.len() {
+		offer(vec![i]);
+	}
+	if coins.len() <= 256 {
+		for i in 0..coins.len() {
+			for j in i + 1..coins.len() {
+				offer(vec![i, j]);
+			}
+		}
+	}
+	let mut by_value: Vec<usize> = (0..coins.len()).collect();
+	by_value.sort_by(|&x, &y| coins[y].0.cmp(&coins[x].0).then(x.cmp(&y)));
+	let mut set = vec![];
+	for &i in by_value.iter().take(max) {
+		set.push(i);
+		if change(&set).is_some() {
+			break;
+		}
+	}
+	if change(&set).is_some() {
+		let last = set.pop().expect("a set that covers is not empty");
+		let swap = by_value.iter().rev().copied().filter(|i| !set.contains(i))
+			.find(|&i| { let mut t = set.clone(); t.push(i); change(&t).is_some() }).unwrap_or(last);
+		set.push(swap);
+		offer(set);
+	}
+	best.map(|(_, _, s)| s)
+}
+
 /// Whether `row` is a resting order's coin (an `order-3` leaf, or an `order-2` leaf from before it): such a coin
 /// is the order, and is spent only by a fill, a cancel or its landing.
 pub(crate) fn is_order_coin(row: &CoinRow) -> bool {
@@ -159,34 +222,55 @@ impl Wallet {
 		Self::min_leaf(info, b)?;
 		let min = Self::min_leaf(info, a)?;
 		let schedule = schedule_of(info, a);
-		// The coins, furthest from their exit date first, until they hold the
-		// amount and the refresh fees, with no change or change of at least
-		// the operator's smallest leaf.
-		// A coin given up in a refresh that waits is taken back first when
-		// the live coins fall short.
+		// Whether the wallet's live coins can rest the order at all: walked
+		// furthest from their exit date first, as a payment walks them, until
+		// they hold the amount and the refresh fees, with no change or change
+		// of at least the operator's smallest leaf. A coin given up in a
+		// refresh that waits is taken back first when the live coins fall
+		// short.
 		self.free_when_short(a, ask.amount)?;
-		let mut chosen: Vec<In> = vec![];
-		let (mut total, mut fee) = (0u64, 0u64);
-		let mut done = None;
-		for c in self.coins_to_give(a)? {
-			if chosen.len() == super::round::MAX_GIVEN {
+		let coins = self.coins_to_give(a)?;
+		// The schedule charges nothing when it has neither a rate nor a base:
+		// then no coin needs reading for its date.
+		let free = schedule["refresh_ppm"].as_u64().unwrap_or(0) == 0
+			&& schedule["refresh_base"].as_str().and_then(|b| b.parse::<u64>().ok()).unwrap_or(0) == 0;
+		let mut priced: Vec<(u64, u64)> = Vec::with_capacity(coins.len());
+		let (mut total, mut fee, mut walked) = (0u64, 0u64, None);
+		for (i, c) in coins.iter().enumerate() {
+			let f = if free { 0 } else {
+				let (record, held) = self.held(&c.row)?;
+				let expiry = self.service_expiry(&record, &held)?;
+				refresh_fee(&schedule, c.coin.value, expiry, now)
+			};
+			priced.push((c.coin.value, f));
+			if walked.is_some() {
+				continue;
+			}
+			if i == super::round::MAX_GIVEN {
 				return Err(Self::too_many_coins(a, total, ask.amount.saturating_add(fee)));
 			}
-			let (record, held) = self.held(&c.row)?;
-			let expiry = self.service_expiry(&record, &held)?;
-			fee = fee.saturating_add(refresh_fee(&schedule, c.coin.value, expiry, now));
+			fee = fee.saturating_add(f);
 			total = total.saturating_add(c.coin.value);
-			chosen.push(c);
-			if let Some(change) = total.checked_sub(ask.amount.saturating_add(fee)).filter(|c| *c == 0 || *c >= min) {
-				done = Some(change);
-				break;
+			if total.checked_sub(ask.amount.saturating_add(fee)).is_some_and(|c| c == 0 || c >= min) {
+				walked = Some(i + 1);
 			}
 		}
-		let Some(change) = done else {
+		let Some(walked) = walked else {
 			return Err(self.short_of(a, ask.amount.saturating_add(fee).saturating_sub(total).max(1), format!("the wallet's live coins of \
 				asset {} hold {} and the order of {} and its refresh fees need {}, with any change at least the operator's smallest leaf of \
 				{}: board or receive more, or rest less", a, total, ask.amount, ask.amount.saturating_add(fee), min))?);
 		};
+		// Of the sets that can rest it, the one that leaves the least change:
+		// every coin given up in a round is fronted anew by the operator, and
+		// the change is a coin it fronts for nothing the order needs (and
+		// pays a refresh fee on). A maker that cancels an order and rests it
+		// again so gives up the cancelled order's own coin, not its largest.
+		let pick = least_change(&priced, ask.amount, min, super::round::MAX_GIVEN, walked)
+			.expect("the walk found a set, so the least-change search finds one");
+		let fee: u64 = pick.iter().map(|&i| priced[i].1).sum();
+		let change = pick.iter().map(|&i| priced[i].0).sum::<u64>() - ask.amount - fee;
+		let mut coins: Vec<Option<In>> = coins.into_iter().map(Some).collect();
+		let chosen: Vec<In> = pick.iter().map(|&i| coins[i].take().expect("each coin picked once")).collect();
 		let bound = max_fee_ppm.unwrap_or(DEFAULT_MAX_FEE_PPM);
 		if !fee_within(fee, ask.amount, bound) {
 			return Err(Error::Refused(format!("resting the order costs {} of asset {}, above the wallet's bound of {} ppm of its amount {} \
@@ -843,5 +927,51 @@ mod test {
 		assert!(reads.iter().all(|r| r.len() <= ORDERS_PER_READ));
 		assert!(order_state_reads(&[]).is_empty(), "nothing asked, nothing read");
 		assert_eq!(order_state_reads(&ask[..100]).len(), 1, "a hundred in one read");
+	}
+
+	/// The maker's shape on the testnet: one large coin (the last change)
+	/// first, then a cancelled order's own coin of the level's size. The walk
+	/// rests the order from the large coin, fronting its change again; the
+	/// least change rests it from the cancelled coin, with none.
+	#[test]
+	fn an_order_rests_from_the_coin_that_leaves_the_least_change() {
+		let min = 2_700_301;
+		let coins = [(300_000_000_000_000, 0), (4_837_672_668_351, 0), (6_000_000_000_000, 0)];
+		assert_eq!(least_change(&coins, 4_837_672_668_351, min, 64, 1), Some(vec![1]), "the cancelled order's coin, no change");
+		// No coin of the size: the smallest that covers, not the largest.
+		assert_eq!(least_change(&coins, 5_000_000_000_000, min, 64, 1), Some(vec![2]));
+		// A pair that holds it exactly beats one coin with change.
+		let coins = [(9_000_000, 0), (6_000_000, 0), (4_000_000, 0)];
+		assert_eq!(least_change(&coins, 10_000_000, 1, 64, 2), Some(vec![1, 2]));
+		// Change below the smallest leaf is never made: a set that would leave
+		// it is passed over for one that leaves none or enough.
+		let coins = [(10_000_001, 0), (10_000_000 + 5_000_000, 0)];
+		assert_eq!(least_change(&coins, 10_000_000, 2_700_301, 64, 2), Some(vec![1]));
+		// Nothing holds it.
+		assert_eq!(least_change(&[(5, 0), (6, 0)], 100, 1, 64, 2), None);
+	}
+
+	/// The refresh fee counts: each coin pays its own, so a coin of exactly the
+	/// order no longer holds it once it is charged, and the least change is
+	/// that coin and the smallest coin that pays the fee.
+	#[test]
+	fn the_least_change_counts_each_coins_refresh_fee() {
+		let coins = [(50_000_000, 500), (1_000_000, 10), (1_000, 1)];
+		// Alone the order's coin is short by its fee; with the 1,000 coin it
+		// leaves 1,000 - 10 - 1 = 989.
+		assert_eq!(least_change(&coins, 1_000_000, 1, 64, 1), Some(vec![1, 2]));
+		// A smallest leaf above 989 leaves only the large coin.
+		assert_eq!(least_change(&coins, 1_000_000, 1_000, 64, 1), Some(vec![0]));
+	}
+
+	/// The walk's own set is kept when nothing leaves less, and no set is
+	/// larger than a participation may give up.
+	#[test]
+	fn the_least_change_keeps_the_walk_and_the_bound() {
+		let coins = [(7, 0), (7, 0), (7, 0)];
+		assert_eq!(least_change(&coins, 14, 1, 64, 2), Some(vec![0, 1]), "ties go to the walk's order");
+		let many: Vec<(u64, u64)> = (0..10).map(|_| (10, 0)).collect();
+		assert_eq!(least_change(&many, 50, 1, 4, 5), None, "five coins needed, four allowed");
+		assert_eq!(least_change(&many, 40, 1, 4, 4).map(|s| s.len()), Some(4));
 	}
 }
