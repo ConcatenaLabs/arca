@@ -32,7 +32,9 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   holds no node credential worth having, so a site serves its wallets a proxy
   that allows exactly these calls, adds the node's credential itself and
   limits each caller, and the wallet is created with `node_url` alone.
-  `scantxoutset` reads the whole UTXO set. The wallet scans once for each
+  `scantxoutset` reads the whole UTXO set. A scan carries at most 256
+  descriptors, which a proxy may hold it to; more are scanned in parts. The
+  wallet scans once for each
   window of on-chain scripts and each output it looks for when the chain has
   moved since its last command (a few, among some fifty calls, for a wallet of
   twenty coins after a new block), and not at all while it has not (see What

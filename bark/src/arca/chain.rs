@@ -317,6 +317,11 @@ const LOOK: [&str; 3] = ["getblockchaininfo", "getanchorstatus", "getrawmempool"
 /// batch of more.
 pub const BATCH_MOST: usize = 64;
 
+/// The most scripts one scan of the set of unspent outputs carries: the
+/// testnet's public node proxy refuses a `scantxoutset` of more descriptors
+/// (`-32602`), so a scan of more is made in parts ([`ChainSource::coins_at`]).
+pub const SCAN_MOST: usize = 256;
+
 /// How a read is kept.
 enum Keep {
 	/// Whatever the view, once the node found it: its answer is fixed by the
@@ -1236,15 +1241,20 @@ impl ChainSource {
 				(m.view_drops, missing)
 			};
 			if !missing.is_empty() {
-				let descs: Vec<Value> = missing.iter().map(|s| json!(format!("raw({})", hex(s.as_bytes())))).collect();
-				let v: Value = self.call("scantxoutset", &[json!("start"), Value::Array(descs)]).map_err(node)?;
 				let mut by: HashMap<Script, Vec<(OutPoint, u64)>> = missing.iter().map(|s| (s.clone(), vec![])).collect();
-				for u in v["unspents"].as_array().cloned().unwrap_or_default() {
-					let txid = Txid::from_str(u["txid"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?;
-					let vout = u["vout"].as_u64().unwrap_or(0) as u32;
-					let script = Script::from(unhex(u["scriptPubKey"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?);
-					if let Some(e) = by.get_mut(&script) {
-						e.push((OutPoint::new(txid, vout), u["height"].as_u64().unwrap_or(0)));
+				// In parts of at most SCAN_MOST scripts, each part a scan of
+				// its own; every part's answer is taken only if the view
+				// stood through all of them (below).
+				for part in missing.chunks(SCAN_MOST) {
+					let descs: Vec<Value> = part.iter().map(|s| json!(format!("raw({})", hex(s.as_bytes())))).collect();
+					let v: Value = self.call("scantxoutset", &[json!("start"), Value::Array(descs)]).map_err(node)?;
+					for u in v["unspents"].as_array().cloned().unwrap_or_default() {
+						let txid = Txid::from_str(u["txid"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?;
+						let vout = u["vout"].as_u64().unwrap_or(0) as u32;
+						let script = Script::from(unhex(u["scriptPubKey"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?);
+						if let Some(e) = by.get_mut(&script) {
+							e.push((OutPoint::new(txid, vout), u["height"].as_u64().unwrap_or(0)));
+						}
 					}
 				}
 				let mut m = self.memo.lock().expect("the chain memo");
@@ -1784,6 +1794,10 @@ mod test {
 					"getanchorstatus" => json!({"validateanchor": true, "anchorstatus": "ok"}),
 					"getrawmempool" => json!([]),
 					"scantxoutset" => {
+						// As the testnet's public proxy: no more than SCAN_MOST descriptors.
+						if call["params"][1].as_array().is_some_and(|d| d.len() > SCAN_MOST) {
+							return json!({"id": id, "result": null, "error": {"code": -32602, "message": "scantxoutset: arguments not allowed here"}});
+						}
 						if counted.fetch_add(1, Ordering::SeqCst) < busy {
 							return json!({"id": id, "result": null, "error": {"code": -8,
 								"message": "Scan already in progress, use action \"abort\" or \"status\""}});
@@ -1888,6 +1902,22 @@ mod test {
 			chain.coins_at(std::slice::from_ref(&a)).unwrap();
 			assert_eq!(asked("scantxoutset"), n, "once in each view, each at a new tip");
 		}
+	}
+
+	/// A scan of more scripts than a proxy takes in one ([`SCAN_MOST`]) is
+	/// made in parts, each answered, and kept for the view as one scan is.
+	#[test]
+	fn a_scan_of_many_scripts_goes_in_parts() {
+		let (url, scans) = busy_node(0);
+		let chain = ChainSource::new(&url, Some("u"), Some("p"), None);
+		let scripts: Vec<Script> = (0..600u32).map(|i| Script::from(i.to_be_bytes().to_vec())).collect();
+		assert!(chain.coins_at(&scripts).is_ok(), "600 scripts answered");
+		assert_eq!(scans.load(Ordering::SeqCst), 3, "256, 256 and 88");
+		assert!(chain.coins_at(&scripts[100..400]).is_ok());
+		assert_eq!(scans.load(Ordering::SeqCst), 3, "kept for the view");
+		// The mock refuses a scan past the bound, as the proxy does.
+		let one = Value::Array((0..=SCAN_MOST).map(|i| json!(format!("raw({:04x})", i))).collect());
+		assert!(chain.call::<Value>("scantxoutset", &[json!("start"), one]).is_err());
 	}
 
 	/// A transaction spending `from` (an output at a bare `OP_TRUE` of
