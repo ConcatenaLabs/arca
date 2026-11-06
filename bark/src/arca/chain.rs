@@ -8,7 +8,11 @@
 //! reports its tip's anchor as validated and `ok`. That is the server's rule
 //! and SeqLN's. Sequentia reorganises whenever its anchor does, with no depth
 //! limit, so finality is read from the node in every view it is asked in
-//! (below), and never remembered past it.
+//! (below), and never remembered past it. Only a block's certificate is
+//! kept, by the block's hash: the committee's countersignatures for a block
+//! are only added, so a block certified stays certified. Whether it is still
+//! in the active chain, how deep its anchor is buried and the node's anchor
+//! status are read again in every view.
 //!
 //! **The anchor depth** is the operator's: the wallet judges finality as the
 //! operator it uses does, from the `finality.anchor_depth` its `info`
@@ -2318,6 +2322,111 @@ mod test {
 		println!("asked again: {} request(s) of the node", after - before);
 		assert!(after - before <= 1, "{} requests", after - before);
 		println!("{} took the parent's coin and is final: the parent and the child are gone", other.txid());
+	}
+
+	/// A source that has a certified block kept ([`Memo::certified`])
+	/// answers, after every reorganisation, as a source opened afresh does,
+	/// and never `Final` for a block a reorganisation took or left unburied:
+	/// a Sequentia reorganisation that takes the block, a Bitcoin one above
+	/// its anchor, and a Bitcoin one that orphans its anchor, with the node
+	/// restarted while its index still names the orphaned block. The kept
+	/// certificate stands for nothing but the certificate.
+	///
+	/// Needs `SEQUENTIAD_EXEC`.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[test]
+	fn a_kept_certificate_follows_every_reorganisation() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		const DEPTH: u64 = 2;
+		let dir = tempfile::tempdir().unwrap();
+		let mut r = Regtest::pos_from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let open = |_: ()| { let c = ChainSource::new(&url, Some("arca"), Some("arca"), None); c.follow_anchor_depth(Some(DEPTH), "elementsregtest"); c };
+		let a = open(());
+		let op_true = Script::from(vec![0x51]);
+		let genesis = a.genesis().unwrap();
+		let block = a.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		let (asset, value) = (coin.asset.explicit().unwrap(), coin.value.explicit().unwrap());
+		r.mine_parent(1).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		r.mine_parent(1).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		let t = spend_to(free, asset, value, op_true.clone());
+		r.node.client().send_raw_transaction(&t).unwrap();
+		let b = r.produce_block().unwrap();
+		let (b_anchor, b_cert) = a.header(&b).unwrap();
+		assert_eq!(b_cert, Some(true), "the committee certified it");
+		r.mine_parent(3).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		// Reads `t` in the open source A (memo kept), and in one closed and
+		// opened again (a fresh source): both must agree.
+		let step = |label: &str| -> Finality {
+			gap();
+			a.new_command();
+			let held = a.memo.lock().unwrap().certified.contains(&b);
+			let fa = a.finality(&t.txid()).unwrap();
+			let reopened = open(());
+			let fc = reopened.finality(&t.txid()).unwrap();
+			let block_now = a.tx_block(&t.txid()).unwrap();
+			println!("{:<46} memo holds B: {:<5} open: {:?}  reopened: {:?}  block: {:?}", label, held, fa, fc,
+				block_now.map(|(h, n)| (if h == b { "B".to_string() } else { h.to_string()[..8].to_string() }, n)));
+			assert_eq!(fa, fc, "{}: the open source answers as a reopened one", label);
+			fa
+		};
+		let f = step("0 B certified, anchor buried 3");
+		assert!(f.is_final(), "{:?}", f);
+		assert!(a.memo.lock().unwrap().certified.contains(&b), "the certificate is memoised");
+		// A closed wallet, opened and filled before the reorganisation.
+		let closed = open(()); assert!(closed.finality(&t.txid()).unwrap().is_final()); drop(closed);
+
+		// R1: a Sequentia reorganisation that takes B (B invalidated).
+		let _: Value = r.node.client().call("invalidateblock", &[json!(b.to_string())]).unwrap();
+		let f = step("R1 Sequentia reorg takes B");
+		assert!(matches!(f, Finality::NotInChain { .. }), "{:?}", f);
+		let _: Value = r.node.client().call("reconsiderblock", &[json!(b.to_string())]).unwrap();
+		let f = step("R1' B reconsidered, back in the chain");
+		assert!(f.is_final(), "{:?}", f);
+
+		// R2: a Bitcoin reorganisation above B's anchor: B stays, its anchor
+		// is no longer buried at the depth asked.
+		r.orphan_parent_from(b_anchor + 1).unwrap();
+		let f = step("R2 Bitcoin reorg above B's anchor");
+		assert!(!f.is_final(), "B's anchor is not buried {} deep now: {:?}", DEPTH, f);
+		r.anchor_to_parent_tip().unwrap();
+		let f = step("R2' new parent blocks bury it again");
+		assert!(f.is_final(), "{:?}", f);
+
+		// R3: a Bitcoin reorganisation that orphans B's anchor: B goes.
+		let closed = open(()); assert!(closed.finality(&t.txid()).unwrap().is_final()); drop(closed);
+		assert!(a.memo.lock().unwrap().certified.contains(&b));
+		r.orphan_parent_from(b_anchor).unwrap();
+		let f = step("R3 Bitcoin reorg orphans B's anchor");
+		assert!(matches!(f, Finality::NotInChain { .. }), "{:?}", f);
+		// The node restarts without its mempool: the index may still name B.
+		r.node.restart(&["-persistmempool=0"]).unwrap();
+		let raw: Value = r.node.client().call("getrawtransaction", &[json!(t.txid().to_string()), json!(true)]).unwrap_or(Value::Null);
+		println!("after restart the node gives T's blockhash {:?} (B {})", raw["blockhash"], b);
+		let f = step("R3 restarted, T out of the mempool");
+		assert!(matches!(f, Finality::NotInChain { .. }), "{:?}", f);
+		// T is mined again, in another block.
+		if matches!(f, Finality::NotInChain { in_mempool: false }) {
+			r.node.client().send_raw_transaction(&t).unwrap();
+		}
+		r.produce_block().unwrap();
+		let f = step("R3' T mined again in another block");
+		assert!(!f.is_final(), "its new block's anchor is not buried yet: {:?}", f);
+		r.mine_parent(3).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		let f = step("R3'' buried again");
+		assert!(f.is_final(), "{:?}", f);
+		assert_ne!(a.tx_block(&t.txid()).unwrap().unwrap().0, b, "another block");
 	}
 
 	#[test]
