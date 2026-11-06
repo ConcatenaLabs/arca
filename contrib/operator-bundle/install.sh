@@ -845,13 +845,15 @@ build arca "$ARCA_SRC" "$ARCA_COMMIT" env CARGO_TARGET_DIR="$CACHE/build/arca-ta
   sh -c 'cargo build --release --locked -p arca-server --bin arcad --bin arca-signer && cargo build --release --locked -p arca-cli --bin arca'
 say "arca at ${ARCA_COMMIT:0:12}"
 
-step "Bark's client, with the testnet4 patch (for the operator's own wallets)"
+step "Bark's client, with the testnet4 patch and the reorg repair (for the operator's own wallets)"
 [ "$(sha256_of "$HERE/patches/bark-testnet4.patch")" = "$BARK_PATCH_SHA256" ] || die "patches/bark-testnet4.patch is not the patch pins.env names"
-if [ "$(cat "$CACHE/build/bark.built" 2>/dev/null)" != "$BARK_COMMIT+$BARK_PATCH_SHA256" ]; then
+[ "$(sha256_of "$HERE/patches/bark-reorg-repair.patch")" = "$BARK_REORG_PATCH_SHA256" ] || die "patches/bark-reorg-repair.patch is not the patch pins.env names"
+if [ "$(cat "$CACHE/build/bark.built" 2>/dev/null)" != "$BARK_COMMIT+$BARK_PATCH_SHA256+$BARK_REORG_PATCH_SHA256" ]; then
   clone_at https://gitlab.com/ark-bitcoin/bark.git "$CACHE/build/bark" "$BARK_COMMIT"
   git -C "$CACHE/build/bark" apply "$HERE/patches/bark-testnet4.patch"
+  git -C "$CACHE/build/bark" apply "$HERE/patches/bark-reorg-repair.patch"
 fi
-build bark "$CACHE/build/bark" "$BARK_COMMIT+$BARK_PATCH_SHA256" env CARGO_TARGET_DIR="$CACHE/build/bark-target" \
+build bark "$CACHE/build/bark" "$BARK_COMMIT+$BARK_PATCH_SHA256+$BARK_REORG_PATCH_SHA256" env CARGO_TARGET_DIR="$CACHE/build/bark-target" \
   cargo build --release --locked -p bark-cli --bin bark --bin barkd
 
 step "the hold-invoice plugin, with the testnet4 patch"

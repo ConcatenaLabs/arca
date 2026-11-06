@@ -71,7 +71,7 @@ jobs:
             ~/.cargo/git
             ${{ runner.temp }}/target-bark
             ${{ runner.temp }}/target-hold
-          key: bitcoin-ark-${{ env.BARK_COMMIT }}-${{ env.HOLD_COMMIT }}
+          key: bitcoin-ark-${{ env.BARK_COMMIT }}-${{ hashFiles('contrib/operator-bundle/patches/bark-reorg-repair.patch') }}-${{ env.HOLD_COMMIT }}
 
       - name: Bark (captaind, bark, barkd) and the hold plugin
         env:
@@ -80,11 +80,21 @@ jobs:
         run: |
           git init -q "$RUNNER_TEMP/bark" && cd "$RUNNER_TEMP/bark"
           git fetch -q --depth 1 https://gitlab.com/ark-bitcoin/bark.git "$BARK_COMMIT" && git checkout -q FETCH_HEAD
+          git apply "$GITHUB_WORKSPACE/contrib/operator-bundle/patches/bark-reorg-repair.patch"
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-bark" cargo build --locked -p bark-server --bin captaind \
             -p bark-cli --bin bark --bin barkd
           git init -q "$RUNNER_TEMP/hold" && cd "$RUNNER_TEMP/hold"
           git fetch -q --depth 1 https://github.com/BoltzExchange/hold.git "$HOLD_COMMIT" && git checkout -q FETCH_HEAD
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-hold" cargo build --locked --bin hold
+
+      - name: The client's reorg repair against Bitcoin Core
+        env:
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        working-directory: ${{ runner.temp }}/bark
+        run: |
+          BITCOIND_EXEC="$RUNNER_TEMP/core/bin/bitcoind" CARGO_TARGET_DIR="$RUNNER_TEMP/target-bark" \
+            cargo test --locked -p bark-wallet --features onchain-bdk --lib onchain::bdk::test
 
       - name: The ark on regtest
         run: |
