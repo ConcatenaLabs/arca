@@ -1288,11 +1288,20 @@ impl ChainSource {
 	/// answers that depend on the mempool before they are used.
 	pub fn unspent_many(&self, outpoints: &[OutPoint]) -> Result<Vec<bool>, Error> {
 		let mut out = Vec::with_capacity(outpoints.len());
-		for chunk in outpoints.chunks(BATCH_MOST - LOOK.len()) {
+		for (k, chunk) in outpoints.chunks(BATCH_MOST - LOOK.len()).enumerate() {
 			if chunk.len() > 1 {
-				// A look of its own, carried in the same request as the chunk:
-				// the view then stands while the chunk's answers are used.
-				self.memo.lock().expect("the chain memo").looked = None;
+				// After the first, a chunk that would find the view more than
+				// half spent takes a look of its own, carried in the same request
+				// as the chunk: the view then stands while its answers are used.
+				// The first (all of a wallet's few) reads in the view the
+				// command stands in, as any read does, and keeps what a burst
+				// of commands shares.
+				if k > 0 {
+					let mut m = self.memo.lock().expect("the chain memo");
+					if m.looked.is_none_or(|t| t.elapsed() > VIEW_FOR / 2) {
+						m.looked = None;
+					}
+				}
 				self.read_ahead(chunk.iter().map(|o| ("gettxout".to_string(), vec![json!(o.txid.to_string()), json!(o.vout), json!(true)])).collect());
 			}
 			for o in chunk {
