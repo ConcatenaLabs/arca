@@ -310,6 +310,11 @@ struct Memo {
 	/// (by height, in [`ChainSource::finality`]), so a reorganisation of any
 	/// depth is seen as before; only the header's re-read is spared.
 	certified: std::collections::HashSet<BlockHash>,
+	/// Each block header read for its times, by hash: its median time and
+	/// its parent's hash. Neither changes for a hash, whatever the active
+	/// chain is (whether the block is in it is read in each view, by its
+	/// transaction's confirmations), so each is read once.
+	headers: HashMap<BlockHash, (u32, Option<BlockHash>)>,
 	/// What each script scanned for in this view's set of unspent outputs
 	/// pays there (outpoint and height), whether found or not. A scan reads
 	/// the set at the tip, so its answer for a script stands until the tip
@@ -1310,11 +1315,36 @@ impl ChainSource {
 	/// that of the block before the one holding `txid` (BIP68); `None` while
 	/// `txid` is in no block of the active chain.
 	pub fn coin_time(&self, txid: &Txid) -> Result<Option<u32>, Error> {
-		let Some((_, height)) = self.tx_block(txid)? else { return Ok(None) };
+		let Some((hash, height)) = self.tx_block(txid)? else { return Ok(None) };
 		if height == 0 {
 			return Ok(None);
 		}
-		self.median_time_at(height - 1)
+		let Some(parent) = self.header_times(&hash)?.1 else { return Ok(None) };
+		Ok(Some(self.header_times(&parent)?.0))
+	}
+
+	/// The median time of the block of the active chain holding `txid`;
+	/// `None` while it is in none. Read through [`Self::header_times`], so a
+	/// wallet that dates each of its coins from its board's or batch's block
+	/// at every complete re-check reads each block's header once, not a
+	/// block hash by height and a header in every view.
+	pub fn block_time(&self, txid: &Txid) -> Result<Option<u32>, Error> {
+		let Some((hash, _)) = self.tx_block(txid)? else { return Ok(None) };
+		Ok(Some(self.header_times(&hash)?.0))
+	}
+
+	/// A block's median time and its parent's hash, by its hash, read once
+	/// ([`Memo::headers`]).
+	fn header_times(&self, hash: &BlockHash) -> Result<(u32, Option<BlockHash>), Error> {
+		if let Some(t) = self.memo.lock().expect("the chain memo").headers.get(hash) {
+			return Ok(*t);
+		}
+		let v: Value = self.call("getblockheader", &[json!(hash.to_string()), json!(true)]).map_err(node)?;
+		let time = v["mediantime"].as_u64().map(|t| t.min(u32::MAX as u64) as u32)
+			.ok_or_else(|| Error::Node(format!("the header of block {} names no median time", hash)))?;
+		let parent = v["previousblockhash"].as_str().and_then(|h| BlockHash::from_str(h).ok());
+		self.memo.lock().expect("the chain memo").headers.insert(*hash, (time, parent));
+		Ok((time, parent))
 	}
 
 	/// Whether `outpoint` is unspent, the mempool's spends included.
@@ -2602,6 +2632,54 @@ mod test {
 		assert!(chain.unspent_many(&ops).unwrap().iter().all(|u| *u));
 		assert_eq!(alone(&chain), 0, "every answer used in the view it was read in");
 		assert_eq!(counts.lock().unwrap().get("gettxout").copied(), Some(600), "each asked once");
+	}
+
+	/// A coin's dates read again at every complete re-check, in a view after
+	/// each new block: a block's times are read by its hash once, so the
+	/// second view asks the node for no header and no block hash by height
+	/// (a wallet with hundreds of coins asked both for each, one at a time,
+	/// in every view: 436 s before a command on the testnet).
+	///
+	/// Needs `SEQUENTIAD_EXEC`.
+	#[cfg(not(target_arch = "wasm32"))]
+	#[test]
+	fn a_blocks_times_are_read_once_by_its_hash() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::pos_from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let op_true = Script::from(vec![0x51]);
+		let genesis = chain.genesis().unwrap();
+		let block = chain.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		let tx = spend_to(free, coin.asset.explicit().unwrap(), coin.value.explicit().unwrap(), op_true);
+		r.node.client().send_raw_transaction(&tx).unwrap();
+		r.produce_block().unwrap();
+		r.produce_block().unwrap();
+		chain.new_command();
+		let (hash, height) = chain.tx_block(&tx.txid()).unwrap().expect("in a block");
+		let first = (chain.block_time(&tx.txid()).unwrap(), chain.coin_time(&tx.txid()).unwrap());
+		assert_eq!(first.0, chain.median_time_at(height).unwrap(), "the block's own median time");
+		assert_eq!(first.1, chain.median_time_at(height - 1).unwrap(), "its parent's");
+		// A new block, a new view: the times again, with no header read and
+		// no block hash asked by height.
+		r.produce_block().unwrap();
+		chain.new_command();
+		let headers = |c: &ChainSource| c.asked_by_method().get("getblockheader").copied().unwrap_or(0);
+		let hashes = |c: &ChainSource| c.asked_by_method().get("getblockhash").copied().unwrap_or(0);
+		assert!(chain.tx_block(&tx.txid()).unwrap().is_some_and(|(h, _)| h == hash));
+		let (h0, b0) = (headers(&chain), hashes(&chain));
+		for _ in 0..5 {
+			assert_eq!((chain.block_time(&tx.txid()).unwrap(), chain.coin_time(&tx.txid()).unwrap()), first);
+		}
+		assert_eq!((headers(&chain) - h0, hashes(&chain) - b0), (0, 0), "no header, no block hash read again");
 	}
 
 	/// What a receiver asks of the chain for a coin's lineage, on a regtest

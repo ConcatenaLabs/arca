@@ -2645,8 +2645,10 @@ impl Wallet {
 			.and_then(|t| t["collect_after_seconds"].as_u64()).map_or(BOARD_LIFETIME, |h| h.min(u32::MAX as u64) as u32);
 		let mut earliest: Option<u32> = None;
 		for (o, board, deadline) in outs {
-			let Some(h) = bases.iter().find(|(t, _)| t.output.contains(&o)).and_then(|(_, f)| f.height()) else { continue };
-			if let Some(m) = self.chain.median_time_at(h)? {
+			let Some(t) = bases.iter().find(|(t, f)| t.output.contains(&o) && f.height().is_some()).map(|(t, _)| t) else { continue };
+			// The base's own block, by its hash: each block's header is read
+			// once, not again at every complete re-check.
+			if let Some(m) = self.chain.block_time(&t.txid())? {
 				let e = if board { m.saturating_add(BOARD_LIFETIME) } else { m.max(deadline).saturating_add(horizon) };
 				earliest = Some(earliest.map_or(e, |x| x.min(e)));
 			}
