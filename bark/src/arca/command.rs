@@ -12,7 +12,8 @@
 //! part cost (`{"start", "command"}`, each `{"ms", "node", "operator"}`: the
 //! milliseconds and the requests made of the node and of the operator). A refusal is
 //! [`refusal`]: the JSON the command line prints, `{"error": {"kind",
-//! "message"}}`, with the server's `code` and `status` when the server refused.
+//! "message"}}`, with the server's `code` and `status` when the server refused;
+//! [`run_answer`] adds what the command cost before it was refused (`cost`).
 
 use std::str::FromStr;
 
@@ -117,6 +118,29 @@ pub fn operators(registry: &str, genesis: Option<&str>) -> Result<Value, Error> 
 /// Runs one command, as `arca <command>` does, `args` a JSON object of its
 /// arguments ([`COMMANDS`]). The answer is `{"result", "start", "cost"}`.
 pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> {
+	let (result, start, cost) = run_costed(w, command, args);
+	Ok(json!({"result": result?, "start": start, "cost": cost}))
+}
+
+/// [`run`], its refusal the JSON [`refusal`] makes with what the command
+/// cost before it was refused (`cost`, as [`run`] answers it): a program
+/// that logs a slow command names one refused after a long time as well,
+/// with what it waited on.
+pub fn run_answer(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Value> {
+	let (result, start, cost) = run_costed(w, command, args);
+	match result {
+		Ok(result) => Ok(json!({"result": result, "start": start, "cost": cost})),
+		Err(e) => {
+			let mut out = refusal(&e);
+			out["cost"] = cost;
+			Err(out)
+		},
+	}
+}
+
+/// [`run`]'s parts: the command's answer or refusal, what its start found,
+/// and what each part cost.
+fn run_costed(w: &mut Wallet, command: &str, args: &Value) -> (Result<Value, Error>, Value, Value) {
 	// Every command reads the chain as it is when it starts: the view the
 	// chain source keeps is looked at again before its first read.
 	w.chain.new_command();
@@ -143,7 +167,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 	let start = start(w, command, args["recheck"].as_str() == Some("coins"));
 	let (t1, (n1, _), g1) = (web_time::Instant::now(), w.chain.calls(), super::chain::gaps());
 	let by1 = w.chain.asked_by_method();
-	let result = command_of(w, command, args)?;
+	let result = command_of(w, command, args);
 	let (n2, _) = w.chain.calls();
 	let mut cost = json!({
 		"start": {"ms": (t1 - t0).as_millis() as u64, "node": n1 - n0, "operator": g1 - g0},
@@ -159,7 +183,7 @@ pub fn run(w: &mut Wallet, command: &str, args: &Value) -> Result<Value, Error> 
 			cost[part]["alone"] = alone;
 		}
 	}
-	Ok(json!({"result": result, "start": start, "cost": cost}))
+	(result, start, cost)
 }
 
 /// The requests made one read at a time between `before` and `after`

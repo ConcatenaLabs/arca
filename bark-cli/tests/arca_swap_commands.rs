@@ -176,3 +176,72 @@ async fn a_swap_through_the_commands_shows_its_terms_before_anything_is_signed()
 		"swaps are listed in the order they were made, two in one second too");
 	assert_eq!(listed[1]["state"], "cancelled");
 }
+
+/// A swap pays from the smallest coin of the latest date that holds what it
+/// gives, the maker's side and the taker's: its change, out of round until
+/// the next round refreshes it, is at most that coin. Taken largest first, a
+/// maker's every small swap spent its largest coin and held nearly all of it
+/// out of round. A refusal carries what the command cost before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swap_pays_from_the_smallest_coin_that_holds_it() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("FA");
+	let b = Arca::new("FB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	// A coin on the chain for each board, so the second waits for no change of the first.
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&a, r.x, 1_000_000), (&b, r.y, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000),
+		(&b, r.x, 1_000_000)]
+	{
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	// Each wallet boards a large coin and a small one in one block: two coins of one date.
+	a.ok(&["board", &x, "2000000"]);
+	a.ok(&["board", &x, "300000"]);
+	b.ok(&["board", &y, "3000000", "--fee-asset", &x]);
+	b.ok(&["board", &y, "500000", "--fee-asset", &x]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let small = coins(&a, "live", &x).into_iter().find(|c| value(c) == 300_000).expect("the small coin");
+	let expiries: Vec<Value> = coins(&a, "live", &x).iter().map(|c| c["expiry"].clone()).collect();
+	println!("MAKER COINS: {:?} expiries {:?}", coins(&a, "live", &x).iter().map(value).collect::<Vec<_>>(), expiries);
+
+	// A refusal names what it cost.
+	let refused = tokio::task::block_in_place(|| {
+		let mut w = Wallet::open(&a.dir).expect("open the wallet");
+		command::run_answer(&mut w, "swap_offer", &json!({"give_asset": x, "give": "100000", "want_asset": x, "want": "100000"}))
+	}).unwrap_err();
+	println!("REFUSED WITH ITS COST: {}", refused);
+	assert_eq!(refused["error"]["message"], "refused: a swap exchanges two assets");
+	assert!(refused["cost"]["command"]["ms"].is_u64() && refused["cost"]["start"]["ms"].is_u64(), "{}", refused);
+
+	// The maker gives 100,000 from the 300,000 coin, not the 2,000,000 one.
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "100000", "want_asset": y, "want": "100000"})).unwrap();
+	let inputs: Vec<Value> = offer["details"]["inputs"].as_array().unwrap().iter().map(|i| i["leaf_id"].clone()).collect();
+	println!("OFFER INPUTS: {:?}", inputs);
+	assert_eq!(inputs, vec![small["leaf_id"].clone()], "the smallest coin that holds it");
+	assert_eq!(total(&a, "offered", &x), 300_000);
+	// The taker pays 100,000 from its 500,000 coin: its change is that coin's rest.
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let pays = num(&read["pays"]["margins"]);
+	assert_eq!(num(&read["change"]["value"]), 500_000 - 100_000 - pays, "the taker's change, from its small coin: {}", read);
+	// A swap only the large coin holds is paid from it.
+	library(&a, "swap_cancel", json!({"swap": offer["swap"]})).unwrap();
+	let big = library(&a, "swap_offer", json!({"give_asset": x, "give": "1000000", "want_asset": y, "want": "100000"})).unwrap();
+	assert_eq!(big["details"]["inputs"].as_array().unwrap().len(), 1);
+	assert_eq!(total(&a, "offered", &x), 2_000_000, "the large coin pays what the small one cannot");
+	library(&a, "swap_cancel", json!({"swap": big["swap"]})).unwrap();
+}
