@@ -3222,7 +3222,7 @@ async fn a_wallet_whose_witness_fails_takes_no_coin_and_signs_no_spend() {
 		}
 		None
 	})));
-	let calls = |w: &str| pb.count(w);
+	let calls = |w: &str| if w == "/v1/mailbox_read" { pb.count(w) + pb.count("/v1/mailbox_reads") } else { pb.count(w) };
 	let (sends, boards_posted, mails) = (calls("/v1/cosign_transfer"), calls("/v1/register_board"), calls("/v1/mailbox_read"));
 	for (what, args) in [
 		("send", vec!["send", to_a.as_str(), "--amount", "100000", "--asset", &x.to_string()]),

@@ -1,5 +1,6 @@
 //! A proxy between a wallet and the server that can rewrite any answer the
-//! server gives, or a request on its way to it, or hold a call unanswered: an operator lying to one wallet,
+//! server gives (a rewrite of `/v1/mailbox_read` covers each mailbox of a
+//! `/v1/mailbox_reads` too), or a request on its way to it, or hold a call unanswered: an operator lying to one wallet,
 //! or gone mid-call. It logs every call as the wallet saw it. In front of a
 //! node's RPC (it passes the request's credentials on) it is another node,
 //! one that answers some calls otherwise.
@@ -91,6 +92,12 @@ fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
 	let mut v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 	let f = p.rewrite.lock().unwrap().clone();
 	if let Some(f) = f {
+		if path == "/v1/mailbox_reads" && status == 200 {
+			if let Some((st, one)) = each_mailbox(&f, &req, &mut v) {
+				status = st;
+				v = one;
+			}
+		}
 		if let Some(st) = f(&path, &req, status, &mut v) {
 			status = st;
 		}
@@ -99,6 +106,28 @@ fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
 	let text = v.to_string();
 	write!(s, "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, text.len(), text)?;
 	s.flush()
+}
+
+/// A batch of mailbox reads (`mailbox_reads`) rewritten as each of its
+/// reads would be alone: `f` is called with `/v1/mailbox_read`, the request
+/// that read would carry and its answer, once for each mailbox the batch
+/// answers, so a test that rewrites mailbox reads covers a wallet reading in
+/// batches. A rewrite that fails one read fails the batch: its status and
+/// answer.
+fn each_mailbox(f: &Rewrite, req: &Value, v: &mut Value) -> Option<(u16, Value)> {
+	for b in v["mailboxes"].as_array_mut().into_iter().flatten() {
+		let e = req["reads"].as_array().and_then(|r| r.iter().find(|e| e["key"] == b["key"])).cloned().unwrap_or(Value::Null);
+		let alone = json!({"auth": {"key": e["key"], "challenge": req["challenge"], "signature": e["signature"]}, "after": e["after"],
+			"limit": req["limit"], "notices": req["notices"]});
+		let mut one = json!({"messages": b["messages"].take()});
+		if let Some(st) = f("/v1/mailbox_read", &alone, 200, &mut one) {
+			if st != 200 {
+				return Some((st, one));
+			}
+		}
+		b["messages"] = one["messages"].take();
+	}
+	None
 }
 
 impl Proxy {
