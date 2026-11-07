@@ -4,7 +4,7 @@
 //! chain: A's `send-quote` names the coins and the fee its `send` then gives
 //! up, to the atom; A puts part of what it holds in a channel, and a payment
 //! larger than the rest is refused naming that channel (`in_channel`), and
-//! quoted the same; closed into a round, the channel's side comes back as a
+//! quoted the same, as is one larger than both; closed into a round, the channel's side comes back as a
 //! leaf of A's own, and the payment goes through.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
@@ -118,6 +118,17 @@ async fn a_quote_names_the_fee_and_a_channel_side_is_closed_to_pay() {
 		let msg = v["error"]["message"].as_str().unwrap();
 		assert!(msg.contains("a transfer does not spend"), "{}", msg);
 		println!("{} refused: {}", cmd, msg);
+	}
+	// More than the plain leaf and the channel's side together: still refused
+	// naming the channel, since closing it raises the most A can send.
+	let over = kept + side + 1;
+	let req3 = b.ok(&["receive", "--asset", &x, "--amount", &over.to_string()])["request"].as_str().unwrap().to_string();
+	for cmd in ["send-quote", "send"] {
+		let (ok, v) = a.run(&[cmd, &req3]);
+		assert!(!ok, "{} paid more than A holds: {}", cmd, v);
+		assert_eq!(v["error"]["kind"], "in_channel", "{}: {}", cmd, v);
+		assert_eq!(v["error"]["close"], serde_json::json!([leaf]), "{}", v);
+		assert!(v["error"]["message"].as_str().unwrap().contains("does not cover it all"), "{}", v);
 	}
 	// What the plain leaf alone allows is still paid out of it.
 	let small = b.ok(&["receive", "--asset", &x, "--amount", "10000"])["request"].as_str().unwrap().to_string();
