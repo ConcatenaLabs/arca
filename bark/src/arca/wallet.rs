@@ -2400,7 +2400,7 @@ impl Wallet {
 			}
 			let payer = match self.board_base(record, &o)? {
 				Some(t) => Some(t),
-				None => self.chain_payer(&o)?,
+				None => self.chain_payer(record, &o)?,
 			};
 			match (payer, stored) {
 				(Some(t), _) => {
@@ -2427,7 +2427,7 @@ impl Wallet {
 			}
 			match self.known_base(&o)? {
 				Some(t) => txs.push(t),
-				None => match self.chain_payer(&o)? {
+				None => match self.chain_payer(record, &o)? {
 					Some(t) => txs.push(t),
 					None => return Err(Error::Missing(format!("no transaction on the chain pays the batch or board output {} it rests on",
 						hex(o.script_pubkey.as_bytes())))),
@@ -2466,15 +2466,58 @@ impl Wallet {
 		Ok(Some(tx))
 	}
 
-	/// The transaction of the active chain that pays `o`: found in the set of
-	/// unspent outputs, else by reading the blocks from before the wallet's
-	/// birthday.
-	fn chain_payer(&self, o: &TxOut) -> Result<Option<Transaction>, Error> {
+	/// The round transaction paying `o`, the batch output of a round leaf
+	/// `record` rests on, as the operator names it (`batch_status`) and the
+	/// node holds it in its active chain: read by txid, so a batch output
+	/// spent since (the watcher unrolled the batch to reclaim nodes its
+	/// holders released) is found without reading blocks. The operator's
+	/// answer only says where to look: a transaction that does not pay `o`,
+	/// or is not in the active chain, is not taken.
+	fn batch_base(&self, record: &CoinRecord, o: &TxOut) -> Result<Option<Transaction>, Error> {
+		fn leaves(r: &CoinRecord, out: &mut Vec<(arca_covenant::LeafId, TxOut)>) {
+			match r {
+				CoinRecord::Leaf { record, .. } => {
+					if let (Ok(id), Ok(b)) = (record.leaf_id(), record.branch()) {
+						out.push((id, b.batch_output().txout()));
+					}
+				},
+				CoinRecord::Accumulator { record, .. } => {
+					if let (Ok(id), Ok(b)) = (record.leaf_id(), record.batch_output()) {
+						out.push((id, b.txout()));
+					}
+				},
+				CoinRecord::Board(_) => {},
+				CoinRecord::Transfer(_) | CoinRecord::Fill(_) => r.parents().into_iter().for_each(|p| leaves(p, out)),
+			}
+		}
+		let mut all = vec![];
+		leaves(record, &mut all);
+		let Some((id, _)) = all.into_iter().find(|(_, out)| out == o) else { return Ok(None) };
+		let Ok(v) = self.server.post("batch_status", &json!({"leaf_id": id.to_string()})) else { return Ok(None) };
+		for r in v["rounds"].as_array().into_iter().flatten() {
+			let (Some(txid), Some(vout)) = (r["round_txid"].as_str().and_then(|t| Txid::from_str(t).ok()), r["vout"].as_u64()) else { continue };
+			self.chain.read_ahead_of(std::slice::from_ref(&txid), &[]);
+			let Some(tx) = self.chain.transaction(&txid)? else { continue };
+			if tx.output.get(vout as usize) == Some(o) && self.chain.whereabouts(&txid)?.0 {
+				return Ok(Some(tx));
+			}
+		}
+		Ok(None)
+	}
+
+	/// The transaction of the active chain that pays `o`, an output `record`
+	/// rests on: found in the set of unspent outputs, else where the operator
+	/// says a round leaf's round is ([`Self::batch_base`]), else by reading
+	/// the blocks from before the wallet's birthday.
+	fn chain_payer(&self, record: &CoinRecord, o: &TxOut) -> Result<Option<Transaction>, Error> {
 		let found = self.chain.coins_at(std::slice::from_ref(&o.script_pubkey))?.into_iter()
 			.find(|(_, out, _)| out == o).map(|(op, _, _)| op.txid);
 		match found {
 			Some(txid) => self.chain.transaction(&txid),
 			None => {
+				if let Some(t) = self.batch_base(record, o)? {
+					return Ok(Some(t));
+				}
 				let from: u64 = self.store.meta("birthday")?.and_then(|b| b.parse().ok()).unwrap_or(0);
 				Ok(self.chain.find_payment(o, from.saturating_sub(1000))?.map(|(t, _)| t))
 			},
