@@ -1605,7 +1605,14 @@ JSON is of kind `planned`, with the `asset` and `release`, the fewest planned
 coins, largest first, whose release covers the payment. A program pays by
 releasing those, running `sync` until the round is final and the new leaf is
 held, and asking again (a release can fall short by the new leaf's own margins,
-and the refusal then names the next coin). The new leaf costs the refresh fee the
+and the refusal then names the next coin). When the plans cannot make it up and
+the wallet's side of its channels in the asset can, the refusal is of kind
+`in_channel` instead, with the `asset` and `close`, the fewest live channel
+leaves, largest side first, whose sides cover the payment: a transfer never
+spends a channel leaf, and closing one into the next round (`quote` and
+`participate` with it) gives its side back as a leaf of the wallet's own, less
+the round's fee. A program pays by closing those, running `sync` until the
+round is final, and asking again. The new leaf costs the refresh fee the
 asset's schedule asks then (none in the coin's free window), and `care` leaves
 it unplanned for a day. The operator takes a coin a step made into a round once
 the batch of the coin that step gave up is swept and the sweep final. The operator applies a plan, as it refreshes any coin: one that
@@ -1696,6 +1703,16 @@ take that much, or it was closed) leaves nothing standing, and the same
 fallback follows. A state sent and not answered stands: `send` refuses it as
 unreachable and pays nothing another way, since the next `channel sync`
 sends it again. `--route channel` or `--route leaf` takes one way alone.
+
+`send-quote` takes what `send` takes and pays nothing: it answers the way
+`send` would go and what it would cost, asking the operator for nothing.
+Over a channel the fee is 0 (`route: "channel"`). To a leaf (`route: "leaf"`)
+it names the coins the payment gives up (`inputs`), its change, and its
+`fee`: the margins its checkpoints and its reassignment leave for their fees,
+priced from the fee floor the operator publishes, out of the wallet's own
+coins. The receiver gets the amount; the wallet's change is short by the fee,
+so a wallet can send at most what its spendable coins hold less that fee. It
+refuses what `send` would refuse, in the same words and kinds.
 
 The payer relies on the operator for the one request a channel payment is:
 the operator could co-sign the payer's new state and keep the receiver's
@@ -1953,6 +1970,7 @@ which a round removes.
     arca board <asset> 2000000                    # spendable once final
     arca sync
     arca receive                                  # on the receiving wallet
+    arca send-quote arca:… --amount 600000 --asset <asset>   # its route, coins and fee; pays nothing
     arca send arca:… --amount 600000 --asset <asset>
     arca mailbox                                  # on the receiving wallet
     arca participate && arca sync                 # refresh into the next round

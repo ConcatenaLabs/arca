@@ -27,7 +27,7 @@ use super::{Config, Error, Wallet};
 /// Every command [`run`] takes, with its arguments.
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, brief?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
-	asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
+	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?}, deposits, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
 	refresh_received {max_fee_ppm?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
@@ -60,6 +60,10 @@ pub fn refusal(e: &Error) -> Value {
 	if let Error::Planned { asset, release, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["release"] = json!(release);
+	}
+	if let Error::InChannel { asset, close, .. } = e {
+		out["error"]["asset"] = json!(asset);
+		out["error"]["close"] = json!(close);
 	}
 	out
 }
@@ -207,7 +211,7 @@ fn reads_only(command: &str) -> bool {
 		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
 		| "info" | "supply" | "leaf_template" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
 		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
-		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels")
+		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote")
 }
 
 /// What `arca` runs before a command: the witness (unless the command stays
@@ -298,6 +302,8 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"forget_request" => w.forget_request(req_str(&a["owner"], "the request's key")?),
 		"send" => w.send_routed(req_str(&a["request"], "the receive request")?, opt_u64(&a["amount"], "the amount")?, opt_asset(&a["asset"])?,
 			a["route"].as_str()),
+		"send_quote" => w.send_quote_routed(req_str(&a["request"], "the receive request")?, opt_u64(&a["amount"], "the amount")?,
+			opt_asset(&a["asset"])?, a["route"].as_str()),
 		"channel_code" => w.channel_code(a["address"].as_str()),
 		"mailbox" => w.mailbox(),
 		"restore" => w.restore(),
@@ -675,6 +681,8 @@ mod test {
 		assert_eq!(refusal(&Error::Refused("no".into())), json!({"error": {"kind": "refused", "message": "refused: no"}}));
 		let p = Error::Planned { asset: "aa".into(), release: vec!["c1".into(), "c2".into()], message: "short".into() };
 		assert_eq!(refusal(&p), json!({"error": {"kind": "planned", "message": "refused: short", "asset": "aa", "release": ["c1", "c2"]}}));
+		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], message: "short".into() };
+		assert_eq!(refusal(&c), json!({"error": {"kind": "in_channel", "message": "refused: short", "asset": "aa", "close": ["ch1"]}}));
 	}
 
 	#[test]
