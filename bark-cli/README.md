@@ -1608,7 +1608,9 @@ held, and asking again (a release can fall short by the new leaf's own margins,
 and the refusal then names the next coin). When the plans cannot make it up and
 the wallet's side of its channels in the asset can, the refusal is of kind
 `in_channel` instead, with the `asset` and `close`, the fewest live channel
-leaves, largest side first, whose sides cover the payment: a transfer never
+leaves, largest side first, whose sides cover the payment (all of them when
+even all fall short: closing them still raises the most it can send, and the
+payment asked again after the round is refused with what the coins then allow): a transfer never
 spends a channel leaf, and closing one into the next round (`quote` and
 `participate` with it) gives its side back as a leaf of the wallet's own, less
 the round's fee. A program pays by closing those, running `sync` until the

@@ -255,7 +255,11 @@ impl Wallet {
 	/// largest first, whose sides together cover `short` (a transfer never
 	/// spends a channel leaf, which pays only by its channel's states, and
 	/// closing one into a round gives its side back as a leaf of the
-	/// wallet's own); `refused` as it is when they do not.
+	/// wallet's own). When all of them together fall short too, it names
+	/// them all: closing them still raises the most the wallet can send,
+	/// and a payment asked again after the round is refused with what its
+	/// coins then allow. `refused` as it is when the wallet has no side in
+	/// a channel of the asset.
 	pub(crate) fn in_channel(&self, asset: AssetId, short: u64, refused: String) -> Result<Error, Error> {
 		let mut held: Vec<(String, u64)> = vec![];
 		for c in self.store.coins_in("live")? {
@@ -270,8 +274,14 @@ impl Wallet {
 		}
 		held.sort_by_key(|(id, v)| (std::cmp::Reverse(*v), id.clone()));
 		let total: u64 = held.iter().map(|(_, v)| v).sum();
-		if total == 0 || total < short {
+		if total == 0 {
 			return Ok(Error::Refused(refused));
+		}
+		if total < short {
+			let close: Vec<String> = held.into_iter().map(|(id, _)| id).collect();
+			let message = format!("{}; {} more is the wallet's side of its channels in the asset, which a transfer does not spend, and does not cover it all: closing the {} of them into the next round (a quote and a participation with each channel leaf) gives that side back as leaves of the wallet's own, less the round's fee, which raises the most it can send",
+				refused, total, close.len());
+			return Ok(Error::InChannel { asset: asset.to_string(), close, message });
 		}
 		let (mut close, mut sum) = (vec![], 0u64);
 		for (id, v) in held {
