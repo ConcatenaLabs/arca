@@ -144,7 +144,7 @@ witness_source_burst = 60
 # read_source_per_second to each source, with bursts of up to
 # read_source_burst. A wallet restored from its mnemonic reads a page of its
 # leaves, a page of its mailbox and a tree for each round its leaves rest on;
-# a mailbox_reads takes one for each 50 keys it names.
+# a mailbox_reads takes one for each 25 keys it names.
 read_per_second = 500
 read_burst = 2000
 read_source_per_second = 10

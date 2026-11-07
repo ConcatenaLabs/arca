@@ -10,7 +10,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use elements::{AssetId, Script, Transaction};
@@ -306,4 +306,172 @@ async fn a_payment_an_anchor_reorg_undoes_reads_as_undone() {
 	assert_ne!(again["state"], "live");
 	assert_eq!(confirmed(&m, x), "0", "nothing counted while R is out");
 	let _ = (std::fs::remove_dir_all(&b.dir), std::fs::remove_dir_all(&m.dir));
+}
+
+/// `n` receive requests drawn through the library, each with the owner key
+/// it asks a payment under.
+fn requests_with_keys(a: &Arca, n: usize) -> Vec<(String, String)> {
+	tokio::task::block_in_place(|| {
+		let mut w = Wallet::open(&a.dir).expect("open the wallet");
+		(0..n).map(|_| {
+			let v = command::run(&mut w, "receive", &json!({})).unwrap();
+			(v["result"]["request"].as_str().unwrap().to_string(), v["result"]["details"]["owner"].as_str().unwrap().to_string())
+		}).collect()
+	})
+}
+
+fn strip_acks(v: &mut Value) {
+	for m in v["messages"].as_array_mut().into_iter().flatten() {
+		if let Some(o) = m["signer_record"].as_object_mut() {
+			o.remove("acks");
+		}
+	}
+}
+
+/// A coin waiting for its keepers' acknowledgements survives a read that
+/// fails later (review RV27's probe, arca#694): B holds `n` waiting requests
+/// and A pays the first. Through a proxy that strips the acknowledgements
+/// from B's mailbox heads (so the coin waits) and answers 503 to any read
+/// naming the key of B's last request, B's read fails; with the answers
+/// whole again, B's next read takes the coin.
+async fn waiting_coin_survives_a_later_error(n: usize, hide_batch: bool) {
+	let mut r = Running::start_kept(1, None).await;
+	let (url, x) = (r.url(), r.x);
+	let pb = Proxy::start(&url);
+	let tag = if hide_batch { "F" } else { "B" };
+	let (a, b) = (Arca::new(&format!("MBKA{}", tag)), Arca::new(&format!("MBKB{}", tag)));
+	boarded(&mut r, &a, &url, x, &[4_000_000]).await;
+	b.ok(&create_args(&pb.url.clone(), &r.node_url()));
+	b.ok(&["mailbox"]);
+	let reqs = requests_with_keys(&b, n);
+	let late = reqs.last().unwrap().1.clone();
+	a.ok(&["send", &reqs[0].0, "--amount", "300000", "--asset", &x.to_string()]);
+	let failed = Arc::new(Mutex::new(0usize));
+	let (f2, late2) = (failed.clone(), late.clone());
+	pb.rewrite(Some(Arc::new(move |path: &str, req: &Value, _: u16, v: &mut Value| {
+		match path {
+			"/v1/info" if hide_batch => {
+				v.as_object_mut().unwrap().remove("mailbox_reads");
+				None
+			},
+			"/v1/mailbox_read" => {
+				strip_acks(v);
+				if req["auth"]["key"].as_str() == Some(late2.as_str()) {
+					*f2.lock().unwrap() += 1;
+					return Some(503);
+				}
+				None
+			},
+			"/v1/mailbox_reads" if req["reads"].as_array().into_iter().flatten().any(|e| e["key"].as_str() == Some(late2.as_str())) => {
+				*f2.lock().unwrap() += 1;
+				Some(503)
+			},
+			_ => None,
+		}
+	})));
+	let (ok, v) = b.run(&["mailbox"]);
+	println!("{} read failing late: ok={} failed reads={} {}", tag, ok, *failed.lock().unwrap(), v["error"]);
+	assert!(!ok && *failed.lock().unwrap() >= 1, "the read fails on the late key");
+	pb.rewrite(None);
+	// The wallet keeps the operator's `info` a few seconds: an operator
+	// without the call stays so for the next read too.
+	let (ok, s) = b.run(&["mailbox"]);
+	println!("{} read with the answers whole: ok={} accepted={} waiting={} dropped={}", tag, ok, s["accepted"], s["waiting"], s["dropped"]);
+	let coins = b.ok(&["coins"]);
+	assert!(coins.as_array().unwrap().iter().any(|c| c["value"] == "300000"), "{}: the coin that waited is taken: {}", tag, coins);
+	assert!(s["dropped"].is_null(), "{}: its notice is not dropped: {}", tag, s["dropped"]);
+	let _ = (std::fs::remove_dir_all(&a.dir), std::fs::remove_dir_all(&b.dir));
+}
+
+/// arca#694 against an operator without `mailbox_reads`: keys read one by one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_coin_survives_a_later_error_key_by_key() {
+	waiting_coin_survives_a_later_error(3, true).await;
+}
+
+/// arca#694 with `mailbox_reads`, more keys than one batch holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_coin_survives_a_later_error_in_batches() {
+	waiting_coin_survives_a_later_error(250, false).await;
+}
+
+/// Keys left out of a `mailbox_reads` answer, and a key's page cut short,
+/// are read again (arca#697): payments to several requests are posted to
+/// each request's own key (the payer names no mailbox for them, as a payer
+/// that leaves it out does), two more to the wallet's mailbox key, and the
+/// operator's answers are cut through a proxy to their first two keys, the
+/// second with one message. One read finds every payment, each once.
+#[tokio::test(flavor = "multi_thread")]
+async fn keys_left_out_of_an_answer_are_read_again() {
+	let mut r = Running::start().await;
+	let (url, x) = (r.url(), r.x);
+	let (pa, pb) = (Proxy::start(&url), Proxy::start(&url));
+	let (a, b) = (Arca::new("MBLA"), Arca::new("MBLB"));
+	boarded(&mut r, &a, &pa.url.clone(), x, &[6_000_000, 6_000_000]).await;
+	let mailbox = b.ok(&create_args(&pb.url.clone(), &r.node_url()))["mailbox_key"].as_str().unwrap().to_string();
+	b.ok(&["mailbox"]);
+	let reqs = requests_with_keys(&b, 30);
+	// A's payments to these requests name no mailbox: the operator posts each
+	// coin, and its notice, to the request's own key.
+	let own: Vec<usize> = vec![3, 9, 17, 22, 28, 29];
+	let owners: Arc<Vec<String>> = Arc::new(own.iter().map(|&i| reqs[i].1.clone()).collect());
+	let o2 = owners.clone();
+	pa.rewrite_request(Some(Arc::new(move |path: &str, body: &mut Value| {
+		if path == "/v1/cosign_transfer" {
+			for o in body["outputs"].as_array_mut().into_iter().flatten() {
+				if o2.iter().any(|k| o["owner"].as_str() == Some(k.as_str()) || o["leaf"]["owner"].as_str() == Some(k.as_str())) {
+					o.as_object_mut().unwrap().remove("mailbox");
+				}
+			}
+		}
+	})));
+	let value = |i: usize| 1_000_000 + 1_000 * i as u64;
+	for &i in own.iter().chain([0usize, 1].iter()) {
+		a.ok(&["send", &reqs[i].0, "--amount", &value(i).to_string(), "--asset", &x.to_string()]);
+		a.ok(&["mailbox"]);
+	}
+	println!("payments to requests {:?} posted to their own keys, two more to the mailbox key {}", own, mailbox);
+	let cut = Arc::new(Mutex::new((0usize, 0usize)));
+	let served: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+	let (c2, s2, mb2) = (cut.clone(), served.clone(), mailbox.clone());
+	pb.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/mailbox_reads" && status == 200 {
+			let boxes = v["mailboxes"].as_array_mut().unwrap();
+			for b in boxes.iter() {
+				let k = b["key"].as_str().unwrap_or("").to_string();
+				if k != mb2 && b["messages"].as_array().is_some_and(|m| !m.is_empty()) {
+					s2.lock().unwrap().insert(k);
+				}
+			}
+			let mut c = c2.lock().unwrap();
+			if boxes.len() > 2 {
+				c.0 += boxes.len() - 2;
+				boxes.truncate(2);
+			}
+			if let Some(m) = boxes.last_mut().and_then(|b| b["messages"].as_array_mut()) {
+				if m.len() > 1 {
+					c.1 += m.len() - 1;
+					m.truncate(1);
+				}
+			}
+		}
+		None
+	})));
+	let from = pb.calls().len();
+	let v = b.ok(&["mailbox"]);
+	let batches = pb.calls()[from..].iter().filter(|(p, ..)| p == "/v1/mailbox_reads").count();
+	let (left_out, cut_messages) = *cut.lock().unwrap();
+	let mut found = accepted_values(&v);
+	found.sort();
+	let mut want: Vec<u64> = own.iter().chain([0usize, 1].iter()).map(|&i| value(i)).collect();
+	want.sort();
+	println!("one read: {} batches, {} keys left out of answers, {} messages cut from pages; took {:?}", batches, left_out, cut_messages, found);
+	assert!(left_out > 0 && cut_messages > 0, "the answers were cut: {} keys, {} messages", left_out, cut_messages);
+	let own_keys: std::collections::BTreeSet<String> = owners.iter().cloned().collect();
+	assert_eq!(*served.lock().unwrap(), own_keys, "the six payments were served under the requests' own keys");
+	assert_eq!(found, want, "every payment found, each once, in one read");
+	pb.rewrite(None);
+	let again = b.ok(&["mailbox"]);
+	assert!(accepted_values(&again).is_empty(), "nothing taken twice: {}", again);
+	let _ = (std::fs::remove_dir_all(&a.dir), std::fs::remove_dir_all(&b.dir));
 }

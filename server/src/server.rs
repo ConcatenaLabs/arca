@@ -450,7 +450,7 @@ pub struct LimitsSection {
 	/// it publishes (`leaf_data`, `mailbox_read`, `mailbox_reads`, `tree`,
 	/// `rounds`, `bind_mailbox`) answered per second at most, over every
 	/// source together, and how many at once: each reads the database and may
-	/// carry a page of records; a `mailbox_reads` counts one for each 50 keys
+	/// carry a page of records; a `mailbox_reads` counts one for each 25 keys
 	/// it names.
 	#[serde(default = "default_read_per_second")]
 	pub read_per_second: u32,
