@@ -985,6 +985,23 @@ async fn board_status_call(State(app): State<Arc<App>>, body: Result<Bytes, Byte
 	}
 }
 
+/// Where a round leaf lies: its rounds and batch output ([`api::BatchStatus`]).
+async fn batch_status(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::BatchStatus>, Refusal>
+{
+	let req: api::BatchStatusRequest = parse(body, app.max_request)?;
+	app.reads.refusal("a batch's rounds", app.source(peer.ip(), &headers))?;
+	let id = leaf_id(&req.leaf_id)?;
+	let rounds = app.store.batch_rounds_of(&id.0).await?;
+	if rounds.is_empty() {
+		return Err(Refusal::new(StatusCode::NOT_FOUND, "unknown_batch", format!("no round leaf {} is known", id)));
+	}
+	Ok(Json(api::BatchStatus {
+		leaf_id: id.to_string(),
+		rounds: rounds.into_iter().map(|(txid, vout, state)| api::BatchRound { round_txid: txid_hex(&txid), vout, state }).collect(),
+	}))
+}
+
 /// A transfer request as the interface carries it, parsed.
 fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput]) -> Result<TransferRequest, Refusal> {
 	let mut ins = Vec::with_capacity(inputs.len());
@@ -2163,6 +2180,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/challenge", post(challenge))
 		.route("/v1/register_board", post(register_board))
 		.route("/v1/board_status", post(board_status_call))
+		.route("/v1/batch_status", post(batch_status))
 		.route("/v1/cosign_transfer", post(cosign_transfer))
 		.route("/v1/lightning_send", post(lightning_send))
 		.route("/v1/lightning_send_status", post(lightning_send_status))

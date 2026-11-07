@@ -919,6 +919,35 @@ pub struct BoardStatus {
 	pub expiry: Option<u32>,
 }
 
+/// `POST /v1/batch_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchStatusRequest {
+	pub leaf_id: String,
+}
+
+/// Where a round leaf lies: each round whose batch output it is in, newest
+/// first, with that output and the round's state (`built`, `broadcast`,
+/// `final`, `lost`). A wallet reads the round by its txid: once the batch
+/// output is spent (the watcher unrolled the batch to reclaim nodes its
+/// holders released) the node's set of unspent outputs no longer finds it.
+/// Hints only: a wallet takes a round only if it pays the output the leaf's
+/// record names and is in the chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchStatus {
+	pub leaf_id: String,
+	pub rounds: Vec<BatchRound>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRound {
+	pub round_txid: String,
+	pub vout: u32,
+	pub state: String,
+}
+
 /// `POST /v1/cosign_transfer`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
