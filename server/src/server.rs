@@ -447,10 +447,11 @@ pub struct LimitsSection {
 	#[serde(default = "default_witness_source_burst")]
 	pub witness_source_burst: u32,
 	/// The reads that serve a wallet what the server holds for it and what
-	/// it publishes (`leaf_data`, `mailbox_read`, `tree`, `rounds`,
-	/// `bind_mailbox`) answered per second at most, over every source
-	/// together, and how many at once: each reads the database and may carry
-	/// a page of records.
+	/// it publishes (`leaf_data`, `mailbox_read`, `mailbox_reads`, `tree`,
+	/// `rounds`, `bind_mailbox`) answered per second at most, over every
+	/// source together, and how many at once: each reads the database and may
+	/// carry a page of records; a `mailbox_reads` counts one for each 50 keys
+	/// it names.
 	#[serde(default = "default_read_per_second")]
 	pub read_per_second: u32,
 	#[serde(default = "default_read_burst")]

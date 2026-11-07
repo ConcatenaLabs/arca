@@ -26,7 +26,7 @@
 //! | `tree`, `rounds` | POST | no: the operator publishes every tree, and the list of its rounds; at the reads' rate |
 //! | `forfeit_leaves` | POST | by each owner's signatures over the forfeits themselves |
 //! | `release_leaves` | POST | by each owner's signature over the release itself |
-//! | `mailbox_read`, `leaf_data` | POST | by a challenge signed with the key ([`crate::auth`]); answered at a bounded rate of their own ([`Limiter`]) |
+//! | `mailbox_read`, `mailbox_reads`, `leaf_data` | POST | by a challenge signed with the key, or with each key read ([`crate::auth`]); answered at a bounded rate of their own ([`Limiter`]) |
 //! | `bind_mailbox` | POST | by each leaf's owner key's signature over its binding; at the reads' rate |
 //! | `holding_back` | POST | by a challenge signed with each key named, answering only for the coins served to them ([`crate::auth`]); at the reads' rate |
 //! | `witness` | POST | no: the heads it hands over are the signer's, signed, and at most four without a valid signature; answered at a bounded rate of its own, for each source and overall ([`Limiter`]) |
@@ -311,11 +311,12 @@ impl Bucket {
 		self.at = now;
 	}
 
-	fn wait(&self, per_second: f64) -> Duration {
+	/// How long until the bucket holds `n` tokens.
+	fn wait_for(&self, per_second: f64, n: f64) -> Duration {
 		if per_second <= 0.0 {
 			return Duration::from_secs(60);
 		}
-		Duration::from_secs_f64((1.0 - self.tokens).max(0.0) / per_second)
+		Duration::from_secs_f64((n - self.tokens).max(0.0) / per_second)
 	}
 }
 
@@ -370,6 +371,15 @@ impl Limiter {
 	/// Takes one token for a request from `source`, from its own bucket and
 	/// from everyone's, or says how long until both have one.
 	pub fn take(&self, source: IpAddr) -> Result<(), Duration> {
+		self.take_n(source, 1.0)
+	}
+
+	/// Takes `n` tokens at once, for a request that does the work of `n`,
+	/// or says how long until both buckets hold them; never more than a
+	/// whole burst, so a bucket set smaller than `n` still serves it when
+	/// full.
+	pub fn take_n(&self, source: IpAddr, n: f64) -> Result<(), Duration> {
+		let n = n.min(self.burst).min(self.source_burst);
 		let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
 		let now = Instant::now();
 		let (all, sources) = &mut *s;
@@ -387,19 +397,23 @@ impl Limiter {
 		}
 		let mine = sources.entry(key).or_insert(Bucket { tokens: self.source_burst, at: now });
 		mine.refill(self.source_per_second, self.source_burst, now);
-		if mine.tokens < 1.0 {
-			return Err(mine.wait(self.source_per_second));
+		if mine.tokens < n {
+			return Err(mine.wait_for(self.source_per_second, n));
 		}
-		if all.tokens < 1.0 {
-			return Err(all.wait(self.per_second));
+		if all.tokens < n {
+			return Err(all.wait_for(self.per_second, n));
 		}
-		mine.tokens -= 1.0;
-		all.tokens -= 1.0;
+		mine.tokens -= n;
+		all.tokens -= n;
 		Ok(())
 	}
 
 	fn refusal(&self, call: &str, source: IpAddr) -> Result<(), Refusal> {
-		self.take(source).map_err(|wait| Refusal::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited",
+		self.refusal_n(call, source, 1.0)
+	}
+
+	fn refusal_n(&self, call: &str, source: IpAddr, n: f64) -> Result<(), Refusal> {
+		self.take_n(source, n).map_err(|wait| Refusal::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited",
 			format!("{} is handed out at a bounded rate to each source, within a high bound overall; try again in {} ms", call,
 				wait.as_millis().max(1))))
 	}
@@ -911,6 +925,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		swept: api::SweptInfo { policy: "repaid".into(), late_fee: "refresh".into() },
 		watchtowers: app.params.watchtowers.clone(),
 		batches: api::BatchesInfo { no_sweep: app.params.no_sweep, collect_after_seconds: app.params.collect_after_seconds },
+		mailbox_reads: MAX_MAILBOX_READS as u32,
 	})
 }
 
@@ -1743,6 +1758,11 @@ async fn mailbox_read(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInf
 	let k = authenticate(&app, "mailbox_read", &req.auth, &auth::mailbox_read_request(after as u64, req.limit)).await?;
 	let limit = req.limit.clamp(1, MAILBOX_PAGE) as i64;
 	let msgs = app.store.mailbox_read(&k.serialize(), after, limit, req.notices).await?;
+	Ok(Json(api::Mailbox { messages: wire_messages(&app, msgs).await? }))
+}
+
+/// A mailbox's messages as `mailbox_read` and `mailbox_reads` serve them.
+async fn wire_messages(app: &App, msgs: Vec<crate::store::MailboxMessage>) -> Result<Vec<api::MailboxMessage>, Refusal> {
 	let mut messages = Vec::with_capacity(msgs.len());
 	for m in msgs {
 		if m.kind != "coin" {
@@ -1771,7 +1791,71 @@ async fn mailbox_read(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInf
 			notice: None,
 		});
 	}
-	Ok(Json(api::Mailbox { messages }))
+	Ok(messages)
+}
+
+/// The most keys one `mailbox_reads` reads: their proofs fit in the
+/// default request size (about 250 bytes each).
+pub const MAX_MAILBOX_READS: usize = 200;
+
+/// The keys one token of the reads' budget pays for in a `mailbox_reads`:
+/// a batch of the most keys takes five, against one for each key read alone.
+pub const MAILBOX_READS_PER_TOKEN: usize = 50;
+
+/// The most rows one `mailbox_reads` reads from the database, a key with an
+/// empty mailbox counting one: every key of the largest batch, and five pages
+/// of messages.
+pub const MAILBOX_READS_ROWS: i64 = MAX_MAILBOX_READS as i64 + 5 * MAILBOX_PAGE as i64;
+
+/// `mailbox_reads`: the mailboxes of up to [`MAX_MAILBOX_READS`] keys, each
+/// after a cursor of its own, under one challenge, each key proven as a
+/// `mailbox_read` of it is. Every proof is checked before anything is read; a
+/// key named twice, or one proof that fails, refuses the whole batch. The
+/// answer holds the keys from the first to where [`MAILBOX_READS_ROWS`] ran
+/// out (see [`crate::Store::mailbox_read_many`]); the wallet asks again for
+/// the keys left out.
+async fn mailbox_reads(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
+	body: Result<Bytes, BytesRejection>) -> Result<Json<api::Mailboxes>, Refusal>
+{
+	let req: api::MailboxReads = parse(body, app.max_request)?;
+	if req.reads.is_empty() || req.reads.len() > MAX_MAILBOX_READS {
+		return Err(Refusal::malformed(format!("{} keys; a mailbox read names 1 to {}", req.reads.len(), MAX_MAILBOX_READS)));
+	}
+	app.reads.refusal_n("a mailbox read", app.source(peer.ip(), &headers), req.reads.len().div_ceil(MAILBOX_READS_PER_TOKEN) as f64)?;
+	let challenge = unhex32(&req.challenge).map_err(Refusal::malformed)?;
+	let unauthenticated = |m: String| Refusal::new(StatusCode::UNAUTHORIZED, "unauthenticated", m);
+	auth::check_challenge(&app.challenge_key, &challenge, unix_now(), app.challenge_ttl.as_secs()).map_err(|e| unauthenticated(e.to_string()))?;
+	let mut reads = Vec::with_capacity(req.reads.len());
+	let mut seen = HashSet::new();
+	for r in &req.reads {
+		let k = key(&r.key)?;
+		if !seen.insert(k.serialize()) {
+			return Err(Refusal::malformed(format!("key {} is named twice; a mailbox read names each key once", r.key)));
+		}
+		let after: i64 = if r.after == "0" { 0 } else {
+			i64::try_from(amount(&r.after)?).map_err(|_| Refusal::malformed("cursor out of range"))?
+		};
+		reads.push((k, after, sig(&r.signature)?));
+	}
+	// Each proof is a signature check: off the threads that serve requests.
+	let (chain, limit) = (app.params.chain, req.limit);
+	let (reads, failed) = tokio::task::spawn_blocking(move || {
+		let failed = reads.iter().position(|(k, after, s)| {
+			!auth::verify(&chain, "mailbox_read", &challenge, k, &auth::mailbox_read_request(*after as u64, limit), s)
+		});
+		(reads, failed)
+	}).await.map_err(|e| Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+	if let Some(i) = failed {
+		return Err(unauthenticated(format!("the signature does not prove key {} for this mailbox_read", req.reads[i].key)));
+	}
+	let keys: Vec<([u8; 32], i64)> = reads.iter().map(|(k, after, _)| (k.serialize(), *after)).collect();
+	let limit = req.limit.clamp(1, MAILBOX_PAGE) as i64;
+	let found = app.store.mailbox_read_many(&keys, limit, req.notices, MAILBOX_READS_ROWS).await?;
+	let mut mailboxes = Vec::with_capacity(found.len());
+	for (k, msgs) in found {
+		mailboxes.push(api::MailboxOf { key: hex(&k), messages: wire_messages(&app, msgs).await? });
+	}
+	Ok(Json(api::Mailboxes { mailboxes }))
 }
 
 /// The most leaves one `leaf_data` page holds.
@@ -2112,6 +2196,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/forfeit_leaves", post(forfeit_leaves))
 		.route("/v1/release_leaves", post(release_leaves))
 		.route("/v1/mailbox_read", post(mailbox_read))
+		.route("/v1/mailbox_reads", post(mailbox_reads))
 		.route("/v1/leaf_data", post(leaf_data))
 		.route("/v1/bind_mailbox", post(bind_mailbox))
 		.route("/v1/witness", post(witness))
