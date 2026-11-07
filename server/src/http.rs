@@ -1799,19 +1799,24 @@ async fn wire_messages(app: &App, msgs: Vec<crate::store::MailboxMessage>) -> Re
 pub const MAX_MAILBOX_READS: usize = 200;
 
 /// The keys one token of the reads' budget pays for in a `mailbox_reads`:
-/// a batch of the most keys takes five, against one for each key read alone.
-pub const MAILBOX_READS_PER_TOKEN: usize = 50;
+/// a batch of the most keys takes eight, against one for each key read
+/// alone, so a token buys at most 25 signature checks and, with the bound on
+/// rows, at most one page of messages.
+pub const MAILBOX_READS_PER_TOKEN: usize = 25;
 
-/// The most rows one `mailbox_reads` reads from the database, a key with an
-/// empty mailbox counting one: every key of the largest batch, and five pages
-/// of messages.
-pub const MAILBOX_READS_ROWS: i64 = MAX_MAILBOX_READS as i64 + 5 * MAILBOX_PAGE as i64;
+/// The most rows one `mailbox_reads` of `keys` keys reads from the
+/// database, a key with an empty mailbox counting one: each key once, and one
+/// page of messages, as much as a `mailbox_read` serves. A wallet asks again
+/// for what is left out.
+pub fn mailbox_reads_rows(keys: usize) -> i64 {
+	keys as i64 + MAILBOX_PAGE as i64
+}
 
 /// `mailbox_reads`: the mailboxes of up to [`MAX_MAILBOX_READS`] keys, each
 /// after a cursor of its own, under one challenge, each key proven as a
 /// `mailbox_read` of it is. Every proof is checked before anything is read; a
 /// key named twice, or one proof that fails, refuses the whole batch. The
-/// answer holds the keys from the first to where [`MAILBOX_READS_ROWS`] ran
+/// answer holds the keys from the first to where [`mailbox_reads_rows`] ran
 /// out (see [`crate::Store::mailbox_read_many`]); the wallet asks again for
 /// the keys left out.
 async fn mailbox_reads(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
@@ -1850,7 +1855,7 @@ async fn mailbox_reads(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectIn
 	}
 	let keys: Vec<([u8; 32], i64)> = reads.iter().map(|(k, after, _)| (k.serialize(), *after)).collect();
 	let limit = req.limit.clamp(1, MAILBOX_PAGE) as i64;
-	let found = app.store.mailbox_read_many(&keys, limit, req.notices, MAILBOX_READS_ROWS).await?;
+	let found = app.store.mailbox_read_many(&keys, limit, req.notices, mailbox_reads_rows(keys.len())).await?;
 	let mut mailboxes = Vec::with_capacity(found.len());
 	for (k, msgs) in found {
 		mailboxes.push(api::MailboxOf { key: hex(&k), messages: wire_messages(&app, msgs).await? });

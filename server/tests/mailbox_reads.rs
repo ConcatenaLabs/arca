@@ -235,6 +235,24 @@ async fn the_call_takes_each_keys_proof_of_a_mailbox_read() {
 	// None, and more than it reads.
 	refused(with(vec![]), 400, "malformed", "a mailbox read names 1 to");
 	let many: Vec<Value> = (0..server::http::MAX_MAILBOX_READS + 1).map(|i| proof(&r, &c, &keypair(&format!("many {}", i)), 0, 100)).collect();
+	// One batch serves at most a page of messages besides one row a key (arca#696): two keys of 100
+	// messages each, read together, answer the first whole and the second cut, which the wallet
+	// reads on from.
+	let (k1, k2) = (keypair("mailbox reads full 1"), keypair("mailbox reads full 2"));
+	let mut full = vec![];
+	for i in 1000..1200 {
+		full.push(coin(i, r.server.store.issue_nonce().await.unwrap()));
+	}
+	r.server.store.insert_coins(&full).await.unwrap();
+	for (i, c) in full.iter().enumerate() {
+		r.server.store.mailbox_post(&xonly(if i < 100 { &k1 } else { &k2 }).serialize(), &c.leaf_id, &c.leaf_id).await.unwrap();
+	}
+	let c3 = challenge(&r);
+	let v = r.http.post("mailbox_reads", &json!({"challenge": hex(&c3), "limit": 100, "notices": true,
+		"reads": [proof(&r, &c3, &k1, 0, 100), proof(&r, &c3, &k2, 0, 100)]})).ok();
+	let served: Vec<usize> = v["mailboxes"].as_array().unwrap().iter().map(|b| b["messages"].as_array().unwrap().len()).collect();
+	println!("two keys of 100 messages read together: {:?} served", served);
+	assert_eq!(served, vec![100, 2], "keys plus one page of rows");
 	let a = r.http.post("mailbox_reads", &with(many));
 	println!("REFUSED {} keys: {} {:?}", server::http::MAX_MAILBOX_READS + 1, a.status, a.refusal());
 	assert!(a.status == 400 || a.status == 413, "{}", a.status);
