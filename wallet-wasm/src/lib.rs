@@ -142,12 +142,14 @@ impl ArcaWallet {
 	}
 
 	/// Runs one command, as `arca <command>` does, `args` a JSON object of its
-	/// arguments: the library's [`command::run`], whose answer is `{"result",
-	/// "start"}` and whose commands are [`command::COMMANDS`].
+	/// arguments: the library's [`command::run_answer`], whose answer is
+	/// `{"result", "start", "cost"}`, whose refusal carries what the command
+	/// cost before it was refused, and whose commands are
+	/// [`command::COMMANDS`].
 	pub fn run(&mut self, command: &str, args: &str) -> Result<String, JsValue> {
 		let a: Value = if args.trim().is_empty() { json!({}) } else {
 			serde_json::from_str(args).map_err(|e| refusal(Error::Parse(format!("the arguments: {}", e))))?
 		};
-		command::run(&mut self.w, command, &a).map(|v| v.to_string()).map_err(refusal)
+		command::run_answer(&mut self.w, command, &a).map(|v| v.to_string()).map_err(|e| JsValue::from_str(&e.to_string()))
 	}
 }
