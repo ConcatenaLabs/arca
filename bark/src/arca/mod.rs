@@ -152,6 +152,14 @@ pub enum Error {
 	/// by releasing them, waiting for their round, and asking again.
 	#[error("refused: {message}")]
 	Planned { asset: String, release: Vec<String>, message: String },
+	/// A payment of `asset` that the coins it may spend cannot cover, and
+	/// that the wallet's side of its channels in the asset could: `close`
+	/// names the fewest of those channel leaves, largest side first, whose
+	/// close into the next round (a quote and a participation with them)
+	/// would give that side back as a leaf a transfer spends. A program pays
+	/// by closing them, waiting for their round, and asking again.
+	#[error("refused: {message}")]
+	InChannel { asset: String, close: Vec<String>, message: String },
 	/// The server refused, with its stable code.
 	#[error("the server refused {call} ({status} {code}): {message}")]
 	Server { call: String, status: i32, code: String, message: String },
@@ -184,6 +192,7 @@ impl Error {
 		match self {
 			Error::Refused(_) => "refused",
 			Error::Planned { .. } => "planned",
+			Error::InChannel { .. } => "in_channel",
 			Error::Server { .. } => "server_refused",
 			Error::Unreachable(_) => "unreachable",
 			Error::Missing(_) => "missing",

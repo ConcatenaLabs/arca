@@ -250,6 +250,20 @@ enum Cmd {
 		#[arg(long)]
 		route: Option<String>,
 	},
+	/// What `send` would pay, paying nothing: the route, the coins it gives
+	/// up and its fee (the margins its transactions leave for their fees).
+	SendQuote {
+		/// A receive request, or a channel code (`arca channel code`).
+		request: String,
+		#[arg(long)]
+		amount: Option<u64>,
+		/// The asset to send, when the request does not name it.
+		#[arg(long)]
+		asset: Option<String>,
+		/// `any`, `channel` or `leaf`, as `send` takes it.
+		#[arg(long)]
+		route: Option<String>,
+	},
 	/// Reads the mailbox and validates every coin in it.
 	Mailbox,
 	/// Payments over Lightning, through the operator's node in each asset.
@@ -1463,6 +1477,8 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Receive { asset: a, amount } => w.receive(a.as_deref().map(asset).transpose()?, amount),
 		Cmd::ForgetRequest { owner } => w.forget_request(&owner),
 		Cmd::Send { request, amount, asset: a, route } => w.send_routed(&request, amount, a.as_deref().map(asset).transpose()?, route.as_deref()),
+		Cmd::SendQuote { request, amount, asset: a, route } =>
+			w.send_quote_routed(&request, amount, a.as_deref().map(asset).transpose()?, route.as_deref()),
 		Cmd::Mailbox => w.mailbox(),
 		Cmd::Lightning(LightningCmd::Pay { invoice, asset: a, max_fee_ppm, timeout, wait }) => {
 			let mut v = w.lightning_pay_until(&invoice, a.as_deref().map(asset).transpose()?, max_fee_ppm, timeout)?;

@@ -233,7 +233,7 @@ impl Wallet {
 		held.sort_by_key(|(id, v)| (std::cmp::Reverse(*v), id.clone()));
 		let total: u64 = held.iter().map(|(_, v)| v).sum();
 		if total == 0 || total < short {
-			return Ok(Error::Refused(refused));
+			return self.in_channel(asset, short, refused);
 		}
 		let (mut release, mut sum) = (vec![], 0u64);
 		for (id, v) in held {
@@ -247,6 +247,44 @@ impl Wallet {
 			paid out of round only once given up in a round for a leaf no plan names ({}, which ends the coin's plan): releasing {} of them \
 			covers it", refused, total, self.spelling.say("{plan_release}"), release.len());
 		Ok(Error::Planned { asset: asset.to_string(), release, message })
+	}
+
+	/// The refusal of a payment of `asset` its spendable coins fall `short`
+	/// atoms short of, when the plans cannot make it up: [`Error::InChannel`]
+	/// naming the fewest live channel leaves of the asset, the wallet's side
+	/// largest first, whose sides together cover `short` (a transfer never
+	/// spends a channel leaf, which pays only by its channel's states, and
+	/// closing one into a round gives its side back as a leaf of the
+	/// wallet's own); `refused` as it is when they do not.
+	pub(crate) fn in_channel(&self, asset: AssetId, short: u64, refused: String) -> Result<Error, Error> {
+		let mut held: Vec<(String, u64)> = vec![];
+		for c in self.store.coins_in("live")? {
+			if c.asset != asset.to_string() {
+				continue;
+			}
+			if let Some(side) = self.channel_worth(&c)? {
+				if side > 0 {
+					held.push((c.leaf_id.clone(), side));
+				}
+			}
+		}
+		held.sort_by_key(|(id, v)| (std::cmp::Reverse(*v), id.clone()));
+		let total: u64 = held.iter().map(|(_, v)| v).sum();
+		if total == 0 || total < short {
+			return Ok(Error::Refused(refused));
+		}
+		let (mut close, mut sum) = (vec![], 0u64);
+		for (id, v) in held {
+			if sum >= short && !close.is_empty() {
+				break;
+			}
+			sum = sum.saturating_add(v);
+			close.push(id);
+		}
+		let message = format!("{}; {} more is the wallet's side of its channels in the asset, which a transfer does not spend: closing {} \
+			of them into the next round (a quote and a participation with the channel leaf) gives that side back as a leaf of the \
+			wallet's own, which covers it less the round's fee", refused, total, close.len());
+		Ok(Error::InChannel { asset: asset.to_string(), close, message })
 	}
 
 	/// The current coin of each plan that is open: the coin its next step

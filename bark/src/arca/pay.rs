@@ -711,6 +711,48 @@ impl Wallet {
 	/// payment: an operator could co-sign the payer's state and withhold the
 	/// receiver's note. The receiver's payment is final once it holds the
 	/// note.
+	/// What [`Self::send_routed`] would do, paying nothing: over the wallet's
+	/// channel (`"route": "channel"`, fee 0) when it would pay that way, else
+	/// [`Self::send_quote`] (`"route": "leaf"`), with `not_by_channel` saying
+	/// why a channel would not; refused as the payment would be.
+	pub fn send_quote_routed(&mut self, text: &str, value: Option<u64>, asset: Option<AssetId>, route: Option<&str>) -> Result<Value, Error> {
+		let route = route.unwrap_or("any");
+		if !matches!(route, "any" | "channel" | "leaf") {
+			return Err(Error::Parse(format!("the route {:?}: any, channel or leaf", route)));
+		}
+		let code = decode(CODE, text, "the channel code").ok();
+		let req = match &code {
+			Some(c) => c.clone(),
+			None => decode(REQUEST_KIND, text, "the receive request or channel code")?,
+		};
+		let tried = if route == "leaf" {
+			if code.is_some() {
+				return Err(Error::Refused("a channel code is paid over a channel or on the chain, never to a leaf".into()));
+			}
+			None
+		} else {
+			Some(self.channel_target(&req, value, asset)?)
+		};
+		match tried {
+			Some(Ok((_, theirs, asset, value))) => Ok(json!({"route": "channel", "asset": asset.to_string(), "value": value.to_string(),
+				"fee": "0", "to": theirs})),
+			Some(Err(why)) if code.is_some() || route == "channel" => {
+				let mut msg = format!("not paid over a channel: {}", why);
+				if let Some(a) = req["address"].as_str() {
+					msg.push_str(&format!("; the code names address {} for a payment on the chain", a));
+				}
+				Err(Error::Refused(msg))
+			},
+			other => {
+				let mut v = self.send_quote(text, value, asset)?;
+				if let Some(Err(why)) = other {
+					v["not_by_channel"] = json!(why);
+				}
+				Ok(v)
+			},
+		}
+	}
+
 	pub fn send_routed(&mut self, text: &str, value: Option<u64>, asset: Option<AssetId>, route: Option<&str>) -> Result<Value, Error> {
 		let route = route.unwrap_or("any");
 		if !matches!(route, "any" | "channel" | "leaf") {
@@ -752,7 +794,9 @@ impl Wallet {
 	/// A payment over the wallet's channel into the one `req` names: the
 	/// answer, or why it was not made with nothing standing (`Ok(Err)`), or
 	/// the error of a state sent and not answered, which stands.
-	fn by_channel(&mut self, req: &Value, value: Option<u64>, asset: Option<AssetId>) -> Result<Result<Value, String>, Error> {
+	fn channel_target(&mut self, req: &Value, value: Option<u64>, asset: Option<AssetId>)
+		-> Result<Result<(String, String, AssetId, u64), String>, Error>
+	{
 		if let Err(e) = self.check_chain(req, "text") {
 			return Ok(Err(e.to_string()));
 		}
@@ -786,6 +830,18 @@ impl Wallet {
 		if worth < value {
 			return Ok(Err(format!("the wallet's channel in asset {} holds {}, less than {}", asset, worth, value)));
 		}
+		Ok(Ok((leaf, theirs, asset, value)))
+	}
+
+	/// A payment over the wallet's channel into the one `req` names
+	/// ([`Self::channel_target`]): the answer, or why it was not made with
+	/// nothing standing (`Ok(Err)`), or the error of a state sent and not
+	/// answered, which stands.
+	fn by_channel(&mut self, req: &Value, value: Option<u64>, asset: Option<AssetId>) -> Result<Result<Value, String>, Error> {
+		let (leaf, theirs, asset, value) = match self.channel_target(req, value, asset)? {
+			Ok(t) => t,
+			Err(why) => return Ok(Err(why)),
+		};
 		match self.channel_pay(&leaf, &theirs, value) {
 			Ok(v) => Ok(Ok(json!({"route": "channel", "sent": {"asset": asset.to_string(), "value": value.to_string(), "to": theirs},
 				"channel": v}))),
@@ -801,7 +857,7 @@ impl Wallet {
 	/// to the mailboxes. No asset is a default: the request or the caller
 	/// names it. A request past its lapse (`until`) is refused before
 	/// anything is built or signed.
-	pub fn send(&mut self, request: &str, value: Option<u64>, asset: Option<AssetId>) -> Result<Value, Error> {
+	fn send_plan(&mut self, request: &str, value: Option<u64>, asset: Option<AssetId>) -> Result<SendPlan, Error> {
 		let req = decode(REQUEST_KIND, request, "the receive request")?;
 		self.check_chain(&req, "receive request")?;
 		// A receiver waits for a payment to its request until the request
@@ -874,6 +930,14 @@ impl Wallet {
 		};
 		let to_out = to.explicit(self);
 		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, false)?;
+		Ok(SendPlan { asset, value, to, to_out, inputs, margin, change, rule })
+	}
+
+	/// Pays `value` of `asset` to the receive request `request`, out of round:
+	/// the payment [`Self::send_plan`] chooses, signed and co-signed.
+	pub fn send(&mut self, request: &str, value: Option<u64>, asset: Option<AssetId>) -> Result<Value, Error> {
+		let SendPlan { asset, value, to, to_out, inputs, margin, change, rule } = self.send_plan(request, value, asset)?;
+		let _ = &to_out;
 		let mut outs = vec![to];
 		if change > 0 {
 			let mut leaf = self.own_leaf("change")?;
@@ -889,6 +953,24 @@ impl Wallet {
 				"reassignment": margin.to_string()},
 			"change": if change > 0 { json!(change.to_string()) } else { Value::Null },
 			"transfer": answer,
+		}))
+	}
+
+	/// What [`Self::send`] would pay, chosen as it chooses and asking the
+	/// server for nothing: the coins it gives up, and its fee, which is the
+	/// margins its checkpoints and its reassignment leave for their fees out
+	/// of the wallet's coins (the receiver gets `value`; the wallet's change
+	/// is short by the fee). Refused as the payment would be.
+	pub fn send_quote(&mut self, request: &str, value: Option<u64>, asset: Option<AssetId>) -> Result<Value, Error> {
+		let SendPlan { asset, value, inputs, margin, change, .. } = self.send_plan(request, value, asset)?;
+		let checkpoints: Vec<u64> = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).collect();
+		let fee = checkpoints.iter().sum::<u64>().saturating_add(margin);
+		Ok(json!({
+			"route": "leaf", "asset": asset.to_string(), "value": value.to_string(), "fee": fee.to_string(),
+			"inputs": inputs.iter().map(|i| i.row.leaf_id.clone()).collect::<Vec<_>>(),
+			"margins": {"asset": asset.to_string(), "checkpoints": checkpoints.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
+				"reassignment": margin.to_string()},
+			"change": if change > 0 { json!(change.to_string()) } else { Value::Null },
 		}))
 	}
 
@@ -2671,4 +2753,17 @@ mod tests {
 		let e = decode(REQUEST_KIND, &encode("a b:", &request), "the receive request").unwrap_err();
 		assert!(e.to_string().contains("is not a word"), "{}", e);
 	}
+}
+
+/// A payment to a receive request as [`Wallet::send`] makes it: the
+/// receiver's output and the coins, margins and change chosen for it.
+struct SendPlan {
+	asset: AssetId,
+	value: u64,
+	to: Out,
+	to_out: ExplicitOutput,
+	inputs: Vec<In>,
+	margin: u64,
+	change: u64,
+	rule: Option<arca_covenant::Landing>,
 }
