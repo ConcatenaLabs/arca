@@ -241,3 +241,36 @@ async fn a_remainder_past_the_operators_most_margin_is_not_given_to_it() {
 	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
 	library(&c, "swap_complete", json!({"accept": acc["accept"]})).unwrap_or_else(|e| panic!("complete refused: {}", e));
 }
+
+/// D93's floor of life: a maker whose one giant coin was made 33 hours after
+/// its others pays a small swap from one of those, not the giant. Taken from
+/// the coins within a day of the newest, the giant was alone in its day and
+/// paid every swap, its change out of round past the maker's share (the
+/// testnet's leaf maker: a $4.65M coin, 672 hours to expiry, beside 59 coins
+/// of $50k to $100k with 515 to 639).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_giant_coin_newer_than_the_rest_is_not_the_only_one_tried() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (a, b) = setup(&mut r, "SCG", &[300_000, 300_000], &[1_000_000]).await;
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 33 * 3_600));
+	r.produce().await;
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, r.x, 3_000_000);
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the giant credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let live: Vec<(u64, Value)> = coins(&a, "live", &x).iter().map(|c| (value(c), c["expiry"].clone())).collect();
+	println!("MAKER COINS (value, expiry): {:?}", live);
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "100000", "want_asset": y, "want": "100000"})).unwrap();
+	let ins = inputs_of(&a, &x, &offer);
+	println!("OFFER: inputs {:?}", ins);
+	assert_eq!(ins, vec![300_000], "a mid-size coin, not the newer giant");
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap();
+}
