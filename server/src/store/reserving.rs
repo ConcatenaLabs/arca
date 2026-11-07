@@ -129,6 +129,21 @@ impl Store {
 		rows.iter().map(|r| array32(r.get(0), "leaf id")).collect()
 	}
 
+	/// The rounds whose batch output a round leaf `id` lies at, with that
+	/// output and each round's state (`built`, `broadcast`, `final`,
+	/// `lost`), newest first: one round, or more when its participation ran
+	/// again after a round that could not return. Empty for a leaf that is
+	/// no round leaf or that the server does not know.
+	pub async fn batch_rounds_of(&self, id: &[u8; 32]) -> Result<Vec<([u8; 32], u32, String)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT r.txid, b.vout, r.state FROM batch_leaf b JOIN round r ON r.round_id = b.round_id WHERE b.leaf_id = $1
+			 ORDER BY r.round_id DESC",
+			&[&&id[..]],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, r.get::<_, i32>(1) as u32, r.get::<_, String>(2)))).collect()
+	}
+
 	/// The outputs on the chain the leaves `ids` lie at: each round leaf's
 	/// round txid and batch output, and each board's output, those the server
 	/// holds (a leaf it does not know, or that is neither, adds nothing).
