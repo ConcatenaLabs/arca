@@ -27,7 +27,7 @@ pub const MARGIN_MULTIPLE: u64 = 4;
 /// coins it gives the wallet, unless the user takes it anyway: two days.
 pub const SWAP_DEADLINE_MARGIN: u32 = 2 * 86_400;
 
-/// What one exit date spans when a swap orders its coins ([`fit_order`]):
+/// What one exit date spans when a swap chooses its coins ([`fit_order`]):
 /// coins whose exit dates lie within a day of the latest are of one date.
 pub const FIT_DATE_SPAN: u32 = 86_400;
 
@@ -536,6 +536,54 @@ impl Wallet {
 		Ok(())
 	}
 
+	/// `c` alone paying `paid` into `others` (with `other_inputs` inputs of
+	/// another owner beside it): the input, the reassignment's margin and the
+	/// change when its change is none or at least `min_leaf` and its margins
+	/// are within the wallet's bound; `None` when it does not pay alone.
+	#[allow(clippy::too_many_arguments)]
+	fn pays_alone(&self, c: &In, margins: &Margins, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
+		other_inputs: usize, asset: AssetId) -> Result<Option<(Vec<In>, u64, u64)>, Error>
+	{
+		let m = self.checkpoint_margin(&c.coin, margins)?;
+		let input = In { checkpoint_value: c.coin.value - m.min(c.coin.value - 1), row: c.row.clone(), coin: c.coin.clone() };
+		let kept = input.checkpoint_value;
+		if kept < paid {
+			return Ok(None);
+		}
+		let all: Vec<&ValidCoin> = std::iter::repeat(&input.coin).take(1 + other_inputs).collect();
+		// With no change, the reassignment has no change output.
+		let margin_with = |change_output: bool| -> Result<u64, Error> {
+			if !pays_margin {
+				return Ok(0);
+			}
+			let mut outs = others.to_vec();
+			if change_output {
+				outs.push(ExplicitOutput::new(asset, 1, leaf_probe()));
+			}
+			self.reassignment_margin(&all, &outs, margins)
+		};
+		// What is left beyond the payment goes into the margin when it is no
+		// more than the margin a change output would need (no change, and no
+		// change output), and is the change when that is at least the
+		// smallest leaf; between the two, the coin does not pay alone.
+		let left = kept - paid;
+		let (exact, with_change) = (margin_with(false)?, margin_with(true)?);
+		let (margin, change) = if left < exact {
+			return Ok(None);
+		} else if left <= with_change {
+			(if pays_margin { left } else { 0 }, 0)
+		} else if left - with_change >= min_leaf {
+			(with_change, left - with_change)
+		} else {
+			return Ok(None);
+		};
+		let chosen = vec![input];
+		if self.margins_within_bound(&chosen, margin, asset).is_err() {
+			return Ok(None);
+		}
+		Ok(Some((chosen, margin, change)))
+	}
+
 	/// Chooses coins of `asset` to pay `paid` (outputs of `asset` the wallet
 	/// pays, plus `extra` atoms more), each input's checkpoint keeping its
 	/// value less its margin; returns the inputs, the reassignment's margin
@@ -547,7 +595,6 @@ impl Wallet {
 	/// from as well: a coin given up in a refresh that waits still pays. A
 	/// quote takes nothing back and chooses from those coins as the trade
 	/// would.
-	#[allow(clippy::too_many_arguments)]
 	#[allow(clippy::too_many_arguments)]
 	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize, fit: bool) -> Result<(Vec<In>, u64, u64), Error>
@@ -564,18 +611,32 @@ impl Wallet {
 		}
 	}
 
-	/// [`Self::choose`] from the coins live now. With `fit` (a swap), the
-	/// coins are taken in [`fit_order`].
+	/// [`Self::choose`] from the coins live now. With `fit` (a swap), no coin
+	/// at the operator's depth limit is taken (its spend could only be
+	/// refused, after the other side signed), and each coin [`fit_order`]
+	/// names is tried alone first, with its real margins: the first whose
+	/// change is none or at least the smallest leaf, and whose margins are
+	/// within the wallet's bound, pays. Only when none does are the coins
+	/// taken as a payment takes them.
 	#[allow(clippy::too_many_arguments)]
 	fn choose_live(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize, fit: bool) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		let margins = Margins::of(info, asset)?;
 		let mut candidates = self.spendable(asset)?;
+		let mut deep = 0u64;
 		if fit {
-			let order = fit_order(&candidates.iter().map(|c| (c.coin.value, c.row.expiry)).collect::<Vec<_>>(), paid.saturating_add(min_leaf));
-			let mut slots: Vec<Option<In>> = candidates.into_iter().map(Some).collect();
-			candidates = order.into_iter().filter_map(|i| slots[i].take()).collect();
+			if let Some(limit) = depth_limit(info) {
+				deep = candidates.iter().filter(|c| c.coin.hops >= limit).map(|c| c.coin.value).sum();
+				candidates.retain(|c| c.coin.hops < limit);
+			}
+			let order = fit_order(&candidates.iter().map(|c| (c.coin.value, c.row.expiry, c.coin.hops)).collect::<Vec<_>>(), paid);
+			for i in order {
+				let c = &candidates[i];
+				if let Some(alone) = self.pays_alone(c, &margins, paid, others, pays_margin, min_leaf, other_inputs, asset)? {
+					return Ok(alone);
+				}
+			}
 		}
 		let total_live: u64 = candidates.iter().map(|c| c.coin.value).sum();
 		let mut chosen: Vec<In> = vec![];
@@ -612,6 +673,13 @@ impl Wallet {
 		if kept >= paid + margin {
 			return Err(Error::Refused(format!("the change would be below the operator's smallest leaf in asset {} ({} atoms): \
 				pay a little less, or that much more", asset, min_leaf)));
+		}
+		// Coins at the operator's depth limit pay no swap: said so, since a
+		// refresh in a round lets them pay again.
+		if deep > 0 {
+			return Err(Error::Refused(format!("the wallet's coins of asset {} that a swap can spend hold {}, short of the {} it takes; \
+				{} more are at the operator's depth limit of reassignments since a round, and pay again once refreshed in a round", asset,
+				total_live, paid, deep)));
 		}
 		// Coins an offline-refresh plan names are paid out of round by no
 		// wallet: say so, naming those whose release would cover it.
@@ -2087,6 +2155,7 @@ impl Wallet {
 		others.push(ExplicitOutput::new(o.give_asset, o.give, leaf_probe()));
 		others.push(ExplicitOutput::new(o.want_asset, 1, leaf_probe()));
 		let (mine, _, change) = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true)?;
+		Self::swap_depth(&info, &o, &mine)?;
 		let outputs = o.maker_outs.len() + 1 + usize::from(change > 0);
 		if outputs > arca_covenant::leaf::MAX_OUTPUTS as usize {
 			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outputs,
@@ -2094,6 +2163,22 @@ impl Wallet {
 		}
 		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
 		self.quoted(Ok(Self::swap_terms(&o, &mine, change, dates)))
+	}
+
+	/// Refuses, before anything is signed, a swap whose new coins would be
+	/// more reassignments from a round or a board than the operator's depth
+	/// limit: one more than the deepest coin it spends, the maker's and the
+	/// taker's. The operator would refuse the maker's completion after the
+	/// taker signed, and the taker's coins would stay held by an acceptance
+	/// that can never complete (#704).
+	fn swap_depth(info: &Value, o: &OfferChecked, mine: &[In]) -> Result<(), Error> {
+		let hops = 1 + o.theirs.iter().chain(mine).map(|i| i.coin.hops).max().unwrap_or(0);
+		match depth_limit(info) {
+			Some(limit) if hops > limit => Err(Error::Refused(format!("this swap's new coins would be {} reassignments from a round or a \
+				board, past the operator's limit of {}: the maker's coins (or the wallet's) are refreshed in a round first; nothing was signed",
+				hops, limit))),
+			_ => Ok(()),
+		}
 	}
 
 	/// What a taker is shown of a swap, by [`Wallet::swap_read`] and
@@ -2127,6 +2212,7 @@ impl Wallet {
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
 		let (mine, _, change) = self.choose(&info, want_asset, want, &others, false, min_want, 0, true)?;
+		Self::swap_depth(&info, &o, &mine)?;
 		if change > 0 {
 			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf_of("change", &info, want_asset, change)?, mailbox,
 				until: None });
@@ -2413,48 +2499,56 @@ fn to_out_owner(o: &Out) -> String {
 	o.leaf.owner.to_string()
 }
 
-/// The order a swap takes its coins in, by index into `coins` (each its value
-/// and its expiry, as [`Wallet::spendable`] orders them: furthest from the
-/// exit date first, D58). Among the coins of the latest date, those whose
-/// expiry is within [`FIT_DATE_SPAN`] of the latest, each that alone holds
-/// `need` (what the swap pays and the smallest change a leaf may hold)
-/// comes first, the smallest first; every other coin follows in the order
-/// given, so a swap that no one coin of that date pays is chosen as before.
+/// The operator's depth limit (`info.depth_limit`): the most reassignments
+/// since a round or a board it co-signs new coins at, so a coin at it can be
+/// spent out of round no more.
+pub(crate) fn depth_limit(info: &Value) -> Option<usize> {
+	info["depth_limit"].as_u64().map(|l| l as usize)
+}
+
+/// The coins a swap tries alone, in order, by index into `coins` (each its
+/// value, its expiry and its reassignments since a round, `hops`): each of
+/// the latest date, its expiry within [`FIT_DATE_SPAN`] of the latest
+/// (D58: what the other side gets lives within a day as long as the longest
+/// the wallet can give), worth at least `paid`, the fewest hops first and
+/// then the smallest. Whether one pays alone, with its margins and a change
+/// of none or at least the smallest leaf, is the caller's to try
+/// ([`Wallet::pays_alone`]).
 ///
 /// A swap's change rests on the reassignment with the other side's coins,
 /// so it is out of round until the next round refreshes it, and counts
-/// against the operator's bond and the wallet's instant budget all that
-/// time. Taken largest first, a maker holding one large coin beside many
-/// small ones spent the large one on every swap, however small, and held
-/// nearly all of it out of round after each, while its refresh made it the
-/// newest coin again. Taken smallest first, the change is at most that coin,
-/// and the coin the other side gets lives within a day as long as the
-/// longest the wallet can give.
-pub(crate) fn fit_order(coins: &[(u64, u32)], need: u64) -> Vec<usize> {
+/// against the operator's bond and the wallet's instant budget meanwhile.
+/// Taken largest first, a maker holding one large coin beside many small
+/// ones spent the large one on every swap, however small, and held nearly
+/// all of it out of round after each, while its refresh made it the newest
+/// coin again. Taken smallest first alone, the newest change came first
+/// again and again, one reassignment deeper each time, to the operator's
+/// depth limit (#703): fewer hops come first.
+pub(crate) fn fit_order(coins: &[(u64, u32, usize)], paid: u64) -> Vec<usize> {
 	let latest = coins.iter().map(|c| c.1).max().unwrap_or(0);
 	let of_latest = |e: u32| e >= latest.saturating_sub(FIT_DATE_SPAN);
-	let mut fits: Vec<usize> = (0..coins.len()).filter(|&i| coins[i].0 >= need && of_latest(coins[i].1)).collect();
-	fits.sort_by_key(|&i| (coins[i].0, i));
-	let rest = (0..coins.len()).filter(|i| !fits.contains(i));
-	fits.iter().copied().chain(rest).collect()
+	let mut fits: Vec<usize> = (0..coins.len()).filter(|&i| coins[i].0 >= paid && of_latest(coins[i].1)).collect();
+	fits.sort_by_key(|&i| (coins[i].2, coins[i].0, i));
+	fits
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	/// A swap pays from the smallest coin of the latest date that holds it;
-	/// with none, the coins follow D58's order.
+	/// A swap tries alone, in order, the coins of the latest date worth at
+	/// least what it pays: the fewest hops first, then the smallest.
 	#[test]
-	fn a_swap_pays_from_the_smallest_coin_that_holds_it() {
+	fn a_swap_tries_the_shallowest_then_smallest_coin_of_the_latest_date() {
 		let t = 2_000_000u32;
-		// D58's order: the giant first (latest, largest), then the rest.
-		let coins = [(2_000_000_000, t + 600), (30_000, t), (50_000, t - 3_600), (20_000, t), (40_000, t - 2 * 86_400)];
-		assert_eq!(fit_order(&coins, 25_000), vec![1, 2, 0, 3, 4], "30k, 50k, then the giant; 20k is too small, 40k is two days older");
-		assert_eq!(fit_order(&coins, 45_000)[0], 2, "the 50k coin, not the 40k one of an earlier date");
-		assert_eq!(fit_order(&coins, 50_000)[0], 2, "a coin of exactly what is needed");
-		assert_eq!(fit_order(&coins, 3_000_000_000), vec![0, 1, 2, 3, 4], "no coin holds it alone: D58's order");
-		assert_eq!(fit_order(&[(10, u32::MAX), (5, u32::MAX)], 4), vec![1, 0], "coins with no expiry are of one date");
+		let coins = [(2_000_000_000, t + 600, 0), (30_000, t, 0), (50_000, t - 3_600, 0), (20_000, t, 0), (40_000, t - 2 * 86_400, 0),
+			(25_000, t, 3)];
+		assert_eq!(fit_order(&coins, 25_000), vec![1, 2, 0, 5], "30k, 50k, the giant, then the 25k three hops deep; 20k is too small, \
+			40k is two days older");
+		assert_eq!(fit_order(&coins, 45_000), vec![2, 0], "50k, then the giant; not the 40k of an earlier date");
+		assert_eq!(fit_order(&coins, 50_000), vec![2, 0], "a coin of exactly what is paid is tried");
+		assert!(fit_order(&coins, 3_000_000_000).is_empty(), "no coin holds it alone");
+		assert_eq!(fit_order(&[(10, u32::MAX, 1), (5, u32::MAX, 0)], 4), vec![1, 0], "coins with no expiry are of one date");
 		assert!(fit_order(&[], 1).is_empty());
 	}
 
