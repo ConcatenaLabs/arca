@@ -21,6 +21,9 @@
 //! takes its leaf of X home: the fill reaches the chain, its `vtxo-2`
 //! checkpoint spent at input 1 by `arca/collab-2`.
 //!
+//! A taker's quote of a resting order reads the order's round where the
+//! operator says it is, never scanning the node's unspent outputs for it.
+//!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
 
@@ -33,6 +36,7 @@ use serde_json::{json, Value};
 
 use arca_covenant::{CoinRecord, ExplicitOutput};
 use common::cli::Arca;
+use common::proxy::Proxy;
 use common::running::Running;
 use server::server::AssetSection;
 use server::store::RoundState;
@@ -318,4 +322,56 @@ async fn an_order_rests_in_the_tree_fills_with_its_maker_away_and_lands() {
 		}
 	}
 	assert!(in_fill, "the fill on the chain, T1's vtxo-2 checkpoint at input 1 by arca/collab-2: {:?}", broadcast);
+}
+
+/// The node RPC methods `calls` (a node proxy's log) asked, batches included.
+fn node_methods(calls: &[common::proxy::Logged]) -> Vec<String> {
+	let mut out = vec![];
+	for (_, req, ..) in calls {
+		let reqs = match req.as_array() {
+			Some(a) => a.clone(),
+			None => vec![req.clone()],
+		};
+		out.extend(reqs.iter().filter_map(|q| q["method"].as_str().map(String::from)));
+	}
+	out
+}
+
+/// A taker's quote of a resting order finds the order's coin where the
+/// operator says its round is (`batch_status`), read by txid, and never scans
+/// the node's set of unspent outputs for it: on a node many wallets share,
+/// that `scantxoutset` took five minutes ahead of every quote, and the
+/// wallet answered nothing else meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resting_quote_reads_the_orders_round_without_a_scan() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+	}).await;
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let maker = holder(&mut r, "SM", x, 1_500_000, 0).await;
+	let (order, _) = rest(&mut r, &maker, 1_000_000, 100_000).await;
+
+	// The taker's node is a proxy that logs every call.
+	let node = Proxy::start(r.node_url().trim_end_matches('/'));
+	let t = Arca::new("ST");
+	t.ok(&create_args(&r.url(), &node.url));
+	let s = script(&t.ok(&["address"]));
+	r.pay_to(s, y, 1_100_000);
+	r.produce().await;
+	t.ok(&["board", &y.to_string(), "1000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || t.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	t.ok(&["sync"]);
+
+	let from = node.calls().len();
+	let q = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	assert_eq!((q["coin"].as_str(), q["gets"]["amount"].as_str()), (Some(order.as_str()), Some("200000")), "{}", q);
+	let asked = node_methods(&node.calls()[from..]);
+	println!("the quote asked the node: {:?}", asked);
+	assert!(!asked.iter().any(|m| m == "scantxoutset"), "no scan of the node's unspent outputs: {:?}", asked);
+	let f = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q.to_string()]);
+	assert_eq!(f["filled"], "200000", "{}", f);
 }

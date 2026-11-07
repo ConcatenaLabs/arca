@@ -2425,7 +2425,11 @@ impl Wallet {
 			if txs.iter().any(|t| t.output.contains(&o)) {
 				continue;
 			}
-			match self.known_base(&o)? {
+			let known = match self.known_base(&o)? {
+				Some(t) => Some(t),
+				None => self.board_base(record, &o)?,
+			};
+			match known {
 				Some(t) => txs.push(t),
 				None => match self.chain_payer(record, &o)? {
 					Some(t) => txs.push(t),
@@ -2512,18 +2516,25 @@ impl Wallet {
 	}
 
 	/// The transaction of the active chain that pays `o`, an output `record`
-	/// rests on: found in the set of unspent outputs, else where the operator
-	/// says a round leaf's round is ([`Self::batch_base`]), else by reading
-	/// the blocks from before the wallet's birthday.
+	/// rests on: where the operator says a round leaf's round is
+	/// ([`Self::batch_base`]), else found in the set of unspent outputs, else
+	/// by reading the blocks from before the wallet's birthday.
+	///
+	/// The operator is asked first because the scan is the node's
+	/// `scantxoutset`, which reads the whole set of unspent outputs and runs
+	/// one at a time on a node: on a node many wallets share it took five
+	/// minutes, ahead of a taker's quote of a resting order whose coin rests on
+	/// another wallet's round, and the wallet answered nothing else meanwhile.
+	/// The operator's answer is checked against the chain as the scan's is.
 	fn chain_payer(&self, record: &CoinRecord, o: &TxOut) -> Result<Option<Transaction>, Error> {
+		if let Some(t) = self.batch_base(record, o)? {
+			return Ok(Some(t));
+		}
 		let found = self.chain.coins_at(std::slice::from_ref(&o.script_pubkey))?.into_iter()
 			.find(|(_, out, _)| out == o).map(|(op, _, _)| op.txid);
 		match found {
 			Some(txid) => self.chain.transaction(&txid),
 			None => {
-				if let Some(t) = self.batch_base(record, o)? {
-					return Ok(Some(t));
-				}
 				let from: u64 = self.store.meta("birthday")?.and_then(|b| b.parse().ok()).unwrap_or(0);
 				Ok(self.chain.find_payment(o, from.saturating_sub(1000))?.map(|(t, _)| t))
 			},
