@@ -2466,6 +2466,10 @@ impl Wallet {
 		Ok(Some(tx))
 	}
 
+	/// The most rounds [`Self::batch_base`] reads of one `batch_status`
+	/// answer.
+	const BATCH_ROUNDS_READ: usize = 3;
+
 	/// The round transaction paying `o`, the batch output of a round leaf
 	/// `record` rests on, as the operator names it (`batch_status`) and the
 	/// node holds it in its active chain: read by txid, so a batch output
@@ -2494,7 +2498,9 @@ impl Wallet {
 		leaves(record, &mut all);
 		let Some((id, _)) = all.into_iter().find(|(_, out)| out == o) else { return Ok(None) };
 		let Ok(v) = self.server.post("batch_status", &json!({"leaf_id": id.to_string()})) else { return Ok(None) };
-		for r in v["rounds"].as_array().into_iter().flatten() {
+		// A leaf is in one round; a few are read at most, whatever the
+		// operator lists, so no answer has the wallet read without end.
+		for r in v["rounds"].as_array().into_iter().flatten().take(Self::BATCH_ROUNDS_READ) {
 			let (Some(txid), Some(vout)) = (r["round_txid"].as_str().and_then(|t| Txid::from_str(t).ok()), r["vout"].as_u64()) else { continue };
 			self.chain.read_ahead_of(std::slice::from_ref(&txid), &[]);
 			let Some(tx) = self.chain.transaction(&txid)? else { continue };
