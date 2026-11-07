@@ -1,6 +1,7 @@
-//! Which coins a swap pays from (arca #703 to #706, review RV28 of #702):
-//! the coin of the latest date that pays it alone, the fewest reassignments
-//! deep first and then the smallest, with its real margins; never a coin at
+//! Which coins a swap pays from (arca #703 to #706 and #709, review RV28 of
+//! #702 and #708): the coin of the latest date that pays it alone with its
+//! real margins, change already out of round first and then a fresh coin,
+//! each the smallest first; never a coin at
 //! the operator's depth limit; a coin over the wallet's margin bound passed
 //! over like one that does not hold it; and a swap whose new coins would be
 //! past the depth limit refused before anything is signed.
@@ -157,7 +158,37 @@ async fn successive_swaps_spread_over_the_shallowest_coins() {
 		println!("SWAP {}: maker input hops {:?}, new coins' hops {}", k, maker_hops, read["hops"]);
 		deepest = deepest.max(read["hops"].as_u64().unwrap());
 	}
-	assert!(deepest <= 3, "eight swaps over three coins each side stay shallow: {}", deepest);
+	assert!(deepest <= 4, "no swap's new coins reach the depth limit of 5 (room is left for a cancel): {}", deepest);
+}
+
+/// #709 (D93): between rounds, a swap pays from change already out of round
+/// before a fresh coin, so the maker's total out of round stays near a
+/// trade's size rather than a coin's: RV28's case, one coin of 2,000,000 and
+/// three of 300,000 of one date, six swaps of 100,000 with no round between.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swap_spends_change_already_out_of_round_before_a_fresh_coin() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (a, b) = setup(&mut r, "SCO", &[2_000_000, 300_000, 300_000, 300_000], &[1_000_000, 1_000_000, 1_000_000]).await;
+	let out_of_round = |w: &Arca| -> u64 {
+		w.ok(&["coins"]).as_array().unwrap().iter()
+			.filter(|c| c["asset"] == x.as_str() && c["kind"] == "transfer" && (c["state"] == "live" || c["state"] == "offered"))
+			.map(value).sum()
+	};
+	let mut totals = vec![];
+	for k in 1..=6 {
+		let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "100000", "want_asset": y, "want": "100000"}))
+			.unwrap_or_else(|e| panic!("swap {}: offer refused: {}", k, e));
+		let ins = inputs_of(&a, &x, &offer);
+		let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap_or_else(|e| panic!("swap {}: read refused: {}", k, e));
+		let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap_or_else(|e| panic!("swap {}: {}", k, e));
+		library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap_or_else(|e| panic!("swap {}: complete refused: {}", k, e));
+		b.ok(&["mailbox"]);
+		a.ok(&["mailbox"]);
+		totals.push(out_of_round(&a));
+		println!("SWAP {}: inputs {:?}, the maker's X out of round {}", k, ins, totals[k - 1]);
+	}
+	assert_eq!(totals, vec![199_272, 98_544, 297_816, 197_088, 396_360, 295_632]);
 }
 
 /// A coin at the operator's depth limit is never taken into a swap: a
@@ -183,4 +214,30 @@ async fn a_coin_at_the_depth_limit_is_never_taken_into_a_swap() {
 	println!("READ REFUSED: {}", e);
 	assert!(e.contains("at the operator's depth limit"), "{}", e);
 	assert!(coins(&b, "offered", &y).is_empty(), "nothing held");
+}
+
+/// #711: under an operator whose most margin is its least (`max_margin_multiple`
+/// 1), a coin that would pay a swap only by leaving more than that in the
+/// margin is passed over, and the swap completes from another coin; the
+/// operator would have refused the margin at completion, after the taker
+/// signed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remainder_past_the_operators_most_margin_is_not_given_to_it() {
+	let mut r = Running::start_with(|c, _, _| c.fees.max_margin_multiple = Some(1)).await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let give = 100_000u64;
+	let (a, b) = setup(&mut r, "SCM", &[2_000_000], &[1_000_000]).await;
+	let first = library(&a, "swap_offer", json!({"give_asset": x, "give": give.to_string(), "want_asset": y, "want": give.to_string()})).unwrap();
+	// A coin of the swap, its checkpoint's margin and a reassignment's with a change output: alone
+	// it leaves the change output's margin, more than the least with none.
+	let near = give + num(&first["pays"]["margin"]) + num(&first["pays"]["margins"]);
+	library(&a, "swap_cancel", json!({"swap": first["swap"]})).unwrap();
+	let (c, _) = setup(&mut r, "SCN", &[2_000_000, near], &[1_000_000]).await;
+	let offer = library(&c, "swap_offer", json!({"give_asset": x, "give": give.to_string(), "want_asset": y, "want": give.to_string()})).unwrap();
+	let ins = inputs_of(&c, &x, &offer);
+	println!("NEAR {}: inputs {:?} pays {}", near, ins, offer["pays"]);
+	assert_eq!(ins, vec![2_000_000], "the near coin passed over");
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	library(&c, "swap_complete", json!({"accept": acc["accept"]})).unwrap_or_else(|e| panic!("complete refused: {}", e));
 }

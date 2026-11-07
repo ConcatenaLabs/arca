@@ -566,13 +566,18 @@ impl Wallet {
 		// more than the margin a change output would need (no change, and no
 		// change output), and is the change when that is at least the
 		// smallest leaf; between the two, the coin does not pay alone.
+		// The operator refuses a margin above its most (`max_margin_multiple`
+		// times the least of the transaction with no change output), so only
+		// a remainder within that goes into the margin (#711).
 		let left = kept - paid;
 		let (exact, with_change) = (margin_with(false)?, margin_with(true)?);
+		let headroom = MARGIN_HEADROOM.min(margins.max_multiple).max(1);
+		let within_most = (left as u128) * (headroom as u128) <= (exact as u128) * (margins.max_multiple as u128);
 		let (margin, change) = if left < exact {
 			return Ok(None);
-		} else if left <= with_change {
+		} else if left <= with_change && within_most {
 			(if pays_margin { left } else { 0 }, 0)
-		} else if left - with_change >= min_leaf {
+		} else if left >= with_change && left - with_change >= min_leaf {
 			(with_change, left - with_change)
 		} else {
 			return Ok(None);
@@ -630,7 +635,8 @@ impl Wallet {
 				deep = candidates.iter().filter(|c| c.coin.hops >= limit).map(|c| c.coin.value).sum();
 				candidates.retain(|c| c.coin.hops < limit);
 			}
-			let order = fit_order(&candidates.iter().map(|c| (c.coin.value, c.row.expiry, c.coin.hops)).collect::<Vec<_>>(), paid);
+			let order = fit_order(&candidates.iter().map(|c| (c.coin.value, c.row.expiry, c.coin.hops, matches!(c.row.kind.as_str(), "transfer" | "fill")))
+				.collect::<Vec<_>>(), paid, depth_limit(info));
 			for i in order {
 				let c = &candidates[i];
 				if let Some(alone) = self.pays_alone(c, &margins, paid, others, pays_margin, min_leaf, other_inputs, asset)? {
@@ -2507,29 +2513,39 @@ pub(crate) fn depth_limit(info: &Value) -> Option<usize> {
 }
 
 /// The coins a swap tries alone, in order, by index into `coins` (each its
-/// value, its expiry and its reassignments since a round, `hops`): each of
-/// the latest date, its expiry within [`FIT_DATE_SPAN`] of the latest
-/// (D58: what the other side gets lives within a day as long as the longest
-/// the wallet can give), worth at least `paid`, the fewest hops first and
-/// then the smallest. Whether one pays alone, with its margins and a change
-/// of none or at least the smallest leaf, is the caller's to try
-/// ([`Wallet::pays_alone`]).
+/// value, its expiry, its reassignments since a round (`hops`) and whether
+/// it is out of round, received or made by a payment out of round): those of
+/// the latest date, their expiry within [`FIT_DATE_SPAN`] of the latest (D58:
+/// what the other side gets lives within a day as long as the longest the
+/// wallet can give), worth at least `paid`, in two tiers (D93):
+/// 1. coins already out of round whose new coins stay below `depth_limit`
+///    with room for one more (a cancel's), so at most `depth_limit` − 2
+///    deep, the smallest first: spending one leaves the wallet's total out of
+///    round where it was;
+/// 2. coins no reassignment deep (of a round or a board), the smallest
+///    first.
+/// Whether one pays alone, with its margins and a change of none or at least
+/// the smallest leaf, is the caller's to try ([`Wallet::pays_alone`]); when
+/// none does, the coins are taken in D58's order.
 ///
-/// A swap's change rests on the reassignment with the other side's coins,
-/// so it is out of round until the next round refreshes it, and counts
-/// against the operator's bond and the wallet's instant budget meanwhile.
-/// Taken largest first, a maker holding one large coin beside many small
-/// ones spent the large one on every swap, however small, and held nearly
-/// all of it out of round after each, while its refresh made it the newest
-/// coin again. Taken smallest first alone, the newest change came first
-/// again and again, one reassignment deeper each time, to the operator's
-/// depth limit (#703): fewer hops come first.
-pub(crate) fn fit_order(coins: &[(u64, u32, usize)], paid: u64) -> Vec<usize> {
+/// A swap's change rests on the reassignment with the other side's coins, so
+/// it is out of round until the next round refreshes it, and counts against
+/// the operator's bond and the wallet's instant budget meanwhile. Taken
+/// largest first, a maker spent its one large coin on every swap and held
+/// nearly all of it out of round after each (#702). Taken smallest first,
+/// the newest change came first again and again, one reassignment deeper
+/// each time, to the depth limit (#703). Taken shallowest first, a fresh
+/// large coin was preferred over a small change that paid alone, putting most
+/// of it out of round (#709).
+pub(crate) fn fit_order(coins: &[(u64, u32, usize, bool)], paid: u64, depth_limit: Option<usize>) -> Vec<usize> {
 	let latest = coins.iter().map(|c| c.1).max().unwrap_or(0);
-	let of_latest = |e: u32| e >= latest.saturating_sub(FIT_DATE_SPAN);
-	let mut fits: Vec<usize> = (0..coins.len()).filter(|&i| coins[i].0 >= paid && of_latest(coins[i].1)).collect();
-	fits.sort_by_key(|&i| (coins[i].2, coins[i].0, i));
-	fits
+	let fits = |i: &usize| coins[*i].0 >= paid && coins[*i].1 >= latest.saturating_sub(FIT_DATE_SPAN);
+	let roomy = |h: usize| depth_limit.is_none_or(|l| h + 2 <= l);
+	let mut out_of_round: Vec<usize> = (0..coins.len()).filter(fits).filter(|&i| coins[i].3 && roomy(coins[i].2)).collect();
+	out_of_round.sort_by_key(|&i| (coins[i].0, i));
+	let mut fresh: Vec<usize> = (0..coins.len()).filter(fits).filter(|&i| !coins[i].3 && coins[i].2 == 0).collect();
+	fresh.sort_by_key(|&i| (coins[i].0, i));
+	out_of_round.into_iter().chain(fresh).collect()
 }
 
 #[cfg(test)]
@@ -2537,19 +2553,28 @@ mod tests {
 	use super::*;
 
 	/// A swap tries alone, in order, the coins of the latest date worth at
-	/// least what it pays: the fewest hops first, then the smallest.
+	/// least what it pays: those already out of round with room below the
+	/// depth limit, the smallest first, then those of a round or a board, the
+	/// smallest first.
 	#[test]
-	fn a_swap_tries_the_shallowest_then_smallest_coin_of_the_latest_date() {
+	fn a_swap_tries_out_of_round_change_first_then_fresh_coins() {
 		let t = 2_000_000u32;
-		let coins = [(2_000_000_000, t + 600, 0), (30_000, t, 0), (50_000, t - 3_600, 0), (20_000, t, 0), (40_000, t - 2 * 86_400, 0),
-			(25_000, t, 3)];
-		assert_eq!(fit_order(&coins, 25_000), vec![1, 2, 0, 5], "30k, 50k, the giant, then the 25k three hops deep; 20k is too small, \
-			40k is two days older");
-		assert_eq!(fit_order(&coins, 45_000), vec![2, 0], "50k, then the giant; not the 40k of an earlier date");
-		assert_eq!(fit_order(&coins, 50_000), vec![2, 0], "a coin of exactly what is paid is tried");
-		assert!(fit_order(&coins, 3_000_000_000).is_empty(), "no coin holds it alone");
-		assert_eq!(fit_order(&[(10, u32::MAX, 1), (5, u32::MAX, 0)], 4), vec![1, 0], "coins with no expiry are of one date");
-		assert!(fit_order(&[], 1).is_empty());
+		let coins = [
+			(2_000_000_000, t + 600, 0, false), // 0: the giant, fresh
+			(30_000, t, 0, false),              // 1: fresh
+			(199_272, t, 1, true),              // 2: change, one deep
+			(50_000, t, 2, true),               // 3: change, two deep
+			(20_000, t, 0, false),              // 4: too small
+			(40_000, t - 2 * 86_400, 0, false), // 5: of an earlier date
+			(25_000, t, 4, true),               // 6: change four deep: no room below a limit of 5
+			(60_000, t, 1, false),              // 7: fresh kind but one deep (not taken alone)
+		];
+		assert_eq!(fit_order(&coins, 25_000, Some(5)), vec![3, 2, 1, 0], "change 50k then 199k, then fresh 30k and the giant");
+		assert_eq!(fit_order(&coins, 100_000, Some(5)), vec![2, 0], "the 199k change before the fresh giant (#709)");
+		assert_eq!(fit_order(&coins, 25_000, None), vec![6, 3, 2, 1, 0], "no limit published: every change has room");
+		assert!(fit_order(&coins, 3_000_000_000, Some(5)).is_empty(), "no coin holds it alone");
+		assert_eq!(fit_order(&[(10, u32::MAX, 0, false), (5, u32::MAX, 0, false)], 4, Some(5)), vec![1, 0], "coins with no expiry are of one date");
+		assert!(fit_order(&[], 1, Some(5)).is_empty());
 	}
 
 	/// The signer's refusal of a spend for a forfeit it holds names the salt
