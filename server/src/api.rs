@@ -191,6 +191,10 @@ pub struct Info {
 	/// How the operator builds its batches.
 	#[serde(default)]
 	pub batches: BatchesInfo,
+	/// The most keys one `mailbox_reads` reads; 0 for a server without it,
+	/// whose wallets read each key's mailbox with `mailbox_read`.
+	#[serde(default)]
+	pub mailbox_reads: u32,
 }
 
 /// How the operator builds its batches.
@@ -1420,6 +1424,48 @@ pub struct MailboxRead {
 	pub limit: u32,
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub notices: bool,
+}
+
+/// `POST /v1/mailbox_reads`: the mailboxes of several keys at once, each
+/// after a cursor of its own, up to `limit` messages each, under one
+/// challenge. Each key's proof is the one a `mailbox_read` of that key would
+/// carry (the call `mailbox_read`, its cursor and `limit` the request), so a
+/// batch authorises exactly the reads it is made of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxReads {
+	pub challenge: String,
+	pub limit: u32,
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub notices: bool,
+	pub reads: Vec<MailboxReadOf>,
+}
+
+/// One key of a [`MailboxReads`]: the key, the cursor it reads after
+/// (decimal) and its proof.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxReadOf {
+	pub key: String,
+	pub after: String,
+	pub signature: String,
+}
+
+/// The answer to a [`MailboxReads`]: the keys it read, in the order asked,
+/// each with its messages as a `mailbox_read` of it answers them. The keys
+/// it answers run from the first to where the answer's bound ran out; a key
+/// left out was not read, and is asked for again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mailboxes {
+	pub mailboxes: Vec<MailboxOf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxOf {
+	pub key: String,
+	pub messages: Vec<MailboxMessage>,
 }
 
 /// A notice in a mailbox (D61): a transfer the server recorded and has not

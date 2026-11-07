@@ -1557,94 +1557,10 @@ impl Wallet {
 		let now = self.now()?.to_consensus_u32();
 		let mut withdrawn = vec![];
 		let mut notes: Vec<String> = vec![];
-		for key in keys {
-			let k = key.x_only_public_key().0.serialize();
-			let mut read_again: Option<i64> = None;
-			let start = self.store.cursor(&k)?;
-			let mut pages = 0;
-			loop {
-				let after = self.store.cursor(&k)?;
-				if pages >= super::client::MAILBOX_PAGES {
-					notes.push(format!("the mailbox of key {} holds more than {} pages after what the wallet has read: the rest is read by the \
-						next sync", hex(&k), super::client::MAILBOX_PAGES));
-					break;
-				}
-				pages += 1;
-				// D67: an exit step whose date comes while the operator serves
-				// page after page is taken at once.
-				self.exits_meanwhile();
-				let v = self.server.mailbox_read(&key, &self.genesis, after, 100)?;
-				let msgs = v["messages"].as_array().cloned().unwrap_or_default();
-				if msgs.is_empty() {
-					break;
-				}
-				let mut progress = false;
-				for m in &msgs {
-					let cursor: i64 = m["cursor"].as_str().unwrap_or("0").parse().unwrap_or(0);
-					let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
-					// The cursor never moves back: a message at or before the
-					// one the wallet has read was read already, whatever the
-					// server serves again.
-					if cursor <= self.store.cursor(&k)? {
-						continue;
-					}
-					progress = true;
-					// A notice of a coin pending or withdrawn (D61).
-					if m["kind"].as_str().is_some_and(|k| k != "coin") {
-						if let Some(w) = self.take_notice(m, now)? {
-							if m["kind"] == "withdrawn" {
-								withdrawn.push(w);
-							}
-						}
-						self.store.set_cursor(&k, cursor)?;
-						continue;
-					}
-					let bytes = unhex(m["record"].as_str().unwrap_or("")).unwrap_or_default();
-					// A coin is taken only once the head it rests on is held
-					// outside the operator's machine as the wallet requires;
-					// until then it waits, and its message is read again from
-					// the server, which hands the head on with what it holds.
-					if let (Err(why), None) = (self.held_outside(&m["signer_record"]), &home) {
-						waiting.push(json!({"leaf_id": leaf, "reason": why}));
-						read_again = Some(read_again.map_or(cursor - 1, |c: i64| c.min(cursor - 1)));
-						self.store.set_cursor(&k, cursor)?;
-						continue;
-					}
-					match self.accept_coin_as(&bytes, &leaf, "mailbox", home.is_some()) {
-						Ok(v) => {
-							self.pending_ended(&leaf)?;
-							if let Err(e) = self.keep_coin_head(&leaf, &m["signer_record"]) {
-								self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
-							}
-							if v["already_held"].is_null() { accepted.push(v) } else { held.push(v) }
-						},
-						Err(e) if passing(&e) => {
-							let head = (!m["signer_record"].is_null()).then(|| m["signer_record"].to_string());
-							self.store.keep_for_retry(&leaf, &bytes, &e.to_string(), head.as_deref())?;
-							waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
-						},
-						Err(e) => {
-							self.pending_ended(&leaf)?;
-							self.store.refused(&format!("mailbox coin {}", leaf), &e.to_string())?;
-							refused.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
-						},
-					}
-					self.store.set_cursor(&k, cursor)?;
-				}
-				// A page with nothing past what the wallet has read: the server
-				// serves again what was read, and the read ends.
-				if !progress {
-					notes.push(format!("the server served the mailbox of key {} from before what the wallet has read (cursor {}) again: the \
-						read ends there", hex(&k), after));
-					break;
-				}
-			}
-			// A coin waiting for its keepers' acknowledgements is read again
-			// next time: the wallet's own step back, never before where this
-			// read began.
-			if let Some(c) = read_again {
-				self.store.set_cursor(&k, c.max(start))?;
-			}
+		{
+			let mut taken = Taken { accepted: &mut accepted, refused: &mut refused, waiting: &mut waiting, held: &mut held,
+				withdrawn: &mut withdrawn };
+			self.read_mailboxes(&keys, now, home.is_some(), &mut taken, &mut notes)?;
 		}
 		self.reread_mailbox(home.is_some(), &mut accepted, &mut waiting, &mut notes)?;
 		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
@@ -1683,6 +1599,166 @@ impl Wallet {
 				nothing more, so the wallet takes every coin it is sent on the chain at once", at, why));
 		}
 		Ok(out)
+	}
+
+	/// Reads the mailbox of each of `keys` on from its cursor, taking each
+	/// message as [`Self::take_message`] does, until a page holds nothing
+	/// past what the wallet has read. The keys are read together: a server
+	/// that publishes `mailbox_reads` in its `info` serves many keys in one
+	/// request, under one challenge, so a read costs a few requests however
+	/// many receive requests wait; one without it is read key by key
+	/// (`mailbox_read`). Every key is read to its end on every read, as each
+	/// was read alone, and a key the server leaves out of an answer is asked
+	/// for again.
+	fn read_mailboxes(&mut self, keys: &[elements::secp256k1_zkp::Keypair], now: u32, home: bool, taken: &mut Taken<'_>,
+		notes: &mut Vec<String>) -> Result<(), Error>
+	{
+		struct KeyRead {
+			k: [u8; 32],
+			start: i64,
+			read_again: Option<i64>,
+			pages: usize,
+		}
+		let mut reads = vec![];
+		for key in keys {
+			let k = key.x_only_public_key().0.serialize();
+			reads.push(KeyRead { k, start: self.store.cursor(&k)?, read_again: None, pages: 0 });
+		}
+		let info = self.server.info().unwrap_or(Value::Null);
+		let fit = info["max_request_bytes"].as_u64().unwrap_or(0).saturating_sub(1024) / super::client::MAILBOX_READ_BYTES;
+		let batch = info["mailbox_reads"].as_u64().unwrap_or(0).min(fit) as usize;
+		let mut challenge: Option<([u8; 32], web_time::Instant, u64)> = None;
+		let mut todo: Vec<usize> = (0..reads.len()).collect();
+		while !todo.is_empty() {
+			let mut asks = vec![];
+			for i in todo {
+				if reads[i].pages >= super::client::MAILBOX_PAGES {
+					notes.push(format!("the mailbox of key {} holds more than {} pages after what the wallet has read: the rest is read by \
+						the next sync", hex(&reads[i].k), super::client::MAILBOX_PAGES));
+					continue;
+				}
+				asks.push((i, self.store.cursor(&reads[i].k)?));
+			}
+			todo = vec![];
+			for chunk in asks.chunks(batch.max(1)) {
+				// D67: an exit step whose date comes while the operator serves
+				// page after page is taken at once.
+				self.exits_meanwhile();
+				let pages: Vec<(usize, Vec<Value>)> = if batch == 0 {
+					let (i, after) = chunk[0];
+					let v = self.server.mailbox_read(&keys[i], &self.genesis, after, 100)?;
+					vec![(0, v["messages"].as_array().cloned().unwrap_or_default())]
+				} else {
+					// One challenge serves the batches of a read while it is
+					// well within its lifetime.
+					let fresh = challenge.as_ref().is_some_and(|(_, at, ttl)| at.elapsed().as_secs().saturating_mul(2) < *ttl);
+					if !fresh {
+						let (c, ttl) = self.server.challenge()?;
+						challenge = Some((c, web_time::Instant::now(), ttl));
+					}
+					let c = challenge.as_ref().expect("a challenge").0;
+					let ask: Vec<(&elements::secp256k1_zkp::Keypair, i64)> = chunk.iter().map(|(i, after)| (&keys[*i], *after)).collect();
+					let pages = self.server.mailbox_reads(&ask, &self.genesis, &c, 100)?;
+					if pages.is_empty() {
+						return Err(Error::Unreachable("mailbox_reads: the server answered none of the keys asked".into()));
+					}
+					pages
+				};
+				let mut answered = vec![false; chunk.len()];
+				for (j, msgs) in pages {
+					let (i, after) = chunk[j];
+					answered[j] = true;
+					reads[i].pages += 1;
+					if msgs.is_empty() {
+						continue;
+					}
+					let k = reads[i].k;
+					let mut progress = false;
+					for m in &msgs {
+						progress |= self.take_message(&k, m, now, home, &mut reads[i].read_again, taken)?;
+					}
+					// A page with nothing past what the wallet has read: the
+					// server serves again what was read, and the read of the key
+					// ends.
+					if !progress {
+						notes.push(format!("the server served the mailbox of key {} from before what the wallet has read (cursor {}) \
+							again: the read ends there", hex(&k), after));
+						continue;
+					}
+					todo.push(i);
+				}
+				// Left out of the answer: asked for again.
+				todo.extend(chunk.iter().zip(&answered).filter(|(_, a)| !**a).map(|((i, _), _)| *i));
+			}
+		}
+		// A coin waiting for its keepers' acknowledgements is read again next
+		// time: the wallet's own step back, never before where this read
+		// began.
+		for r in &reads {
+			if let Some(c) = r.read_again {
+				self.store.set_cursor(&r.k, c.max(r.start))?;
+			}
+		}
+		Ok(())
+	}
+
+	/// Takes one message of the mailbox of key `k` (cursor and all): a notice
+	/// as [`Self::take_notice`] says, a coin once the head it rests on is held
+	/// outside the operator's machine as the wallet requires, each kept,
+	/// kept for a retry or refused with its reason. Whether it lay past what
+	/// the wallet had read: one at or before its cursor was read already,
+	/// whatever the server serves again, and is passed over.
+	fn take_message(&mut self, k: &[u8; 32], m: &Value, now: u32, home: bool, read_again: &mut Option<i64>, t: &mut Taken<'_>)
+		-> Result<bool, Error>
+	{
+		let cursor: i64 = m["cursor"].as_str().unwrap_or("0").parse().unwrap_or(0);
+		let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
+		// The cursor never moves back.
+		if cursor <= self.store.cursor(k)? {
+			return Ok(false);
+		}
+		// A notice of a coin pending or withdrawn (D61).
+		if m["kind"].as_str().is_some_and(|k| k != "coin") {
+			if let Some(w) = self.take_notice(m, now)? {
+				if m["kind"] == "withdrawn" {
+					t.withdrawn.push(w);
+				}
+			}
+			self.store.set_cursor(k, cursor)?;
+			return Ok(true);
+		}
+		let bytes = unhex(m["record"].as_str().unwrap_or("")).unwrap_or_default();
+		// A coin is taken only once the head it rests on is held outside the
+		// operator's machine as the wallet requires; until then it waits,
+		// and its message is read again from the server, which hands the
+		// head on with what it holds.
+		if let (Err(why), false) = (self.held_outside(&m["signer_record"]), home) {
+			t.waiting.push(json!({"leaf_id": leaf, "reason": why}));
+			*read_again = Some(read_again.map_or(cursor - 1, |c: i64| c.min(cursor - 1)));
+			self.store.set_cursor(k, cursor)?;
+			return Ok(true);
+		}
+		match self.accept_coin_as(&bytes, &leaf, "mailbox", home) {
+			Ok(v) => {
+				self.pending_ended(&leaf)?;
+				if let Err(e) = self.keep_coin_head(&leaf, &m["signer_record"]) {
+					self.store.refused(&format!("the head of mailbox coin {}", leaf), &e.to_string())?;
+				}
+				if v["already_held"].is_null() { t.accepted.push(v) } else { t.held.push(v) }
+			},
+			Err(e) if passing(&e) => {
+				let head = (!m["signer_record"].is_null()).then(|| m["signer_record"].to_string());
+				self.store.keep_for_retry(&leaf, &bytes, &e.to_string(), head.as_deref())?;
+				t.waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
+			},
+			Err(e) => {
+				self.pending_ended(&leaf)?;
+				self.store.refused(&format!("mailbox coin {}", leaf), &e.to_string())?;
+				t.refused.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
+			},
+		}
+		self.store.set_cursor(k, cursor)?;
+		Ok(true)
 	}
 
 	/// Reads every mailbox of the wallet again from its start, once for each
@@ -2296,6 +2372,16 @@ const MAILBOX_REREAD: &str = "mailbox_reread";
 /// The most pages of the mailboxes [`Wallet::reread_mailbox`] reads in one
 /// sync.
 const REREAD_PAGES: usize = 10;
+
+/// What a mailbox read did with the messages it took, as
+/// [`Wallet::mailbox`] reports it.
+struct Taken<'a> {
+	accepted: &'a mut Vec<Value>,
+	refused: &'a mut Vec<Value>,
+	waiting: &'a mut Vec<Value>,
+	held: &'a mut Vec<Value>,
+	withdrawn: &'a mut Vec<Value>,
+}
 
 fn passing(e: &Error) -> bool {
 	matches!(e, Error::Missing(_) | Error::Unread(_) | Error::Node(_) | Error::Unreachable(_) | Error::Store(_) | Error::Io(_))
