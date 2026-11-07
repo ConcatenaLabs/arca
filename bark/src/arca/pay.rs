@@ -1610,19 +1610,26 @@ impl Wallet {
 	/// (`mailbox_read`). Every key is read to its end on every read, as each
 	/// was read alone, and a key the server leaves out of an answer is asked
 	/// for again.
+	///
+	/// Each key is read on from a position of the read's own (`pos`); the
+	/// cursor the store keeps moves with it only up to the first coin that
+	/// waits for its keepers' acknowledgements, and stays before it from
+	/// then on. So whatever ends the read (an error in any later request, a
+	/// closed tab, a killed app), what the store holds is already where the
+	/// next read starts: at the waiting coin, never past it.
 	fn read_mailboxes(&mut self, keys: &[elements::secp256k1_zkp::Keypair], now: u32, home: bool, taken: &mut Taken<'_>,
 		notes: &mut Vec<String>) -> Result<(), Error>
 	{
 		struct KeyRead {
 			k: [u8; 32],
-			start: i64,
-			read_again: Option<i64>,
+			pos: i64,
+			held_back: bool,
 			pages: usize,
 		}
 		let mut reads = vec![];
 		for key in keys {
 			let k = key.x_only_public_key().0.serialize();
-			reads.push(KeyRead { k, start: self.store.cursor(&k)?, read_again: None, pages: 0 });
+			reads.push(KeyRead { k, pos: self.store.cursor(&k)?, held_back: false, pages: 0 });
 		}
 		let info = self.server.info().unwrap_or(Value::Null);
 		let fit = info["max_request_bytes"].as_u64().unwrap_or(0).saturating_sub(1024) / super::client::MAILBOX_READ_BYTES;
@@ -1637,7 +1644,7 @@ impl Wallet {
 						the next sync", hex(&reads[i].k), super::client::MAILBOX_PAGES));
 					continue;
 				}
-				asks.push((i, self.store.cursor(&reads[i].k)?));
+				asks.push((i, reads[i].pos));
 			}
 			todo = vec![];
 			for chunk in asks.chunks(batch.max(1)) {
@@ -1675,7 +1682,8 @@ impl Wallet {
 					let k = reads[i].k;
 					let mut progress = false;
 					for m in &msgs {
-						progress |= self.take_message(&k, m, now, home, &mut reads[i].read_again, taken)?;
+						let r = &mut reads[i];
+						progress |= self.take_message(&k, m, now, home, &mut r.pos, &mut r.held_back, taken)?;
 					}
 					// A page with nothing past what the wallet has read: the
 					// server serves again what was read, and the read of the key
@@ -1691,14 +1699,6 @@ impl Wallet {
 				todo.extend(chunk.iter().zip(&answered).filter(|(_, a)| !**a).map(|((i, _), _)| *i));
 			}
 		}
-		// A coin waiting for its keepers' acknowledgements is read again next
-		// time: the wallet's own step back, never before where this read
-		// began.
-		for r in &reads {
-			if let Some(c) = r.read_again {
-				self.store.set_cursor(&r.k, c.max(r.start))?;
-			}
-		}
 		Ok(())
 	}
 
@@ -1706,17 +1706,24 @@ impl Wallet {
 	/// as [`Self::take_notice`] says, a coin once the head it rests on is held
 	/// outside the operator's machine as the wallet requires, each kept,
 	/// kept for a retry or refused with its reason. Whether it lay past what
-	/// the wallet had read: one at or before its cursor was read already,
-	/// whatever the server serves again, and is passed over.
-	fn take_message(&mut self, k: &[u8; 32], m: &Value, now: u32, home: bool, read_again: &mut Option<i64>, t: &mut Taken<'_>)
+	/// the read had reached (`pos`): one at or before it was read already,
+	/// whatever the server serves again, and is passed over. The read moves
+	/// on past each message; the store's cursor moves with it until a coin
+	/// waits for its keepers' acknowledgements (`held_back`), and from then
+	/// on stays before that coin, so the next read takes it up again (the
+	/// coins after it the wallet took already are then reported as held,
+	/// never again as taken).
+	#[allow(clippy::too_many_arguments)]
+	fn take_message(&mut self, k: &[u8; 32], m: &Value, now: u32, home: bool, pos: &mut i64, held_back: &mut bool, t: &mut Taken<'_>)
 		-> Result<bool, Error>
 	{
 		let cursor: i64 = m["cursor"].as_str().unwrap_or("0").parse().unwrap_or(0);
 		let leaf = m["leaf_id"].as_str().unwrap_or("").to_string();
 		// The cursor never moves back.
-		if cursor <= self.store.cursor(k)? {
+		if cursor <= (*pos).max(self.store.cursor(k)?) {
 			return Ok(false);
 		}
+		*pos = cursor;
 		// A notice of a coin pending or withdrawn (D61).
 		if m["kind"].as_str().is_some_and(|k| k != "coin") {
 			if let Some(w) = self.take_notice(m, now)? {
@@ -1724,7 +1731,9 @@ impl Wallet {
 					t.withdrawn.push(w);
 				}
 			}
-			self.store.set_cursor(k, cursor)?;
+			if !*held_back {
+				self.store.set_cursor(k, cursor)?;
+			}
 			return Ok(true);
 		}
 		let bytes = unhex(m["record"].as_str().unwrap_or("")).unwrap_or_default();
@@ -1734,8 +1743,7 @@ impl Wallet {
 		// head on with what it holds.
 		if let (Err(why), false) = (self.held_outside(&m["signer_record"]), home) {
 			t.waiting.push(json!({"leaf_id": leaf, "reason": why}));
-			*read_again = Some(read_again.map_or(cursor - 1, |c: i64| c.min(cursor - 1)));
-			self.store.set_cursor(k, cursor)?;
+			*held_back = true;
 			return Ok(true);
 		}
 		match self.accept_coin_as(&bytes, &leaf, "mailbox", home) {
@@ -1757,7 +1765,9 @@ impl Wallet {
 				t.refused.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
 			},
 		}
-		self.store.set_cursor(k, cursor)?;
+		if !*held_back {
+			self.store.set_cursor(k, cursor)?;
+		}
 		Ok(true)
 	}
 
