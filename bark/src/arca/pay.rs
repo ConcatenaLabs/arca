@@ -27,9 +27,12 @@ pub const MARGIN_MULTIPLE: u64 = 4;
 /// coins it gives the wallet, unless the user takes it anyway: two days.
 pub const SWAP_DEADLINE_MARGIN: u32 = 2 * 86_400;
 
-/// What one exit date spans when a swap chooses its coins ([`fit_order`]):
-/// coins whose exit dates lie within a day of the latest are of one date.
-pub const FIT_DATE_SPAN: u32 = 86_400;
+/// The least life a coin has left, to its first expiry, for a swap to try
+/// it alone ([`fit_order`]): seven days, so the coin the other side gets
+/// lives at least that long, well past a swap's own two days
+/// ([`SWAP_DEADLINE_MARGIN`]) and the two-day refresh window before an exit
+/// deadline. A coin of a batch without a sweep has no expiry and qualifies.
+pub const FIT_LIFE: u32 = 7 * 86_400;
 
 /// How many times the operator's least margin the wallet leaves, within the
 /// operator's most: room for the operator's floor to rise between the
@@ -635,8 +638,9 @@ impl Wallet {
 				deep = candidates.iter().filter(|c| c.coin.hops >= limit).map(|c| c.coin.value).sum();
 				candidates.retain(|c| c.coin.hops < limit);
 			}
+			let now = self.now()?.to_consensus_u32();
 			let order = fit_order(&candidates.iter().map(|c| (c.coin.value, c.row.expiry, c.coin.hops, matches!(c.row.kind.as_str(), "transfer" | "fill")))
-				.collect::<Vec<_>>(), paid, depth_limit(info));
+				.collect::<Vec<_>>(), paid, depth_limit(info), now);
 			for i in order {
 				let c = &candidates[i];
 				if let Some(alone) = self.pays_alone(c, &margins, paid, others, pays_margin, min_leaf, other_inputs, asset)? {
@@ -2514,10 +2518,10 @@ pub(crate) fn depth_limit(info: &Value) -> Option<usize> {
 
 /// The coins a swap tries alone, in order, by index into `coins` (each its
 /// value, its expiry, its reassignments since a round (`hops`) and whether
-/// it is out of round, received or made by a payment out of round): those of
-/// the latest date, their expiry within [`FIT_DATE_SPAN`] of the latest (D58:
-/// what the other side gets lives within a day as long as the longest the
-/// wallet can give), worth at least `paid`, in two tiers (D93):
+/// it is out of round, received or made by a payment out of round): those
+/// with at least [`FIT_LIFE`] left before their expiry at `now` (so the coin
+/// the other side gets lives at least that long), worth at least `paid`, in
+/// two tiers (D93):
 /// 1. coins already out of round whose new coins stay below `depth_limit`
 ///    with room for one more (a cancel's), so at most `depth_limit` − 2
 ///    deep, the smallest first: spending one leaves the wallet's total out of
@@ -2536,10 +2540,12 @@ pub(crate) fn depth_limit(info: &Value) -> Option<usize> {
 /// the newest change came first again and again, one reassignment deeper
 /// each time, to the depth limit (#703). Taken shallowest first, a fresh
 /// large coin was preferred over a small change that paid alone, putting most
-/// of it out of round (#709).
-pub(crate) fn fit_order(coins: &[(u64, u32, usize, bool)], paid: u64, depth_limit: Option<usize>) -> Vec<usize> {
-	let latest = coins.iter().map(|c| c.1).max().unwrap_or(0);
-	let fits = |i: &usize| coins[*i].0 >= paid && coins[*i].1 >= latest.saturating_sub(FIT_DATE_SPAN);
+/// of it out of round (#709). Taken only from the coins within a day of the
+/// newest, a maker whose one giant coin was refreshed a day after the rest
+/// had no other coin to try, and spent the giant on every swap.
+pub(crate) fn fit_order(coins: &[(u64, u32, usize, bool)], paid: u64, depth_limit: Option<usize>, now: u32) -> Vec<usize> {
+	let lives = |e: u32| e == u32::MAX || e >= now.saturating_add(FIT_LIFE);
+	let fits = |i: &usize| coins[*i].0 >= paid && lives(coins[*i].1);
 	let roomy = |h: usize| depth_limit.is_none_or(|l| h + 2 <= l);
 	let mut out_of_round: Vec<usize> = (0..coins.len()).filter(fits).filter(|&i| coins[i].3 && roomy(coins[i].2)).collect();
 	out_of_round.sort_by_key(|&i| (coins[i].0, i));
@@ -2552,29 +2558,32 @@ pub(crate) fn fit_order(coins: &[(u64, u32, usize, bool)], paid: u64, depth_limi
 mod tests {
 	use super::*;
 
-	/// A swap tries alone, in order, the coins of the latest date worth at
-	/// least what it pays: those already out of round with room below the
-	/// depth limit, the smallest first, then those of a round or a board, the
-	/// smallest first.
+	/// A swap tries alone, in order, the coins with at least seven days of
+	/// life worth at least what it pays: those already out of round with room
+	/// below the depth limit, the smallest first, then those of a round or a
+	/// board, the smallest first.
 	#[test]
 	fn a_swap_tries_out_of_round_change_first_then_fresh_coins() {
-		let t = 2_000_000u32;
+		let now = 1_000_000u32;
+		let t = now + 20 * 86_400;
 		let coins = [
-			(2_000_000_000, t + 600, 0, false), // 0: the giant, fresh
-			(30_000, t, 0, false),              // 1: fresh
-			(199_272, t, 1, true),              // 2: change, one deep
-			(50_000, t, 2, true),               // 3: change, two deep
-			(20_000, t, 0, false),              // 4: too small
-			(40_000, t - 2 * 86_400, 0, false), // 5: of an earlier date
-			(25_000, t, 4, true),               // 6: change four deep: no room below a limit of 5
-			(60_000, t, 1, false),              // 7: fresh kind but one deep (not taken alone)
+			(2_000_000_000, t + 33 * 3_600, 0, false), // 0: the giant, fresh, 33 h newer than the rest
+			(30_000, t, 0, false),                     // 1: fresh
+			(199_272, t, 1, true),                     // 2: change, one deep
+			(50_000, t, 2, true),                      // 3: change, two deep
+			(20_000, t, 0, false),                     // 4: too small
+			(40_000, now + 5 * 86_400, 0, false),      // 5: five days of life: not tried alone
+			(25_000, t, 4, true),                      // 6: change four deep: no room below a limit of 5
+			(60_000, t, 1, false),                     // 7: fresh kind but one deep (not taken alone)
+			(45_000, u32::MAX, 0, false),              // 8: no expiry (a batch without a sweep)
 		];
-		assert_eq!(fit_order(&coins, 25_000, Some(5)), vec![3, 2, 1, 0], "change 50k then 199k, then fresh 30k and the giant");
-		assert_eq!(fit_order(&coins, 100_000, Some(5)), vec![2, 0], "the 199k change before the fresh giant (#709)");
-		assert_eq!(fit_order(&coins, 25_000, None), vec![6, 3, 2, 1, 0], "no limit published: every change has room");
-		assert!(fit_order(&coins, 3_000_000_000, Some(5)).is_empty(), "no coin holds it alone");
-		assert_eq!(fit_order(&[(10, u32::MAX, 0, false), (5, u32::MAX, 0, false)], 4, Some(5)), vec![1, 0], "coins with no expiry are of one date");
-		assert!(fit_order(&[], 1, Some(5)).is_empty());
+		assert_eq!(fit_order(&coins, 25_000, Some(5), now), vec![3, 2, 1, 8, 0], "change 50k then 199k, then fresh 30k, 45k and the giant");
+		assert_eq!(fit_order(&coins, 100_000, Some(5), now), vec![2, 0], "the 199k change before the fresh giant (#709)");
+		assert_eq!(fit_order(&coins, 35_000, Some(5), now), vec![3, 2, 8, 0],
+			"a mid-size coin before the giant 33 h newer than it, not the giant alone; the 40k of five days is not tried");
+		assert_eq!(fit_order(&coins, 25_000, None, now), vec![6, 3, 2, 1, 8, 0], "no limit published: every change has room");
+		assert!(fit_order(&coins, 3_000_000_000, Some(5), now).is_empty(), "no coin holds it alone");
+		assert!(fit_order(&[], 1, Some(5), now).is_empty());
 	}
 
 	/// The signer's refusal of a spend for a forfeit it holds names the salt
