@@ -926,9 +926,10 @@ pub struct BatchStatusRequest {
 	pub leaf_id: String,
 }
 
-/// Where a round leaf lies: each round whose batch output it is in, newest
-/// first, with that output and the round's state (`built`, `broadcast`,
-/// `final`, `lost`). A wallet reads the round by its txid: once the batch
+/// Where a round leaf lies: the round whose batch output it is in (`rounds`
+/// holds one entry; a list, so an answer can grow without a new call), with
+/// that output and the round's state (`built`, `broadcast`, `final`,
+/// `lost`). A wallet reads the round by its txid: once the batch
 /// output is spent (the watcher unrolled the batch to reclaim nodes its
 /// holders released) the node's set of unspent outputs no longer finds it.
 /// Hints only: a wallet takes a round only if it pays the output the leaf's

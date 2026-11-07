@@ -129,11 +129,11 @@ impl Store {
 		rows.iter().map(|r| array32(r.get(0), "leaf id")).collect()
 	}
 
-	/// The rounds whose batch output a round leaf `id` lies at, with that
-	/// output and each round's state (`built`, `broadcast`, `final`,
-	/// `lost`), newest first: one round, or more when its participation ran
-	/// again after a round that could not return. Empty for a leaf that is
-	/// no round leaf or that the server does not know.
+	/// The round whose batch output a round leaf `id` lies at, with that
+	/// output and the round's state (`built`, `broadcast`, `final`, `lost`):
+	/// one row at most, a leaf id being in one round only (a participation
+	/// that runs again asks for new leaves). Empty for a leaf that is no
+	/// round leaf or that the server does not know.
 	pub async fn batch_rounds_of(&self, id: &[u8; 32]) -> Result<Vec<([u8; 32], u32, String)>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
