@@ -373,6 +373,10 @@ pub const LEAF_DATA_PAGES: usize = 1_000;
 /// thousand messages. The rest is read by the next.
 pub const MAILBOX_PAGES: usize = 100;
 
+/// The bytes one key of a `mailbox_reads` takes in its request, at most (its
+/// key, cursor and proof, about 230): how many fit a server's request size.
+pub const MAILBOX_READ_BYTES: u64 = 256;
+
 /// How long an answer of the server's `info` serves the calls after it: a
 /// burst of commands (a quote runs several, each reading the server's terms)
 /// asks once, so a wallet on a slow or far link pays one round trip, not one a
@@ -518,6 +522,39 @@ impl ServerClient {
 	pub fn mailbox_read(&self, key: &Keypair, chain: &Chain, after: i64, limit: u32) -> Result<Value, Error> {
 		let auth = self.auth("mailbox_read", key, chain, &mailbox_read_request(after.max(0) as u64, limit))?;
 		self.post("mailbox_read", &json!({"auth": auth, "after": after.to_string(), "limit": limit, "notices": true}))
+	}
+
+	/// A challenge of the server's, and the seconds it is taken for.
+	pub fn challenge(&self) -> Result<([u8; 32], u64), Error> {
+		let v = self.post("challenge", &json!({}))?;
+		Ok((unhex32(v["challenge"].as_str().unwrap_or(""))?, v["expires_in_seconds"].as_u64().unwrap_or(0)))
+	}
+
+	/// The mailboxes of several keys at once (`mailbox_reads`), each after
+	/// its own cursor, up to `limit` messages each, all under `challenge`:
+	/// each key signs the proof a `mailbox_read` of it would carry. Answers
+	/// the messages of each key the server read, by its place in `reads`; a
+	/// key it left out was not read.
+	pub fn mailbox_reads(&self, reads: &[(&Keypair, i64)], chain: &Chain, challenge: &[u8; 32], limit: u32)
+		-> Result<Vec<(usize, Vec<Value>)>, Error>
+	{
+		let entries: Vec<Value> = reads.iter().map(|(key, after)| {
+			let (xonly, after) = (key.x_only_public_key().0, (*after).max(0));
+			let request = mailbox_read_request(after as u64, limit);
+			let sig = sign_digest(key, &auth_digest(chain, "mailbox_read", challenge, &xonly, &request), &random32());
+			json!({"key": hex(&xonly.serialize()), "after": after.to_string(), "signature": hex(sig.as_ref())})
+		}).collect();
+		let v = self.post("mailbox_reads", &json!({"challenge": hex(challenge), "limit": limit, "notices": true, "reads": entries}))?;
+		let mut out = vec![];
+		for m in v["mailboxes"].as_array().cloned().unwrap_or_default() {
+			// Only a key the wallet asked for, once.
+			let Some(i) = entries.iter().position(|e| e["key"] == m["key"]) else { continue };
+			if out.iter().any(|(j, _)| *j == i) {
+				continue;
+			}
+			out.push((i, m["messages"].as_array().cloned().unwrap_or_default()));
+		}
+		Ok(out)
 	}
 
 	/// A page of the leaves the server serves to `key`, after cursor `after`,
