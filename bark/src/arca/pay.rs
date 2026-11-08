@@ -694,8 +694,43 @@ impl Wallet {
 		// Coins an offline-refresh plan names are paid out of round by no
 		// wallet: say so, naming those whose release would cover it.
 		let need = paid + total_live.saturating_sub(kept) + margin;
-		Err(self.short_of(asset, need.saturating_sub(total_live), format!("the wallet holds {} of asset {} in live coins, and paying {} \
-			takes {} with the margins its transactions leave for their fees", total_live, asset, paid, need))?)
+		let refused = self.short_of(asset, need.saturating_sub(total_live), format!("the wallet holds {} of asset {} in live coins, and paying {} \
+			takes {} with the margins its transactions leave for their fees", total_live, asset, paid, need))?;
+		Err(self.after_close(refused, &chosen, others, other_inputs, pays_margin, &margins, total_live)?)
+	}
+
+	/// A refusal [`Error::InChannel`] of a payment from `chosen` (every live
+	/// coin it may spend, holding `total_live`), with the most it could pay
+	/// once the channels it names are closed, and that payment's fee: the
+	/// checkpoints' margins of `chosen` and of one leaf like the first of
+	/// them for each channel closed, and the reassignment's margin with them
+	/// all and a change output, as [`Self::choose_live`] sizes it then. The
+	/// wallet asked for the most is paid on the first ask after the round,
+	/// before the round's fee, which the round sets. Any other refusal, or
+	/// one with no live coin to size from, as it is.
+	#[allow(clippy::too_many_arguments)]
+	fn after_close(&self, refused: Error, chosen: &[In], others: &[ExplicitOutput], other_inputs: usize, pays_margin: bool,
+		margins: &Margins, total_live: u64) -> Result<Error, Error>
+	{
+		let Error::InChannel { asset, close, side, message, .. } = refused else { return Ok(refused) };
+		let Some(first) = chosen.first() else {
+			return Ok(Error::InChannel { asset, close, side, most: None, fee: None, message });
+		};
+		let k = close.len();
+		let kept_margins: u64 = chosen.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
+		let new_margins = self.checkpoint_margin(&first.coin, margins)?.saturating_mul(k as u64);
+		let mut all: Vec<&ValidCoin> = chosen.iter().map(|i| &i.coin).collect();
+		for _ in 0..(k + other_inputs) {
+			all.push(&first.coin);
+		}
+		let mut outs = others.to_vec();
+		outs.push(ExplicitOutput::new(first.coin.asset, 1, leaf_probe()));
+		let reassignment = if pays_margin { self.reassignment_margin(&all, &outs, margins)? } else { 0 };
+		let fee = kept_margins.saturating_add(new_margins).saturating_add(reassignment);
+		let most = total_live.saturating_add(side).saturating_sub(fee);
+		let message = format!("{}; with them closed, a payment takes {} in margins, so the most it can pay is {} (less the round's fee)",
+			message, fee, most);
+		Ok(Error::InChannel { asset, close, side, most: Some(most), fee: Some(fee), message })
 	}
 
 	/// Pays `value` of `asset` to `text`, a receive request or a channel code

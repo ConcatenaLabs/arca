@@ -157,9 +157,13 @@ pub enum Error {
 	/// names the fewest of those channel leaves, largest side first, whose
 	/// close into the next round (a quote and a participation with them)
 	/// would give that side back as a leaf a transfer spends. A program pays
-	/// by closing them, waiting for their round, and asking again.
+	/// by closing them, waiting for their round, and asking again. `side` is
+	/// what those sides hold; a payment to a receive request also names, in
+	/// `most` and `fee`, the most it could pay once they are closed and the
+	/// fee that payment would leave, its margins counted with the leaves the
+	/// close gives back (before the round's fee, which the round sets).
 	#[error("refused: {message}")]
-	InChannel { asset: String, close: Vec<String>, message: String },
+	InChannel { asset: String, close: Vec<String>, side: u64, most: Option<u64>, fee: Option<u64>, message: String },
 	/// The server refused, with its stable code.
 	#[error("the server refused {call} ({status} {code}): {message}")]
 	Server { call: String, status: i32, code: String, message: String },
