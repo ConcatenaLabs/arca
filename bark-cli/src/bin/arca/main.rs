@@ -597,6 +597,10 @@ enum Cmd {
 		/// the wallet holds leaves of but no channel (half of them in it).
 		#[arg(long)]
 		channels: bool,
+		/// With `--channels`, opens no channel in this asset (repeatable);
+		/// its channels are still read and folded.
+		#[arg(long = "no-open")]
+		no_open: Vec<String>,
 	},
 	/// The claims paid to this wallet, found by asking the operator under its
 	/// OpenAMP account key, its staking key and each address key: their distribution, value,
@@ -1667,9 +1671,9 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Watchtower(TowerCmd::Deposits) => w.tower_deposits(),
 		Cmd::PlanCancel { plan } => w.plan_cancel(&plan),
 		Cmd::PlanRelease { coins, max_fee_ppm } => w.plan_release(&coins, max_fee_ppm),
-		Cmd::Care { scan, expiries, max_fee_ppm, plan_within, channels } => {
+		Cmd::Care { scan, expiries, max_fee_ppm, plan_within, channels, no_open } => {
 			let c = if channels {
-				Some(w.care_channels(Some(max_fee_ppm.unwrap_or(bark::arca::CARE_MAX_FEE_PPM))).unwrap_or_else(|e| json!({"error": e.to_string()})))
+				Some(w.care_channels(Some(max_fee_ppm.unwrap_or(bark::arca::CARE_MAX_FEE_PPM)), &no_open).unwrap_or_else(|e| json!({"error": e.to_string()})))
 			} else {
 				None
 			};

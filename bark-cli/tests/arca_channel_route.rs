@@ -76,6 +76,13 @@ async fn wallets_open_pay_over_and_fold_channels_by_themselves() {
 		w.ok(&["sync"]);
 	}
 
+	// --- asked to open none in the asset, care opens none ---
+	let v = a.ok(&["care", "--channels", "--no-open", &x]);
+	let o = &v["channels"]["opened"][0];
+	assert_eq!(o["asset"], x.as_str(), "{}", v);
+	assert!(o["left"].as_str().unwrap_or("").starts_with("not opened"), "no channel opened in an asset named in no_open: {}", v);
+	assert!(v["channels"]["opened"].as_array().unwrap().iter().all(|o| o.get("capacity").is_none()), "{}", v);
+
 	// --- care opens a channel: half in it, half kept beside it ---
 	for w in [&a, &b] {
 		let v = w.ok(&["care", "--channels"]);
