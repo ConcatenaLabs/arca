@@ -279,9 +279,10 @@ impl Wallet {
 		}
 		if total < short {
 			let close: Vec<String> = held.into_iter().map(|(id, _)| id).collect();
+			let side = total;
 			let message = format!("{}; {} more is the wallet's side of its channels in the asset, which a transfer does not spend, and does not cover it all: closing the {} of them into the next round (a quote and a participation with each channel leaf) gives that side back as leaves of the wallet's own, less the round's fee, which raises the most it can send",
 				refused, total, close.len());
-			return Ok(Error::InChannel { asset: asset.to_string(), close, message });
+			return Ok(Error::InChannel { asset: asset.to_string(), close, side, most: None, fee: None, message });
 		}
 		let (mut close, mut sum) = (vec![], 0u64);
 		for (id, v) in held {
@@ -294,7 +295,7 @@ impl Wallet {
 		let message = format!("{}; {} more is the wallet's side of its channels in the asset, which a transfer does not spend: closing {} \
 			of them into the next round (a quote and a participation with the channel leaf) gives that side back as a leaf of the \
 			wallet's own, which covers it less the round's fee", refused, total, close.len());
-		Ok(Error::InChannel { asset: asset.to_string(), close, message })
+		Ok(Error::InChannel { asset: asset.to_string(), close, side: sum, most: None, fee: None, message })
 	}
 
 	/// The current coin of each plan that is open: the coin its next step

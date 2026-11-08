@@ -61,9 +61,16 @@ pub fn refusal(e: &Error) -> Value {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["release"] = json!(release);
 	}
-	if let Error::InChannel { asset, close, .. } = e {
+	if let Error::InChannel { asset, close, side, most, fee, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["close"] = json!(close);
+		out["error"]["side"] = json!(side.to_string());
+		if let Some(m) = most {
+			out["error"]["most"] = json!(m.to_string());
+		}
+		if let Some(f) = fee {
+			out["error"]["fee"] = json!(f.to_string());
+		}
 	}
 	out
 }
@@ -681,8 +688,11 @@ mod test {
 		assert_eq!(refusal(&Error::Refused("no".into())), json!({"error": {"kind": "refused", "message": "refused: no"}}));
 		let p = Error::Planned { asset: "aa".into(), release: vec!["c1".into(), "c2".into()], message: "short".into() };
 		assert_eq!(refusal(&p), json!({"error": {"kind": "planned", "message": "refused: short", "asset": "aa", "release": ["c1", "c2"]}}));
-		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], message: "short".into() };
-		assert_eq!(refusal(&c), json!({"error": {"kind": "in_channel", "message": "refused: short", "asset": "aa", "close": ["ch1"]}}));
+		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], side: 7, most: None, fee: None, message: "short".into() };
+		assert_eq!(refusal(&c), json!({"error": {"kind": "in_channel", "message": "refused: short", "asset": "aa", "close": ["ch1"], "side": "7"}}));
+		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], side: 7, most: Some(9), fee: Some(3), message: "short".into() };
+		assert_eq!(refusal(&c), json!({"error": {"kind": "in_channel", "message": "refused: short", "asset": "aa", "close": ["ch1"], "side": "7",
+			"most": "9", "fee": "3"}}));
 	}
 
 	#[test]

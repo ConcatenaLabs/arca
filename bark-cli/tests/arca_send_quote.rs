@@ -129,7 +129,13 @@ async fn a_quote_names_the_fee_and_a_channel_side_is_closed_to_pay() {
 		assert_eq!(v["error"]["kind"], "in_channel", "{}: {}", cmd, v);
 		assert_eq!(v["error"]["close"], serde_json::json!([leaf]), "{}", v);
 		assert!(v["error"]["message"].as_str().unwrap().contains("does not cover it all"), "{}", v);
+		// The most it can pay once the channel is closed, and that payment's fee.
+		assert_eq!(num(&v["error"]["side"]), side, "{}", v);
+		assert_eq!(num(&v["error"]["most"]) + num(&v["error"]["fee"]), kept + side, "{}", v);
 	}
+	let (_, v) = a.run(&["send-quote", &req3]);
+	let (most, fee_after) = (num(&v["error"]["most"]), num(&v["error"]["fee"]));
+	println!("once the channel is closed: at most {} with {} in margins", most, fee_after);
 	// What the plain leaf alone allows is still paid out of it.
 	let small = b.ok(&["receive", "--asset", &x, "--amount", "10000"])["request"].as_str().unwrap().to_string();
 	assert_eq!(a.ok(&["send-quote", &small])["route"], "leaf");
@@ -144,6 +150,11 @@ async fn a_quote_names_the_fee_and_a_channel_side_is_closed_to_pay() {
 	r.round_state(&round, RoundState::Final).await;
 	let s = a.ok(&["sync"]);
 	assert_eq!(s["participations"][0]["state"], "released", "{}", s);
+	// The most named before the close is paid once it is, with the fee named.
+	let req4 = b.ok(&["receive", "--asset", &x, "--amount", &most.to_string()])["request"].as_str().unwrap().to_string();
+	let q4 = a.ok(&["send-quote", &req4]);
+	assert_eq!(num(&q4["fee"]), fee_after, "the fee named before the close: {}", q4);
+	assert_eq!(q4["change"], Value::Null, "the most leaves no change: {}", q4);
 	let q2 = a.ok(&["send-quote", &req2]);
 	let fee2 = num(&q2["fee"]);
 	let sent2 = a.ok(&["send", &req2]);
