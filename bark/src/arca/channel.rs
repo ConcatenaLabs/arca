@@ -226,8 +226,11 @@ impl Wallet {
 	/// capacity on its side, the other half in a plain leaf beside it. Coins
 	/// a plan names, resting orders, coins awaiting a preimage and coins of a
 	/// supervised asset stay as they are; so do coins too small to split into
-	/// two leaves of the operator's smallest.
-	pub fn care_channels(&mut self, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+	/// two leaves of the operator's smallest. No channel is opened in an
+	/// asset `no_open` names (a program that is paying out of it, or holds
+	/// too little of it for a channel to be worth its while): its channels
+	/// are still read and folded.
+	pub fn care_channels(&mut self, max_fee_ppm: Option<u64>, no_open: &[String]) -> Result<Value, Error> {
 		let mut synced = vec![];
 		let mut folded = vec![];
 		for c in self.store.coins_in("live")? {
@@ -262,6 +265,10 @@ impl Wallet {
 			let Some(capacity) = a["channels"]["capacity"].as_str().and_then(|c| c.parse::<u64>().ok()).filter(|c| *c > 0) else { continue };
 			let Some(asset) = a["asset"].as_str().and_then(|s| AssetId::from_str(s).ok()) else { continue };
 			if with_channel.contains(&asset.to_string()) || !matches!(self.landing_rule(&info, asset), Ok(None)) {
+				continue;
+			}
+			if no_open.iter().any(|a| a.eq_ignore_ascii_case(&asset.to_string())) {
+				opened.push(json!({"asset": asset.to_string(), "left": "not opened: the program asked for none in this asset now"}));
 				continue;
 			}
 			let mut coins = vec![];
