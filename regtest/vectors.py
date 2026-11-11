@@ -150,6 +150,7 @@ SALTS = {i: label_hash("salt", "leaf%d" % i) for i in range(NLEAVES)}
 SALT_CHECKPOINT = label_hash("salt", "checkpoint")
 SALT_CHECKPOINT_EXIT = label_hash("salt", "checkpoint with exit")
 SALT_CHECKPOINT_EXIT_SWEEP = label_hash("salt", "checkpoint with exit and sweep")
+SALT_CHECKPOINT_LANDING = label_hash("salt", "checkpoint with landing")
 SALT_RECV = label_hash("salt", "receiver leaf")
 SALT_CHANGE = label_hash("salt", "change leaf")
 SALT_HTLC = label_hash("salt", "htlc")
@@ -523,6 +524,16 @@ def generate():
         "allowance": LANDING_ALLOWANCE, "asset": hx(X_ID), "value": LEAF_VALUE, "min_value": LEAF_VALUE - LANDING_ALLOWANCE,
         "exit_delay": DELAY, "max_outputs": M_MAX},
         gtap, [("collab", 1), ("landing", 1)])
+    # A landing-1 coin's checkpoint with its owner's exit: the landing over
+    # the checkpoint's value less the coin's allowance.
+    cp_land_v = LEAF_VALUE - 600
+    cl_exit = landing_exit_own_index(A.x, DELAY, LANDING_PROGRAM, X_ID, cp_land_v - LANDING_ALLOWANCE)
+    cltap, _ = checkpoint_taptree(A.x, S.x, SALT_CHECKPOINT_LANDING, CTAG, None, DELAY, cl_exit)
+    outputs["checkpoint_landing"] = output_json("checkpoint of a landing-1 coin with its owner's exit, the landing", {
+        "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_CHECKPOINT_LANDING),
+        "K": hx(leaf_const(CTAG, SALT_CHECKPOINT_LANDING, fold=True)), "exit_delay": DELAY, "landing_program": hx(LANDING_PROGRAM),
+        "asset": hx(X_ID), "value": cp_land_v, "min_value": cp_land_v - LANDING_ALLOWANCE},
+        cltap, [("collab", 1), ("exit", 1)])
     qtap, _ = claim_taptree(A.x, S.x, SALT_CLAIM, CTAG, DELAY, CLAIM_DEADLINE, CLAIM_RETURN, X_ID, LEAF_VALUE, CLAIM_ALLOWANCE)
     outputs["claim"] = output_json("claim-1, a distribution's claim leaf", {
         "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_CLAIM), "chain_tag": hx(CTAG),
@@ -738,6 +749,9 @@ def generate():
     land_spk = b"\x00\x14" + LANDING_PROGRAM
     sp = Spend([("landing/landing", g_spent, DELAY)], [txout(LEAF_VALUE - 500, land_spk), fee_out(500)])
     spends.append(checksig_spend("landing/landing", "landing", "landing", gtap, sp, 0, A))
+    sp = Spend([("checkpoint_landing/exit", txout(cp_land_v, cltap.scriptPubKey), DELAY)],
+               [txout(cp_land_v - 500, land_spk), fee_out(500)])
+    spends.append(checksig_spend("checkpoint_landing/exit, the landing", "checkpoint_landing", "exit", cltap, sp, 0, A))
     spends.append(rebind_spend("landing/collab m=1", "landing", "collab", gtap, CTAG, SALT_LANDING, g_spent,
                                [(X_ID, LEAF_VALUE - 500, OPERATOR_SPK)], [S, A],
                                const=landing_prefix(CTAG, SALT_LANDING, LANDING_PROGRAM)))
@@ -786,7 +800,8 @@ def generate():
             "node_reserve": NODE_RESERVE, "path_leaf": PATH_LEAF,
             "salts": dict([("leaf%d" % j, hx(SALTS[j])) for j in range(NLEAVES)]
                           + [("checkpoint", hx(SALT_CHECKPOINT)), ("checkpoint with exit", hx(SALT_CHECKPOINT_EXIT)),
-                             ("checkpoint with exit and sweep", hx(SALT_CHECKPOINT_EXIT_SWEEP)), ("receiver leaf", hx(SALT_RECV)),
+                             ("checkpoint with exit and sweep", hx(SALT_CHECKPOINT_EXIT_SWEEP)),
+                             ("checkpoint with landing", hx(SALT_CHECKPOINT_LANDING)), ("receiver leaf", hx(SALT_RECV)),
                              ("change leaf", hx(SALT_CHANGE)), ("board", hx(SALT_BOARD)), ("landing", hx(SALT_LANDING)),
                              ("claim", hx(SALT_CLAIM))]
                           + [("htlc", hx(SALT_HTLC)), ("htlc receive", hx(SALT_HTLC_RECEIVE))]),

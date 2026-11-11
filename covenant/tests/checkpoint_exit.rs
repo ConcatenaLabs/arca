@@ -181,7 +181,7 @@ fn swap_case(c: &mut Arca, tag: &str, s: &Keypair, policy: &WalletPolicy, rounds
 	assert!(ay.has_checkpoint_exit());
 	let w_in = inputs(&ay);
 	let acp = w_in[0].checkpoint;
-	assert_eq!(acp.exit, Some(acoin.leaf.exit_delay), "the exit waits the coin's own exit delay");
+	assert_eq!(acp.exit.map(|e| e.delay), Some(acoin.leaf.exit_delay), "the exit waits the coin's own exit delay");
 	assert_eq!(acp.exit_script().unwrap(), arca_covenant::LeafPolicy { v2: false, ..acoin.leaf }.exit_script(),
 		"the exit is the coin's own exit script");
 	// The pair into the exit checkpoint does not fit a checkpoint without one.
@@ -280,7 +280,7 @@ fn a_dead_swap_in_batches_with_a_sweep() {
 	let rounds = vec![rx, ry];
 	let t = mt(c.net.mtp() - 60);
 	let acoin = base(&tx_, 0, &ak, apre, t).resolve(&rounds, &policy).unwrap();
-	let cp = acoin.checkpoint_of(true);
+	let cp = acoin.checkpoint_of(true, acoin.value);
 	assert!(cp.sweep.is_some() && cp.exit.is_some());
 	assert_eq!(cp.taproot().script_pubkey(),
 		arca_covenant::taptree::TapOutput::new(vec![(1, cp.collab_script()), (2, cp.sweep_script().unwrap()), (2, cp.exit_script().unwrap())])
@@ -399,7 +399,7 @@ fn make_fill(order_rec: &CoinRecord, order: &ValidCoin, coin_rec: &CoinRecord, c
 	outputs.push(ExplicitOutput::new(coin.asset, coin.value - price - 2_000, change.policy(xonly(s), op.chain).script_pubkey()));
 	let txouts: Vec<_> = outputs.iter().map(|o| o.txout()).collect();
 	let digest = op.fill_digest(order.value, &txouts).unwrap();
-	let cp = coin.checkpoint_of(true);
+	let cp = coin.checkpoint_of(true, coin.value);
 	let cp_out = ExplicitOutput::new(coin.asset, coin.value, cp.script_pubkey());
 	let m_cp = coin.leaf.collab_message(coin.asset, coin.value, std::slice::from_ref(&cp_out)).unwrap();
 	let m_f = cp.collab_message(coin.asset, coin.value, &outputs).unwrap();
@@ -465,7 +465,7 @@ fn a_dead_fill_returns_the_takers_coin() {
 	let ValidOrigin::Fill { inputs: in0, .. } = &got_coin.origin else { unreachable!() };
 	let ValidOrigin::Fill { inputs: in1, .. } = &other.origin else { unreachable!() };
 	let cp0 = in0[0].checkpoint;
-	assert_eq!(cp0.exit, Some(coins[0].leaf.exit_delay));
+	assert_eq!(cp0.exit.map(|e| e.delay), Some(coins[0].leaf.exit_delay));
 
 	let order_at = bring(&mut c, "the order's path", &order);
 	let t1_at = bring(&mut c, "taker 1's path", &coins[1]);

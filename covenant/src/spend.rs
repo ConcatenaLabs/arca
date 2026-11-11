@@ -521,9 +521,14 @@ impl CheckpointPolicy {
 	pub fn exit_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
 		-> Result<KeySpend, SpendError>
 	{
-		let (delay, script) = self.exit.zip(self.exit_script()).ok_or(Error::CheckpointHasNoExit)?;
+		let (e, script) = self.exit.zip(self.exit_script()).ok_or(Error::CheckpointHasNoExit)?;
+		// A supervised coin's checkpoint lands as its leaf does.
+		if let Some(l) = &e.landing {
+			let first = outputs.first().ok_or(SpendError::Landing(crate::LandingError::Output { min: l.min_value }))?;
+			l.check_output(first).map_err(SpendError::Landing)?;
+		}
 		let spent = explicit_txout(asset, value, self.script_pubkey());
-		KeySpend::build(self.taproot(), script, vec![(coin, spent, Sequence(delay.to_sequence()))], outputs, fee)
+		KeySpend::build(self.taproot(), script, vec![(coin, spent, Sequence(e.delay.to_sequence()))], outputs, fee)
 	}
 }
 

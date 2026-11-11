@@ -1206,7 +1206,7 @@ impl Wallet {
 				}
 			}
 			// Its checkpoint, of either form (with or without its owner's exit).
-			if sp.output.first().is_some_and(|o| [coin.checkpoint(), coin.checkpoint_of(true)].iter().any(|c| o.script_pubkey == c.script_pubkey())) {
+			if sp.output.first().is_some_and(|o| [coin.checkpoint(), coin.checkpoint_of(true, o.value.explicit().unwrap_or(0))].iter().any(|c| o.script_pubkey == c.script_pubkey())) {
 				let why = format!("taken on the chain by its co-signed checkpoint {}: the transfer it was sent in stands", txid);
 				self.store.set_coin_spent(leaf_id, &format!("checkpoint {}", txid))?;
 				return Ok(Some(json!({"leaf_id": leaf_id, "state": "spent", "spent_by": txid, "note": why})));
@@ -1527,7 +1527,12 @@ impl Wallet {
 		let key = self.coin_key(&row.owner_nonce)?;
 		let (asset, value) = (i.coin.asset, i.checkpoint_value);
 		let claim_index = prior["claim_index"].as_u64().unwrap_or(0) as u32;
-		let to = self.keys.onchain_script(super::keys::RECEIVE, claim_index)?;
+		// A supervised coin lands where its leaf would: P2WPKH of the
+		// wallet's landing key, where the issuer's freeze binds.
+		let to = match i.checkpoint.exit.and_then(|e| e.landing) {
+			Some(l) => l.script_pubkey(),
+			None => self.keys.onchain_script(super::keys::RECEIVE, claim_index)?,
+		};
 		let cp_out = i.checkpoint_output().txout();
 		// The checkpoint spent: by the wallet's claim, or by the trade after all.
 		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);

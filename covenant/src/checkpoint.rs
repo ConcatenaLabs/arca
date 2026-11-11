@@ -7,8 +7,8 @@
 //! ```text
 //! collab:  <A> and <S>, rebindable, with the checkpoint's own salt
 //! sweep:   the sweep with notice of the input's batch
-//! exit:    <delay> CSV DROP <A> CHECKSIG, the coin's own exit, where the
-//!          checkpoint has one
+//! exit:    the coin's own exit, where the checkpoint has one:
+//!          <delay> CSV DROP <A> CHECKSIG, or a landing-1 coin's landing
 //! ```
 //!
 //! The checkpoint of a coin of a batch without a sweep has no sweep path
@@ -51,10 +51,19 @@
 //! never the spent script. A `vtxo-2` checkpoint's message names each
 //! checkpoint output, so its pairs are made for one form or the other.
 //!
-//! Only a coin of a plain leaf (`vtxo-1` or `vtxo-2`) has a checkpoint with
-//! an exit ([`exit_allowed`]): a coin of a supervised or a restricted asset
-//! exits only to its landing or its enclave, which a checkpoint's plain exit
-//! would bypass.
+//! A coin of a supervised asset (`landing-1`) exits only by its landing, so
+//! its checkpoint's exit is the landing: the output at the spending input's
+//! own index pays P2WPKH of the holder's landing key, in the asset,
+//! explicitly, at least the checkpoint's value less the coin's allowance
+//! ([`CheckpointExit::landing`], [`LandingTerms::script_at_own_index`]), so
+//! two landings spent together each need an output of their own. The
+//! checkpoint is a script path, which no freeze reaches, exactly as the
+//! leaf; the landed coin is a single-owner output, where the issuer's freeze
+//! and pause bind, as they bind on a coin landed from its leaf. Only a coin
+//! of a plain leaf or a `landing-1` leaf has a checkpoint with an exit
+//! ([`exit_allowed`]). A coin of a restricted asset (`enclave-1`) is never
+//! in a reassignment of several owners: a transfer of one moves that asset
+//! alone, from one holder.
 //!
 //! The checkpoint's salt differs from the leaf's, so a reassignment's
 //! signatures do not fit the leaf and a checkpoint's do not fit the checkpoint:
@@ -65,6 +74,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
 
 use crate::collab::Collab2;
+use crate::landing::LandingTerms;
 use crate::leaf::{exit_script, rebindable_two_party, two_party_items, two_party_message, LeafPolicy};
 use crate::message::{Chain, CsfsMessage};
 use crate::script::ExplicitOutput;
@@ -87,17 +97,33 @@ pub struct CheckpointPolicy {
 	/// The checkpoint of a `vtxo-2` coin: its collaborative path is
 	/// `arca/collab-2` ([`crate::collab`]), `[[program, data], sweep]`.
 	pub v2: bool,
-	/// The owner's exit after this delay, the coin's own exit delay; `None`
-	/// for a checkpoint that only owner and operator together spend. See
-	/// the [module documentation](self).
-	pub exit: Option<RelativeTime>,
+	/// The owner's exit; `None` for a checkpoint that only owner and
+	/// operator together spend. See the [module documentation](self).
+	pub exit: Option<CheckpointExit>,
+}
+
+/// A checkpoint's exit: the coin's own exit delay, and for a coin of a
+/// supervised asset its landing over the checkpoint's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CheckpointExit {
+	pub delay: RelativeTime,
+	/// `landing-1`'s terms over the checkpoint: the holder's landing program,
+	/// the asset, and the checkpoint's value less the coin's allowance.
+	pub landing: Option<LandingTerms>,
+}
+
+impl CheckpointExit {
+	/// The plain exit after `delay`.
+	pub fn plain(delay: RelativeTime) -> CheckpointExit {
+		CheckpointExit { delay, landing: None }
+	}
 }
 
 /// Whether a coin of `leaf` may move into a checkpoint with an exit: a plain
-/// leaf, `vtxo-1` or `vtxo-2`, whose exit pays wherever its owner signs.
+/// leaf (`vtxo-1`, `vtxo-2`), whose exit pays wherever its owner signs, or a
+/// `landing-1` leaf, whose checkpoint lands as the leaf does.
 pub fn exit_allowed(leaf: &LeafPolicy) -> bool {
-	leaf.htlc.is_none() && leaf.order.is_none() && leaf.landing.is_none() && leaf.enclave.is_none() && leaf.channel.is_none()
-		&& leaf.claim.is_none()
+	leaf.htlc.is_none() && leaf.order.is_none() && leaf.enclave.is_none() && leaf.channel.is_none() && leaf.claim.is_none()
 }
 
 impl CheckpointPolicy {
@@ -120,9 +146,14 @@ impl CheckpointPolicy {
 	}
 
 	/// The owner's exit leaf, when the checkpoint has one: the coin's own
-	/// exit script, `<delay> CSV DROP <A> CHECKSIG`.
+	/// exit script, `<delay> CSV DROP <A> CHECKSIG`, or its landing, which
+	/// inspects the output at the spending input's own index
+	/// ([`LandingTerms::script_at_own_index`]).
 	pub fn exit_script(&self) -> Option<Script> {
-		self.exit.map(|d| exit_script(&self.owner, d))
+		self.exit.map(|e| match e.landing {
+			Some(l) => l.script_at_own_index(&self.owner, e.delay),
+			None => exit_script(&self.owner, e.delay),
+		})
 	}
 
 	/// `[collab, sweep]`, both at depth 1; a `vtxo-2` coin's checkpoint
