@@ -617,3 +617,93 @@ async fn an_anchor_rollback_makes_every_coin_on_it_arrive_until_final_again() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 8. The operator runs a refresh of payments arriving past its in-flight cap.
+// ---------------------------------------------------------------------------
+
+fn server_state(r: &Running, pid: &str) -> Value {
+	let body = json!({"participation_id": pid});
+	let resp = minreq::post(format!("{}/v1/participation_status", r.url())).with_header("Content-Type", "application/json")
+		.with_body(body.to_string()).send().unwrap();
+	serde_json::from_str(resp.as_str().unwrap()).unwrap()
+}
+
+fn in_flight(r: &Running, asset: AssetId) -> String {
+	let v: Value = serde_json::from_str(minreq::get(format!("{}/v1/info", r.url())).send().unwrap().as_str().unwrap()).unwrap();
+	v["assets"].as_array().unwrap().iter().find(|a| a["asset"] == asset.to_string()).map(|a| a["in_flight"].to_string())
+		.unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_of_payments_arriving_runs_past_a_full_in_flight_cap() {
+	cap_run(true).await;
+}
+
+/// Control: B sets no instant limit, so it names nothing arriving: the cap
+/// holds B's refresh behind H's, as it holds any refresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_payments_arriving_the_cap_holds_the_later_refresh() {
+	cap_run(false).await;
+}
+
+async fn cap_run(limit: bool) {
+	// The watcher off: the nodes of coins given up do not come back, so what
+	// is fronted stays in flight.
+	let mut r = Running::start_with(|c, _, _| {
+		c.assets[0].in_flight_cap = Some("1500000".into());
+		c.watcher.enabled = false;
+	}).await;
+	let x = r.x;
+	post_bond(&mut r, None).await;
+	let info: Value = serde_json::from_str(minreq::get(format!("{}/v1/info", r.url())).send().unwrap().as_str().unwrap()).unwrap();
+	println!("CP8: info.participations = {}", info["participations"]);
+	assert_eq!(info["participations"]["arriving"], true);
+	let tag = if limit { "CP8" } else { "CP8c" };
+	let (s, b, h) = (Arca::new(&format!("{} S", tag)), Arca::new(&format!("{} B", tag)), Arca::new(&format!("{} H", tag)));
+	boarded(&mut r, &s, &[(x, 6_000_000)]).await;
+	create(&r, &b);
+	create(&r, &h);
+	// S's coin in a round: the cap weighs coins resting on a round's batch.
+	s.ok(&["participate"]);
+	rounds_final(&r).await;
+	s.ok(&["sync"]);
+	println!("CP8: in flight {} of a cap of 1500000", in_flight(&r, x));
+	if limit {
+		library(&b, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	}
+	let arriving = pay(&s, &b, x, 1_500_000);
+	pay(&s, &h, x, 500_000);
+	assert_eq!(place_of(&places(&b), &arriving), if limit { "arriving" } else { "counted" });
+	// H's ordinary refresh first, B's of a payment arriving after it: the two
+	// take 2,000,000 past a cap of 1,500,000, so one waits.
+	let hp = h.ok(&["refresh-received"])["participations"][0]["participation"].as_str().unwrap().to_string();
+	let bp = b.ok(&["refresh-received"])["participations"][0]["participation"].as_str().unwrap().to_string();
+	let (built, errs) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(errs.is_empty(), "{:?}", errs);
+	let (hs, bs) = (server_state(&r, &hp), server_state(&r, &bp));
+	println!("CP8: {} round(s); H's ordinary refresh: {} ({}); B's refresh of a payment arriving: {}", built.len(), hs["state"],
+		hs["waiting"], bs["state"]);
+	if !limit {
+		assert_eq!(bs["state"], "pending", "control: the cap holds the later refresh: {}", bs);
+		assert_ne!(hs["state"], "pending", "control: {}", hs);
+		for w in [&s, &b, &h] {
+			let _ = std::fs::remove_dir_all(&w.dir);
+		}
+		return;
+	}
+	assert_eq!(hs["state"], "pending", "the cap holds the ordinary refresh: {}", hs);
+	assert!(hs["waiting"].as_str().unwrap_or("").contains("in flight"), "{}", hs);
+	assert_ne!(bs["state"], "pending", "the refresh of a payment arriving runs: {}", bs);
+	r.produce().await;
+	r.bury().await;
+	for k in &built {
+		r.round_state(&k.tx.txid(), RoundState::Final).await;
+	}
+	b.ok(&["sync"]);
+	let p = summary("CP8 after its round", &b);
+	assert!(p["coins"].as_array().unwrap().iter().filter(|k| k["state"] == "live").all(|k| k["place"] == "settled"), "{}", p);
+	for w in [&s, &b, &h] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
