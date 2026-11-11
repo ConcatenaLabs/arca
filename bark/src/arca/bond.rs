@@ -419,6 +419,23 @@ impl Wallet {
 	/// one; a refusal when the bond is required and does not stand, or does
 	/// not cover what the wallet would hold out of round.
 	pub(crate) fn bond_gate(&self, incoming: Option<(AssetId, u64)>) -> Result<Option<String>, Error> {
+		// A wallet with an instant limit ([`super::places`]) never refuses a
+		// payment here: what it counts at once is within its limit, and
+		// anything past it, or that it cannot value, arrives and counts only
+		// after its round, so the bond is the safety of nothing above the
+		// limit. The refusal is said instead.
+		let gate = self.bond_gate_strict(incoming);
+		if self.own_instant_limit()?.is_some() {
+			if let Err(Error::Refused(why)) = &gate {
+				return Ok(Some(format!("{}; with an instant limit the payment is taken, and counts once its round has made it the \
+					wallet's own", why)));
+			}
+		}
+		gate
+	}
+
+	/// [`Self::bond_gate`] without an instant limit.
+	fn bond_gate_strict(&self, incoming: Option<(AssetId, u64)>) -> Result<Option<String>, Error> {
 		let info = self.server_info()?;
 		let s = self.bond_standing(&info)?;
 		let seen = self.store.meta(BOND_SEEN)?.is_some();

@@ -581,7 +581,9 @@ impl Wallet {
 				rec["send_timeout"] = json!(t);
 				rec["state"] = json!("locking");
 				self.set_btc_swap(rec["id"].as_str().unwrap_or(""), rec.clone())?;
-				match self.lightning_pay_until(&invoice_x, Some(asset), None, Some(t)) {
+				// The asset leg goes to another party: no trade proceeds pay it
+				// before their round ([`super::places`]).
+				match self.lightning_pay_spend(&invoice_x, Some(asset), None, Some(t), None, super::places::Spend::CrossChain) {
 					Ok(p) => {
 						rec["state"] = json!("locked");
 						rec["lock"] = p["paying"].clone();

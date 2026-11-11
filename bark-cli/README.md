@@ -310,15 +310,22 @@ and a board whose registration never reached the server, are not recovered.
   suggested share is taken, and zero while the operator's bond does not
   stand. Received coins count oldest first, by the operator's record of the
   transfers that made them, until the next would pass the limit; a counted
-  coin stays counted. With a limit set, the wallet spends no arriving coin
-  but in a refresh, which it names to the operator so the refresh runs first
-  (`refresh-needed` asks for it, rule `arriving`); spends trade proceeds in
-  no payment that leaves the Arca (on the chain, over Lightning, the Bitcoin
-  side of a cross-chain swap); trades only when every checkpoint has its
-  owner's exit; and gives into a trade a coin of exactly its amount, paying
-  itself one first when it holds none, so no change of its own rides in the
-  trade. A wallet sets no limit unless its owner sets one; without one every
-  received coin counts at once and nothing above applies.
+  coin stays counted, and the change of the wallet's own payment out of a
+  counted coin keeps its place. A channel coin counts the wallet's side of it
+  alone, and with a limit set is arriving: it is the wallet's to spend once
+  its close has made it a coin. With a limit set, the wallet spends no
+  arriving coin but in a refresh, which it names to the operator so the
+  refresh runs first (`refresh-needed` asks for it, rule `arriving`, and
+  `refresh_received {leaves}` gives up those coins alone); spends trade
+  proceeds in no leg of a cross-chain swap paid to another party, and when
+  only proceeds would pay one, puts them into the next round at once and
+  goes ahead after it (they pay inside the Arca, over Lightning and on the
+  chain at once); trades only when every checkpoint has its owner's exit;
+  gives into a swap a coin of exactly its amount, paying itself one first
+  when it holds none, so no change of its own rides in it; and never refuses
+  a payment for its bond (one it cannot value, or past what the bond covers,
+  arrives instead). A wallet sets no limit unless its owner sets one;
+  without one every received coin counts at once and nothing above applies.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.

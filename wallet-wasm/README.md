@@ -118,7 +118,7 @@ not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_q
 value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
-{max_fee_ppm?}`, `refresh_needed {idle_seconds?}` (whether what the wallet received out
+{max_fee_ppm?, leaves?}` (`leaves`: those coins alone), `refresh_needed {idle_seconds?}` (whether what the wallet received out
 of round should be refreshed now, and by which rule: `arriving`, `depth`, `exposure`, `expiry`, `idle`),
 `instant_limit {value}` (the wallet's instant limit, atoms of the reference unit, or `"off"`),
 `coin_places` (each coin's place, `settled`, `proceeds`, `counted` or `arriving`, the totals by asset,

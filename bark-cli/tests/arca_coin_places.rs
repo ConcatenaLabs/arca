@@ -488,11 +488,11 @@ async fn proceeds_trade_on_at_once_and_a_dead_first_trade_unwinds_the_chain() {
 	let bond = a.ok(&["bond"]);
 	println!("CP5: A's bond view: out of round {}", bond["out_of_round"]);
 	assert_eq!(bond["out_of_round"], json!([]), "proceeds count nothing against the bond");
-	// Proceeds never leave the Arca before their round.
+	// Proceeds pay on the chain at once: an offboard is made in a round.
 	let addr = a.ok(&["address"]);
 	let off = library(&a, "offboard_quote", json!({"asset": y, "amount": "100000", "script": addr["script_pubkey"]}));
-	println!("CP5: A pays the proceeds on the chain: {:?}", off);
-	assert!(off.is_err(), "{:?}", off);
+	println!("CP5: A quotes paying the proceeds on the chain: {:?}", off.as_ref().map(|v| v["gives"].clone()));
+	assert!(off.is_ok(), "{:?}", off);
 
 	// Trade 2, at once: A gives Y of its proceeds for X from E.
 	let offer2 = a.ok(&["swap", "offer", "--give-asset", &y.to_string(), "--give", "200000", "--want-asset", &x.to_string(), "--want", "150000"]);
@@ -767,13 +767,18 @@ async fn a_wallet_naming_its_own_change_as_arriving_is_judged_as_any_refresh() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn payments_arriving_run_past_the_cap_only_to_twice_it() {
+async fn payments_arriving_run_past_the_cap_only_within_the_operators_lane() {
 	let mut r = Running::start_with(|c, _, _| {
 		c.assets[0].in_flight_cap = Some("1500000".into());
+		c.assets[0].arriving_lane = Some("1500000".into());
 		c.watcher.enabled = false;
 	}).await;
 	let x = r.x;
 	post_bond(&mut r, None).await;
+	let info: Value = serde_json::from_str(minreq::get(format!("{}/v1/info", r.url())).send().unwrap().as_str().unwrap()).unwrap();
+	let lane = info["assets"].as_array().unwrap().iter().find(|e| e["asset"] == x.to_string()).unwrap()["arriving_lane"].clone();
+	println!("CP10: info publishes the lane: {}", lane);
+	assert_eq!(lane, "1500000");
 	let s = Arca::new("CP10 S");
 	boarded(&mut r, &s, &[(x, 8_000_000)]).await;
 	s.ok(&["participate"]);
@@ -794,12 +799,161 @@ async fn payments_arriving_run_past_the_cap_only_to_twice_it() {
 	assert!(errs.is_empty(), "{:?}", errs);
 	let states: Vec<String> = pids.iter().map(|p| server_state(&r, p)["state"].as_str().unwrap().to_string()).collect();
 	println!("CP10: {} round(s); three refreshes of 1,500,000 arriving against a cap of 1,500,000: {:?}", built.len(), states);
-	assert_eq!(states.iter().filter(|s| *s != "pending").count(), 2, "two run, to twice the cap: {:?}", states);
+	assert_eq!(states.iter().filter(|s| *s != "pending").count(), 2, "two run, to the cap and its lane: {:?}", states);
+	assert_eq!(states[2], "pending", "the oldest go first: {:?}", states);
 	let waiting = pids.iter().map(|p| server_state(&r, p)).find(|v| v["state"] == "pending").unwrap();
 	println!("CP10: the third: {}", waiting["waiting"]);
 	assert!(waiting["waiting"].as_str().unwrap_or("").contains("in flight"));
 	let _ = std::fs::remove_dir_all(&s.dir);
 	for w in &ws {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 11. Review fixes (RV33): a channel, change of a counted coin, a coin posted
+//     to its own key, a missing rate.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_counts_its_owners_side_and_is_coming_back_not_spendable() {
+	let mut r = Running::start_with(|c, _, _| c.assets[0].channel_capacity = Some("2000000".into())).await;
+	let x = r.x;
+	post_bond(&mut r, None).await;
+	let (a, b) = (Arca::new("CP11 A"), Arca::new("CP11 B"));
+	boarded(&mut r, &a, &[(x, 3_000_000)]).await;
+	boarded(&mut r, &b, &[(x, 3_000_000)]).await;
+	for w in [&a, &b] {
+		w.ok(&["channel", "open", "--capacity", "1000000"]);
+	}
+	rounds_final(&r).await;
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	library(&b, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	let live = |w: &Arca| w.ok(&["channel", "list"]).as_array().unwrap().iter().find(|c| c["coin_state"] == "live").unwrap()["leaf_id"]
+		.as_str().unwrap().to_string();
+	let (la, lb) = (live(&a), live(&b));
+	a.ok(&["channel", "pay", &la, &lb, "400000"]);
+	b.ok(&["channel", "sync", &lb]);
+	let bal = b.ok(&["balance"]);
+	let n = |v: &Value| v.as_str().map(|t| t.parse::<u64>().unwrap()).unwrap_or(0);
+	let held = n(&bal["held"][x.to_string()]) - n(&bal["sequentia_onchain"][x.to_string()]);
+	let p = summary("CP11 B, a channel paid into", &b);
+	let c = p["coins"].as_array().unwrap().iter().find(|k| k["leaf_id"] == lb.as_str()).unwrap().clone();
+	println!("CP11: B's balance holds {}; the channel coin in coin_places: {}", held, c);
+	assert_eq!(c["channel"], true);
+	assert_eq!(c["place"], "arriving", "not the wallet's to spend until its close makes it a coin");
+	assert_eq!(c["value"].as_str().unwrap().parse::<u64>().unwrap(), held, "its side alone, as the balance counts it");
+	assert!(p["spendable"].get(x.to_string()).is_none(), "{}", p);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_of_a_counted_coin_stays_counted_and_the_arriving_refresh_gives_up_arriving_coins_alone() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	post_bond(&mut r, None).await;
+	let (s, s2, d, c) = (Arca::new("CP12 S"), Arca::new("CP12 S2"), Arca::new("CP12 D"), Arca::new("CP12 C"));
+	boarded(&mut r, &s, &[(x, 4_000_000)]).await;
+	boarded(&mut r, &s2, &[(x, 4_000_000)]).await;
+	create(&r, &d);
+	create(&r, &c);
+	library(&d, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	let first = pay(&s, &d, x, 600_000);
+	let second = pay(&s2, &d, x, 600_000);
+	let p = summary("CP12 two received", &d);
+	assert_eq!((place_of(&p, &first).as_str(), place_of(&p, &second).as_str()), ("counted", "arriving"));
+	pay(&d, &c, x, 100_000);
+	let p = summary("CP12 after D pays C from its counted coin", &d);
+	let change = p["coins"].as_array().unwrap().iter().find(|k| k["state"] == "live" && k["leaf_id"] != second.as_str())
+		.expect("D's change")["leaf_id"].as_str().unwrap().to_string();
+	println!("CP12: the change {}… is {}; the older arriving coin is {}", &change[..8], place_of(&p, &change), place_of(&p, &second));
+	assert_eq!(place_of(&p, &change), "counted", "the change keeps its parent's place");
+	assert_eq!(place_of(&p, &second), "arriving");
+	let need = library(&d, "refresh_needed", json!({})).unwrap();
+	let only: Vec<Value> = need["reasons"].as_array().unwrap().iter().filter(|r| r["rule"] == "arriving").flat_map(|r| r["coins"].as_array().unwrap().clone()).collect();
+	assert_eq!(only, vec![json!(second)], "{}", need);
+	let rr = library(&d, "refresh_received", json!({"leaves": only})).unwrap();
+	println!("CP12: the refresh of the arriving coin alone gives up {}", rr["refreshed"]);
+	assert_eq!(rr["refreshed"], json!([second]), "{}", rr);
+	let p = summary("CP12 during the refresh", &d);
+	assert_eq!(p["coins"].as_array().unwrap().iter().find(|k| k["leaf_id"] == change.as_str()).unwrap()["state"], "live",
+		"the counted change stays spendable");
+	for w in [&s, &s2, &d, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_posted_to_its_own_key_named_arriving_gets_no_lane() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.assets[0].in_flight_cap = Some("1500000".into());
+		c.assets[0].arriving_lane = Some("1500000".into());
+		c.watcher.enabled = false;
+	}).await;
+	let x = r.x;
+	post_bond(&mut r, None).await;
+	let (s, h, liar, c) = (Arca::new("CP13 S"), Arca::new("CP13 H"), Arca::new("CP13 L"), Arca::new("CP13 C"));
+	boarded(&mut r, &s, &[(x, 3_000_000)]).await;
+	boarded(&mut r, &liar, &[(x, 3_000_000)]).await;
+	create(&r, &h);
+	create(&r, &c);
+	for w in [&s, &liar] {
+		w.ok(&["participate"]);
+	}
+	rounds_final(&r).await;
+	for w in [&s, &liar] {
+		w.ok(&["sync"]);
+	}
+	pay(&s, &h, x, 500_000);
+	pay(&liar, &c, x, 1_400_000);
+	let change = liar.ok(&["coins"]).as_array().unwrap().iter()
+		.find(|k| k["state"] == "live" && k["kind"] == "transfer").expect("the liar's change")["leaf_id"].as_str().unwrap().to_string();
+	// What the operator holds for an output that named no mailbox: its leaf's own key.
+	let (db, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	let n = db.execute("UPDATE transfer_output o SET mailbox_key = l.owner_key FROM leaf l WHERE l.leaf_id = o.leaf_id AND o.leaf_id = $1",
+		&[&unhex(&change)]).await.unwrap();
+	assert_eq!(n, 1);
+	let hp = h.ok(&["refresh-received"])["participations"][0]["participation"].as_str().unwrap().to_string();
+	rounds_final(&r).await;
+	println!("CP13: H's refresh {}; in flight {}", server_state(&r, &hp)["state"], in_flight(&r, x));
+	let lp = liar.ok(&["participate", "--leaf", &change])["participations"][0]["participation"].as_str().unwrap().to_string();
+	name_arriving(&r, &lp, &[&change]).await;
+	let (_, errs) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(errs.is_empty(), "{:?}", errs);
+	let ls = server_state(&r, &lp);
+	println!("CP13: the liar's change posted to its own key, named arriving: {} ({})", ls["state"], ls["waiting"]);
+	assert_eq!(ls["state"], "pending", "{}", ls);
+	assert!(ls["waiting"].as_str().unwrap_or("").contains("in flight"), "{}", ls);
+	for w in [&s, &h, &liar, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_rate_never_stops_receiving_the_coin_arrives() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x, r.y);
+	post_bond(&mut r, None).await;
+	let rates: Value = r.rt.client().call("getfeeexchangerates", &[]).unwrap();
+	assert!(rates.get(y.to_string()).is_none(), "the node gives Y no rate: {}", rates);
+	let (s, d) = (Arca::new("CP14 S"), Arca::new("CP14 D"));
+	boarded(&mut r, &s, &[(y, 3_000_000)]).await;
+	create(&r, &d);
+	library(&d, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	let k = pay(&s, &d, y, 100_000);
+	// A second payment while D holds unvalued coins out of round: refused
+	// before, as the bond could not be weighed against them.
+	let k2 = pay(&s, &d, y, 50_000);
+	let p = summary("CP14 Y unpriced", &d);
+	assert_eq!((place_of(&p, &k).as_str(), place_of(&p, &k2).as_str()), ("arriving", "arriving"), "a coin the wallet cannot value arrives");
+	let need = library(&d, "refresh_needed", json!({})).unwrap();
+	assert_eq!(need["reasons"][0]["rule"], "arriving", "{}", need);
+	for w in [&s, &d] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
