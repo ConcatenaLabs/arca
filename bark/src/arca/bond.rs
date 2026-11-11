@@ -127,6 +127,19 @@ struct Budget {
 	room_atoms: BTreeMap<AssetId, u64>,
 }
 
+/// What the wallet holds out of round against the most it may hold
+/// ([`Wallet::exposure`]).
+#[derive(Debug, Clone)]
+pub(crate) struct Exposure {
+	/// Out of round, in atoms of the reference unit, over every asset the
+	/// node prices.
+	pub held: u128,
+	/// The instant budget, or the bond's value without one.
+	pub limit: u128,
+	/// The assets held out of round that the node does not price.
+	pub unpriced: Vec<String>,
+}
+
 impl Standing {
 	fn of(state: &'static str, policy: Option<BondPolicy>, why: impl Into<String>) -> Standing {
 		Standing { state, policy, coin: None, asset: None, value: None, withdrawable_at: None, why: why.into() }
@@ -384,6 +397,47 @@ impl Wallet {
 			}
 		}
 		Ok(None)
+	}
+
+	/// What the wallet holds out of round against the most it may hold, both
+	/// in the reference unit at its node's rates, over every asset: its
+	/// instant budget when it sets one, else the bond's whole value. The
+	/// assets the node does not price are named apart (`unpriced`), the
+	/// bond's own among them when the node has no rate for it (then `limit`
+	/// is 0): they cannot be weighed, so a caller treats them as past any
+	/// share. `None` while the operator posts no bond, or its bond does not
+	/// stand (`sync` then refreshes every such coin by itself,
+	/// [`Self::uncovered`]).
+	pub(crate) fn exposure(&self) -> Result<Option<Exposure>, Error> {
+		let info = self.server_info()?;
+		let s = self.bond_standing(&info)?;
+		if s.state != "bonded" {
+			return Ok(None);
+		}
+		let (asset, value) = (s.asset.expect("bonded"), s.value.expect("bonded"));
+		let rates = self.chain.fee_rates()?;
+		let mut unpriced = vec![];
+		let bond = match rates.get(&asset) {
+			Some(rate) => value as u128 * *rate as u128 / 100_000_000,
+			None => {
+				unpriced.push(asset.to_string());
+				0
+			},
+		};
+		let operator = info["bond"]["instant_budget_ppm"].as_u64().and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 0);
+		let limit = match self.own_budget_ppm()? {
+			Some(own) => bond * operator.map_or(own, |o| o.min(own)) as u128 / 1_000_000,
+			None => bond,
+		};
+		let mut held = 0u128;
+		for (a, v) in self.out_of_round()? {
+			match rates.get(&a) {
+				Some(r) => held += v as u128 * *r as u128 / 100_000_000,
+				None if !unpriced.contains(&a.to_string()) => unpriced.push(a.to_string()),
+				None => {},
+			}
+		}
+		Ok(Some(Exposure { held, limit, unpriced }))
 	}
 
 	/// The coins that rest on an out-of-round lineage while the operator's
