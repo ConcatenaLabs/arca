@@ -602,6 +602,78 @@ fn held_in(w: &Arca, asset: &AssetId) -> u64 {
 	arca_held(w, asset)
 }
 
+/// D63 with the restore's history (#721): a wallet receives over
+/// Lightning (claimed), then pays out of round from the coin its claim made
+/// and again from that payment's change, so the claim's coin is spent two
+/// transfers down, in the history a restore leaves to its steps. A wallet restored from the mnemonic is right
+/// when its restore returns, before any sync: the received leaf is spent by
+/// its claim (the coin the claim made is judged with it, at once), so the
+/// balance is the lost wallet's and nothing received is counted twice or
+/// held `receiving`.
+#[tokio::test(flavor = "multi_thread")]
+async fn d63_a_restore_counts_a_received_leaf_once_when_its_claims_coin_was_spent() {
+	let Some(lnd) = lightningd("d63_a_restore_counts_a_received_leaf_once_when_its_claims_coin_was_spent") else { return };
+	let mut r = short_delays().await;
+	let x = r.x;
+	let xs = x.to_string();
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d63h").await;
+	let url = r.url();
+	let a = wallet_at("D63H", &url, &r);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &xs, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let (hash, paying) = held(&r, &a, &px, 600_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	a.ok(&["sync"]);
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete");
+	assert_eq!(a.ok(&["lightning", "receives"])[&hash]["state"], "received");
+	a.ok(&["sync"]);
+	// The claim's coin paid on (a wallet pays from the coin furthest from
+	// its exit date first: the claim's, younger than the board).
+	let claimed: Vec<String> = a.ok(&["coins"]).as_array().unwrap().iter()
+		.filter(|c| c["state"] == "live" && c["value"].as_str().is_some_and(|v| v.parse::<u64>().unwrap() < 1_000_000))
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	let b = wallet_at("D63HB", &url, &r);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req, "--amount", "300000", "--asset", &xs]);
+	println!("D63H A pays from {} (the claim's coin {:?})", sent["inputs"], claimed);
+	assert_eq!(sent["inputs"], json!(claimed), "the claim's coin is the one paid from");
+	b.ok(&["sync"]);
+	a.ok(&["sync"]);
+	// And once more from the change, so the claim's coin is two transfers
+	// below the coin A holds: deep in the history, not the parent of a
+	// live coin.
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req, "--amount", "15000", "--asset", &xs]);
+	println!("D63H A pays again from {}", sent["inputs"]);
+	b.ok(&["sync"]);
+	a.ok(&["sync"]);
+	let bal_a = held_in(&a, &x);
+
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let a2 = Arca::new("D63H2");
+	let made = a2.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", mnemonic.trim()]);
+	println!("D63H restore: served {} | restored {} | history {}", made["restore"]["served"], made["restore"]["restored"],
+		made["restore"]["history"]["left"]);
+	let bal_b = held_in(&a2, &x);
+	let receiving: Vec<Value> = a2.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "receiving").cloned().collect();
+	println!("D63H when the restore returns: A2 holds {} in X (A {}) | receiving {:?}", bal_b, bal_a, receiving);
+	assert_eq!(bal_b, bal_a, "the balance is the lost wallet's when the restore returns, before any sync");
+	assert!(receiving.is_empty(), "no received leaf held receiving: {:?}", receiving);
+	drop((ox, px));
+	for w in [&a, &a2, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// R7j F3, turned around (D63). A wallet pays an invoice over Lightning
 /// (paid: its htlc-1 leaf the operator's), has one fail (its leaf returned),
 /// and receives one (claimed). Its device is lost and a wallet is restored

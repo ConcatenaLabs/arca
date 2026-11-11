@@ -864,8 +864,15 @@ impl Wallet {
 				parents.extend(r.parents().into_iter().map(|p| owner_of(p).1));
 			}
 		}
+		// And a coin of the history whose record spends a leaf received over
+		// Lightning that is taken at once: the leaf is spent by its claim only
+		// once the wallet holds a coin the claim made (D68), so that coin is
+		// judged with it, or the leaf would be counted until its step.
+		let received: BTreeSet<[u8; 32]> = now.iter().filter_map(|e| record(e)).filter(Self::received_htlc)
+			.map(|r| owner_of(&r).1).collect();
 		let (mut moved, kept): (Vec<Value>, Vec<Value>) = later.into_iter()
-			.partition(|e| record(e).is_some_and(|r| parents.contains(&owner_of(&r).1)));
+			.partition(|e| record(e).is_some_and(|r| parents.contains(&owner_of(&r).1)
+				|| r.parents().iter().any(|p| received.contains(&owner_of(p).1))));
 		later = kept;
 		for e in &moved {
 			namers.remove(e["leaf_id"].as_str().unwrap_or(""));
