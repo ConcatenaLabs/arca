@@ -63,7 +63,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V43__record_formats.sql`](schema/V43__record_formats.sql),
 [`schema/V44__watched_for_index.sql`](schema/V44__watched_for_index.sql),
 [`schema/V45__final_pass_indexes.sql`](schema/V45__final_pass_indexes.sql),
-[`schema/V46__resting_order_reads.sql`](schema/V46__resting_order_reads.sql)). `Store::connect` builds it
+[`schema/V46__resting_order_reads.sql`](schema/V46__resting_order_reads.sql),
+[`schema/V47__participation_arriving.sql`](schema/V47__participation_arriving.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -339,6 +340,9 @@ shorter `D`, and with `W` equal to `S`.
 - `instant_budget_fraction` (optional): the share of the bond's value the
   operator suggests a counterparty hold out of round at once, more than 0 and
   at most 1 (`0.1`: a tenth). See "Limits an operator publishes".
+- `instant_limit_value` (optional): the most a wallet holds, in atoms of the
+  reference unit, of coins paid to it out of round that it counts as its own
+  at once (a decimal string). See "Limits an operator publishes".
 
 `info.bond` names the bond as the server's node shows it, read again every
 ten seconds, in the background (see `info` in The interface):
@@ -360,6 +364,8 @@ ten seconds, in the background (see `info` in The interface):
   withdrawal can confirm.
 - With `instant_budget_fraction` set: `instant_budget_ppm`, that share in
   millionths, and `instant_budget`, that share of `reference_value`.
+- With `instant_limit_value` set: `instant_limit_value`, in atoms of the
+  reference unit.
 
 The section is absent when no bond is configured. A wallet trusts none of
 this until it has checked the coin on its own node.
@@ -432,7 +438,17 @@ holding figures of their own:
   sets its own instant budget in its wallet (`arca instant-budget`); where
   the operator suggests a lower share, the wallet takes that one. Past its
   budget the counterparty takes the rest after its next round, once what it
-  holds is refreshed.
+  holds is refreshed;
+- optionally, the instant limit it suggests a wallet keep
+  (`bond.instant_limit_value`, in atoms of the reference unit): of coins paid
+  to a wallet out of round, the most it counts as its own at once. A wallet
+  that sets an instant limit (`arca instant-limit`) takes the lowest of its
+  own, this, and the bond's suggested share at its node's rate; a payment past
+  it arrives, and counts once a round has refreshed it. It is a plain figure
+  rather than a share because a wallet's default mode wants a small, steady
+  amount, which a share of a large bond moving with its token's price is not;
+- of each asset with channel leaves, the most it holds on its side of all of
+  them together (`channels.total`; see Channel leaves).
 
 An operator sets no limit on the balances its holders keep: a coin refreshed
 in a round rests on no out-of-round lineage the operator could sign twice.
@@ -1754,6 +1770,29 @@ A round held for its forfeits counts from when it is built, so a refresh
 judged while an earlier round of its asset is held waits as it would once
 that round is out, and the rounds built in one forfeit window cannot
 together front past the cap.
+A participation may name payments arriving among the coins it gives up
+(`arriving`, their leaf ids, when `info.participations.arriving` says the
+operator reads it; not part of the participation's id): its owner has the
+payment only once a round has refreshed it, and a coin out of round is what
+the bond wants refreshed soonest. A name that is not one of the
+participation's inputs is refused (`malformed`). The operator takes each
+name only as far as its own records bear it out: the coin is out of round (a
+reassignment's or a fill's), and the transfer that made it posted it to a
+mailbox other than its inputs' (an output that named no mailbox is posted to
+its leaf's own key, and never qualifies). This screens out a wallet's change
+sent back to its own mailbox, and no more: it does not identify a payer. A
+wallet can post its own change to another key, or spend coins bound to no
+mailbox, and pass it. A name the records do not bear out is logged, and that
+coin is judged as any coin; the others keep their place.
+A participation with payments arriving runs ahead of the other
+participations of its asset, oldest first. What those payments open may run
+past the cap by the asset's lane (`arriving_lane`, in atoms, or
+`arriving_lane_value`, a value at the asset's rate; published as
+`assets[].arriving_lane`; no lane when absent), while what the
+participation opens beside them stays within the cap. The lane is capital
+the operator chooses to risk: no record tells a payment between two wallets
+of one owner from a real one, so anyone can use it, and the lane is sized as
+the capital the operator is willing to front for that.
 A coin whose own forfeit is final on the chain, brought down by a collection
 (through its lineage's reassignments when it was paid on out of round), counts
 for nothing either.
@@ -2431,6 +2470,15 @@ against the coins it gives up; the operator funds its side from the asset's
 pool in the round. Anything else is refused (`out_of_bounds`); a supervised
 asset has no channel leaves.
 
+An asset's section may also bound what the operator holds on its side of all
+its channel leaves of the asset together (`channel_capacity_total`, in atoms,
+or `channel_capacity_total_value`, a value at the asset's rate; no total when
+absent), published as `assets[].channels.total`. What counts is the operator's
+side at opening of every channel leaf live or being made, and of every one a
+participation not yet run wants. A participation that would take it past the
+total is refused (`out_of_bounds`, saying what is held of what total); a
+channel opens again once others have closed.
+
 **Paying.** `POST channel_update` takes state `n + 1` of a channel its owner
 signed (`state`: `number`, `owner`, `operator`, `folded`; `owner_sig` over its
 state message) and, for a payment, `pay` (`to`, another channel leaf of the
@@ -2938,7 +2986,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity and credit window (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), and how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep) |
+| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), and how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
