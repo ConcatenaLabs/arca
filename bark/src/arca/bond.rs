@@ -31,6 +31,17 @@
 //! No budget is set unless the wallet's owner sets one: the library imposes
 //! none, and values the bond at its node's rate whatever its asset.
 //!
+//! What counts against the budget is what the operator, with someone other
+//! than the wallet, could take by signing a second spend: each coin whose
+//! lineage holds an input of a reassignment or a fill that the wallet does
+//! not own (a payment received, what a swap or a fill paid it, change from
+//! one included), at its whole value. A coin of the wallet's own lineage
+//! alone (its round's and boards' coins, its own change from paying out of
+//! them) counts nothing. A coin on its way into a swap whose checkpoint has
+//! its owner's exit is judged by its own lineage, since it comes home if the
+//! swap never completes; one whose checkpoint has none counts as a coin
+//! received out of round does.
+//!
 //! The wallet keeps the operator's signature over every message of its
 //! coins' lineage ([`arca_covenant::bond::cosigned_by`]) and writes it as
 //! evidence lines ([`Wallet::bond_evidence`]): `{"salt", "form", "rest",
@@ -261,18 +272,76 @@ impl Wallet {
 		Ok(s)
 	}
 
-	/// What the wallet holds on lineages paid out of round, by asset: its
-	/// coins received by a reassignment or an in-tree fill, not yet refreshed
-	/// in a round.
+	/// What the wallet holds at risk out of round, by asset: each coin the
+	/// operator and someone else could take from it by signing twice
+	/// ([`Self::at_risk`]), not yet refreshed in a round.
 	fn out_of_round(&self) -> Result<BTreeMap<AssetId, u64>, Error> {
 		let mut out: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for c in self.store.coins_in_states(&HELD)? {
-			if (c.kind == "transfer" || c.kind == "fill") && HELD.contains(&c.state.as_str()) {
+			if HELD.contains(&c.state.as_str()) && self.at_risk(&c)? {
 				let a = AssetId::from_str(&c.asset).map_err(|e| Error::Store(e.to_string()))?;
 				*out.entry(a).or_default() = out.get(&a).copied().unwrap_or(0).saturating_add(c.value);
 			}
 		}
 		Ok(out)
+	}
+
+	/// Whether the coin `c` is at risk out of round: whether the operator,
+	/// with someone other than the wallet, could take it by signing a second
+	/// spend.
+	///
+	/// - A coin whose lineage, back to the rounds and boards it rests on,
+	///   holds an input of a reassignment or a fill that the wallet does not
+	///   own (a payment received, a swap's or a fill's coins, change
+	///   included) is at risk at its whole value: that input's owner and the
+	///   operator can spend it elsewhere, and every coin the reassignment
+	///   made is void.
+	/// - A coin of the wallet's own lineage alone (a round's or a board's, or
+	///   its own change from paying out of one) is not: only the wallet's key
+	///   spends it.
+	/// - A coin on its way into a swap or a fill (`offered`, `sending`,
+	///   `given`) whose checkpoint has its owner's exit is judged by its own
+	///   lineage: if the trade never completes, the coin comes home by that
+	///   exit. One whose checkpoint has none counts as a coin received out of
+	///   round does, as it always has: should the trade die, it would stand
+	///   in a checkpoint only the wallet and the operator can spend.
+	fn at_risk(&self, c: &super::store::CoinRow) -> Result<bool, Error> {
+		let paid_out = c.kind == "transfer" || c.kind == "fill";
+		if matches!(c.state.as_str(), "offered" | "sending" | "given") && !self.given_with_exit(c)? {
+			return Ok(paid_out);
+		}
+		if !paid_out {
+			return Ok(false);
+		}
+		let record = Self::record_of(c)?;
+		Ok(self.foreign_in_lineage(&record))
+	}
+
+	/// Whether `record`'s lineage holds an input of a reassignment, or the
+	/// order of a fill, whose coin is not the wallet's own.
+	fn foreign_in_lineage(&self, record: &arca_covenant::CoinRecord) -> bool {
+		use arca_covenant::CoinRecord;
+		let mine = |r: &CoinRecord| {
+			let (owner, nonce) = super::wallet::owner_of(r);
+			self.keys.leaf_xonly(&nonce).is_ok_and(|k| k == owner)
+		};
+		match record {
+			CoinRecord::Transfer(t) => t.inputs.iter().any(|i| !mine(&i.coin) || self.foreign_in_lineage(&i.coin)),
+			CoinRecord::Fill(f) => !mine(&f.fill.order) || self.foreign_in_lineage(&f.fill.order)
+				|| f.fill.inputs.iter().any(|i| !mine(&i.coin) || self.foreign_in_lineage(&i.coin)),
+			CoinRecord::Leaf { .. } | CoinRecord::Board(_) | CoinRecord::Accumulator { .. } => false,
+		}
+	}
+
+	/// Whether the coin `c`, on its way into a swap, goes into a checkpoint
+	/// with its owner's exit: its swap's acceptance signs so. A swap not yet
+	/// accepted, and a fill, count as one without.
+	fn given_with_exit(&self, c: &super::store::CoinRow) -> Result<bool, Error> {
+		let Some(id) = c.note.strip_prefix("swap ") else { return Ok(false) };
+		Ok(match self.store.swap(id)? {
+			Some((_, _, Some(accept), _)) => serde_json::from_str::<Value>(&accept).is_ok_and(|a| a["checkpoint_exit"] == json!(true)),
+			_ => false,
+		})
 	}
 
 	/// `held` worth more than the bond's `value` of `asset`, and by how much,
