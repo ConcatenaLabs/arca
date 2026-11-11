@@ -189,6 +189,20 @@ that serves pages without end is read no further, and the restore says so in
   never read is taken, checked as ever; then a `sync` re-checks every coin,
   follows every forfeit and completes every participation.
 
+The restore checks first the coins that make the balance now, and leaves the
+wallet's history to the syncs after it, so a wallet with a long history is
+usable as soon as `restore` returns. Its history is every coin the server
+serves as given up for good (in a transfer the operator co-signed, or a
+participation it released), and every coin that a record the server serves
+names as an input of a transfer, whatever the server says of that coin. Those
+coins are kept in the store as served, and each `sync` checks at most twenty
+of them (`HISTORY_STEP`) with every check above, the coins whose records
+spend a coin before the coin itself, until none is left; `restore-history`
+runs one step on its own. A coin of the history is counted nowhere until its
+step has checked it. `restore` says how many are left (`history.left`), and
+each `sync` whose step ran answers it under `history`. A catch-up leaves
+those coins to the steps.
+
 What it cannot recover it lists with the reason (`not_recovered`): a record
 the server withholds that the published tree does not hold, a coin that fails
 a check, a transfer the server recorded and never co-signed (the request to
@@ -1978,7 +1992,8 @@ registry for both commands.
 | `create --server URL --node-url URL [--node-user U [--node-password-file FILE] \| --node-cookie FILE] [--mnemonic M \| --mnemonic-file FILE]` | Creates the wallet: a new mnemonic (or the one given, on the command line or read once from a file, `-` for the standard input, a pipe or a socket alike, which keeps it off the command line other users of the machine can read), the node's chain, and the server's operator key, pinned and shown for the user to compare with the key the operator publishes through a channel they trust. `--exit-delay-units` is the exit delay the wallet asks for its own leaves; `--min-exit-delay-units` and `--max-exit-delay-units` bound what it accepts (512-second units; 36 to 48 hours by default). With `--mnemonic`, the wallet is then restored (`restore`), and its answer is under `restore` |
 | `join --from-registry KEY --registry URL --node-url URL …` (`create --from-registry`) | Creates the wallet with the operator the Sequentia registry lists under operator key `KEY`, in place of a server named by address, taking the node, mnemonic and delay options of `create`: the operator's record is read from the registry, its signature by `KEY` checked by the wallet itself, the server's address taken from it, and the wallet created only when that server shows the record's operator key, chain and keepers (see Finding an operator in the registry); a record the registry finds `mismatched` is refused. The answer carries the record's listing under `registry` |
 | `operators --registry URL [--genesis G]` | The operators the registry lists, each record's signature checked by the wallet (`signature: "verified"`), with what the registry says of each (`status`: `ok`, `stale` or `mismatched`, and the `differences`); a record whose signature does not verify is listed under `refused` with the reason. With `--genesis`, those of that chain only. Needs no wallet |
-| `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`), and the offline-refresh plans found under the mailbox key, their keys checked against the mnemonic (`plans`); what each of its steps cost in time and in requests of the node and the operator (`cost_by_step`, as `sync` gives it) |
+| `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), the wallet's history left to the syncs after it (`history.left`), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`), and the offline-refresh plans found under the mailbox key, their keys checked against the mnemonic (`plans`); what each of its steps cost in time and in requests of the node and the operator (`cost_by_step`, as `sync` gives it) |
+| `restore-history` | One step of the history a restore left (see Restoring from the mnemonic): at most twenty of its coins checked as a restore checks a coin, then what the records of every coin held say of the coins they spend; `sync` runs one step too. What it took (`restored`), what it could not (`not_recovered`), what the checks found (`notes`) and how many are left (`left`; `{"left": 0}` once none is) |
 | `info` | The wallet's chain, operator, mailbox key and policy, the address every coin of a supervised asset lands at (`landing_address`), and what the server publishes |
 | `supervised-check TXID:VOUT` | Reads the published batch at output `VOUT` of round `TXID` of a supervised asset, from the published tree and the chain alone (see Holding a supervised asset): the asset supervised on the wallet's node, every leaf a landing leaf with the allowance the operator publishes, every output of the round explicit, each leaf's landing and whether the node shows it frozen; `ok` and the `problems` found |
 | `supply ASSET` | For an asset the operator serves issuer-operated, the operator's supply report (`issuer_supply`): each mint of its rounds and each burn of its own, the totals, what is final, the value live in its burn-only batches and where its mint limiter stands; each mint and burn read again from the wallet's node, with what the chain says beside the operator's figure (`on_chain`, `agrees`), and `checked_on_the_node: true` only when every one agrees. It checks the transactions the report lists, not that the list is whole: a mint left out of it is found only by following the asset's reissuance token on the chain |

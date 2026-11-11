@@ -291,9 +291,14 @@ enum Cmd {
 	Lightning(LightningCmd),
 	/// Restores the wallet from its mnemonic: every leaf the server serves to
 	/// its mailbox key, each checked against the chain, the published tree
-	/// and its owner's own signatures, then the mailbox and a sync. Run
-	/// again, it takes only what the wallet does not hold.
+	/// and its owner's own signatures, then the mailbox and a sync. The coins
+	/// the server serves as given up for good (the wallet's history) are left
+	/// to the syncs after it, a step at each. Run again, it takes only what
+	/// the wallet does not hold.
 	Restore,
+	/// One step of the history a restore left: at most 20 of its coins,
+	/// checked as the restore checks a coin. `sync` runs one step too.
+	RestoreHistory,
 	/// The refresh fee of each coin a participation would give up (every
 	/// live coin when none is named), priced by its asset's schedule, before
 	/// anything is signed: what `participate --shown` takes.
@@ -1546,6 +1551,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),
 		Cmd::Lightning(LightningCmd::Claim { .. }) => unreachable!("handled above"),
 		Cmd::Restore => w.restore(),
+		Cmd::RestoreHistory => match w.restore_history()? {
+			Some(v) => Ok(v),
+			None => Ok(json!({"left": 0})),
+		},
 		Cmd::Quote { leaves, max_fee_ppm, piece, pieces } => {
 			let mut quote = w.refresh_quote(&leaves, max_fee_ppm)?;
 			match piece {

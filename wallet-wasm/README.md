@@ -66,7 +66,9 @@ record), as `arca`'s directory does. A wallet whose store is gone (a site's
 data cleared, another browser) is created again from its mnemonic with
 `ArcaWallet.create` and restored with `run('restore')`, which rebuilds what
 the server and the chain hold of it, every record checked, as `arca create
---mnemonic` does (`bark-cli/README.md`, Restoring from the mnemonic).
+--mnemonic` does (`bark-cli/README.md`, Restoring from the mnemonic). It
+returns once the coins that make the balance are checked; the coins given up
+for good, the wallet's history, are checked a step at each `sync` after it.
 
 ## Why a workspace of its own
 
@@ -113,7 +115,7 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 `balance`, `coins {held?, brief?}`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?, channels?}` (`channels: false` names none of the wallet's channels), `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
-`mailbox`, `restore`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
+`mailbox`, `restore`, `restore_history`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_quote {asset,
 value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,

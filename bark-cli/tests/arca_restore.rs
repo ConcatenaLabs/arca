@@ -473,7 +473,9 @@ fn case_rewrite(c: &Ctx, page: Option<Edit>, tree: Option<Edit>, info: Option<Ed
 /// - a wrong tree: the leaf of the batch is refused;
 /// - a leaf of another key: M's board served to A's mailbox key is refused;
 /// - an old copy of a leaf: the board A paid from, served live and given up
-///   nowhere, is held spent, by the transfer A's change rests on;
+///   nowhere, is counted nowhere while the record of A's change names it,
+///   left to the history, whose step holds it spent, by the transfer A's
+///   change rests on;
 /// - a keeper set not acknowledged: with every acknowledgement stripped, or
 ///   with `info` naming no keeper while the heads carry a keeper's
 ///   acknowledgements, nothing is restored.
@@ -556,11 +558,14 @@ async fn a_restore_takes_the_operators_word_for_nothing_it_can_check() {
 			}})),
 		("an old copy of a leaf: the board A paid from, live and given up nowhere", Some(old_copy), None, None, None,
 			Box::new({ let c = c.clone(); move |out: &Value, w: &Arca| {
+				// The record of A's change names it spent: it was left to the
+				// history, counted nowhere until its step.
+				assert!(out["history"]["left"].as_u64().unwrap() >= 1, "{}", out["history"]);
 				assert!(out["notes"].as_array().unwrap().iter().any(|n| n["leaf_id"] == c.paid_from.as_str()
 					&& n["note"].as_str().unwrap_or("").contains("an old copy")), "{}", out["notes"]);
 				let coin = coin_of(w, &c.paid_from);
 				assert_eq!(coin["state"], "spent", "{}", coin);
-				assert!(coin["spent_by"].as_str().unwrap().starts_with("transfer "), "{}", coin);
+				assert!(coin["spent_by"].as_str().unwrap().contains("transfer"), "{}", coin);
 			}})),
 		("a keeper set not acknowledged: every acknowledgement stripped", None, None, Some(no_acks), None,
 			Box::new(|out: &Value, w: &Arca| {
@@ -581,7 +586,22 @@ async fn a_restore_takes_the_operators_word_for_nothing_it_can_check() {
 		let mut args = create_args(&p.url, &node);
 		args.extend(["--mnemonic", &mnemonic]);
 		let made = w.ok(&args);
-		let out = &made["restore"];
+		// The restore's answer, with each step of the history it left: what
+		// the two say together is what the restore found.
+		let mut out = made["restore"].clone();
+		while out["error"].is_null() && out["history"]["left"].as_u64().unwrap_or(0) > out["history"]["checked"].as_u64().unwrap_or(0) {
+			let step = w.ok(&["restore-history"]);
+			for k in ["restored", "not_recovered", "notes"] {
+				let more = step[k].as_array().cloned().unwrap_or_default();
+				out[k].as_array_mut().unwrap().extend(more);
+			}
+			let done = out["history"]["checked"].as_u64().unwrap_or(0) + step["checked"].as_u64().unwrap_or(0);
+			out["history"]["checked"] = json!(done);
+			if step["left"] == 0 {
+				break;
+			}
+		}
+		let out = &out;
 		println!("RX {}: restored {} | not recovered {} | notes {} | error {}", what,
 			json!(out["restored"].as_array().map(|v| v.iter().map(|x| format!("{} {}", &x["leaf_id"].as_str().unwrap_or("")[..16], x["state"].as_str().unwrap_or(""))).collect::<Vec<_>>())),
 			out["not_recovered"], out["notes"], out["error"]["message"]);
@@ -725,6 +745,10 @@ async fn a_coin_restored_past_its_expiry_goes_home_while_its_path_stands() {
 	let why = why["why"].as_str().unwrap();
 	assert!(why.contains("path is gone") && why.contains(&sweep.txid().to_string()) && why.contains("final"), "{}", why);
 	assert_eq!(coin_of(&b2, &lb), Value::Null, "counted nowhere");
+	// The board B gave up for it, in a participation the operator released,
+	// is B's history: its step holds it spent.
+	assert_eq!(coin_of(&b2, &bb[0]), Value::Null, "not held before its step");
+	b2.ok(&["restore-history"]);
 	assert_eq!(coin_of(&b2, &bb[0])["state"], "spent", "the board B gave up for it");
 	for w in [&a, &b, &a2, &b2] {
 		let _ = std::fs::remove_dir_all(&w.dir);
@@ -1113,6 +1137,240 @@ async fn two_stores_of_one_mnemonic_spending_in_turn_show_the_same_coins() {
 	assert_eq!(tree_balance(&a3), tree_balance(&a), "and shows the same balance");
 	println!("TS the end: A {} | A2 {} | A3 {}", tree_balance(&a), tree_balance(&a2), tree_balance(&a3));
 	for w in [&a, &a2, &a3, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// The height of the block holding `txid` on the regtest chain.
+fn block_height(r: &Running, txid: &str) -> u64 {
+	let tx: Value = r.rt.client().call("getrawtransaction", &[json!(txid), json!(true)]).unwrap();
+	let h: Value = r.rt.client().call("getblockheader", &[tx["blockhash"].clone(), json!(true)]).unwrap();
+	h["height"].as_u64().unwrap()
+}
+
+/// A store's birthday: the height its reads of the chain start from.
+fn birthday(w: &Arca) -> u64 {
+	let db = rusqlite::Connection::open(w.dir.join("arca.sqlite")).unwrap();
+	db.query_row("SELECT value FROM meta WHERE key = 'birthday'", [], |r| r.get::<_, String>(0)).unwrap().parse().unwrap()
+}
+
+/// A wallet with a long history (#721): A pays B twenty-five times out of
+/// round, each payment from the change of the one before, and refreshes its
+/// change in a round after every four (a coin goes at most five
+/// reassignments from a round), so over thirty of the coins the server
+/// serves to its mailbox key are spent: in transfers, and in participations
+/// the operator released. A2, restored from A's mnemonic alone, checks first
+/// the one coin that makes A's balance: its balance is A's when the restore
+/// returns, it holds no spent coin yet, its history holds every one of
+/// them (`history.left`), counted nowhere, and its birthday is the block of
+/// the board everything rests on, as a restore that checked everything at
+/// once sets it. A step checks twenty of them, each spent on its owner's own
+/// signatures. A restore run again meanwhile, as after one cut short, takes
+/// nothing twice and leaves the rest. A pays once more, from the coin both
+/// stores hold: A2's next sync catches up (it gives that coin up and takes
+/// A's change, leaving the listed coins to their steps) and runs the next
+/// step. Once none is left, A2's coins are A's, field by field.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_history_is_restored_after_the_balance() {
+	let mut r = Running::start_kept(1, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, a2, b) = (Arca::new("LHA"), Arca::new("LHA2"), Arca::new("LHB"));
+	let boards = boarded(&mut r, &a, &url, &[(x, 3_000_000)]).await;
+	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+	let board_tx = a.ok(&["boards"])[0]["server"]["txid"].as_str().unwrap().to_string();
+	let mut spent: Vec<String> = vec![];
+	for k in 0..25 {
+		if k > 0 && k % 4 == 0 {
+			let coin: Vec<String> = live(&a).into_keys().collect();
+			a.ok(&["participate", "--leaf", &coin[0], "--max-fee-ppm", "1000000"]);
+			final_round(&r).await;
+			a.ok(&["sync"]);
+			spent.push(coin[0].clone());
+		}
+		let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		let sent = a.ok(&["send", &req_b, "--amount", "20000", "--asset", &xs]);
+		spent.push(sent["inputs"][0].as_str().unwrap().to_string());
+	}
+	assert_eq!(spent[0], boards[0]);
+	b.ok(&["sync"]);
+	a.ok(&["sync"]);
+	let held: Vec<String> = live(&a).into_keys().collect();
+	assert_eq!(held.len(), 1, "A holds its last change alone: {:?}", held);
+	let history = spent.len();
+	assert!(history > 20, "{} spent", history);
+
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	let restore = &made["restore"];
+	println!("LH A2's restore: served {} | restored {} | history {} | cost {}", restore["served"], restore["restored"], restore["history"],
+		restore["cost_by_step"]);
+	assert!(restore["error"].is_null(), "{}", restore);
+	assert_eq!(restore["not_recovered"], json!([]), "{}", restore);
+	assert_eq!(restore["history"]["left"], history, "{}", restore["history"]);
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "A2's balance is A's when the restore returns");
+	assert_eq!(live(&a2), live(&a), "the coin A holds");
+	for id in &spent {
+		assert_eq!(coin_of(&a2, id), Value::Null, "spent coin {} is not held before its step", id);
+	}
+	assert_eq!(birthday(&a2), block_height(&r, &board_tx), "the birthday is the board's block");
+
+	let step = a2.ok(&["restore-history"]);
+	println!("LH A2's first step: checked {} | left {} | notes {}", step["checked"], step["left"], step["notes"]);
+	// A refresh the step completes takes its new leaf, a coin listed
+	// further on: that coin is settled with the step, by its own entry.
+	let left = step["left"].as_u64().unwrap();
+	assert_eq!(step["checked"], 20, "{}", step);
+	assert!(left > 0 && left <= history as u64 - 20, "{}", step);
+	assert_eq!(step["not_recovered"], json!([]), "{}", step);
+	let checked: Vec<Value> = spent.iter().map(|id| coin_of(&a2, id)).filter(|c| !c.is_null()).collect();
+	assert_eq!(checked.len() as u64, history as u64 - left, "every coin off the list is held");
+	assert!(checked.iter().all(|c| c["state"] == "spent"), "each of them spent: {:?}", checked);
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "a step moves no balance");
+
+	// A restore run again, as after one cut short: nothing twice.
+	let again = a2.ok(&["restore"]);
+	println!("LH A2's restore run again: restored {} | history {}", again["restored"], again["history"]);
+	assert_eq!(again["restored"], json!([]), "{}", again);
+	assert_eq!(again["history"]["left"], left, "{}", again["history"]);
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "a restore run again moves no balance");
+
+	// A pays from the coin both hold; A2 catches up and takes the next step.
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req_b, "--amount", "20000", "--asset", &xs]);
+	b.ok(&["sync"]);
+	catch_up_due(&r).await;
+	let s = a2.ok(&["sync"]);
+	println!("LH A2's sync: caught up {} | history {}", s["caught_up"], s["history"]);
+	assert!(s["caught_up"]["error"].is_null(), "{}", s["caught_up"]);
+	let gone: Vec<&str> = s["caught_up"]["given_elsewhere"].as_array().unwrap().iter().filter_map(|g| g["leaf_id"].as_str()).collect();
+	assert_eq!(gone, vec![held[0].as_str()], "A2 gives up the coin A spent: {}", s["caught_up"]);
+	assert!(s["history"]["checked"].as_u64().unwrap() >= 1, "{}", s["history"]);
+	let mut left = s["history"]["left"].as_u64().unwrap();
+	a.ok(&["sync"]);
+	while left > 0 {
+		assert_eq!(tree_balance(&a2), tree_balance(&a), "no step moves the balance");
+		left = a2.ok(&["sync"])["history"]["left"].as_u64().unwrap();
+	}
+	let s = a2.ok(&["sync"]);
+	assert!(s["history"].is_null(), "no step once none is left: {}", s["history"]);
+	a.ok(&["sync"]);
+	let (ca, ca2) = (a.ok(&["coins"]), a2.ok(&["coins"]));
+	let diff = differences(&ca, &ca2);
+	println!("LH coins differing (A | A2): {:?}", diff);
+	assert!(diff.is_empty(), "A2's coins are A's: {:?}", diff);
+	assert_eq!(tree_balance(&a2), tree_balance(&a));
+	assert_eq!(birthday(&a2), block_height(&r, &board_tx));
+	for w in [&a, &a2, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// Bitcoin anchoring is supreme, also while a restore's history waits: A
+/// holds a board B1 and pays B out of round from a board B2 whose block is
+/// anchored to Bitcoin parent block p, so B2 is spent and its change, resting
+/// on it, is live. A2, restored from A's mnemonic, holds B1 and the change
+/// when its restore returns, B2 left to its history. Then p is orphaned: B2's block leaves the chain with
+/// it, and the change resting on it is no longer live, in A and in A2 alike,
+/// their balances equal. A2's history step meets coins whose board is in no
+/// block: it takes nothing on them. B2 is mined again and buried: the change
+/// is live again in both. A2's catch-up then takes what its step could not,
+/// and its coins are A's.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anchor_reorganisation_while_a_restores_history_waits() {
+	let mut r = Running::start_kept(1, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, a2, b) = (Arca::new("ARA"), Arca::new("ARA2"), Arca::new("ARB"));
+	let b1 = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await[0].clone();
+	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 4_000_000);
+	r.produce().await;
+	// A parent block of B2's own: orphaning it takes B2's block, and every
+	// block after it, out of the chain.
+	let p = tokio::task::block_in_place(|| {
+		r.rt.mine_parent(1).unwrap();
+		r.rt.anchor_to_parent_tip().unwrap();
+		r.rt.parent.client().block_count().unwrap()
+	});
+	let b2 = a.ok(&["board", &xs, "3000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("B2 to be credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let b2_tx = a.ok(&["boards"]).as_array().unwrap().iter().find(|v| v["leaf_id"] == b2.as_str()).unwrap()["server"]["txid"]
+		.as_str().unwrap().to_string();
+	// A payment from B2 (B1 cannot make it): B2 spent, its change live on it.
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req_b, "--amount", "2600000", "--asset", &xs]);
+	let spent = vec![sent["inputs"][0].as_str().unwrap().to_string()];
+	let change = sent["transfer"]["kept"][0]["leaf_id"].as_str().unwrap().to_string();
+	b.ok(&["sync"]);
+	a.ok(&["sync"]);
+	assert_eq!(spent[0], b2, "{:?}", spent);
+
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	let restore = &made["restore"];
+	println!("AR A2's restore: restored {} | history {}", restore["restored"], restore["history"]);
+	assert!(restore["error"].is_null(), "{}", restore);
+	assert_eq!(restore["history"]["left"], spent.len(), "{}", restore["history"]);
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "the balance when the restore returns");
+	assert_eq!(coin_of(&a2, &change)["state"], "live");
+
+	// The parent block orphaned: B2's block leaves the chain, B2 back in the
+	// mempool and kept out of blocks.
+	let c = r.rt.client();
+	let _: Value = c.call("prioritisetransaction", &[json!(b2_tx), json!(0), json!(-1_000_000_000i64)]).unwrap();
+	tokio::task::block_in_place(|| r.rt.orphan_parent_from(p)).unwrap();
+	r.produce().await;
+	r.synced().await;
+	let tx: Result<Value, _> = c.call("getrawtransaction", &[json!(b2_tx), json!(true)]);
+	assert!(tx.map(|t| t["blockhash"].is_null()).unwrap_or(true), "B2 is in no block");
+	let sa = a.ok(&["sync"]);
+	let sa2 = a2.ok(&["sync"]);
+	println!("AR after the reorganisation: A's change {} | A2's change {} | A2's step {}", coin_of(&a, &change)["state"],
+		coin_of(&a2, &change)["state"], sa2["history"]);
+	let _ = sa;
+	assert_ne!(coin_of(&a, &change)["state"], "live", "A: a coin on a board in no block is not live");
+	assert_eq!(coin_of(&a2, &change)["state"], coin_of(&a, &change)["state"], "A2 follows the chain as A does");
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "the same balance through the reorganisation");
+	for id in &spent {
+		assert_ne!(coin_of(&a2, id)["state"], "live", "a coin of the history is never live: {}", id);
+	}
+
+	// B2 mined again and buried: the change is live again in both.
+	let _: Value = c.call("prioritisetransaction", &[json!(b2_tx), json!(0), json!(1_000_000_000i64)]).unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	a.ok(&["sync"]);
+	a2.ok(&["sync"]);
+	assert_eq!(coin_of(&a, &change)["state"], "live");
+	assert_eq!(coin_of(&a2, &change)["state"], "live", "A2's change live again");
+	assert_eq!(tree_balance(&a2), tree_balance(&a));
+	// Whatever the step could not take, the history (or a catch-up) takes now.
+	for _ in 0..3 {
+		a2.ok(&["restore-history"]);
+	}
+	catch_up_due(&r).await;
+	a.ok(&["sync"]);
+	let s = a2.ok(&["sync"]);
+	println!("AR A2's catch-up: {}", s["caught_up"]);
+	let (ca, ca2) = (a.ok(&["coins"]), a2.ok(&["coins"]));
+	let diff = differences(&ca, &ca2);
+	println!("AR coins differing (A | A2): {:?}", diff);
+	assert!(diff.is_empty(), "A2's coins are A's: {:?}", diff);
+	assert_eq!(tree_balance(&a2), tree_balance(&a));
+	for w in [&a, &a2, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

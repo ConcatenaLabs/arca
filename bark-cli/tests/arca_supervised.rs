@@ -252,6 +252,27 @@ async fn a_frozen_holder_lands_its_coin_in_its_own_key() {
 	a.refused(&["plan", &leaf], "supervised asset, whose operator runs no plans for it");
 	let care = a.ok(&["care"]);
 	assert_eq!(care["supervised"]["coins"], json!(1), "{}", care);
+	// A store restored from A's mnemonic holds the supervised leaf when its
+	// restore returns, landing at A's own key; the board A gave up for it is
+	// the history its next step checks.
+	let a2 = Arca::new("SUPA2");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&url, &node_url);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	let restore = &made["restore"];
+	assert!(restore["error"].is_null(), "{}", restore);
+	assert_eq!(restore["not_recovered"], json!([]), "{}", restore);
+	let held = live_in(&a2, &z).into_iter().find(|c| c["leaf_id"] == leaf.as_str()).unwrap_or_else(|| panic!("A2 holds A's leaf of Z: {}", restore));
+	assert_eq!(held["landing"], json!(a_landing), "{}", held);
+	assert_eq!(a2.ok(&["balance"])["arca"][&z], a.ok(&["balance"])["arca"][&z], "A2's Z is A's");
+	assert!(restore["history"]["left"].as_u64().unwrap() >= 1, "{}", restore["history"]);
+	let step = a2.ok(&["restore-history"]);
+	assert_eq!(step["left"], json!(0), "{}", step);
+	assert_eq!(step["not_recovered"], json!([]), "{}", step);
+	println!("RESTORED: A2 holds A's leaf of Z landing at {} when its restore returns; its history, {} coin(s), after one step",
+		a_landing, step["checked"]);
+	let _ = std::fs::remove_dir_all(&a2.dir);
 	// A batch of another asset is not a supervised one.
 	let x_board = a.ok(&["board", &x, "1000000"])["leaf_id"].as_str().unwrap().to_string();
 	r.produce().await;

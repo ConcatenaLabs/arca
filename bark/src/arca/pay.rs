@@ -1352,6 +1352,11 @@ impl Wallet {
 				return Ok(json!({"leaf_id": c.leaf_id, "already_held": c.state}));
 			}
 		}
+		// The coins a restore left to its history (below, by the coin's own id).
+		let history = self.history_ids()?;
+		if history.contains(claimed) {
+			return Ok(json!({"leaf_id": claimed, "already_held": "history", "note": "left to the restore's history"}));
+		}
 		let record = CoinRecord::from_bytes(bytes).map_err(|e| if e.is_unknown_format() {
 			Error::Unread(e.to_string())
 		} else {
@@ -1420,6 +1425,13 @@ impl Wallet {
 		}
 		if let Some(v) = self.held_again(&id, &record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?)? {
 			return Ok(v);
+		}
+		// A coin a restore left to its history's steps is theirs: it may have
+		// been spent off the chain, which only those steps can tell (by its
+		// owner's signatures and the records that spend it), so a mailbox
+		// read, which knows nothing of that, never takes it.
+		if history.contains(&id) {
+			return Ok(json!({"leaf_id": id, "already_held": "history", "note": "left to the restore's history"}));
 		}
 		// A resting order, resting again after a fill, is under its order's
 		// own key and nonce: every coin of its lineage is.

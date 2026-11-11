@@ -1950,6 +1950,13 @@ impl Wallet {
 	/// others from the wallet (a maker's firm offer) then finds the library
 	/// free between the two. The deposits answer nothing anyone waits on.
 	pub fn sync_parts(&mut self, catch_up: bool, deposits: bool) -> Result<Value, Error> {
+		self.sync_with(catch_up, deposits, true)
+	}
+
+	/// [`Self::sync_parts`]; with `history` false, without the step of a
+	/// restore's history ([`Self::restore_history`]): the sync that ends a
+	/// restore, which leaves the history to the syncs after it.
+	pub(crate) fn sync_with(&mut self, catch_up: bool, deposits: bool, history: bool) -> Result<Value, Error> {
 		// The schedule's relative times count from this sync.
 		let start = self.now()?.to_consensus_u32();
 		self.store.set_meta(super::wallet::LAST_SYNC, &start.to_string())?;
@@ -1960,7 +1967,7 @@ impl Wallet {
 		let (mut early_home, mut early_exits) = self.exit_steps();
 		*self.exit_watch.borrow_mut() = Some(start);
 		*self.exits_done.borrow_mut() = (vec![], vec![]);
-		let out = self.sync_asking(recheck, catch_up, deposits);
+		let out = self.sync_asking(recheck, catch_up, deposits, history);
 		*self.exit_watch.borrow_mut() = None;
 		let (h, e) = std::mem::take(&mut *self.exits_done.borrow_mut());
 		early_home.extend(h);
@@ -1985,7 +1992,7 @@ impl Wallet {
 
 	/// The part of [`Self::sync`] that asks the operator, with every exit step
 	/// whose date comes meanwhile taken at once ([`Self::exits_meanwhile`]).
-	fn sync_asking(&mut self, recheck: Value, catch_up: bool, with_deposits: bool) -> Result<Value, Error> {
+	fn sync_asking(&mut self, recheck: Value, catch_up: bool, with_deposits: bool, with_history: bool) -> Result<Value, Error> {
 		// What each step cost (milliseconds, and requests of the node and of
 		// the operator): `cost_by_step`, for a program that logs a slow sync.
 		let mut steps = Steps::start(self);
@@ -2044,6 +2051,13 @@ impl Wallet {
 			self.catch_up().unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { Value::Null };
 		steps.lap(self, "catch up");
+		self.exits_meanwhile();
+		// The coins a restore left to be checked after it (the wallet's
+		// history): one bounded step of them ([`Self::restore_history`]).
+		let history = if talk && with_history {
+			self.restore_history().map(|v| v.unwrap_or(Value::Null)).unwrap_or_else(|e| json!({"error": e.to_string()}))
+		} else { Value::Null };
+		steps.lap(self, "history");
 		self.exits_meanwhile();
 		// Every coin kept before the wallet named its mailbox key is bound to
 		// it, so that a restore from the mnemonic finds it.
@@ -2158,6 +2172,9 @@ impl Wallet {
 			"participations": participations, "forfeits": forfeits, "exits": exits, "schedule": schedule});
 		steps.lap(self, "schedule");
 		out["cost_by_step"] = steps.done();
+		if !history.is_null() {
+			out["history"] = history;
+		}
 		if refresh.as_array().is_none_or(|r| !r.is_empty()) {
 			out["refresh"] = refresh;
 		}

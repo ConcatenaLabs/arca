@@ -344,6 +344,9 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"channel_code" => w.channel_code(a["address"].as_str()),
 		"mailbox" => w.mailbox(),
 		"restore" => w.restore(),
+		// One step of the coins a restore left to be checked after it; `sync`
+		// runs one too. `{"left": 0}` once none is left.
+		"restore_history" => w.restore_history().and_then(|v| Ok(v.unwrap_or(json!({"left": w.history_left()?})))),
 		"quote" => {
 			let mut quote = w.refresh_quote(&leaves(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)?;
 			match in_pieces(&mut quote, a)? {
