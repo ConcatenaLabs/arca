@@ -167,12 +167,15 @@ impl Wallet {
 		let nonce = repayment_nonce(&coin, k);
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		let landing = self.landing_rule(info, asset)?;
-		let template = if landing.is_some() { Template::Landing1 } else { Template::Vtxo1 };
+		let template = landing.map_or(Template::Vtxo1, |l| l.template());
 		let wanted = Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(), order: None, landing,
 			channel: None };
 		let mut entry = json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()});
 		if let Some(l) = &landing {
 			entry["landing"] = arca_covenant::record_json::landing_json(l);
+			if l.own_index {
+				entry["template"] = json!(arca_covenant::LANDING_2);
+			}
 		}
 		Ok((wanted, nonce, entry))
 	}

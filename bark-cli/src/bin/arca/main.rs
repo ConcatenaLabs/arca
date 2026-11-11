@@ -187,7 +187,7 @@ enum Cmd {
 	},
 	/// Checks a published batch of a supervised asset, `TXID:VOUT` of its
 	/// round: the asset supervised on the wallet's own node, every leaf
-	/// `landing-1` with the published allowance, every output of the round
+	/// a landing leaf with the published allowance, every output of the round
 	/// explicit; each leaf's landing and whether the node shows it frozen.
 	SupervisedCheck { batch: String },
 	/// A new on-chain Sequentia address of the wallet's.

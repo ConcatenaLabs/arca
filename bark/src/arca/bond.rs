@@ -174,7 +174,7 @@ pub fn read_line(v: &Value) -> Result<([u8; 32], Signed), Error> {
 
 /// The asset and amount of the coin a rebindable message's rest names: the
 /// rest is `asset ‖ 01 01 ‖ value ‖ m ‖ m output hashes`, after a
-/// `landing-1` leaf's landing program where the leaf is one
+/// landing leaf's landing program where the leaf is one
 /// ([`arca_covenant::landing::PROGRAM_BYTES`]); its length says which.
 fn coin_of_rest(rest: &[u8]) -> Option<(AssetId, u64)> {
 	[0, arca_covenant::landing::PROGRAM_BYTES].into_iter().find_map(|at| {
@@ -190,7 +190,7 @@ fn coin_of_rest(rest: &[u8]) -> Option<(AssetId, u64)> {
 }
 
 /// The watched salt a push of a leaf's collaborative script names: its
-/// `K`, or a `landing-1` leaf's `K ‖ P`.
+/// `K`, or a landing leaf's `K ‖ P`.
 fn watched_push<'a>(push: &[u8], ks: &'a BTreeMap<[u8; 32], [u8; 32]>) -> Option<&'a [u8; 32]> {
 	if push.len() != 32 && push.len() != 32 + arca_covenant::landing::PROGRAM_BYTES {
 		return None;
