@@ -1282,6 +1282,10 @@ pub struct OrderPublish {
 	pub mailbox: String,
 	/// The order's leaf key's signature over the publication.
 	pub signature: String,
+	/// The coin record formats the maker's wallet reads
+	/// (`arca_covenant::RECORD_FORMATS`); absent from an older build.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub record_formats: Vec<String>,
 }
 
 /// `POST /v1/order_fill_delegation_terms`: a signed fill, by its transfer
@@ -1429,6 +1433,12 @@ pub struct OrderState {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub record: Option<String>,
 	pub fills: Vec<OrderFillState>,
+	/// The coin record formats the order's maker reads, as it named them:
+	/// a taker asks for checkpoints with their owners' exit, and gives a
+	/// coin whose record is of the newer format, only where they include
+	/// `coin-2`. Empty for an order an older build published.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub maker_reads: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

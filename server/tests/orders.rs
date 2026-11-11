@@ -45,7 +45,7 @@ use arca_covenant::record_json::order_terms_from_json;
 use arca_covenant::script::sha256;
 use arca_covenant::sign::sign_digest;
 use arca_covenant::spend::FeeSource;
-use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, NewLeaf, RelativeTime, Template, TransferPlan, ValidCoin, ValidOrigin};
+use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, NewLeaf, Rebindable, RelativeTime, Template, TransferPlan, ValidCoin, ValidOrigin};
 use common::client::{auths_json, exit_delay, forfeit_sig, hex, hold_key, new_leaf, participation_body, random32, transfer_body, unhex};
 use common::flow::{drive, final_of, forfeit_for, held_by, log, settle, txid, verdict, Coin};
 use common::keys::{keypair, xonly};
@@ -720,4 +720,91 @@ async fn an_absent_makers_order_is_landed_by_the_operator_at_its_exit_deadline()
 	println!("order_state after the landing: {}", st["state"]);
 	assert_eq!(st["state"], "landed", "the order takes no fill in the tree");
 	let _ = y;
+}
+
+/// A fill asks for checkpoints with their owners' exit only against a maker
+/// that reads the record format it makes: the order's publication names the
+/// formats its maker's wallet reads, its state serves them (`maker_reads`),
+/// and the operator refuses an exit fill of an order whose maker names none,
+/// before anything is recorded or signed, as from an older build. The same
+/// fill without the exit is co-signed; an exit fill of an order whose maker
+/// names `coin-2` is co-signed, its records of format 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exit_fill_goes_only_to_a_maker_that_reads_its_records() {
+	let mut r = start().await;
+	let (x, y) = (r.x, r.y);
+	let (m, n) = (maker(&r, "XM"), maker(&r, "XN"));
+	let (t1, t2) = (keypair("XT1"), keypair("XT2"));
+	let mut boards = vec![];
+	for (label, asset) in [("XM, board", x), ("XN, board", x), ("XT1, board", y), ("XT2, board", y)] {
+		let (held, tx) = credited_board(&mut r, &keypair(label), asset).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let (wm, nm) = want_order(&m, VALUE, x);
+	let (wn, nn) = want_order(&n, VALUE, x);
+	let (w1, n1) = want_leaf(&t1, y, VALUE);
+	let (w2, n2) = want_leaf(&t2, y, VALUE);
+	let got = one_round(&mut r, &[(&boards[0], &m.key, wm, nm), (&boards[1], &n.key, wn, nn), (&boards[2], &t1, w1, n1),
+		(&boards[3], &t2, w2, n2)]).await;
+	let (om, on, c1, c2) = (&got[0], &got[1], &got[2], &got[3]);
+	let bases = om.bases.clone();
+	// M publishes as an older build does, naming no format; N names its own.
+	r.http.post("order_publish", &publish_body(&r, &m, om, &m.key)).ok();
+	let mut body = publish_body(&r, &n, on, &n.key);
+	body["record_formats"] = json!(arca_covenant::RECORD_FORMATS);
+	r.http.post("order_publish", &body).ok();
+	let view = order_state(&r, &[om.held.id, on.held.id]);
+	let (sm, sn) = (view.iter().find(|v| v["order"] == om.held.id.to_string()).unwrap(), view.iter().find(|v| v["order"] == on.held.id.to_string()).unwrap());
+	println!("XF: M's order serves maker_reads {}, N's {}", sm["maker_reads"], sn["maker_reads"]);
+	assert!(sm["maker_reads"].is_null(), "an older build's order names nothing");
+	assert!(sn["maker_reads"].as_array().unwrap().contains(&json!("coin-2")));
+	let exit_body = |st: &Value, coin: &Coin, key: &Keypair, label: &str| {
+		let p = policy_of(&r, st, &bases);
+		let v = coin.valid(&r);
+		let (l, _) = new_leaf(&keypair(&format!("{} X", label)));
+		let (ch, _) = new_leaf(&keypair(&format!("{} change", label)));
+		let mut b = fill_body(&r, st, &p, (coin, v.clone()), VALUE - 1, 300_000, (&l, &ch), 1, key, None);
+		// Signed again over the checkpoint with its owner's exit.
+		let value: u64 = st["value"].as_str().unwrap().parse().unwrap();
+		let plan = p.plan(value, 300_000).unwrap();
+		let mut outputs = vec![plan.credit.clone()];
+		outputs.extend(plan.rest.clone());
+		outputs.push(ExplicitOutput::new(p.terms().asset_a, 300_000, l.policy(xonly(&r.s), r.chain).script_pubkey()));
+		outputs.push(ExplicitOutput::new(v.asset, VALUE - 1 - plan.credit.value - 1, ch.policy(xonly(&r.s), r.chain).script_pubkey()));
+		let tplan = TransferPlan { checkpoint_exit: true, inputs: vec![(v.clone(), VALUE - 1)], outputs: outputs.clone() };
+		let order_out = ExplicitOutput::new(p.terms().asset_a, value, p.script_pubkey()).txout();
+		let named = vec![order_out, tplan.checkpoint_output(0).txout()];
+		let cp = sign_digest(key, &tplan.checkpoint_message(0).unwrap().digest, &random32());
+		let re = sign_digest(key, &tplan.checkpoint(0).message_in(1, &named, &outputs).unwrap().digest, &random32());
+		b["inputs"][0]["checkpoint_sig"] = json!(hex(cp.as_ref()));
+		b["inputs"][0]["reassignment_sig"] = json!(hex(re.as_ref()));
+		b["checkpoint_exit"] = json!(true);
+		b
+	};
+	let a = r.http.post("order_fill", &exit_body(sm, c1, &t1, "XT1"));
+	println!("XF: an exit fill of M's order (its maker an older build): {} {:?}", a.status, a.refusal());
+	assert_eq!(a.status, 422, "{}", a.json);
+	assert!(a.refusal().1.contains("reads no coin record"), "{:?}", a.refusal());
+	let done = r.http.post("order_fill", &exit_body(sn, c2, &t2, "XT2")).ok();
+	let rec = arca_covenant::CoinRecord::from_bytes(&unhex(done["outputs"][0]["record"].as_str().unwrap())).unwrap();
+	println!("XF: an exit fill of N's order: co-signed, transfer {}, its records format {}", done["transfer_id"], rec.to_bytes().unwrap()[0]);
+	assert_eq!(rec.to_bytes().unwrap()[0], arca_covenant::transfer::COIN_RECORD_VERSION_EXIT);
+	// T2's change from that fill has a record of format 2: given to M's
+	// order, whose maker reads none, it is refused though the fill does not
+	// ask for the exit.
+	let ck = keypair("XT2 change");
+	let ld = r.http.post("leaf_data", &json!({"auth": r.http.auth("leaf_data", &ck, &r.chain)})).ok();
+	let entry = ld["leaves"].as_array().unwrap()[0].clone();
+	let held = common::client::Held { key: ck, nonce: [0; 32], id: LeafId(unhex(entry["leaf_id"].as_str().unwrap()).try_into().unwrap()),
+		record: CoinRecord::from_bytes(&unhex(entry["record"].as_str().unwrap())).unwrap() };
+	let change = Coin { held, bases: bases.clone() };
+	let cv = change.valid(&r);
+	println!("XF: T2's change, {} of Y, record format {}", cv.value, change.held.record.to_bytes().unwrap()[0]);
+	let p = policy_of(&r, sm, &bases);
+	let (l, _) = new_leaf(&keypair("XT2 second X"));
+	let (ch, _) = new_leaf(&keypair("XT2 second change"));
+	let body = fill_body(&r, sm, &p, (&change, cv.clone()), cv.value, 100_000, (&l, &ch), 1, &ck, None);
+	let (status, _, why) = refused(&r, "a fill of M's order giving a coin of format 2", &body);
+	assert_eq!(status, 422);
+	assert!(why.contains("past holds a checkpoint with its owner's exit"), "{}", why);
 }

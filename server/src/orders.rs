@@ -101,6 +101,8 @@ pub struct PublishRequest {
 	pub mailbox: XOnlyPublicKey,
 	/// The order's leaf key's signature over [`publish_digest`].
 	pub signature: Signature,
+	/// The coin record formats the maker's wallet reads.
+	pub record_formats: Vec<String>,
 }
 
 /// A taker's fill of a resting order.
@@ -456,7 +458,8 @@ impl Orders {
 			return Err(OrderError::NotAnOrder("the record published is not the record of the coin the server holds".into()));
 		}
 		let bytes = req.record.to_bytes().map_err(internal)?;
-		self.store.insert_resting_order(&id.0, &record.owner.serialize(), &req.mailbox.serialize(), &bytes, &req.credit_nonces).await?;
+		self.store.insert_resting_order(&id.0, &record.owner.serialize(), &req.mailbox.serialize(), &bytes, &req.credit_nonces,
+			&req.record_formats).await?;
 		log::info!("resting order {} published, {} of {} resting", id, coin.value, coin.asset);
 		self.view(&id).await?.ok_or_else(|| internal("a published order is gone"))
 	}
@@ -590,6 +593,13 @@ impl Orders {
 		crate::restricted::gate(&self.store, &self.params, &given, "a fill of a resting order").await.map_err(CosignError::from)?;
 		let order = self.store.resting_order(&req.order.0).await?.ok_or_else(|| OrderError::UnknownOrder(req.order.to_string()))?;
 		let recorded = self.store.order_fill_by_transfer(&transfer).await?.is_some();
+		// The maker reads the coin record of a fill only in a format its
+		// wallet named: none of the newer one (`coin-2`) for an older build.
+		let maker_reads_exit = order.record_formats.iter().any(|f| f == "coin-2");
+		if !recorded && req.checkpoint_exit && !maker_reads_exit {
+			return Err(OrderError::Cosign(CosignError::NotServed(format!("order {}'s maker reads no coin record of the format a \
+				checkpoint with its owner's exit makes (coin-2): the taker signs the fill again without it", req.order))));
+		}
 		if !recorded && order.current_leaf != req.coin.0 {
 			return Err(OrderError::Moved(format!("order {} rests at coin {} now, not {}: fill the coin it rests at",
 				req.order, LeafId(order.current_leaf), req.coin)));
@@ -670,6 +680,10 @@ impl Orders {
 				return Err(OrderError::Terms(format!("coin {} expires at median time {}, before the order's coin ({}): a fill is paid with \
 					coins that expire no earlier than the order, so every coin it makes ages with the order; refresh it first", i.leaf_id,
 					c.expiry().to_consensus_u32(), oc.expiry().to_consensus_u32())));
+			}
+			if !recorded && !maker_reads_exit && c.coin.has_checkpoint_exit() {
+				return Err(OrderError::Cosign(CosignError::NotServed(format!("coin {}'s past holds a checkpoint with its owner's exit, and \
+					order {}'s maker reads no coin record of that format (coin-2): the fill pays from other coins", i.leaf_id, req.order))));
 			}
 			checked.push(c);
 		}

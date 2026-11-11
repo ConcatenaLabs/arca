@@ -47,7 +47,9 @@ round_interval_seconds = 60
 # also has the owner's own exit after its exit delay, so that a swap that can
 # never complete gives every coin back without the operator. A wallet asks for
 # it only where every party to the swap reads the record format it makes; one
-# that never asks is served as before, so turning it on refuses no client.
+# that never asks is served as before. A fill that asks for it, or that gives
+# a coin already made that way, is refused against an order whose maker named
+# no such format when it published, and the taker signs it again without.
 # The watcher answers such a checkpoint published early by bringing the other
 # inputs on and publishing the reassignment inside the delay. Changed only by
 # a restart.

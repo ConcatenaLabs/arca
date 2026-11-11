@@ -315,6 +315,13 @@ pub struct FeeStatus {
 	/// Board forfeits held back for block space, and for the fee pool.
 	pub held_for_space: usize,
 	pub held_for_fees: usize,
+	/// When the watcher's last pass ended, in Unix seconds, or when it
+	/// started, before its first pass ends; 0 for a status made otherwise.
+	/// The watcher answers an early checkpoint with its owner's exit within
+	/// the coin's exit delay, so a watcher that stops passing, or never
+	/// finishes its first, is an alert for the operator
+	/// ([`FeeStatus::metrics`]).
+	pub last_pass_at: u64,
 }
 
 impl FeeStatus {
@@ -335,6 +342,14 @@ impl FeeStatus {
 		out.push_str("# TYPE arca_watcher_forfeits_held gauge\n");
 		out.push_str(&format!("arca_watcher_forfeits_held{{reason=\"block_space\"}} {}\n", self.held_for_space));
 		out.push_str(&format!("arca_watcher_forfeits_held{{reason=\"fee_pool\"}} {}\n", self.held_for_fees));
+		out.push_str("# HELP arca_watcher_last_pass_age_seconds Seconds since the watcher's last pass ended, or since it started before \
+			its first ended: the stale exits it answers, \
+			early checkpoints with their owners' exit among them, wait on it; alert well within the shortest exit delay.\n");
+		out.push_str("# TYPE arca_watcher_last_pass_age_seconds gauge\n");
+		if self.last_pass_at > 0 {
+			let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+			out.push_str(&format!("arca_watcher_last_pass_age_seconds {}\n", now.saturating_sub(self.last_pass_at)));
+		}
 		out
 	}
 }
@@ -374,7 +389,10 @@ impl Watcher {
 		Arc::new(Watcher {
 			store, finality, params, wallet, nursery, signer, rounds, config,
 			running: Mutex::new(()), trees: Mutex::new(HashMap::new()), accumulators: Mutex::new(HashMap::new()), pay_to: Mutex::new(None),
-			status: std::sync::Mutex::new(FeeStatus::default()),
+			status: std::sync::Mutex::new(FeeStatus {
+				last_pass_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+				..FeeStatus::default()
+			}),
 			lineage_waits: std::sync::Mutex::new(HashMap::new()),
 		})
 	}
@@ -414,6 +432,8 @@ impl Watcher {
 		self.collections(now).await?;
 		self.returns().await?;
 		self.owed().await?;
+		self.status.lock().unwrap_or_else(|e| e.into_inner()).last_pass_at =
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
 		Ok(())
 	}
 
@@ -1664,7 +1684,11 @@ impl Watcher {
 					waiting take {}; {} board forfeit(s) are held back until the wallet is paid more of it", pool, fa, owed, held_for_fees);
 			}
 		}
-		*self.status.lock().unwrap_or_else(|e| e.into_inner()) = FeeStatus { pools, held_for_space: held_back, held_for_fees };
+		{
+			let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
+			let last_pass_at = st.last_pass_at;
+			*st = FeeStatus { pools, held_for_space: held_back, held_for_fees, last_pass_at };
+		}
 		Ok(())
 	}
 
