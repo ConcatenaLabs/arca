@@ -265,6 +265,12 @@ pub struct BondInfo {
 	/// That share of `reference_value`, in atoms of the reference unit.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub instant_budget: Option<String>,
+	/// The instant limit the operator suggests a wallet hold at most, in
+	/// atoms of the reference unit (`[bond] instant_limit_value`): of coins
+	/// paid to it out of round, what it counts as its own at once. Absent
+	/// when it suggests none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub instant_limit_value: Option<String>,
 	/// What the state rests on.
 	pub why: String,
 }
@@ -458,6 +464,11 @@ pub struct ParticipationsInfo {
 	/// slot of an accumulator batch without a sweep (`accumulator-4`).
 	#[serde(default)]
 	pub record_formats: bool,
+	/// The operator reads `arriving` on a participation: a refresh of
+	/// payments arriving, as its records bear them out, runs ahead of other
+	/// refreshes and past the in-flight cap, up to twice it.
+	#[serde(default)]
+	pub arriving: bool,
 }
 
 /// The dates a board, and every coin resting on it, carries: those of a batch
@@ -546,6 +557,10 @@ pub struct AssetInfo {
 	pub in_flight_cap: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub in_flight: Option<String>,
+	/// How far past the cap refreshes of payments arriving may run, in
+	/// atoms (the operator's `arriving_lane`); absent for no lane.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub arriving_lane: Option<String>,
 }
 
 /// What the operator owes in an asset for swept coins.
@@ -594,6 +609,11 @@ pub struct ChannelsInfo {
 	pub capacity: String,
 	/// The credit window every channel leaf carries, in 512-second units.
 	pub window_units: u16,
+	/// The most the operator holds on its own side of all its channel leaves
+	/// of the asset together, in its atoms; absent for no total. A channel
+	/// past it opens only once others close.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub total: Option<String>,
 }
 
 /// What the operator serves of a supervised asset.
@@ -1898,6 +1918,14 @@ pub struct SubmitParticipation {
 	/// part of the participation's id.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub record_formats: Vec<String>,
+	/// The coins among `inputs` the wallet names as payments arriving
+	/// (received out of round, past what it counts as its own at once), by
+	/// leaf id, when the operator reads them (`info.participations.arriving`):
+	/// a refresh whose names the operator's records bear out runs ahead of
+	/// other refreshes and past the in-flight cap, up to twice it. Not part
+	/// of the participation's id.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub arriving: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

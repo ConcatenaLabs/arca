@@ -166,6 +166,19 @@ enum Cmd {
 		/// A share of the bond such as 0.1, or off.
 		share: String,
 	},
+	/// Sets the wallet's instant limit: in atoms of the reference unit at
+	/// this node's rates, the most it holds of coins received out of round
+	/// and counts as its own at once; past it a payment arrives, and counts
+	/// once its round has refreshed it. The lower of this and what the
+	/// operator suggests is taken. Coins arriving are spent in no payment,
+	/// and trade proceeds in none that leaves the Arca.
+	InstantLimit {
+		/// Atoms of the reference unit, or off.
+		value: String,
+	},
+	/// Every coin in its place (settled, proceeds, counted, arriving), the
+	/// totals of each place by asset, and the instant limit.
+	CoinPlaces,
 	/// Every message the operator key signed that the wallet's coins rest
 	/// on, as evidence lines (`{"lines": […]}`): what the wallet hands a
 	/// watcher.
@@ -1466,6 +1479,8 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Bond => w.bond(),
 		Cmd::BondEvidence => w.bond_evidence().map(|lines| json!({"lines": lines})),
 		Cmd::InstantBudget { share } => w.set_instant_budget_text(&share),
+		Cmd::InstantLimit { value } => w.set_instant_limit_text(&value),
+		Cmd::CoinPlaces => w.coin_places(),
 		Cmd::WatchBond { evidence, fee_asset } => {
 			// A file is what `bond-evidence` printed, or one line a line.
 			let mut lines = vec![];

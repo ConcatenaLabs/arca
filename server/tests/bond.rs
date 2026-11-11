@@ -50,7 +50,7 @@ async fn the_bond_is_posted_named_and_noticed() {
 	// posted from a node wallet.
 	let mut r = Running::start_on(&["-disablewallet=0"], |c, _| {
 		c.assets[0].rate = Some(toml::from_str("source = \"node\"").unwrap());
-		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None, instant_budget_fraction: None });
+		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None, instant_budget_fraction: None, instant_limit_value: None });
 	}).await;
 	let x = r.x;
 
@@ -167,7 +167,7 @@ async fn no_bond_is_posted_under_a_key_that_signed_twice() {
 	let units = min_notice_seconds(LIFETIME, RelativeTime::from_units(338).unwrap()).div_ceil(512) as u16;
 	let mut r = Running::start_on(&["-disablewallet=0"], |c, _| {
 		c.assets[0].rate = Some(toml::from_str("source = \"node\"").unwrap());
-		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None, instant_budget_fraction: None });
+		c.bond = Some(BondSection { withdraw_key: w.to_string(), notice_units: units, outpoint: None, notice: None, instant_budget_fraction: None, instant_limit_value: None });
 	}).await;
 	let x = r.x;
 	let _: Value = r.rt.client().call("createwallet", &[json!("operating")]).unwrap();

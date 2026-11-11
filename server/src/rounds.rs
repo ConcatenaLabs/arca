@@ -547,6 +547,11 @@ struct CapAsk {
 	given: HashSet<[u8; 32]>,
 	/// Whether the cap never holds it.
 	exempt: bool,
+	/// Of what it opens, what its payments arriving open, by asset: the
+	/// coins it names as arriving that the operator's records bear out
+	/// ([`Rounds::arriving_coins`]). That part may run past the cap within
+	/// the asset's lane; the rest is judged as any refresh is.
+	arriving: BTreeMap<AssetId, u64>,
 }
 
 /// What the in-flight cap makes of a participation.
@@ -574,12 +579,21 @@ struct CapJudge<'a> {
 	/// brings back with all of them: a round runs each set whole or not at
 	/// all ([`Rounds::whole_sets`]).
 	sets: Vec<Vec<usize>>,
+	/// How far past each asset's cap payments arriving may run
+	/// ([`crate::params::Params::arriving_lane`]); none when absent.
+	lanes: BTreeMap<AssetId, u64>,
 }
 
 impl<'a> CapJudge<'a> {
 	fn new(caps: &'a BTreeMap<AssetId, u64>, flight: BTreeMap<AssetId, u64>,
 		in_flight: &'a BTreeMap<[u8; 32], (AssetId, u64, Vec<Option<[u8; 32]>>)>, missing: &'a BTreeMap<[u8; 32], Lacking>) -> Self {
-		CapJudge { caps, flight, in_flight, missing, taken: HashSet::new(), back: HashSet::new(), sets: vec![] }
+		CapJudge { caps, flight, in_flight, missing, taken: HashSet::new(), back: HashSet::new(), sets: vec![], lanes: BTreeMap::new() }
+	}
+
+	/// The judge with each asset's lane for payments arriving.
+	fn with_lanes(mut self, lanes: BTreeMap<AssetId, u64>) -> Self {
+		self.lanes = lanes;
+		self
 	}
 
 	/// The nodes not brought back yet of which `ask` gives up a lacking slot.
@@ -600,6 +614,19 @@ impl<'a> CapJudge<'a> {
 	/// would take past its cap, what is in flight of it, and what running
 	/// would take that to.
 	fn over(&self, group: &[&CapAsk]) -> Option<(AssetId, u64, u64)> {
+		self.over_with(group, false)
+	}
+
+	/// Whether `ask` fits by its payments arriving: in each asset, what it
+	/// opens within the cap and the asset's lane together, and what it opens
+	/// beside its payments arriving within the cap alone.
+	fn fits_lane(&self, ask: &CapAsk) -> bool {
+		!ask.arriving.is_empty() && self.over_with(&[ask], true).is_none()
+	}
+
+	/// [`Self::over`]; with `lane`, the lane of payments arriving counted
+	/// beside the cap for what the group's payments arriving open.
+	fn over_with(&self, group: &[&CapAsk], lane: bool) -> Option<(AssetId, u64, u64)> {
 		let mut opens: BTreeMap<AssetId, u64> = BTreeMap::new();
 		let mut assets: BTreeSet<AssetId> = BTreeSet::new();
 		for a in group {
@@ -625,6 +652,13 @@ impl<'a> CapJudge<'a> {
 			let f = self.flight.get(&a).copied().unwrap_or(0);
 			let cap = self.caps[&a];
 			let net = opens.get(&a).copied().unwrap_or(0).saturating_sub(returns.get(&a).copied().unwrap_or(0));
+			if lane {
+				let arriving: u64 = group.iter().map(|g| g.arriving.get(&a).copied().unwrap_or(0)).sum();
+				let ordinary = net.saturating_sub(arriving);
+				let past_lane = f.saturating_add(net) > cap.saturating_add(self.lanes.get(&a).copied().unwrap_or(0));
+				let past_cap = ordinary > 0 && f.saturating_add(ordinary) > cap;
+				return (net > 0 && (past_lane || past_cap) && !(f == 0 && cap > 0)).then(|| (a, f, f.saturating_add(net)));
+			}
 			(net > 0 && f.saturating_add(net) > cap && !(f == 0 && cap > 0)).then(|| (a, f, f.saturating_add(net)))
 		})
 	}
@@ -665,7 +699,7 @@ impl<'a> CapJudge<'a> {
 		let mut k = 0;
 		while k < waiting.len() {
 			let i = waiting[k];
-			if self.over(&[&asks[i]]).is_none() {
+			if self.over(&[&asks[i]]).is_none() || self.fits_lane(&asks[i]) {
 				self.take(&[&asks[i]]);
 				runs[i] = true;
 				waiting.remove(k);
@@ -770,7 +804,7 @@ impl<'a> CapJudge<'a> {
 		let mut runs = vec![false; asks.len()];
 		let mut waiting = vec![];
 		for (i, ask) in asks.iter().enumerate() {
-			if ask.exempt || self.over(&[ask]).is_none() {
+			if ask.exempt || self.over(&[ask]).is_none() || self.fits_lane(ask) {
 				self.take(&[ask]);
 				runs[i] = true;
 			} else {
@@ -2265,11 +2299,18 @@ impl Rounds {
 	{
 		let mut chosen: Vec<ParticipationRow> = vec![];
 		let mut count = 0usize;
+		// A refresh of payments arriving, as the operator's records show them
+		// ([`Self::arriving_coins`]), goes first: its owner waits on this
+		// round to have the payment at all. The rest keep their order.
+		let mut rows = Vec::with_capacity(ids.len());
 		for id in ids {
-			let row = match self.store.participation(id).await? {
-				Some(r) => r,
-				None => continue,
-			};
+			if let Some(r) = self.store.participation(id).await? {
+				let first = !self.arriving_coins(&r).await?.is_empty();
+				rows.push((!first, r));
+			}
+		}
+		rows.sort_by_key(|(later, _)| *later);
+		for (_, row) in rows {
 			if row.state != ParticipationState::Pending || row.fill.is_some() || Self::asset_of(&row) != Some(asset) {
 				continue;
 			}
@@ -2689,6 +2730,14 @@ impl Rounds {
 		let mut asks = Vec::with_capacity(chosen.len());
 		for row in &chosen {
 			let mut ask = CapAsk::default();
+			// The coins it names as payments arriving that the operator's
+			// records bear out may run past the cap within the asset's lane,
+			// where any other coin waits at the cap: their owner has the
+			// payment only once a round refreshes it, and a coin out of round
+			// is what the bond and its holder want refreshed soonest. A name
+			// the records do not bear out (the wallet's own change, a round's
+			// coin) is judged as any coin is, and the rest keep their lane.
+			let arriving = self.arriving_coins(row).await?;
 			for i in row.inputs.iter().filter(|i| !i.returned) {
 				let asset = AssetId::from_byte_array(i.asset);
 				if !caps.contains_key(&asset) {
@@ -2711,6 +2760,9 @@ impl Rounds {
 				let completes = lowest_nodes(&record).is_some_and(|ns| !ns.is_empty() && ns.iter().all(|h| completable.contains(h)));
 				if !completes {
 					*ask.opens.entry(asset).or_default() += i.value;
+					if arriving.contains(&i.leaf_id) {
+						*ask.arriving.entry(asset).or_default() += i.value;
+					}
 				}
 				*ask.adds.entry(asset).or_default() += i.value;
 				ask.given.insert(i.leaf_id);
@@ -2723,7 +2775,8 @@ impl Rounds {
 			asks.push(ask);
 		}
 		laps.lap("asks");
-		let (judged, sets) = CapJudge::new(&caps, flight, &in_flight, &missing).judge_sets(&asks);
+		let lanes: BTreeMap<AssetId, u64> = caps.keys().map(|a| (*a, self.params.arriving_lane(a))).filter(|(_, l)| *l > 0).collect();
+		let (judged, sets) = CapJudge::new(&caps, flight, &in_flight, &missing).with_lanes(lanes).judge_sets(&asks);
 		laps.lap("judge");
 		laps.done();
 		let sets: Vec<Vec<[u8; 32]>> = sets.into_iter().map(|s| s.into_iter().map(|i| chosen[i].id).collect()).collect();
@@ -2768,6 +2821,33 @@ impl Rounds {
 	/// [`holding_back`] in this server's store.
 	pub async fn holding_back(&self, leaf_ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], u64)>, StoreError> {
 		holding_back(&self.store, leaf_ids, &self.active).await
+	}
+
+	/// The coins `row` names as payments arriving (`arriving`) that the
+	/// operator's own records bear out, each on its own: one of its inputs,
+	/// out of round (a reassignment's or a fill's coin), that a transfer
+	/// paid to it from another's mailbox ([`Store::paid_by_another`]). A name
+	/// they do not bear out is logged and judged as any coin; it takes
+	/// nothing from the others.
+	async fn arriving_coins(&self, row: &ParticipationRow) -> Result<HashSet<[u8; 32]>, RoundError> {
+		let mut out = HashSet::new();
+		for named in &row.arriving {
+			let Ok(id) = crate::signer::unhex32(named) else { continue };
+			if !row.inputs.iter().any(|i| i.leaf_id == id && !i.returned) {
+				continue;
+			}
+			let out_of_round = match self.store.leaf(&id).await? {
+				Some(l) => CoinRecord::from_bytes(&l.record).is_ok_and(|r| matches!(r, CoinRecord::Transfer(_) | CoinRecord::Fill(_))),
+				None => false,
+			};
+			if out_of_round && self.store.paid_by_another(&id).await? {
+				out.insert(id);
+			} else {
+				log::warn!("participation {} names {} as arriving, which the operator's records do not show paid to it by another: \
+					judged as any coin", crate::signer::hex(&row.id), named);
+			}
+		}
+		Ok(out)
 	}
 
 	/// Records why `row` waits.
@@ -4655,7 +4735,7 @@ mod tests {
 
 	fn take(n: u8, at: OutPoint, terms: &FillOrder, locked: u64, filled: u64, shared: bool) -> ParticipationRow {
 		ParticipationRow {
-			record_formats: vec![],
+			record_formats: vec![], arriving: vec![],
 			id: [n; 32], unlock_hash: [0; 32], preimage: [0; 32], attempt: 0, round_id: None, state: ParticipationState::Pending,
 			not_before: None, refund_delay_units: 1, inputs: vec![], outputs: vec![], fees: vec![], waiting: None, void_reason: None,
 			fill: Some(FillRow {

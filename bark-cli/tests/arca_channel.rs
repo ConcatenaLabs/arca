@@ -289,3 +289,66 @@ async fn a_channel_closed_by_someone_else_has_its_credit_claimed_by_sync() {
 	assert!(home > PAID - 50_000 && home <= PAID, "B's credit not folded, less the claim's and the sweep's fees, swept home: {}", home);
 	assert!(after >= before + home, "and in B's on-chain balance: {} -> {}", before, after);
 }
+
+/// The operator's total on its side of all its channel leaves of an asset
+/// (`channel_capacity_total`): a channel past it is refused, saying why,
+/// and opens once another has closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_channel_past_the_operators_total_is_refused_until_another_closes() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.assets[0].channel_capacity = Some("2000000".into());
+		c.assets[0].channel_capacity_total = Some("1500000".into());
+	}).await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("channel total A");
+	let b = Arca::new("channel total B");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1",
+		"--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for w in [&a, &b] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, r.x, 5_000_000);
+	}
+	r.produce().await;
+	for w in [&a, &b] {
+		w.ok(&["board", &x, &BOARD.to_string()]);
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit both boards", || {
+		a.ok(&["boards"])[0]["server"]["state"] == "credited" && b.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let info: serde_json::Value = serde_json::from_str(minreq::get(format!("{}/v1/info", url)).send().unwrap().as_str().unwrap()).unwrap();
+	let x_info = info["assets"].as_array().unwrap().iter().find(|e| e["asset"] == x.as_str()).unwrap().clone();
+	println!("channel total: info.assets[X].channels = {}", x_info["channels"]);
+	assert_eq!(x_info["channels"]["total"], "1500000");
+	let p = a.ok(&["channel", "open", "--capacity", &CAPACITY.to_string()]);
+	assert_eq!(p["participations"][0]["state"], "pending", "{}", p);
+	let why = b.refused(&["channel", "open", "--capacity", &CAPACITY.to_string()], "of a total of 1500000");
+	println!("channel total: B's channel past the total: {}", why);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	a.ok(&["sync"]);
+	b.refused(&["channel", "open", "--capacity", &CAPACITY.to_string()], "of a total of 1500000");
+	// A closes its channel into a plain coin in a round: B's opens.
+	let la = channel(&a)["leaf_id"].as_str().unwrap().to_string();
+	a.ok(&["participate", "--leaf", &la]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	a.ok(&["sync"]);
+	let p = b.ok(&["channel", "open", "--capacity", &CAPACITY.to_string()]);
+	println!("channel total: after A's closed, B's channel: {}", p["participations"][0]["state"]);
+	assert_eq!(p["participations"][0]["state"], "pending", "{}", p);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

@@ -72,7 +72,7 @@ async fn post_bond(r: &mut Running) -> OutPoint {
 	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
 	let op = OutPoint::new(tx.txid(), vout);
 	r.config.bond = Some(BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice_units(),
-		outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None });
+		outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None, instant_limit_value: None });
 	r.restart_server().await;
 	r.synced().await;
 	op
@@ -142,7 +142,7 @@ async fn a_refresh_is_needed_only_by_its_rules() {
 	let v = library(&n, "refresh_needed", json!({"idle_seconds": 10_000})).unwrap();
 	println!("RN nothing received: {}", v);
 	assert_eq!(v["needed"], false, "{}", v);
-	assert_eq!(v["rules"], json!(["depth", "exposure", "expiry", "idle"]));
+	assert_eq!(v["rules"], json!(["arriving", "depth", "exposure", "expiry", "idle"]));
 
 	// 1. A small coin of Y: nothing needed while the person is active; idle after two minutes.
 	let b = Arca::new("RN B");

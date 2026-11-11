@@ -175,6 +175,9 @@ pub struct NewParticipation {
 	/// The leaf record formats its wallet names as ones it reads
 	/// ([`arca_covenant::RECORD_FORMATS`]); none for one that names none.
 	pub record_formats: Vec<String>,
+	/// The coins of its inputs its wallet names as payments arriving, by
+	/// leaf id in hex ([`crate::participations::ParticipationRequest::arriving`]).
+	pub arriving: Vec<String>,
 }
 
 /// The on-chain order a take takes, as its id covers it.
@@ -308,6 +311,9 @@ pub struct ParticipationRow {
 	/// The leaf record formats its wallet named as ones it reads
 	/// ([`arca_covenant::reads_format`]).
 	pub record_formats: Vec<String>,
+	/// The coins of its inputs its wallet names as payments arriving, by
+	/// leaf id in hex.
+	pub arriving: Vec<String>,
 }
 
 fn u64_of(v: i64, what: &str) -> Result<u64, StoreError> {
@@ -353,7 +359,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 {
 	let r = c.query_opt(
 		"SELECT participation_id, unlock_hash, preimage, attempt, round_id, state::text, void_reason, not_before,
-		        refund_delay_units, waiting, record_formats
+		        refund_delay_units, waiting, record_formats, arriving
 		 FROM participation WHERE participation_id = $1",
 		&[&&id[..]],
 	).await?;
@@ -380,6 +386,7 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 		void_reason: r.get(6),
 		fill: None,
 		record_formats: r.get(10),
+		arriving: r.get(11),
 	};
 	for r in c.query(
 		"SELECT leaf_id, asset, value, margin, attestation, active FROM participation_input WHERE participation_id = $1 ORDER BY idx",
@@ -1419,10 +1426,10 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 	-> Result<(), StoreError>
 {
 	let r = t.execute(
-		"INSERT INTO participation (participation_id, unlock_hash, preimage, not_before, refund_delay_units, record_formats)
-		 VALUES ($1, $2, $3, $4, $5, $6)",
+		"INSERT INTO participation (participation_id, unlock_hash, preimage, not_before, refund_delay_units, record_formats, arriving)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)",
 		&[&&p.id[..], &&p.unlock_hash[..], &&p.preimage[..], &p.not_before.map(|t| t as i64), &(p.refund_delay_units as i32),
-			&p.record_formats],
+			&p.record_formats, &p.arriving],
 	).await;
 	if let Err(e) = r {
 		if StoreError::is_unique(&e, "participation_pkey") {

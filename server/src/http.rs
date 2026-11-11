@@ -726,6 +726,7 @@ async fn bond_info(app: &Arc<App>) -> Option<api::BondInfo> {
 		reference_value: reference.map(|v| v.to_string()),
 		instant_budget_ppm: bond.instant_budget_ppm,
 		instant_budget: reference.zip(bond.instant_budget_ppm).map(|(v, ppm)| (v as u128 * ppm as u128 / 1_000_000).to_string()),
+		instant_limit_value: bond.instant_limit_value.map(|v| v.to_string()),
 		operator: hex(&p.operator.serialize()),
 		withdraw_key: hex(&p.withdraw.serialize()),
 		notice_units: p.notice.units(),
@@ -843,7 +844,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			}),
 			supervised: ap.supervised.map(|s| api::SupervisedInfo { landing_allowance: s.landing_allowance.to_string() }),
 			channels: p.channel_capacity(a).ok().filter(|c| *c > 0).map(|c| api::ChannelsInfo {
-				capacity: c.to_string(), window_units: p.channel_window.units(),
+				capacity: c.to_string(), window_units: p.channel_window.units(), total: p.channel_capacity_total(a).map(|t| t.to_string()),
 			}),
 			restricted: ap.restricted.as_ref().map(|r| api::RestrictedInfo {
 				policy: hex(&r.policy.serialize()), clawback: r.clawback.map(|k| hex(&k.serialize())), policy_server: r.server.clone(),
@@ -855,6 +856,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			in_flight_cap: p.in_flight_cap(a).map(|c| c.to_string()),
 			in_flight: p.in_flight_cap(a).and(in_flight.as_ref())
 				.map(|f| f.get(&a.into_inner().to_byte_array()).copied().unwrap_or(0).to_string()),
+			arriving_lane: Some(p.arriving_lane(a)).filter(|l| *l > 0).map(|l| l.to_string()),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,
@@ -890,6 +892,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			withdraw: true,
 			forfeits_before_broadcast: true,
 			record_formats: true,
+			arriving: true,
 		},
 		boards: api::BoardsInfo {
 			lifetime_seconds: Params::BOARD_LIFETIME,
@@ -1333,8 +1336,19 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 	if req.record_formats.len() > MAX_RECORD_FORMATS || req.record_formats.iter().any(|f| f.is_empty() || f.len() > 32) {
 		return Err(Refusal::malformed(format!("record_formats: at most {} names, each of 1 to 32 bytes", MAX_RECORD_FORMATS)));
 	}
+	// The coins named as arriving are among the inputs, each named once.
+	let mut arriving: Vec<String> = vec![];
+	for a in &req.arriving {
+		let a = a.to_ascii_lowercase();
+		if !req.inputs.iter().any(|i| i.leaf_id.eq_ignore_ascii_case(&a)) {
+			return Err(Refusal::malformed(format!("arriving: {} is not one of the participation's inputs", a)));
+		}
+		if !arriving.contains(&a) {
+			arriving.push(a);
+		}
+	}
 	let status = app.participations.submit(&ParticipationRequest { inputs, outputs, key_proofs, fees, not_before,
-		forfeits_before_broadcast: req.forfeits_before_broadcast, record_formats: req.record_formats.clone() }).await?;
+		forfeits_before_broadcast: req.forfeits_before_broadcast, record_formats: req.record_formats.clone(), arriving }).await?;
 	for (owner, (mailbox, proof)) in bindings {
 		app.store.bind_mailbox(&owner.serialize(), &mailbox.serialize(), proof.as_ref()).await?;
 	}

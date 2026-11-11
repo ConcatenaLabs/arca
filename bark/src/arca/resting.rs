@@ -229,7 +229,7 @@ impl Wallet {
 		// refresh that waits is taken back first when the live coins fall
 		// short.
 		self.free_when_short(a, ask.amount)?;
-		let coins = self.coins_to_give(a)?;
+		let coins = self.coins_to_give(a, super::places::Spend::Trade)?;
 		// The schedule charges nothing when it has neither a rate nor a base:
 		// then no coin needs reading for its date.
 		let free = schedule["refresh_ppm"].as_u64().unwrap_or(0) == 0
@@ -588,6 +588,9 @@ impl Wallet {
 		self.witnessed_now()?;
 		let info = self.server_info()?;
 		let o = self.served_order(order)?;
+		// Refused here as the fill would refuse it, so a program leaves the
+		// order out of what it offers rather than show a fill that cannot go.
+		self.resting_exit(&info, &o)?;
 		let leaf = |w: &Wallet| -> Result<NewLeaf, Error> {
 			let n = random32();
 			Ok(NewLeaf { enclave: None, v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
@@ -595,6 +598,21 @@ impl Wallet {
 		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
 		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;
 		self.quoted(Ok(f.quote(order, &o)))
+	}
+
+	/// Whether a fill of the order served as `o` moves the taker's coins
+	/// into checkpoints with their owners' exit: when the operator co-signs
+	/// them and the order's maker reads the record format they make. Refused
+	/// when it cannot and the wallet requires the exit
+	/// ([`Wallet::require_checkpoint_exit`]).
+	fn resting_exit(&self, info: &Value, o: &Value) -> Result<bool, Error> {
+		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
+		let checkpoint_exit = Self::checkpoint_exit_offered(info) && maker_reads;
+		if !checkpoint_exit {
+			self.exit_required(if maker_reads { "the operator does not offer it (info.checkpoint_exit)" } else {
+				"the order's maker reads no coin record of the format it makes (an older build)" })?;
+		}
+		Ok(checkpoint_exit)
 	}
 
 	/// The order `order` as the operator serves it now, resting.
@@ -655,7 +673,7 @@ impl Wallet {
 		// maker reads no coin record of the newer format.
 		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
 		let mut unread = 0u64;
-		for mut c in self.coins_to_give(asset_b)? {
+		for mut c in self.coins_to_give(asset_b, super::places::Spend::Trade)? {
 			if c.row.expiry < order_expiry {
 				continue;
 			}
@@ -733,12 +751,7 @@ impl Wallet {
 		// the operator co-signs them: a fill the maker and the operator never
 		// complete then gives them back (`arca_covenant::checkpoint`). The
 		// maker's order coin is spent only if the fill confirms.
-		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
-		let checkpoint_exit = Self::checkpoint_exit_offered(&info) && maker_reads;
-		if !checkpoint_exit {
-			self.exit_required(if maker_reads { "the operator does not offer it (info.checkpoint_exit)" } else {
-				"the order's maker reads no coin record of the format it makes (an older build)" })?;
-		}
+		let checkpoint_exit = self.resting_exit(&info, &o)?;
 		let tplan = TransferPlan { checkpoint_exit, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
 		// The fill spends the order's coin at input 0 and the checkpoints
 		// after it: a vtxo-2 checkpoint's pair names them all, its own index

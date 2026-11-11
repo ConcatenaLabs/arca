@@ -780,6 +780,16 @@ pub struct AssetSection {
 	pub channel_capacity: Option<String>,
 	#[serde(default)]
 	pub channel_capacity_value: Option<String>,
+	/// The most the operator holds on its own side of all its `channel-1`
+	/// leaves of the asset together, open or being opened, in its atoms, or
+	/// (`_value`) as a value in atoms of the reference unit, converted at
+	/// the asset's rate; decimal strings. A participation that would open a
+	/// channel past it is refused until channels close. No total when
+	/// absent.
+	#[serde(default)]
+	pub channel_capacity_total: Option<String>,
+	#[serde(default)]
+	pub channel_capacity_total_value: Option<String>,
 	/// The most of the asset the operator fronts for refreshes whose old
 	/// coins have not come back yet, in its atoms, or (`_value`) as a value in
 	/// atoms of the reference unit, converted at the asset's rate; decimal
@@ -789,6 +799,16 @@ pub struct AssetSection {
 	pub in_flight_cap: Option<String>,
 	#[serde(default)]
 	pub in_flight_cap_value: Option<String>,
+	/// How far past the in-flight cap the operator lets refreshes of
+	/// payments arriving run, in the asset's atoms, or (`_value`) as a value
+	/// in atoms of the reference unit, converted at the asset's rate; decimal
+	/// strings. Capital the operator chooses to risk: anyone with two wallets
+	/// can pay one from the other and use it. No lane when absent: a refresh
+	/// of payments arriving still goes first, within the cap.
+	#[serde(default)]
+	pub arriving_lane: Option<String>,
+	#[serde(default)]
+	pub arriving_lane_value: Option<String>,
 	/// The restricted profile ([`crate::restricted`]): the asset is a
 	/// restricted asset its issuer serves in this tree, and its policy server
 	/// co-signs beside the operator.
@@ -828,7 +848,8 @@ impl AssetSection {
 			asset: asset.to_string(), refresh_ppm: None, offboard_ppm: None, refresh_base: None, refresh_base_value: None,
 			offboard_base: None, offboard_base_value: None, min_leaf: Some(min_leaf.to_string()), min_leaf_value: None, rate: None,
 			lightning: None, lightning_ppm: None, lightning_base: None, lightning_base_value: None, issuer: None, supervised: None,
-			channel_capacity: None, channel_capacity_value: None, in_flight_cap: None, in_flight_cap_value: None, restricted: None,
+			channel_capacity: None, channel_capacity_value: None, channel_capacity_total: None, channel_capacity_total_value: None,
+			in_flight_cap: None, in_flight_cap_value: None, arriving_lane: None, arriving_lane_value: None, restricted: None,
 		}
 	}
 }
@@ -1607,12 +1628,20 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 			},
 		};
 		let channel_capacity = amount("channel_capacity", &a.channel_capacity, &a.channel_capacity_value)?;
+		let channel_total = match (&a.channel_capacity_total, &a.channel_capacity_total_value) {
+			(None, None) => None,
+			_ => Some(amount("channel_capacity_total", &a.channel_capacity_total, &a.channel_capacity_total_value)?),
+		};
+		let arriving_lane = match (&a.arriving_lane, &a.arriving_lane_value) {
+			(None, None) => None,
+			_ => Some(amount("arriving_lane", &a.arriving_lane, &a.arriving_lane_value)?),
+		};
 		let in_flight_cap = match (&a.in_flight_cap, &a.in_flight_cap_value) {
 			(None, None) => None,
 			_ => Some(amount("in_flight_cap", &a.in_flight_cap, &a.in_flight_cap_value)?),
 		};
-		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity, restricted: None,
-			in_flight_cap }));
+		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity, channel_total,
+			restricted: None, in_flight_cap, arriving_lane }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
