@@ -638,7 +638,21 @@ impl Wallet {
 		// A leaf the lost wallet took home: its own output on the chain, found
 		// and followed as an exit would (its claim, a forfeit or a checkpoint
 		// that took it, or the exit to go on), never held live.
+		// The batch outputs and boards every coin rests on are read together,
+		// in one request, and judged at once: a coin whose every one stands
+		// has nothing of its lineage on the chain ([`Chain::descendants_from`]
+		// answers the same), and only the others are looked at one by one.
+		let mut roots: BTreeSet<elements::OutPoint> = BTreeSet::new();
 		for (id, t) in &taken {
+			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				roots.extend(t.coin.roots());
+			}
+		}
+		let standing = self.chain.unspent_of(&roots.into_iter().collect::<Vec<_>>())?;
+		for (id, t) in &taken {
+			if t.coin.roots().iter().all(|r| standing.contains(r)) {
+				continue;
+			}
 			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
 				if let Some(n) = self.restore_on_chain(id, &t.coin)? {
 					notes.push(n);
@@ -831,7 +845,7 @@ impl Wallet {
 			let id = e["leaf_id"].as_str().unwrap_or("");
 			let by: BTreeSet<String> = record(e).and_then(|r| named.get(&owner_of(&r).1).cloned()).unwrap_or_default()
 				.into_iter().filter(|b| b != id).collect();
-			if Self::given_for_good(e) || !by.is_empty() {
+			if !record(e).as_ref().is_some_and(Self::received_htlc) && (Self::given_for_good(e) || !by.is_empty()) {
 				namers.insert(id.to_string(), by);
 				later.push(e.clone());
 			} else {
@@ -881,6 +895,20 @@ impl Wallet {
 		Ok((now, ordered))
 	}
 
+	/// Whether `record` is a leaf received over Lightning (`htlc-1`, received):
+	/// its claim decides where it stands, which only the restore's checks of
+	/// it at once can judge (D68), whatever the server serves of it.
+	fn received_htlc(record: &CoinRecord) -> bool {
+		let htlc = match record {
+			CoinRecord::Leaf { record, .. } => record.leaf().htlc,
+			CoinRecord::Accumulator { record, .. } => record.leaf().htlc,
+			CoinRecord::Board(b) => b.leaf().htlc,
+			CoinRecord::Transfer(t) => t.leaf.htlc,
+			CoinRecord::Fill(_) => None,
+		};
+		htlc.is_some_and(|h| h.direction == arca_covenant::HtlcDirection::Receive)
+	}
+
 	/// Keeps `history` as the coins left to [`Self::restore_history`],
 	/// those the store does not hold, in place of any list kept before.
 	fn keep_history(&self, history: &[Value]) -> Result<(), Error> {
@@ -928,17 +956,38 @@ impl Wallet {
 			return Ok(None);
 		}
 		let info = self.server_info()?;
-		let step: Vec<Value> = all.iter().take(HISTORY_STEP).cloned().collect();
 		// A step cut short (the program closed, the link lost) may have taken
-		// a coin and not yet applied how it was given up: such a coin is
-		// settled first, as a coin held by another way is, so a step resumed
-		// never leaves it counted.
-		let (unheld, mut notes) = self.settle_held_history(&step)?;
+		// a coin and not yet applied how it was given up, and a participation
+		// completed or a catch-up may have taken one of the list since: each
+		// such coin is settled first, by its own served record, as a restore
+		// that took everything at once settles it, so none is left counted.
+		let (unheld, mut notes) = self.settle_held_history(&all)?;
+		// The next coins of the list, those whose bases are in a block of the
+		// active chain: a coin resting on a transaction an anchor-driven
+		// reorganisation took out of the chain waits in the list until it is
+		// mined again (or can never return), as it would have been taken
+		// while it was in a block. Bitcoin anchoring decides, not the order.
+		let ahead: Vec<Txid> = unheld.iter().take(2 * HISTORY_STEP).flat_map(Self::served_bases)
+			.filter_map(|t| Txid::from_str(&t).ok()).collect();
+		self.chain.read_ahead_of(&ahead, &[]);
+		let (mut step, mut waiting) = (vec![], 0usize);
+		let mut later: Vec<Value> = vec![];
+		for e in unheld {
+			if step.len() >= HISTORY_STEP {
+				later.push(e);
+				continue;
+			}
+			if self.base_out_of_chain(&e)? {
+				waiting += 1;
+				later.push(e);
+			} else {
+				step.push(e);
+			}
+		}
 		let TakenServed { mut restored, not_recovered, notes: taken_notes, given_elsewhere: _ } =
-			self.take_served(&info, &unheld, &[], false, None)?;
+			self.take_served(&info, &step, &[], false, None)?;
 		notes.extend(taken_notes);
-		notes.extend(self.held_records_spend()?);
-		let (rest, settled) = self.settle_held_history(&all[step.len().min(all.len())..])?;
+		let (rest, settled) = self.settle_held_history(&later)?;
 		notes.extend(settled);
 		notes.extend(self.held_records_spend()?);
 		self.lower_birthday(&[])?;
@@ -949,8 +998,32 @@ impl Wallet {
 			}
 		}
 		let left = self.history_left()?;
-		Ok(Some(json!({"checked": step.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes,
-			"left": left, "loading": left > 0})))
+		let mut out = json!({"checked": step.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes,
+			"left": left, "loading": left > 0});
+		if waiting > 0 {
+			out["waiting_for_the_chain"] = json!(waiting);
+		}
+		Ok(Some(out))
+	}
+
+	/// Whether a transaction coin `e` rests on, as the server names them, is
+	/// in no block of the active chain and can still return to it (taken out
+	/// by a reorganisation, back in the mempool or not): the coin waits. One
+	/// the node does not know, or that can never return, does not wait: the
+	/// coin's own check says what becomes of it.
+	fn base_out_of_chain(&self, e: &Value) -> Result<bool, Error> {
+		for t in Self::served_bases(e) {
+			let Ok(txid) = Txid::from_str(&t) else { continue };
+			if self.chain.tx_block(&txid)?.is_some() {
+				continue;
+			}
+			if let Some(tx) = self.chain.transaction(&txid)? {
+				if !self.chain.gone(&tx)? {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
 	}
 
 	/// The coins that held coins' records spend in a transfer, among those

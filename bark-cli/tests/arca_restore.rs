@@ -1162,22 +1162,25 @@ fn birthday(w: &Arca) -> u64 {
 	db.query_row("SELECT value FROM meta WHERE key = 'birthday'", [], |r| r.get::<_, String>(0)).unwrap().parse().unwrap()
 }
 
-/// A wallet with a long history (#721): A pays B twenty-five times out of
+/// A wallet with a long history (#721): A pays B forty-five times out of
 /// round, each payment from the change of the one before, and refreshes its
 /// change in a round after every four (a coin goes at most five
-/// reassignments from a round), so over thirty of the coins the server
+/// reassignments from a round), so over fifty of the coins the server
 /// serves to its mailbox key are spent: in transfers, and in participations
 /// the operator released. A2, restored from A's mnemonic alone, checks first
-/// the one coin that makes A's balance: its balance is A's when the restore
-/// returns, it holds no spent coin yet, its history holds every one of
-/// them (`history.left`), counted nowhere, and its birthday is the block of
+/// the one coin that makes A's balance, with the coin it was made from: its
+/// balance is A's when the restore returns, while the balance says the
+/// history is loading; its history holds every other spent coin
+/// (`history.left`), counted nowhere, and its birthday is the block of
 /// the board everything rests on, as a restore that checked everything at
 /// once sets it. A step checks twenty of them, each spent on its owner's own
-/// signatures. A restore run again meanwhile, as after one cut short, takes
+/// signatures; the same step cut short after taking its coins resumes the list
+/// and settles them first. A restore run again meanwhile takes
 /// nothing twice and leaves the rest. A pays once more, from the coin both
 /// stores hold: A2's next sync catches up (it gives that coin up and takes
 /// A's change, leaving the listed coins to their steps) and runs the next
-/// step. Once none is left, A2's coins are A's, field by field.
+/// step. Once none is left, A2's coins are A's, field by field, and those
+/// of A3, restored with every coin checked before its restore returned.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_history_is_restored_after_the_balance() {
 	let mut r = Running::start_kept(1, None).await;
@@ -1189,7 +1192,7 @@ async fn a_long_history_is_restored_after_the_balance() {
 	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
 	let board_tx = a.ok(&["boards"])[0]["server"]["txid"].as_str().unwrap().to_string();
 	let mut spent: Vec<String> = vec![];
-	for k in 0..25 {
+	for k in 0..45 {
 		if k > 0 && k % 4 == 0 {
 			let coin: Vec<String> = live(&a).into_keys().collect();
 			a.ok(&["participate", "--leaf", &coin[0], "--max-fee-ppm", "1000000"]);
@@ -1218,17 +1221,21 @@ async fn a_long_history_is_restored_after_the_balance() {
 		restore["cost_by_step"]);
 	assert!(restore["error"].is_null(), "{}", restore);
 	assert_eq!(restore["not_recovered"], json!([]), "{}", restore);
-	assert_eq!(restore["history"]["left"], history, "{}", restore["history"]);
+	// The coin the live change was made from is judged with it, at once
+	// (a coin is judged beside the coins it was made from): held, spent.
+	let parent = spent.last().unwrap().clone();
+	assert_eq!(restore["history"]["left"], history - 1, "{}", restore["history"]);
 	assert_eq!(tree_balance(&a2), tree_balance(&a), "A2's balance is A's when the restore returns");
 	assert_eq!(live(&a2), live(&a), "the coin A holds");
-	for id in &spent {
+	assert_eq!(coin_of(&a2, &parent)["state"], "spent", "the coin the change was made from, taken with it");
+	for id in spent.iter().filter(|id| **id != parent) {
 		assert_eq!(coin_of(&a2, id), Value::Null, "spent coin {} is not held before its step", id);
 	}
 	assert_eq!(birthday(&a2), block_height(&r, &board_tx), "the birthday is the board's block");
 	// While the history fills, the balance says so: an activity view reads
 	// it as still loading, never as complete.
 	let bal = a2.ok(&["balance"]);
-	assert_eq!(bal["history"], json!({"loading": true, "left": history}), "{}", bal);
+	assert_eq!(bal["history"], json!({"loading": true, "left": history - 1}), "{}", bal);
 	assert!(a.ok(&["balance"])["history"].is_null(), "A's history is whole");
 	assert_eq!(restore["deposits"]["owed"], true, "{}", restore);
 	let list_before = history_list(&a2);
@@ -1239,7 +1246,7 @@ async fn a_long_history_is_restored_after_the_balance() {
 	// further on: that coin is settled with the step, by its own entry.
 	let left = step["left"].as_u64().unwrap();
 	assert_eq!(step["checked"], 20, "{}", step);
-	assert!(left > 0 && left <= history as u64 - 20, "{}", step);
+	assert!(left > 0 && left <= history as u64 - 21, "{}", step);
 	assert_eq!(step["not_recovered"], json!([]), "{}", step);
 	let checked: Vec<Value> = spent.iter().map(|id| coin_of(&a2, id)).filter(|c| !c.is_null()).collect();
 	assert_eq!(checked.len() as u64, history as u64 - left, "every coin off the list is held");
@@ -1249,9 +1256,10 @@ async fn a_long_history_is_restored_after_the_balance() {
 	// The same step cut short (the program closed mid-step): the coins it
 	// took are held as it took them, before how each was given up was
 	// applied, and the list is as before the step. The step run again
-	// resumes the list where it stopped: it settles those coins first, and
-	// nothing it took is left counted.
-	let cut: Vec<String> = checked.iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	// resumes the list where it stopped: it settles those coins first, by
+	// their own records, then goes on with the coins after them; nothing it
+	// took is left counted.
+	let cut: Vec<String> = checked.iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).filter(|id| *id != parent).collect();
 	{
 		let db = rusqlite::Connection::open(a2.dir.join("arca.sqlite")).unwrap();
 		for id in &cut {
@@ -1265,12 +1273,16 @@ async fn a_long_history_is_restored_after_the_balance() {
 	let resumed = a2.ok(&["restore-history"]);
 	println!("LH A2's step resumed after one cut short: checked {} | left {} | restored {}", resumed["checked"], resumed["left"],
 		resumed["restored"]);
-	assert_eq!(resumed["left"], left, "the list resumes where the step stopped: {}", resumed);
-	assert_eq!(resumed["restored"], json!([]), "nothing taken twice: {}", resumed);
+	let taken_again: Vec<&str> = resumed["restored"].as_array().unwrap().iter().filter_map(|c| c["leaf_id"].as_str())
+		.filter(|id| cut.iter().any(|c| c == id)).collect();
+	assert!(taken_again.is_empty(), "nothing taken twice: {:?}", taken_again);
+	assert_eq!(resumed["checked"].as_u64().unwrap(), left.min(20), "it goes on with the coins after them: {}", resumed);
 	for id in &cut {
 		assert_eq!(coin_of(&a2, id)["state"], "spent", "coin {} settled again", id);
 	}
 	assert_eq!(tree_balance(&a2), tree_balance(&a), "resumed, nothing it took is counted");
+	let left = resumed["left"].as_u64().unwrap();
+	assert!(left > 0, "{}", resumed);
 
 	// A restore run again, as after one cut short: nothing twice.
 	let again = a2.ok(&["restore"]);
@@ -1331,10 +1343,11 @@ async fn a_long_history_is_restored_after_the_balance() {
 }
 
 /// Bitcoin anchoring is supreme, also while a restore's history waits: A
-/// holds a board B1 and pays B out of round from a board B2 whose block is
-/// anchored to Bitcoin parent block p, so B2 is spent and its change, resting
-/// on it, is live. A2, restored from A's mnemonic, holds B1 and the change
-/// when its restore returns, B2 left to its history. Then p is orphaned: B2's block leaves the chain with
+/// holds a board B1 and pays B out of round twice from a board B2 whose block
+/// is anchored to Bitcoin parent block p, so B2 and its first change are
+/// spent and the second change, resting on B2, is live. A2, restored from
+/// A's mnemonic, holds B1, the first change (spent) and the second when its
+/// restore returns, B2 left to its history. Then p is orphaned: B2's block leaves the chain with
 /// it, and the change resting on it is no longer live, in A and in A2 alike,
 /// their balances equal. A2's history step meets coins whose board is in no
 /// block: it takes nothing on them. B2 is mined again and buried: the change
@@ -1347,7 +1360,7 @@ async fn an_anchor_reorganisation_while_a_restores_history_waits() {
 	let x = r.x;
 	let xs = x.to_string();
 	let (a, a2, b) = (Arca::new("ARA"), Arca::new("ARA2"), Arca::new("ARB"));
-	let b1 = boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await[0].clone();
+	boarded(&mut r, &a, &url, &[(x, 2_000_000)]).await;
 	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
 	let s = script(&a.ok(&["address"]));
 	r.pay_to(s, x, 4_000_000);
@@ -1367,14 +1380,20 @@ async fn an_anchor_reorganisation_while_a_restores_history_waits() {
 	a.ok(&["sync"]);
 	let b2_tx = a.ok(&["boards"]).as_array().unwrap().iter().find(|v| v["leaf_id"] == b2.as_str()).unwrap()["server"]["txid"]
 		.as_str().unwrap().to_string();
-	// A payment from B2 (B1 cannot make it): B2 spent, its change live on it.
+	// Two payments from B2's lineage (a wallet pays from the coin furthest
+	// from its exit date first: B2, then its change): B2 and the first
+	// change spent, the second change live on B2.
 	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
-	let sent = a.ok(&["send", &req_b, "--amount", "2600000", "--asset", &xs]);
-	let spent = vec![sent["inputs"][0].as_str().unwrap().to_string()];
+	let sent = a.ok(&["send", &req_b, "--amount", "1000000", "--asset", &xs]);
+	assert_eq!(sent["inputs"], json!([b2]), "{}", sent);
+	let change1 = sent["transfer"]["kept"][0]["leaf_id"].as_str().unwrap().to_string();
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req_b, "--amount", "1000000", "--asset", &xs]);
+	assert_eq!(sent["inputs"], json!([change1]), "{}", sent);
+	let spent = vec![b2.clone(), change1.clone()];
 	let change = sent["transfer"]["kept"][0]["leaf_id"].as_str().unwrap().to_string();
 	b.ok(&["sync"]);
 	a.ok(&["sync"]);
-	assert_eq!(spent[0], b2, "{:?}", spent);
 
 	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
 	let mut args = create_args(&url, &node);
@@ -1383,7 +1402,11 @@ async fn an_anchor_reorganisation_while_a_restores_history_waits() {
 	let restore = &made["restore"];
 	println!("AR A2's restore: restored {} | history {}", restore["restored"], restore["history"]);
 	assert!(restore["error"].is_null(), "{}", restore);
-	assert_eq!(restore["history"]["left"], spent.len(), "{}", restore["history"]);
+	// B2 waits in the history; the first change, which the live change was
+	// made from, is judged with it at once.
+	assert_eq!(restore["history"]["left"], 1, "{}", restore["history"]);
+	assert_eq!(coin_of(&a2, &b2), Value::Null, "B2 is left to the history");
+	assert_eq!(coin_of(&a2, &change1)["state"], "spent");
 	assert_eq!(tree_balance(&a2), tree_balance(&a), "the balance when the restore returns");
 	assert_eq!(coin_of(&a2, &change)["state"], "live");
 
@@ -1407,6 +1430,10 @@ async fn an_anchor_reorganisation_while_a_restores_history_waits() {
 	for id in &spent {
 		assert_ne!(coin_of(&a2, id)["state"], "live", "a coin of the history is never live: {}", id);
 	}
+	assert_eq!(sa2["history"]["checked"], 0, "the step takes nothing on a board in no block: {}", sa2["history"]);
+	assert_eq!(sa2["history"]["waiting_for_the_chain"], 1, "{}", sa2["history"]);
+	assert_eq!(sa2["history"]["left"], 1, "B2 waits in the list: {}", sa2["history"]);
+	assert_eq!(coin_of(&a2, &b2), Value::Null, "B2 not taken while its board is out of the chain");
 
 	// B2 mined again and buried: the change is live again in both.
 	let _: Value = c.call("prioritisetransaction", &[json!(b2_tx), json!(0), json!(1_000_000_000i64)]).unwrap();
