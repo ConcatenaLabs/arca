@@ -221,7 +221,21 @@ impl Ctx {
 			chain: self.chain,
 			sweep: (name == "checkpoint_exit_sweep").then(|| self.sweep_of(p, false)),
 			v2: false,
-			exit: Some(rel(&p["exit_delay"])),
+			exit: Some(CheckpointExit::plain(rel(&p["exit_delay"]))),
+		};
+		assert_eq!(cp.leaf_constant(), h32(&p["K"]));
+		cp
+	}
+
+	/// A `landing-1` coin's checkpoint with its owner's exit, the landing.
+	fn checkpoint_landing(&self) -> CheckpointPolicy {
+		let p = &self.output("checkpoint_landing")["params"];
+		let mut program = [0u8; 20];
+		program.copy_from_slice(&hex(&p["landing_program"]));
+		let landing = LandingTerms { program, asset: asset(&p["asset"]), min_value: p["min_value"].as_u64().unwrap() };
+		let cp = CheckpointPolicy {
+			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, sweep: None, v2: false,
+			exit: Some(CheckpointExit { delay: rel(&p["exit_delay"]), landing: Some(landing) }),
 		};
 		assert_eq!(cp.leaf_constant(), h32(&p["K"]));
 		cp
@@ -347,6 +361,10 @@ impl Ctx {
 				}
 				(c.taproot(), m)
 			},
+			"checkpoint_landing" => {
+				let c = self.checkpoint_landing();
+				(c.taproot(), BTreeMap::from([("collab", c.collab_script()), ("exit", c.exit_script().unwrap())]))
+			},
 			"htlc" | "htlc_receive" => {
 				let h = self.htlc(name);
 				(h.taproot(), BTreeMap::from([
@@ -373,7 +391,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 22);
+	assert_eq!(outputs.len(), 23);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();
@@ -413,7 +431,7 @@ fn every_spend_matches_its_vector_and_verifies() {
 	let ctx = Ctx::load();
 	let verifier = Verifier::consensus(ctx.genesis);
 	let spends = ctx.v["spends"].as_array().unwrap();
-	assert_eq!(spends.len(), 40);
+	assert_eq!(spends.len(), 41);
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let output = s["output"].as_str().unwrap();
@@ -462,8 +480,8 @@ fn every_spend_matches_its_vector_and_verifies() {
 			},
 			("entry", "sweep") => ctx.entry("entry", false).sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32).unwrap(),
 			("checkpoint", "sweep") => ctx.checkpoint().sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32).unwrap(),
-			(n @ ("checkpoint_exit" | "checkpoint_exit_sweep"), "exit") => {
-				let c = ctx.checkpoint_exit(n);
+			(n @ ("checkpoint_exit" | "checkpoint_exit_sweep" | "checkpoint_landing"), "exit") => {
+				let c = if n == "checkpoint_landing" { ctx.checkpoint_landing() } else { ctx.checkpoint_exit(n) };
 				let ks = c.exit_tx(tx.input[0].previous_output, asset_in, value_in, &committed(1), &FeeSource::Reserve).unwrap();
 				assert_eq!(ks.tx.txid(), tx.txid(), "{}: the policy's exit transaction", name);
 				c.exit_witness(&checksig(ctx.label_of(&c.owner))).unwrap()

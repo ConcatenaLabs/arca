@@ -954,7 +954,7 @@ impl Cosigner {
 		let mut sized = Vec::with_capacity(checked.len());
 		for (k, (i, c)) in req.inputs.iter().zip(checked).enumerate() {
 			let vi = ValidInput {
-				coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed()),
+				coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed(), c.coin.value),
 				checkpoint_value: c.coin.value,
 				checkpoint_pair: pair, reassignment_pair: pair,
 			};

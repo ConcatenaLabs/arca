@@ -770,7 +770,8 @@ reaches it. If one input's owner and the operator spend that owner's checkpoint
 elsewhere, it can never confirm, and every other owner's coin stands in a
 checkpoint only that owner and the operator can spend together. With
 `TransferPlan::checkpoint_exit` set, each coin of a plain leaf (`vtxo-1` or
-`vtxo-2`) moves instead into a checkpoint that also has the coin's own exit,
+`vtxo-2`) or of a supervised asset (`landing-1`) moves instead into a
+checkpoint that also has the coin's own exit,
 `<delay> CSV DROP <A> CHECKSIG` after the coin's exit delay: `[collab, exit]`,
 `[collab, [sweep, exit]]` with a sweep, and for a `vtxo-2` coin `[[arca/collab-2,
 data], exit]` or `[[arca/collab-2, data], [sweep, exit]]`
@@ -783,8 +784,16 @@ answered, by publishing the other checkpoints and the reassignment. Once the
 reassignment confirms the checkpoint is spent and the exit is gone, so an owner
 can pull out of a good reassignment only against every other party and their
 watchtowers staying away for the whole delay, the same option every sender has
-against an absent receiver. A coin of a supervised or a restricted asset keeps
-the checkpoint without the exit, which would bypass its landing or its enclave.
+against an absent receiver. A coin of a supervised asset exits by its landing, exactly as from
+its leaf: the output at the spending input's own index pays P2WPKH of its
+holder's landing key, in the asset, explicitly, at least the checkpoint's
+value less the coin's allowance (`CheckpointExit::landing`,
+`LandingTerms::script_at_own_index`: the leaf's landing with
+`OP_PUSHCURRENTINPUTINDEX` where it pushes 0, the same 119 bytes), so a
+freeze or pause of the asset binds on the landed coin as on one landed from
+its leaf, and two landings spent together each need an output of their own. A coin of a restricted asset is
+never in a reassignment of several owners: a transfer of one moves that
+asset alone, from one holder.
 The checkpoint pair names the checkpoint's output, so it is made for one form
 or the other; the reassignment pair of a `vtxo-1` checkpoint names the salt and
 never the script. Measured on the node: a dead swap's checkpoint exit is 219 vB
@@ -1281,6 +1290,18 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   second fill the operator signs alone; every negative case refused by the
   mempool and in a block, for its reason. The record's exit flag: flipped under
   the same pairs, refused; version 2 with no exit anywhere, refused.
+- `tests/checkpoint_landing.rs`: the same for a coin of a supervised asset,
+  whose checkpoint's exit is its landing: refused before its delay, signed by
+  the operator, to another key's P2WPKH, to a taproot output, one atom below
+  the checkpoint's value less the allowance, and by the plain exit script (no
+  leaf of the checkpoint); under a pause, with the checkpoint's script named in
+  a freeze, the landing confirms, and the landed coin is frozen by the pause
+  and by a freeze of its address until it is lifted; a good swap completes,
+  and the landing after it is refused; a rollback of the checkpoint's block
+  moves its delay to the block that confirms it again. Two of one holder's
+  checkpoints landed together, sharing output 0 while output 1 pays another
+  script, are refused (`Script failed an OP_EQUALVERIFY operation`); each
+  landing at its own index, they confirm.
 - `tests/merge.rs`: on an anchored regtest chain, two reassignments merged into
   one transaction. Two senders pay one receive request, each drawing the
   creator nonce of the leaf it creates: the operator admits both, the receiver

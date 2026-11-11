@@ -262,7 +262,7 @@ impl Wallet {
 			if let Ok((_, a)) = self.held(&c) {
 				scripts.push(("leaf", a.valid.output().script_pubkey));
 				scripts.push(("checkpoint", a.valid.checkpoint().script_pubkey()));
-				scripts.push(("checkpoint", a.valid.checkpoint_of(true).script_pubkey()));
+				scripts.push(("checkpoint", a.valid.checkpoint_of(true, a.valid.value).script_pubkey()));
 			}
 			if let Some((what, _)) = scripts.iter().find(|(_, s)| v1_program(s) == Some(*p)) {
 				return Err(Error::Refused(format!("the maker program {} is the {} script of the wallet's coin {}, an Arca script: a pair of \
