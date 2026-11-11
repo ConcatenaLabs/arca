@@ -50,7 +50,10 @@
 //! the wallet counts, all together, at most what the coins given were worth
 //! when it took their place; what the trade brought beyond that counts
 //! nothing against the limit, and the wallet's own payments out of such a
-//! coin carry that bound on. A coin that
+//! coin carry that bound on. While the node gives no rate for a coin a trade
+//! paid, or for a coin given for it, what that trade paid the wallet is
+//! arriving and the room the coins given held stays taken; the next read
+//! with rates places it. A coin that
 //! arrives is refreshed at the next round ([`Wallet::refresh_needed`]), and
 //! is then `settled`.
 //!
@@ -345,10 +348,23 @@ impl Wallet {
 		//   counts nothing against the limit (the trade's gain, which a dead
 		//   trade takes back with the coin given coming home).
 		let mut inherited = false;
+		// What one transfer paid the wallet out of counted coins is placed
+		// whole or not at all: while the node gives no rate for a coin it
+		// paid, or for a coin given for it, those coins arrive, the coins
+		// given stay noted so that a later read places them, and the room
+		// the coins given held stays taken, so no payment counts in it
+		// meanwhile. A cap is never written from a missing rate.
+		let mut deferred: BTreeSet<String> = BTreeSet::new();
+		let mut keep: BTreeSet<String> = BTreeSet::new();
+		let mut reserved = 0u128;
+		let mut reserve_unknown = false;
 		let unplaced: Vec<usize> = received.iter().map(|(_, i)| *i).filter(|i| !sticky.contains(&coins[*i].0.leaf_id)).collect();
 		if !unplaced.is_empty() && !sticky.is_empty() {
 			let by_record: std::collections::HashMap<Vec<u8>, CoinRow> = self.store.coins()?.into_iter().map(|c| (c.record.clone(), c)).collect();
-			let mut budget: BTreeMap<Vec<String>, u128> = BTreeMap::new();
+			// Each unplaced coin made from counted coins: the coins given (by
+			// leaf id, sorted), whether a trade made it, and whether it takes
+			// a cap.
+			let mut from: Vec<(usize, Vec<&CoinRow>, Vec<String>, bool, bool)> = vec![];
 			for i in unplaced {
 				let Ok(record) = Self::record_of(&coins[i].0) else { continue };
 				let inputs: Vec<(&CoinRecord, Option<bool>)> = match &record {
@@ -367,20 +383,43 @@ impl Wallet {
 				if given.is_empty() {
 					continue;
 				}
+				let capped = trade || given.iter().any(|g| caps.contains_key(&g.leaf_id));
+				let mut key: Vec<String> = given.iter().map(|g| g.leaf_id.clone()).collect();
+				key.sort();
+				from.push((i, given, key, trade, capped));
+			}
+			// What a coin given counts toward the coins made from it: a
+			// trade's, its whole worth then; an own payment's, at most its cap.
+			let room = |g: &CoinRow, trade: bool, caps: &BTreeMap<String, u128>| worth(g).map(|w| if trade { w } else { caps.get(&g.leaf_id).map_or(w, |c| w.min(*c)) });
+			let mut waits: BTreeMap<Vec<String>, (Vec<&CoinRow>, bool)> = BTreeMap::new();
+			for (i, given, key, trade, capped) in &from {
+				if *capped && (worth(&coins[*i].0).is_none() || given.iter().any(|g| worth(g).is_none())) {
+					waits.insert(key.clone(), (given.clone(), *trade));
+				}
+			}
+			for (given, trade) in waits.values() {
+				keep.extend(given.iter().map(|g| g.leaf_id.clone()));
+				match given.iter().map(|g| room(g, *trade, &caps)).sum::<Option<u128>>() {
+					Some(v) => reserved += v,
+					None => reserve_unknown = true,
+				}
+			}
+			let mut budget: BTreeMap<Vec<String>, u128> = BTreeMap::new();
+			for (i, given, key, trade, capped) in from {
+				if waits.contains_key(&key) {
+					deferred.insert(coins[i].0.leaf_id.clone());
+					continue;
+				}
 				sticky.insert(coins[i].0.leaf_id.clone());
 				// The coins one transfer pays the wallet out of counted coins
 				// share what those coins counted: each counts at most what is
 				// left of it, in the order the wallet holds them. A trade's is
 				// what the coins given were worth then; an own payment's carries
 				// on the caps of the coins it spent, so paying itself never
-				// turns a trade's gain into counted value.
-				if trade || given.iter().any(|g| caps.contains_key(&g.leaf_id)) {
-					let mut key: Vec<String> = given.iter().map(|g| g.leaf_id.clone()).collect();
-					key.sort();
-					let left = budget.entry(key).or_insert_with(|| given.iter().map(|g| {
-						let w = worth(g).unwrap_or(0);
-						if trade { w } else { caps.get(&g.leaf_id).map_or(w, |c| w.min(*c)) }
-					}).sum());
+				// turns a trade's gain into counted value. Every coin here is
+				// valued: one that is not waits above.
+				if capped {
+					let left = budget.entry(key).or_insert_with(|| given.iter().map(|g| room(g, trade, &caps).unwrap_or(0)).sum());
 					let cap = worth(&coins[i].0).unwrap_or(0).min(*left);
 					*left -= cap;
 					caps.insert(coins[i].0.leaf_id.clone(), cap);
@@ -389,14 +428,14 @@ impl Wallet {
 			}
 		}
 		let before = sticky.len();
-		sticky.retain(|id| held.contains(id));
+		sticky.retain(|id| held.contains(id) || keep.contains(id));
 		caps.retain(|id, _| sticky.contains(id));
 		let pruned = sticky.len() != before || inherited;
 		let counts = |c: &CoinRow| {
 			let w = worth(c).unwrap_or(0);
 			caps.get(&c.leaf_id).map_or(w, |cap| w.min(*cap))
 		};
-		let mut counted = 0u128;
+		let mut counted = reserved;
 		let mut unvalued: BTreeSet<String> = BTreeSet::new();
 		for (_, i) in &received {
 			let c = &coins[*i].0;
@@ -405,10 +444,17 @@ impl Wallet {
 			}
 		}
 		let mut grew = false;
-		let mut open = true;
+		let mut open = !reserve_unknown;
 		for (_, i) in &received {
 			let c = &coins[*i].0;
 			if sticky.contains(&c.leaf_id) {
+				continue;
+			}
+			if deferred.contains(&c.leaf_id) {
+				if worth(c).is_none() {
+					unvalued.insert(c.asset.clone());
+				}
+				coins[*i].2 = Place::Arriving;
 				continue;
 			}
 			let place = match worth(c) {
