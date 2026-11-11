@@ -48,7 +48,7 @@ use arca_covenant::CoinRecord;
 
 use super::chain::MempoolEntry;
 use super::keys::{p2wpkh, CHANGE, RECEIVE};
-use super::wallet::{owner_of, Wallet};
+use super::wallet::{owner_of, Wallet, REFRESH_FROM};
 use super::Error;
 
 /// Seconds a refresh of received coins may wait at the operator, for funds
@@ -57,6 +57,13 @@ pub const WITHDRAW_AFTER: u64 = 120;
 /// Seconds after taking a coin back from a refresh that waited before the
 /// wallet gives it up in a refresh again.
 pub const RETRY_AFTER: u64 = 600;
+
+/// Seconds the person leaves the wallet alone before what it received
+/// out of round is refreshed when no other rule asks for it
+/// ([`Wallet::refresh_needed`]).
+pub const REFRESH_IDLE: u64 = 120;
+/// The rules [`Wallet::refresh_needed`] weighs, by name, in its order.
+pub const REFRESH_RULES: [&str; 4] = ["depth", "exposure", "expiry", "idle"];
 
 /// The wall-clock time, in seconds.
 fn wall_now() -> u64 {
@@ -454,6 +461,69 @@ impl Wallet {
 			}
 		}
 		Ok(false)
+	}
+
+	/// Whether the coins the wallet received out of round should be given
+	/// up in a refresh now ([`Self::refresh_received`]), and why: each rule
+	/// of [`REFRESH_RULES`] that holds, with the coins it concerns. A
+	/// received coin given up in a round is not the wallet's to spend until
+	/// that round is final, so a wallet in use refreshes only when it must:
+	///
+	/// - `depth`: a received coin one reassignment short of the operator's
+	///   depth limit, which cannot be paid on again out of round;
+	/// - `exposure`: more than half of what the wallet may hold out of round
+	///   ([`Self::exposure`]: its instant budget, else the bond), over every
+	///   asset at the node's rates, or an asset the node does not price;
+	/// - `expiry`: a received coin within [`REFRESH_FROM`] of its expiry;
+	/// - `idle`: the person has left the wallet alone `idle_seconds` of at
+	///   least [`REFRESH_IDLE`] (the caller counts them).
+	///
+	/// Asks nothing of the operator but its `info`, and signs nothing.
+	pub fn refresh_needed(&self, idle_seconds: Option<u64>) -> Result<Value, Error> {
+		let info = self.server_info()?;
+		let now = self.now()?.to_consensus_u32();
+		let mut received = vec![];
+		for c in self.store.coins_in("live")? {
+			if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) {
+				continue;
+			}
+			let record = Self::record_of(&c)?;
+			if self.received_from_another(&record)? {
+				received.push((c, record));
+			}
+		}
+		let mut reasons = vec![];
+		if !received.is_empty() {
+			if let Some(limit) = super::pay::depth_limit(&info) {
+				let deep: Vec<String> = received.iter().filter(|(_, r)| super::wallet::record_hops(r) + 1 >= limit)
+					.map(|(c, _)| c.leaf_id.clone()).collect();
+				if !deep.is_empty() {
+					reasons.push(json!({"rule": "depth", "coins": deep,
+						"why": format!("a received coin is one reassignment short of the operator's depth limit, {}", limit)}));
+				}
+			}
+			if let Some(e) = self.exposure()? {
+				if !e.unpriced.is_empty() {
+					reasons.push(json!({"rule": "exposure", "why": format!("the wallet holds out of round assets its node does not price ({}), \
+						which cannot be weighed against what it may hold", e.unpriced.join(", "))}));
+				} else if e.held.saturating_mul(2) > e.limit {
+					reasons.push(json!({"rule": "exposure", "held": e.held.to_string(), "limit": e.limit.to_string(),
+						"why": format!("the wallet holds out of round {} of the {} it may hold (reference atoms at its node's rates), past half", e.held, e.limit)}));
+				}
+			}
+			let soon: Vec<String> = received.iter().filter(|(c, _)| c.expiry != u32::MAX && c.expiry as u64 <= now as u64 + REFRESH_FROM as u64)
+				.map(|(c, _)| c.leaf_id.clone()).collect();
+			if !soon.is_empty() {
+				reasons.push(json!({"rule": "expiry", "coins": soon, "why": "a received coin is close to its expiry"}));
+			}
+			if let Some(idle) = idle_seconds.filter(|i| *i >= REFRESH_IDLE) {
+				reasons.push(json!({"rule": "idle", "why": format!("the wallet has been left alone {} s", idle)}));
+			}
+		}
+		Ok(json!({
+			"needed": !reasons.is_empty(), "reasons": reasons, "rules": REFRESH_RULES,
+			"received": received.iter().map(|(c, _)| c.leaf_id.clone()).collect::<Vec<_>>(),
+		}))
 	}
 
 	/// Gives up in the operator's next round the coins the wallet received

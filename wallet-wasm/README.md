@@ -118,7 +118,9 @@ not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_q
 value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
-{max_fee_ppm?}`, `withdraw_participation {participation}`, `refusals`; a payment to an address on the chain from leaves
+{max_fee_ppm?}`, `refresh_needed {idle_seconds?}` (whether what the wallet received out
+of round should be refreshed now, and by which rule: `depth`, `exposure`, `expiry`, `idle`),
+`withdraw_participation {participation}`, `refusals`; a payment to an address on the chain from leaves
 (`offboard_quote {asset, amount, address | script, max_fee_ppm?}`, `offboard
 {asset, amount, address | script, fee_asset?, max_fee_ppm?, shown?}`,
 `offboards`); a take of an on-chain order and an order placed from
