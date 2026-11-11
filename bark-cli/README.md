@@ -315,7 +315,10 @@ and a board whose registration never reached the server, are not recovered.
   its owner's exit on every checkpoint paid for one, which counts (with any
   change of that trade) at most what the coins given were worth; what the
   trade brought beyond that counts nothing against the limit, and the
-  wallet's own payments out of such a coin carry that bound on. A channel coin counts the wallet's side of it
+  wallet's own payments out of such a coin carry that bound on. While the
+  node gives no rate for what a trade paid, or for a coin given for it,
+  what it paid is arriving and the room the coins given held stays taken,
+  until a read with rates places it. A channel coin counts the wallet's side of it
   alone, and with a limit set is arriving: it is the wallet's to spend once
   its close has made it a coin. With a limit set, the wallet spends no
   arriving coin but in a refresh, which it names to the operator so the
