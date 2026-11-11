@@ -102,7 +102,7 @@ pub enum OwedError {
 	BadKeyProof,
 	#[error("{0}")]
 	OutOfBounds(String),
-	#[error("the leaf wanted is a {0} leaf: a repayment is a vtxo-1 or vtxo-2 leaf, or landing-1 in a supervised asset")]
+	#[error("the leaf wanted is a {0} leaf: a repayment is a vtxo-1 or vtxo-2 leaf, or a landing leaf in a supervised asset")]
 	Template(String),
 	#[error("the key the leaf is wanted under owns a leaf, or is wanted already: every leaf has a key of its own")]
 	KeyReused,
@@ -178,7 +178,8 @@ pub async fn claim(store: &Store, params: &Params, req: &ClaimRequest) -> Result
 			value, req.coin, entry.owed(), entry.value, entry.fee)));
 	}
 	match (template, order, landing, channel) {
-		(Template::Vtxo1 | Template::Vtxo2, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
+		(Template::Vtxo1 | Template::Vtxo2, None, None, None) => {},
+		(Template::Landing1 | Template::Landing2, None, Some(l), None) if l.template() == *template => {},
 		_ => return Err(OwedError::Template(template.to_string())),
 	}
 	params.check_landing(*asset, *value, landing.as_ref()).map_err(OwedError::OutOfBounds)?;

@@ -129,6 +129,9 @@ impl Running {
 			// The operator offers checkpoints with their owners' exit; a test
 			// of an operator that does not turns it off.
 			checkpoint_exit: true,
+			// The operator makes both landing leaves; a test of the switch
+			// turns landing-1 off.
+			landing_2_only: false,
 		};
 		// `ARCA_TEST_NO_SWEEP=1` runs a suite with batches without a sweep,
 		// every round held for its forfeits ([`super::rounds::round_final`]

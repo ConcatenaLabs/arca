@@ -11,10 +11,12 @@
 //! spent by a script path, so a freeze never reaches the tree. The profile
 //! brings it back to the holder:
 //!
-//! - every leaf of the asset, in a batch, a board or a reassignment, is
-//!   `landing-1` (`arca_covenant::landing`), whose exit pays only P2WPKH of
+//! - every leaf of the asset, in a batch, a board or a reassignment, is a
+//!   landing leaf (`arca_covenant::landing`), whose exit pays only P2WPKH of
 //!   the owner's own landing key, explicitly in the asset, all but the
-//!   published allowance; no other template holds it. Every output of every
+//!   published allowance: `landing-2`, landing at the output of its own
+//!   index, or `landing-1`, landing at output 0, while the operator makes
+//!   it (`landing_2_only` off); no other template holds it. Every output of every
 //!   transaction that moves it is explicit, as consensus requires;
 //! - the operator mirrors freezes: before it co-signs anything that spends a
 //!   coin of the asset it asks its node whether the coin's landing is frozen,
@@ -84,7 +86,7 @@ pub enum SupervisionError {
 		the operator co-signs nothing that spends the coin (no transfer, swap, refresh, offboard, take, fill, distribution, plan or \
 		Lightning payment), and its holder takes it home by its landing, where it stays frozen until the issuer lifts the freeze")]
 	Frozen { leaf: LeafId, asset: AssetId, program: String, why: Freeze },
-	#[error("coin {leaf} of supervised asset {asset} is not a landing-1 leaf: a supervised asset is held in the tree in landing-1 \
+	#[error("coin {leaf} of supervised asset {asset} is not a landing leaf: a supervised asset is held in the tree in landing \
 		leaves only")]
 	NotLanding { leaf: LeafId, asset: AssetId },
 	#[error("the node: {0}")]

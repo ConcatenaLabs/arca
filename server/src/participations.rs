@@ -23,9 +23,11 @@
 //! - no coin given up is of a supervised asset whose holder is frozen
 //!   ([`crate::supervision`]), checked before anything else about the
 //!   request;
-//! - every leaf wanted is a template the round builds (`vtxo-1`; `landing-1`
-//!   with the published allowance for a supervised asset, whose leaves are
-//!   all `landing-1`; `order-3` for a resting order, never `order-2`, whose
+//! - every leaf wanted is a template the round builds (`vtxo-1`; `landing-2`,
+//!   or `landing-1` while the operator makes it, with the published allowance
+//!   for a supervised asset, whose leaves are all landing leaves, a `landing-2`
+//!   leaf only for a participation naming `landing-2` among the formats it
+//!   reads; `order-3` for a resting order, never `order-2`, whose
 //!   fill takes an annex nothing signs), within the
 //!   published bounds (an asset served, a value within its bounds, an exit
 //!   delay within the bounds), under a key that owns no leaf, is wanted by no
@@ -63,7 +65,7 @@
 //!      ‖ m, each output: kind (0 leaf, 1 offboard), asset, value (u64),
 //!          then for a leaf: template id, template version, owner key, owner nonce, exit delay units (u16),
 //!          and for an order-3 (or order-2) leaf its terms (the leaf record's binary form of them, 252 bytes)
-//!          and for a landing-1 leaf its landing (the program, 20 bytes, and the allowance, u64)
+//!          and for a landing leaf its landing (the program, 20 bytes, and the allowance, u64)
 //!          and for an offboard: script length (u16), script
 //!      ‖ f, each fee: asset, amount (u64)
 //!      ‖ 0, or 1 and the earliest round time (u32)
@@ -172,7 +174,8 @@ pub enum OutputRequest {
 		asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime,
 		/// An order's terms, for a resting order (`order-3`).
 		order: Option<arca_covenant::OrderLeafTerms>,
-		/// `landing-1`'s landing, for a leaf of a supervised asset.
+		/// The landing, for a leaf of a supervised asset: `landing-1`'s or
+		/// `landing-2`'s, as the template names.
 		landing: Option<arca_covenant::Landing>,
 		/// `channel-1`'s terms, for a channel leaf: the operator's side of
 		/// `value` and the credit window.
@@ -788,7 +791,14 @@ impl Participations {
 			match o {
 				OutputRequest::Leaf { template, owner, exit_delay, order, asset, value, landing, channel, .. } => {
 					match (template, order, landing, channel) {
-						(Template::Vtxo1 | Template::Vtxo2, None, None, None) | (Template::Landing1, None, Some(_), None) => {},
+						(Template::Vtxo1 | Template::Vtxo2, None, None, None) => {},
+						(Template::Landing1 | Template::Landing2, None, Some(l), None) if l.template() == *template => {
+							// A landing-2 leaf only for a wallet that says it reads one.
+							if *template == Template::Landing2 && !req.record_formats.iter().any(|f| f == arca_covenant::LANDING_2) {
+								return Err(ParticipationError::OutOfBounds(format!("output {}: a landing-2 leaf for a wallet that does not \
+									name landing-2 among the formats it reads", j)));
+							}
+						},
 						(Template::Order3, Some(o), None, None) if o.template() == Template::Order3 =>
 							self.check_order_terms(j, o, *asset, owner, now).await?,
 						// order-2's fill takes an annex nobody signs, so a relay

@@ -104,9 +104,9 @@ pub struct AssetParams {
 /// What the operator serves of a supervised asset beside the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Supervised {
-	/// The fee allowance every `landing-1` leaf of the asset carries: the
-	/// most of a leaf's value its landing may leave out of the landing's
-	/// output, in the asset's atoms.
+	/// The fee allowance every landing leaf of the asset carries: the most
+	/// of a leaf's value its landing may leave out of the landing's output,
+	/// in the asset's atoms.
 	pub landing_allowance: u64,
 }
 
@@ -332,6 +332,14 @@ pub struct Params {
 	/// format version 2, which a wallet asks for only where every party
 	/// reads it.
 	pub checkpoint_exit: bool,
+	/// Whether the operator makes `landing-2` leaves only (`landing_2_only`):
+	/// it builds no `landing-1` leaf in a round, a board or a transfer, and
+	/// refuses the participations, boards and transfers that would make one
+	/// ([`Params::check_landing`]). `landing-1` coins already made are still
+	/// spent, refreshed into `landing-2` and answered. Off until every
+	/// client of the operator reads `landing-2`
+	/// ([`arca_covenant::LANDING_2`]).
+	pub landing_2_only: bool,
 }
 
 /// The name the node gives the main chain (`getblockchaininfo`'s `chain`),
@@ -381,6 +389,7 @@ impl Params {
 			no_sweep: false,
 			collect_after_seconds: COLLECT_AFTER_SECONDS,
 			checkpoint_exit: false,
+			landing_2_only: false,
 		};
 		p.set_delays();
 		p
@@ -495,18 +504,23 @@ impl Params {
 	}
 
 	/// Why a new leaf of `asset` and `value` with `landing` breaks the
-	/// supervised profile, if it does: a leaf of a supervised asset is
-	/// `landing-1` with the published allowance, and no other asset's is
-	/// ([`crate::supervision`]).
+	/// supervised profile, if it does: a leaf of a supervised asset is a
+	/// landing leaf with the published allowance, `landing-2` once the
+	/// operator makes no `landing-1` ([`Params::landing_2_only`]), and no
+	/// other asset's leaf is one ([`crate::supervision`]).
 	pub fn check_landing(&self, asset: AssetId, value: u64, landing: Option<&arca_covenant::Landing>) -> Result<(), String> {
 		match (self.supervised(&asset), landing) {
 			(None, None) => Ok(()),
-			(None, Some(_)) => Err(format!("asset {} is not supervised: its leaves are not landing-1", asset)),
-			(Some(_), None) => Err(format!("asset {} is supervised: every leaf of it is landing-1, naming the landing its owner's exit \
-				pays, where a freeze of the asset binds", asset)),
+			(None, Some(_)) => Err(format!("asset {} is not supervised: its leaves are not landing leaves", asset)),
+			(Some(_), None) => Err(format!("asset {} is supervised: every leaf of it is a landing leaf, naming the landing its owner's \
+				exit pays, where a freeze of the asset binds", asset)),
 			(Some(s), Some(l)) => {
+				if self.landing_2_only && !l.own_index {
+					return Err(format!("this operator makes landing-2 leaves only (info.landing_2_only): a leaf of asset {} lands at its \
+						own index; a wallet that reads landing-2 asks for it", asset));
+				}
 				if l.allowance != s.landing_allowance {
-					return Err(format!("a landing-1 leaf of asset {} carries the published allowance, {}, not {}", asset,
+					return Err(format!("a {} leaf of asset {} carries the published allowance, {}, not {}", l.template(), asset,
 						s.landing_allowance, l.allowance));
 				}
 				l.terms(asset, value).map(|_| ()).map_err(|e| e.to_string())
@@ -533,11 +547,11 @@ impl Params {
 	/// Why a new `channel-1` leaf of `asset`, `value` and `channel` is
 	/// outside what the operator makes, if it is: the operator's side at most
 	/// the asset's channel capacity, the owner's side at least one atom, and
-	/// the operator's credit window; a supervised asset's leaves are
-	/// `landing-1`.
+	/// the operator's credit window; a supervised asset's leaves are landing
+	/// leaves.
 	pub fn check_channel(&self, asset: AssetId, value: u64, channel: &arca_covenant::Channel) -> Result<(), String> {
 		if self.supervised(&asset).is_some() {
-			return Err(format!("asset {} is supervised: every leaf of it is landing-1", asset));
+			return Err(format!("asset {} is supervised: every leaf of it is a landing leaf", asset));
 		}
 		let cap = self.channel_capacity(&asset)?;
 		if cap == 0 {
