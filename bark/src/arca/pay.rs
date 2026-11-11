@@ -14,6 +14,7 @@ use arca_covenant::spend::{margin_for, FeeSource};
 use arca_covenant::{CoinRecord, ExplicitOutput, NewLeaf, Pair, RelativeTime, TransferPlan, ValidCoin, ValidInput, WalletPolicy};
 
 use super::chain::{hex, unhex, unhex32};
+use super::places::Spend;
 use super::store::CoinRow;
 use super::wallet::{amount, htlc_of, kind_of, owner_of, sign, Assessed, CoinDates, Wallet};
 use super::{random32, Error};
@@ -409,12 +410,13 @@ impl Wallet {
 	pub(crate) fn choose_coins(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64)
 		-> Result<(Vec<In>, u64, u64), Error>
 	{
-		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false)
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, Spend::Leave)
 	}
 
-	/// The live coins of `asset` the wallet can pay with ([`Self::spendable`]).
+	/// The live coins of `asset` the wallet can pay with ([`Self::spendable`])
+	/// in a payment that may leave the Arca.
 	pub(crate) fn spendable_coins(&self, asset: AssetId) -> Result<Vec<In>, Error> {
-		self.spendable(asset)
+		self.spendable(asset, Spend::Leave)
 	}
 
 	/// The live coins of `asset` a participation, a take or an offboard may
@@ -422,8 +424,8 @@ impl Wallet {
 	/// orders them while the wallet holds at most [`super::round::MAX_GIVEN`],
 	/// and the largest first when it holds more, since a selection stops at
 	/// that many coins.
-	pub(crate) fn coins_to_give(&self, asset: AssetId) -> Result<Vec<In>, Error> {
-		let mut coins = self.spendable(asset)?;
+	pub(crate) fn coins_to_give(&self, asset: AssetId, spend: Spend) -> Result<Vec<In>, Error> {
+		let mut coins = self.spendable(asset, spend)?;
 		if coins.len() > super::round::MAX_GIVEN {
 			coins.sort_by(|a, b| b.coin.value.cmp(&a.coin.value));
 		}
@@ -458,9 +460,13 @@ impl Wallet {
 	/// exit deadline is not paid on (the operator co-signs no spend of it,
 	/// and `sync` takes it on the chain), nor one an offline-refresh plan
 	/// names ([`super::plan`]). While a quote runs, the coins it counts in
-	/// refreshes that wait as well ([`Self::counted_given`]).
-	fn spendable(&self, asset: AssetId) -> Result<Vec<In>, Error> {
+	/// refreshes that wait as well ([`Self::counted_given`]). While the
+	/// wallet sets an instant limit, no coin its place bars from `spend`
+	/// ([`super::places`]): an arriving coin, and trade proceeds for a
+	/// payment that leaves the Arca.
+	fn spendable(&self, asset: AssetId, spend: Spend) -> Result<Vec<In>, Error> {
 		let mut out = vec![];
+		let barred = self.unspendable(spend)?;
 		let now = self.now()?.to_consensus_u32() as u64;
 		// A coin an offline-refresh plan names carries refund halves the
 		// wallet signed, valid while its script is unspent: it is paid out of
@@ -474,7 +480,7 @@ impl Wallet {
 			if row.expiry != u32::MAX && now + WalletPolicy::EXIT_DEADLINE as u64 >= row.expiry as u64 {
 				continue;
 			}
-			if planned.contains(&row.leaf_id) {
+			if planned.contains(&row.leaf_id) || barred.contains(&row.leaf_id) {
 				continue;
 			}
 			// A resting order's coin is the order: a fill, a cancel or its
@@ -605,12 +611,12 @@ impl Wallet {
 	/// would.
 	#[allow(clippy::too_many_arguments)]
 	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize, fit: bool) -> Result<(Vec<In>, u64, u64), Error>
+		other_inputs: usize, fit: bool, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
-		match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit) {
+		match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, spend) {
 			Err(e @ Error::Refused(_)) => {
 				if self.free_refreshes(asset)? {
-					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit)
+					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, spend)
 				} else {
 					Err(e)
 				}
@@ -628,10 +634,10 @@ impl Wallet {
 	/// taken as a payment takes them.
 	#[allow(clippy::too_many_arguments)]
 	fn choose_live(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize, fit: bool) -> Result<(Vec<In>, u64, u64), Error>
+		other_inputs: usize, fit: bool, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		let margins = Margins::of(info, asset)?;
-		let mut candidates = self.spendable(asset)?;
+		let mut candidates = self.spendable(asset, spend)?;
 		let mut deep = 0u64;
 		if fit {
 			if let Some(limit) = depth_limit(info) {
@@ -968,7 +974,7 @@ impl Wallet {
 			until,
 		};
 		let to_out = to.explicit(self);
-		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, false)?;
+		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, false, Spend::Pay)?;
 		Ok(SendPlan { asset, value, to, to_out, inputs, margin, change, rule })
 	}
 
@@ -2124,7 +2130,8 @@ impl Wallet {
 		// with probes of the same shape.
 		let probe = |a: AssetId| ExplicitOutput::new(a, 1, leaf_probe());
 		let others = vec![wanted.explicit(self), probe(give_asset), probe(want_asset)];
-		let (inputs, margin, change) = self.choose(&info, give_asset, give, &others, true, min_give, 1, true)?;
+		self.trade_allowed(&info, true)?;
+		let (inputs, margin, change) = self.choose_for_trade(&info, give_asset, give, &others, true, min_give, 1)?;
 		let mut outs = vec![wanted];
 		if change > 0 {
 			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_of("change", &info, give_asset, change)?, mailbox, until: None });
@@ -2164,6 +2171,76 @@ impl Wallet {
 	/// (an offer's `checkpoint_exit`) or by signing so (an acceptance's).
 	pub(crate) fn checkpoint_exit_offered(info: &Value) -> bool {
 		info["checkpoint_exit"] == json!(true)
+	}
+
+	/// While the wallet sets an instant limit ([`super::places`]), a trade
+	/// only when every checkpoint in it has its owner's exit: when the
+	/// operator co-signs them, and the other side asks for them
+	/// (`other_side`; a maker asks for them itself). Else the trade would put
+	/// the coin the wallet gives in a checkpoint only it and the operator can
+	/// spend, should the other side and the operator kill the trade.
+	pub(crate) fn trade_allowed(&self, info: &Value, other_side: bool) -> Result<(), Error> {
+		if self.own_instant_limit()?.is_none() {
+			return Ok(());
+		}
+		if !Self::checkpoint_exit_offered(info) {
+			return Err(Error::Refused("this operator does not co-sign checkpoints with their owner's exit, so a trade could hold the \
+				coin given until the operator signs again; a wallet with an instant limit trades once it does".into()));
+		}
+		if !other_side {
+			return Err(Error::Refused("the other side does not ask for checkpoints with their owner's exit, so the trade could hold the \
+				coin given until the operator signs again; a wallet with an instant limit does not take it".into()));
+		}
+		Ok(())
+	}
+
+	/// [`Self::choose`] for a trade. While the wallet sets an instant limit,
+	/// the coin it gives holds exactly what the trade takes, so no change of
+	/// the wallet's rides in the trade: when no coin does, the wallet first
+	/// pays itself, out of round, a coin of exactly that value and the rest
+	/// as change ([`Self::shape_coin`]); that change is of the coin's own
+	/// lineage, not the trade's.
+	#[allow(clippy::too_many_arguments)]
+	fn choose_for_trade(&mut self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
+		other_inputs: usize) -> Result<(Vec<In>, u64, u64), Error>
+	{
+		let mut got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, Spend::Trade)?;
+		if self.own_instant_limit()?.is_none() || got.2 == 0 {
+			return Ok(got);
+		}
+		// Twice at most: the coin the first payment makes may take another
+		// template than the coin it came from, and so other margins.
+		for _ in 0..2 {
+			let template = got.0.first().map(|i| i.coin.clone()).ok_or_else(|| Error::Refused("a trade with no coin".into()))?;
+			let margins = Margins::of(info, asset)?;
+			let m = self.checkpoint_margin(&template, &margins)?;
+			let all: Vec<&ValidCoin> = std::iter::repeat(&template).take(1 + other_inputs).collect();
+			let r = if pays_margin { self.reassignment_margin(&all, others, &margins)? } else { 0 };
+			let need = paid.checked_add(m).and_then(|v| v.checked_add(r)).ok_or_else(|| Error::Refused("a trade above 2^64 atoms".into()))?;
+			self.shape_coin(info, asset, need)?;
+			got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, Spend::Trade)?;
+			if got.2 == 0 {
+				return Ok(got);
+			}
+		}
+		Err(Error::Refused(format!("the wallet could not make a coin of asset {} holding exactly what this trade gives; it trades from \
+			coins a round has shaped, after the next round", asset)))
+	}
+
+	/// Pays the wallet itself, out of round, a coin of exactly `need` of
+	/// `asset`, and the rest as change, from coins a trade may give.
+	fn shape_coin(&mut self, info: &Value, asset: AssetId, need: u64) -> Result<(), Error> {
+		let min = Self::min_leaf(info, asset)?;
+		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		let leaf = self.own_leaf_of("shaped", info, asset, need)?;
+		let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
+		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(&probe), true, min, 0, false, Spend::Trade)?;
+		let mut outs = vec![Out { asset, value: need, leaf, mailbox, until: None }];
+		if change > 0 {
+			outs.push(Out { asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });
+		}
+		self.transfer_back(&inputs, &outs)?;
+		Ok(())
 	}
 
 	/// What a maker's coins leave for a swap's fees, in the asset it gives:
@@ -2303,7 +2380,7 @@ impl Wallet {
 		let mut others: Vec<ExplicitOutput> = o.maker_outs.iter().map(|m| m.explicit(self)).collect();
 		others.push(ExplicitOutput::new(o.give_asset, o.give, leaf_probe()));
 		others.push(ExplicitOutput::new(o.want_asset, 1, leaf_probe()));
-		let (mine, _, change) = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true)?;
+		let (mine, _, change) = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true, Spend::Trade)?;
 		Self::swap_depth(&info, &o, &mine)?;
 		let outputs = o.maker_outs.len() + 1 + usize::from(change > 0);
 		if outputs > arca_covenant::leaf::MAX_OUTPUTS as usize {
@@ -2360,7 +2437,8 @@ impl Wallet {
 		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf_of("swap", &info, give_asset, give)?, mailbox, until: None });
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
-		let (mine, _, change) = self.choose(&info, want_asset, want, &others, false, min_want, 0, true)?;
+		self.trade_allowed(&info, o.offer["checkpoint_exit"] == json!(true))?;
+		let (mine, _, change) = self.choose_for_trade(&info, want_asset, want, &others, false, min_want, 0)?;
 		Self::swap_depth(&info, &o, &mine)?;
 		if change > 0 {
 			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf_of("change", &info, want_asset, change)?, mailbox,
@@ -2530,6 +2608,12 @@ impl Wallet {
 			Some(true) => return Err(Error::Refused("the acceptance signs checkpoints with their owners' exit, which the offer did not \
 				ask for".into())),
 		};
+		// A wallet with an instant limit trades only when every checkpoint
+		// has its owner's exit: it cancels the offer rather than complete it.
+		if !checkpoint_exit && self.own_instant_limit()?.is_some() {
+			return Err(Error::Refused(format!("the other side signed this trade without its owner's exit on every checkpoint, which a \
+				wallet with an instant limit does not trade; cancel the offer (swap_cancel {})", id)));
+		}
 		// Coins of the taker's are not the wallet's to mark: only the maker's
 		// are put to `sending`.
 		let answer = self.transfer_with(&inputs, &outs, &theirs, None, checkpoint_exit)?;

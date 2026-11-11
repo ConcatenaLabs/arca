@@ -229,7 +229,7 @@ impl Wallet {
 		// refresh that waits is taken back first when the live coins fall
 		// short.
 		self.free_when_short(a, ask.amount)?;
-		let coins = self.coins_to_give(a)?;
+		let coins = self.coins_to_give(a, super::places::Spend::Trade)?;
 		// The schedule charges nothing when it has neither a rate nor a base:
 		// then no coin needs reading for its date.
 		let free = schedule["refresh_ppm"].as_u64().unwrap_or(0) == 0
@@ -643,7 +643,7 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		let mut kept = 0u64;
 		let mut done = None;
-		for mut c in self.coins_to_give(asset_b)? {
+		for mut c in self.coins_to_give(asset_b, super::places::Spend::Trade)? {
 			if c.row.expiry < order_expiry {
 				continue;
 			}
@@ -711,6 +711,7 @@ impl Wallet {
 		// complete then gives them back (`arca_covenant::checkpoint`). The
 		// maker's order coin is spent only if the fill confirms.
 		let checkpoint_exit = Self::checkpoint_exit_offered(&info);
+		self.trade_allowed(&info, true)?;
 		let tplan = TransferPlan { checkpoint_exit, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
 		// The fill spends the order's coin at input 0 and the checkpoints
 		// after it: a vtxo-2 checkpoint's pair names them all, its own index
