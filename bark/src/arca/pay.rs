@@ -202,13 +202,39 @@ impl Out {
 		v
 	}
 
+	/// [`Self::json`] for another wallet to sign over (an offer's outputs,
+	/// an acceptance's): a `landing-2` leaf's landing also names its
+	/// template inside itself. A library that does not read `landing-2`
+	/// takes a landing with any key beyond `program` and `allowance` for
+	/// malformed, so it refuses the offer before it signs anything, where
+	/// it would otherwise read the leaf as `landing-1` and sign a transfer
+	/// that cannot complete. The server is sent [`Self::json`].
+	fn for_wallet(&self) -> Value {
+		let mut v = self.json();
+		if v["template"].as_str() == Some(arca_covenant::LANDING_2) {
+			v["landing"]["template"] = json!(arca_covenant::LANDING_2);
+		}
+		v
+	}
+
 	fn from_json(v: &Value) -> Result<Out, Error> {
 		let asset = asset_of(&v["asset"], "an output's asset")?;
 		let value = amount(&v["value"], "an output's value")?;
 		let landing = match v.get("landing").filter(|g| !g.is_null()) {
-			Some(g) => Some(arca_covenant::Landing { own_index: v["template"].as_str() == Some(arca_covenant::LANDING_2),
-				..arca_covenant::record_json::landing_from_json(g).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))? }
-				.terms(asset, value).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))?),
+			Some(g) => {
+				// A landing written for another wallet names `landing-2`
+				// inside itself too ([`Self::for_wallet`]).
+				let mut g = g.clone();
+				let inner = g.as_object_mut().and_then(|m| m.remove("template"));
+				let landing_2 = match inner {
+					None => v["template"].as_str() == Some(arca_covenant::LANDING_2),
+					Some(t) if t.as_str() == Some(arca_covenant::LANDING_2) && v["template"].as_str() == Some(arca_covenant::LANDING_2) => true,
+					Some(t) => return Err(Error::Parse(format!("an output's landing names template {} beside the leaf's {}", t, v["template"]))),
+				};
+				Some(arca_covenant::Landing { own_index: landing_2,
+					..arca_covenant::record_json::landing_from_json(&g).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))? }
+					.terms(asset, value).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))?)
+			},
 			None => None,
 		};
 		Ok(Out {
@@ -661,18 +687,31 @@ impl Wallet {
 			r => r,
 		};
 		// Coins enough, but only of a format the other side does not read:
-		// say so.
+		// say so, and say when coins it reads are held back only while they
+		// arrive (the wallet's instant limit), which is the cause then.
 		match r {
 			Err(Error::Refused(_)) if reads != Reads::ALL
 				&& self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, Reads::ALL, spend).is_ok() =>
+			{
+				let unread = match (reads.exit, reads.landing_2) {
+					(false, false) => "a checkpoint with its owner's exit or a landing-2 leaf",
+					(false, true) => "a checkpoint with its owner's exit",
+					_ => "a landing-2 leaf",
+				};
+				let barred = self.unspendable(spend)?;
+				let arriving: u64 = self.store.coins_in("live")?.into_iter()
+					.filter(|c| c.asset == asset.to_string() && barred.contains(&c.leaf_id) && reads.record(&c.record))
+					.map(|c| c.value).sum();
+				if arriving > 0 {
+					return Err(Error::Refused(format!("the wallet's coins of asset {} that the other side's wallet reads, {} in all, are \
+						still arriving, and a coin is given only once it has arrived (the wallet's instant limit): they pay {} once they \
+						arrive; its other coins hold in their past {}, which the other side, an older build, does not read; nothing was \
+						signed", asset, arriving, paid, unread)));
+				}
 				Err(Error::Refused(format!("the other side's wallet is an older build, which reads no coin whose past holds {}, and the \
 					wallet's coins of asset {} that would pay {} are such coins: they pay it once the other side updates{}; nothing was \
-					signed",
-					match (reads.exit, reads.landing_2) {
-						(false, false) => "a checkpoint with its owner's exit or a landing-2 leaf",
-						(false, true) => "a checkpoint with its owner's exit",
-						_ => "a landing-2 leaf",
-					}, asset, paid, if reads.exit { "" } else { ", or once a round refreshes them (refresh-received)" }))),
+					signed", unread, asset, paid, if reads.exit { "" } else { ", or once a round refreshes them (refresh-received)" })))
+			},
 			r => r,
 		}
 	}
@@ -695,12 +734,7 @@ impl Wallet {
 	{
 		let margins = Margins::of(info, asset)?;
 		let mut candidates = self.spendable(asset, spend)?;
-		if !reads.exit {
-			candidates.retain(|c| c.row.record.first() != Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT));
-		}
-		if !reads.landing_2 {
-			candidates.retain(|c| !CoinRecord::from_bytes(&c.row.record).is_ok_and(|r| r.has_landing_2()));
-		}
+		candidates.retain(|c| reads.record(&c.row.record));
 		let mut deep = 0u64;
 		if fit {
 			if let Some(limit) = depth_limit(info) {
@@ -2236,7 +2270,7 @@ impl Wallet {
 			"margin": margin.to_string(),
 			"inputs": inputs.iter().map(|i| json!({"leaf_id": i.coin.id.to_string(), "record": hex(&i.row.record),
 				"checkpoint_value": i.checkpoint_value.to_string()})).collect::<Vec<_>>(),
-			"outputs": outs.iter().map(Out::json).collect::<Vec<_>>(),
+			"outputs": outs.iter().map(Out::for_wallet).collect::<Vec<_>>(),
 		});
 		// The maker reads the record format of checkpoints with their
 		// owners' exit, and the operator co-signs them: a taker that reads it
@@ -2561,6 +2595,7 @@ impl Wallet {
 		let _quote = self.quoting();
 		let o = self.swap_offer_checked(offer_text)?;
 		let info = self.server_info()?;
+		self.swap_landing_guard(&info, &o)?;
 		let min_want = Self::min_leaf(&info, o.want_asset)?;
 		// The leaf the wallet would get is not made here: a probe of its size
 		// prices the same margins.
@@ -2578,6 +2613,34 @@ impl Wallet {
 		}
 		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
 		self.quoted(Ok(Self::swap_terms(&o, &mine, change, dates)))
+	}
+
+	/// Refuses, before anything is signed, an offer that trades a
+	/// supervised asset and cannot complete while the operator makes
+	/// `landing-2` leaves only (`info.landing_2_only`): the maker's wallet is
+	/// an older build, which writes its own leaves as `landing-1` and would
+	/// read this wallet's `landing-2` leaves as `landing-1`, or the offer
+	/// carries a `landing-1` leaf (made before the switch). The operator
+	/// co-signs neither, and the maker could not take back what it signed.
+	fn swap_landing_guard(&self, info: &Value, o: &OfferChecked) -> Result<(), Error> {
+		if !super::wallet::landing_2_only(info) {
+			return Ok(());
+		}
+		if let Some(out) = o.maker_outs.iter().find(|m| m.leaf.landing.is_some_and(|l| !l.own_index)) {
+			return Err(Error::Refused(format!("the offer pays the maker a landing-1 leaf of asset {}, and this operator makes landing-2 \
+				leaves only (info.landing_2_only): the swap could never complete; ask the maker for a new offer; nothing was signed",
+				out.asset)));
+		}
+		if !Reads::of(&o.offer).landing_2 {
+			for a in [o.give_asset, o.want_asset] {
+				if self.landing_rule(info, a)?.is_some() {
+					return Err(Error::Refused(format!("asset {} is supervised, this operator makes landing-2 leaves only \
+						(info.landing_2_only), and the maker's wallet is an older build that reads none: the swap could never complete; \
+						it can trade once the maker updates; nothing was signed", a)));
+				}
+			}
+		}
+		Ok(())
 	}
 
 	/// Refuses, before anything is signed, a swap the wallet would take
@@ -2632,6 +2695,7 @@ impl Wallet {
 		// The coin the swap pays this wallet comes out of round.
 		self.bond_gate(Some((give_asset, give)))?;
 		let info = self.server_info()?;
+		self.swap_landing_guard(&info, &o)?;
 		let min_want = Self::min_leaf(&info, want_asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let mut outs = o.maker_outs.clone();
@@ -2695,7 +2759,7 @@ impl Wallet {
 			"kind": ACCEPT_KIND.name, "swap": id,
 			"inputs": inputs.iter().map(|i| json!({"leaf_id": i.coin.id.to_string(), "record": hex(&i.row.record),
 				"checkpoint_value": i.checkpoint_value.to_string()})).collect::<Vec<_>>(),
-			"outputs": outs.iter().map(Out::json).collect::<Vec<_>>(),
+			"outputs": outs.iter().map(Out::for_wallet).collect::<Vec<_>>(),
 			"signatures": sigs,
 		});
 		if checkpoint_exit {
@@ -2958,6 +3022,15 @@ impl Reads {
 	pub(crate) fn of(v: &Value) -> Reads {
 		Reads { exit: Wallet::reads_exit_format(v), landing_2: super::wallet::reads_landing_2(v) }
 	}
+
+	/// Whether a side that reads this can read a new coin whose past is the
+	/// coin record `record`: none of the second format (a checkpoint with
+	/// its owner's exit) unless it reads that, and none whose past holds a
+	/// `landing-2` leaf unless it reads that.
+	pub(crate) fn record(&self, record: &[u8]) -> bool {
+		(self.exit || record.first() != Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT))
+			&& (self.landing_2 || !CoinRecord::from_bytes(record).is_ok_and(|r| r.has_landing_2()))
+	}
 }
 
 /// Whether a coin refused with `e` may be accepted later: what it rests on
@@ -3066,6 +3139,36 @@ mod tests {
 		assert_eq!(fit_order(&coins, 25_000, None, now), vec![6, 3, 2, 1, 8, 0], "no limit published: every change has room");
 		assert!(fit_order(&coins, 3_000_000_000, Some(5), now).is_empty(), "no coin holds it alone");
 		assert!(fit_order(&[], 1, Some(5), now).is_empty());
+	}
+
+	/// An offer's or an acceptance's `landing-2` leaf, as written for another
+	/// wallet, is malformed to a library that reads no `landing-2` (the
+	/// covenant's `landing_from_json` is the reader every older build has),
+	/// so it refuses the offer before it signs; this library reads it back
+	/// as `landing-2`. The server's form, and a `landing-1` leaf's, are
+	/// unchanged, and a landing that names another template is refused.
+	#[test]
+	fn a_landing_2_leaf_written_for_another_wallet_is_malformed_to_an_older_library() {
+		let key = xonly("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap();
+		let asset = AssetId::from_str(&"07".repeat(32)).unwrap();
+		let out = |own_index: bool| Out { asset, value: 100_000, mailbox: key, until: None, leaf: NewLeaf { enclave: None, owner: key,
+			owner_nonce: [1; 32], creator_nonce: [2; 32], exit_delay: RelativeTime::from_units(1).unwrap(), htlc: None, v2: false,
+			landing: Some(arca_covenant::Landing { program: [3; 20], allowance: 1_000, own_index }.terms(asset, 100_000).unwrap()) } };
+		let older = |v: &Value| arca_covenant::record_json::landing_from_json(&v["landing"]);
+		let two = out(true);
+		let w = two.for_wallet();
+		assert_eq!(w["template"], json!(arca_covenant::LANDING_2));
+		assert!(older(&w).is_err(), "an older library refuses it: {}", w);
+		assert!(older(&two.json()).is_ok(), "the server's form is unchanged");
+		assert_eq!(Out::from_json(&w).unwrap().leaf.landing, two.leaf.landing, "read back as landing-2");
+		assert_eq!(Out::from_json(&two.json()).unwrap().leaf.landing, two.leaf.landing, "the template beside the landing alone");
+		let one = out(false);
+		assert_eq!(one.for_wallet(), one.json(), "a landing-1 leaf is written as ever");
+		assert!(older(&one.for_wallet()).is_ok());
+		assert_eq!(Out::from_json(&one.for_wallet()).unwrap().leaf.landing, one.leaf.landing);
+		let mut bad = w.clone();
+		bad["template"] = Value::Null;
+		assert!(Out::from_json(&bad).is_err(), "a landing naming landing-2 on a leaf that does not");
 	}
 
 	/// The signer's refusal of a spend for a forfeit it holds names the salt
