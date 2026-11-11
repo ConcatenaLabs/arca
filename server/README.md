@@ -1775,15 +1775,21 @@ A participation may name payments arriving among the coins it gives up
 operator reads it; not part of the participation's id): its owner has the
 payment only once a round has refreshed it, and a coin out of round is what
 the bond wants refreshed soonest. A name that is not one of the
-participation's inputs is refused (`malformed`). The operator takes the
-names only as far as its own records bear them out: the participation gives
-up nothing but coins out of round (reassignments' and fills' coins), and the
-transfer that made each coin named paid it to a mailbox other than its
-inputs' (a wallet's change from its own payment goes back to its own
-mailbox). Such a participation runs ahead of the other participations of its
-asset, and runs past the cap as long as what is in flight stays within twice
-it; past that it waits like any other. One whose names the records do not
-bear out is judged as any participation, and the operator logs it.
+participation's inputs is refused (`malformed`). The operator takes each
+name only as far as its own records bear it out: the coin is out of round (a
+reassignment's or a fill's), and the transfer that made it posted it to a
+mailbox other than its inputs' (a wallet's change from its own payment goes
+back to its own mailbox; an output that named no mailbox is posted to its
+leaf's own key, and never qualifies). A name the records do not bear out is
+logged, and that coin is judged as any coin; the others keep their place.
+A participation with payments arriving runs ahead of the other
+participations of its asset, oldest first. What those payments open may run
+past the cap by the asset's lane (`arriving_lane`, in atoms, or
+`arriving_lane_value`, a value at the asset's rate; published as
+`assets[].arriving_lane`; no lane when absent), while what the
+participation opens beside them stays within the cap. The lane is capital
+the operator chooses to risk: no record tells a payment between two wallets
+of one owner from a real one, so anyone holding two wallets can use it.
 A coin whose own forfeit is final on the chain, brought down by a collection
 (through its lineage's reassignments when it was paid on out of round), counts
 for nothing either.

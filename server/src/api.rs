@@ -557,6 +557,10 @@ pub struct AssetInfo {
 	pub in_flight_cap: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub in_flight: Option<String>,
+	/// How far past the cap refreshes of payments arriving may run, in
+	/// atoms (the operator's `arriving_lane`); absent for no lane.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub arriving_lane: Option<String>,
 }
 
 /// What the operator owes in an asset for swept coins.
