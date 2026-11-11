@@ -20,6 +20,10 @@
 //! - Rollback: the block holding A's checkpoint leaves the chain and the
 //!   checkpoint confirms again later; the landing waits the delay from the
 //!   new block.
+//! - Two landings together: two of A's checkpoints landing at one key,
+//!   spent in one transaction sharing output 0 while output 1 pays another
+//!   script, are refused (each landing inspects the output at its own
+//!   input's index); each landing at its own index, they confirm.
 //!
 //! Needs `SEQUENTIAD_EXEC`.
 
@@ -343,14 +347,14 @@ fn a_dead_swap_returns_a_supervised_coin_by_its_landing() {
 	let sup = issue(&mut c.net);
 	let (z, x) = (sup.z, c.net.x);
 	let s = keypair("ob1 sup operator");
-	let ak: Vec<Keypair> = (0..3).map(|i| keypair(&format!("ob1 sup A{}", i))).collect();
-	let ck: Vec<Keypair> = (0..3).map(|i| keypair(&format!("ob1 sup C{}", i))).collect();
+	let ak: Vec<Keypair> = (0..5).map(|i| keypair(&format!("ob1 sup A{}", i))).collect();
+	let ck: Vec<Keypair> = (0..5).map(|i| keypair(&format!("ob1 sup C{}", i))).collect();
 	let l = keypair("ob1 sup A landing key");
 	let program = hash160::Hash::hash(&l.public_key().serialize()).to_byte_array();
-	let apre: Vec<[u8; 32]> = (0..3).map(|i| label32(&format!("ob1 sup A pre {}", i))).collect();
-	let cpre: Vec<[u8; 32]> = (0..3).map(|i| label32(&format!("ob1 sup C pre {}", i))).collect();
-	let zs: Vec<LeafSpec> = (0..3).map(|i| landing_spec(&ak[i], &format!("ob1 sup A leaf {}", i), program, sha256(&apre[i]))).collect();
-	let xs: Vec<LeafSpec> = (0..3).map(|i| spec(&ck[i], &format!("ob1 sup C leaf {}", i), LEAF, sha256(&cpre[i]))).collect();
+	let apre: Vec<[u8; 32]> = (0..5).map(|i| label32(&format!("ob1 sup A pre {}", i))).collect();
+	let cpre: Vec<[u8; 32]> = (0..5).map(|i| label32(&format!("ob1 sup C pre {}", i))).collect();
+	let zs: Vec<LeafSpec> = (0..5).map(|i| landing_spec(&ak[i], &format!("ob1 sup A leaf {}", i), program, sha256(&apre[i]))).collect();
+	let xs: Vec<LeafSpec> = (0..5).map(|i| spec(&ck[i], &format!("ob1 sup C leaf {}", i), LEAF, sha256(&cpre[i]))).collect();
 	let tz = tree_of(&c, &s, z, None, &zs);
 	let tx_ = tree_of(&c, &s, x, None, &xs);
 	let rz = round(&mut c, "round of Z, landing-1 leaves (no sweep)", &s, &tz.batch_output(), None);
@@ -431,5 +435,32 @@ fn a_dead_swap_returns_a_supervised_coin_by_its_landing() {
 	c.net.wait_csv(&r.cp_id, delay());
 	c.net.pass("rollback/the landing once the delay has run from the new block", &land(&c, &r.cp, &rscript, r.at, z, r.value,
 		vec![explicit(z, r.value - FEE, r.land_spk.clone()), fee(z, FEE)], &ak[2], seq));
+
+	// ---- two landings together (#763) --------------------------------------
+	// Two dead swaps, A's coins landing at one landing key. Landed together,
+	// each pays the output at its own index: sharing output 0 would carry
+	// one coin's worth to any script, past the landing key where the
+	// issuer's freeze binds. Under the leaf's script (output 0 inspected by
+	// both) the first case is mined.
+	let p = swap_case(&mut c, "pair one", &s, &rounds, (&tz, &tx_), 3, (&ak[3], &ck[3]), (apre[3], cpre[3]), &l, true, t0);
+	let q = swap_case(&mut c, "pair two", &s, &rounds, (&tz, &tx_), 4, (&ak[4], &ck[4]), (apre[4], cpre[4]), &l, true, t0);
+	assert_eq!(p.land_spk, q.land_spk, "one landing key");
+	c.net.wait_csv(&p.cp_id, delay());
+	c.net.wait_csv(&q.cp_id, delay());
+	let both = |c: &Arca, outs: Vec<TxOut>| -> Transaction {
+		let (ps, qs) = (p.cp.exit_script().unwrap(), q.cp.exit_script().unwrap());
+		let mut sp = spend(0).input(p.at, explicit(z, p.value, p.cp.script_pubkey()), seq)
+			.input(q.at, explicit(z, q.value, q.cp.script_pubkey()), seq).outputs(outs);
+		let (s0, s1) = (sp.sign(&ak[3], 0, &ps, c.net.genesis), sp.sign(&ak[4], 1, &qs, c.net.genesis));
+		sp.witness(0, p.cp.taproot().witness(&ps, vec![s0.as_ref().to_vec()]));
+		sp.witness(1, q.cp.taproot().witness(&qs, vec![s1.as_ref().to_vec()]));
+		sp.tx
+	};
+	let shared = p.value.max(q.value) - ALLOWANCE;
+	let attack = both(&c, vec![explicit(z, shared, p.land_spk.clone()), explicit(z, p.value + q.value - shared - FEE, op_true_spk()),
+		fee(z, FEE)]);
+	c.net.refuse("pair/neg both landed sharing output 0, output 1 paying another script", &attack, EQ);
+	let home = both(&c, vec![explicit(z, p.value - FEE, p.land_spk.clone()), explicit(z, q.value, q.land_spk.clone()), fee(z, FEE)]);
+	c.net.pass("pair/both landed together, each at its own index", &home);
 	c.net.print();
 }

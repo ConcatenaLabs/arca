@@ -527,7 +527,7 @@ def generate():
     # A landing-1 coin's checkpoint with its owner's exit: the landing over
     # the checkpoint's value less the coin's allowance.
     cp_land_v = LEAF_VALUE - 600
-    cl_exit = landing_exit(A.x, DELAY, LANDING_PROGRAM, X_ID, cp_land_v - LANDING_ALLOWANCE)
+    cl_exit = landing_exit_own_index(A.x, DELAY, LANDING_PROGRAM, X_ID, cp_land_v - LANDING_ALLOWANCE)
     cltap, _ = checkpoint_taptree(A.x, S.x, SALT_CHECKPOINT_LANDING, CTAG, None, DELAY, cl_exit)
     outputs["checkpoint_landing"] = output_json("checkpoint of a landing-1 coin with its owner's exit, the landing", {
         "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_CHECKPOINT_LANDING),

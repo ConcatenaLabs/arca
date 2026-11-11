@@ -785,10 +785,13 @@ reassignment confirms the checkpoint is spent and the exit is gone, so an owner
 can pull out of a good reassignment only against every other party and their
 watchtowers staying away for the whole delay, the same option every sender has
 against an absent receiver. A coin of a supervised asset exits by its landing, exactly as from
-its leaf: output 0 pays P2WPKH of its holder's landing key, in the asset,
-explicitly, at least the checkpoint's value less the coin's allowance
-(`CheckpointExit::landing`), so a freeze or pause of the asset binds on the
-landed coin as on one landed from its leaf. A coin of a restricted asset is
+its leaf: the output at the spending input's own index pays P2WPKH of its
+holder's landing key, in the asset, explicitly, at least the checkpoint's
+value less the coin's allowance (`CheckpointExit::landing`,
+`LandingTerms::script_at_own_index`: the leaf's landing with
+`OP_PUSHCURRENTINPUTINDEX` where it pushes 0, the same 119 bytes), so a
+freeze or pause of the asset binds on the landed coin as on one landed from
+its leaf, and two landings spent together each need an output of their own. A coin of a restricted asset is
 never in a reassignment of several owners: a transfer of one moves that
 asset alone, from one holder.
 The checkpoint pair names the checkpoint's output, so it is made for one form
@@ -1295,7 +1298,10 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   a freeze, the landing confirms, and the landed coin is frozen by the pause
   and by a freeze of its address until it is lifted; a good swap completes,
   and the landing after it is refused; a rollback of the checkpoint's block
-  moves its delay to the block that confirms it again.
+  moves its delay to the block that confirms it again. Two of one holder's
+  checkpoints landed together, sharing output 0 while output 1 pays another
+  script, are refused (`Script failed an OP_EQUALVERIFY operation`); each
+  landing at its own index, they confirm.
 - `tests/merge.rs`: on an anchored regtest chain, two reassignments merged into
   one transaction. Two senders pay one receive request, each drawing the
   creator nonce of the leaf it creates: the operator admits both, the receiver

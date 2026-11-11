@@ -52,9 +52,11 @@
 //! checkpoint output, so its pairs are made for one form or the other.
 //!
 //! A coin of a supervised asset (`landing-1`) exits only by its landing, so
-//! its checkpoint's exit is the landing: output 0 pays P2WPKH of the
-//! holder's landing key, in the asset, explicitly, at least the checkpoint's
-//! value less the coin's allowance ([`CheckpointExit::landing`]). The
+//! its checkpoint's exit is the landing: the output at the spending input's
+//! own index pays P2WPKH of the holder's landing key, in the asset,
+//! explicitly, at least the checkpoint's value less the coin's allowance
+//! ([`CheckpointExit::landing`], [`LandingTerms::script_at_own_index`]), so
+//! two landings spent together each need an output of their own. The
 //! checkpoint is a script path, which no freeze reaches, exactly as the
 //! leaf; the landed coin is a single-owner output, where the issuer's freeze
 //! and pause bind, as they bind on a coin landed from its leaf. Only a coin
@@ -144,10 +146,12 @@ impl CheckpointPolicy {
 	}
 
 	/// The owner's exit leaf, when the checkpoint has one: the coin's own
-	/// exit script, `<delay> CSV DROP <A> CHECKSIG`, or its landing.
+	/// exit script, `<delay> CSV DROP <A> CHECKSIG`, or its landing, which
+	/// inspects the output at the spending input's own index
+	/// ([`LandingTerms::script_at_own_index`]).
 	pub fn exit_script(&self) -> Option<Script> {
 		self.exit.map(|e| match e.landing {
-			Some(l) => l.script(&self.owner, e.delay),
+			Some(l) => l.script_at_own_index(&self.owner, e.delay),
 			None => exit_script(&self.owner, e.delay),
 		})
 	}

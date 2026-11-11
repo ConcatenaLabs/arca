@@ -770,6 +770,19 @@ def connector_taptree(s_x):
     return tap, {"issue": issue}
 
 
+def landing_exit_own_index(a_x, delay, program, asset_id, min_value):
+    """A checkpoint's landing exit: landing_exit with the output at the
+    spending input's own index inspected (OP_PUSHCURRENTINPUTINDEX where the
+    leaf pushes 0), so two landings spent together can never share one
+    output. The same 119 bytes with a 512-second delay. Witness: <sig_A>."""
+    assert len(program) == 20 and len(asset_id) == 32
+    return CScript([delay, OP_CHECKSEQUENCEVERIFY, OP_DROP,
+                    OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTSCRIPTPUBKEY, OP_0, OP_EQUALVERIFY, program, OP_EQUALVERIFY,
+                    OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTASSET, OP_1, OP_EQUALVERIFY, asset_id, OP_EQUALVERIFY,
+                    OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTVALUE, OP_1, OP_EQUALVERIFY, le8(min_value), OP_GREATERTHANOREQUAL64,
+                    OP_VERIFY, a_x, OP_CHECKSIG])
+
+
 def checkpoint_taptree(a_x, s_x, salt, ctag, sweep, exit_delay=None, exit_script=None):
     """Checkpoint output: the leaf's collaborative path with the checkpoint's
     own salt, and the sweep with notice of its batch; for a coin of a batch
@@ -780,9 +793,9 @@ def checkpoint_taptree(a_x, s_x, salt, ctag, sweep, exit_delay=None, exit_script
     sweep, [collab, [sweep, exit]] with one. A reassignment of several
     owners' coins that can never complete then gives each owner its coin
     back alone after the delay (T28). A landing-1 coin's checkpoint exits by
-    its landing instead (exit_script, landing_exit over the checkpoint's
-    value less the coin's allowance), so a supervised coin still lands where
-    its issuer's freeze binds."""
+    its landing instead (exit_script, landing_exit_own_index over the
+    checkpoint's value less the coin's allowance), so a supervised coin still
+    lands where its issuer's freeze binds."""
     collab = collab3_loop(a_x, s_x, salt, ctag, fold=True)
     if exit_delay is not None:
         ex = exit_script if exit_script is not None else exit_leaf(a_x, exit_delay)
