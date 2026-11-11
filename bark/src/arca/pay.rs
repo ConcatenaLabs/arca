@@ -1338,6 +1338,20 @@ impl Wallet {
 	}
 
 	fn accept_coin_as(&mut self, bytes: &[u8], claimed: &str, source: &str, home: bool) -> Result<Value, Error> {
+		// The very record of a coin the store holds under the id the server
+		// names was checked when that coin was taken, and every re-check
+		// since reads it against the chain again: it is answered as held
+		// without reading the chain once more. A restore reads the mailbox
+		// from its start, where nearly every message is such a coin. The
+		// store's id was computed from these same bytes when the coin was
+		// taken, so the server's word for it decides nothing; any other
+		// record goes through every check below.
+		if let Some(c) = if claimed.is_empty() { None } else { self.store.coin(claimed)? } {
+			let canonical = CoinRecord::from_bytes(&c.record).ok().and_then(|r| r.to_bytes().ok());
+			if !c.record.is_empty() && (c.record == bytes || canonical.as_deref() == Some(bytes)) {
+				return Ok(json!({"leaf_id": c.leaf_id, "already_held": c.state}));
+			}
+		}
 		let record = CoinRecord::from_bytes(bytes).map_err(|e| if e.is_unknown_format() {
 			Error::Unread(e.to_string())
 		} else {

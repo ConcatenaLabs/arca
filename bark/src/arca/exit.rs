@@ -2237,7 +2237,7 @@ mod test {
 
 /// The cost of each step of a command, as [`super::command::run`] counts a
 /// command's: milliseconds, and requests of the node and of the operator.
-struct Steps {
+pub(crate) struct Steps {
 	at: web_time::Instant,
 	node: u64,
 	operator: u64,
@@ -2247,14 +2247,14 @@ struct Steps {
 }
 
 impl Steps {
-	fn start(w: &Wallet) -> Steps {
+	pub(crate) fn start(w: &Wallet) -> Steps {
 		Steps { at: web_time::Instant::now(), node: w.chain.calls().0, operator: super::chain::gaps(), by: w.chain.asked_by_method(),
 			op: super::chain::operator_calls(), out: serde_json::Map::new() }
 	}
 
 	/// The step `name` ends here; where it made many requests of the node one
 	/// read at a time, with their methods (`alone`).
-	fn lap(&mut self, w: &Wallet, name: &str) {
+	pub(crate) fn lap(&mut self, w: &Wallet, name: &str) {
 		let (node, operator, by) = (w.chain.calls().0, super::chain::gaps(), w.chain.asked_by_method());
 		let mut step = json!({"ms": self.at.elapsed().as_millis() as u64, "node": node - self.node, "operator": operator - self.operator});
 		let alone = super::command::cost_by_method(&self.by, &by);
@@ -2273,7 +2273,7 @@ impl Steps {
 		*self = Steps { at: web_time::Instant::now(), node, operator, by, op, out: std::mem::take(&mut self.out) };
 	}
 
-	fn done(self) -> Value {
+	pub(crate) fn done(self) -> Value {
 		Value::Object(self.out)
 	}
 }

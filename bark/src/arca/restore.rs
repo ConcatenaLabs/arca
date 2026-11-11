@@ -124,10 +124,12 @@ impl Wallet {
 	/// mnemonic; run again, it takes only what it does not hold. Refuses, and
 	/// restores nothing, while the operator's keeper set is not acknowledged.
 	pub fn restore(&mut self) -> Result<Value, Error> {
+		let mut steps = super::exit::Steps::start(self);
 		let info = self.server_info()?;
 		let (entries, served_receives, read_note) = self.read_served()?;
+		steps.lap(self, "read");
 		let TakenServed { mut restored, not_recovered, notes, given_elsewhere: _ } =
-			self.take_served(&info, &entries, &served_receives, false)?;
+			self.take_served(&info, &entries, &served_receives, false, Some(&mut steps))?;
 		let now = self.now()?;
 
 		// The mailbox, from its start: a coin held is held, one paid to a key
@@ -136,17 +138,20 @@ impl Wallet {
 		let mailbox_read = self.mailbox();
 		self.adopting.set(false);
 		let mailbox_read = mailbox_read.unwrap_or_else(|e| json!({"error": e.to_string()}));
+		steps.lap(self, "mailbox");
 
 		// The chain is read from the oldest base on; the schedule holds at a
 		// day while a request handed out before may still be paid.
+		// Only the height of each base's block is wanted, read for all of them
+		// at once; whether a block is final has no part in the birthday.
+		let bases: BTreeSet<Txid> = self.store.coins()?.iter().flat_map(|c| c.bases.iter().filter_map(|b| Txid::from_str(b).ok()))
+			.collect();
+		let bases: Vec<Txid> = bases.into_iter().collect();
+		self.chain.read_ahead_of(&bases, &[]);
 		let mut lowest: Option<u64> = None;
-		for c in self.store.coins()? {
-			for b in &c.bases {
-				if let Ok(t) = Txid::from_str(b) {
-					if let Some(h) = self.chain.finality(&t)?.height() {
-						lowest = Some(lowest.map_or(h, |l| l.min(h)));
-					}
-				}
+		for t in &bases {
+			if let Some((_, h)) = self.chain.tx_block(t)? {
+				lowest = Some(lowest.map_or(h, |l| l.min(h)));
 			}
 		}
 		if let Some(h) = lowest {
@@ -158,6 +163,7 @@ impl Wallet {
 		let until = now.to_consensus_u32().saturating_add(super::wallet::REQUEST_HOLDS);
 		let held_until: u32 = self.store.meta(RESTORED_UNTIL)?.and_then(|v| v.parse().ok()).unwrap_or(0);
 		self.store.set_meta(RESTORED_UNTIL, &until.max(held_until).to_string())?;
+		steps.lap(self, "birthday");
 
 		// One line per coin not recovered, its reasons together.
 		let mut merged: Vec<Value> = vec![];
@@ -179,9 +185,11 @@ impl Wallet {
 		// checked against the mnemonic; `sync` takes up each step whose round
 		// is final.
 		let plans = self.restore_plans().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		steps.lap(self, "plans");
 		// A restore has just read everything a catch-up would.
 		self.store.set_meta(CAUGHT_UP, &now.to_consensus_u32().to_string())?;
 		let sync = self.sync()?;
+		steps.lap(self, "sync");
 		let mut out = json!({
 			"served": entries.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes, "mailbox": mailbox_read,
 			"plans": plans,
@@ -191,6 +199,7 @@ impl Wallet {
 		if let Some(n) = read_note {
 			out["note"] = json!(n);
 		}
+		out["cost_by_step"] = steps.done();
 		Ok(out)
 	}
 
@@ -449,7 +458,9 @@ impl Wallet {
 	/// it up (`given_elsewhere`); and a coin it could not take is said, not
 	/// recorded as refused again, since it is looked at again next time; and
 	/// a coin under a nonce this store drew is left to its mailbox read.
-	fn take_served(&mut self, info: &Value, entries: &[Value], served_receives: &[Value], catching_up: bool) -> Result<TakenServed, Error> {
+	fn take_served(&mut self, info: &Value, entries: &[Value], served_receives: &[Value], catching_up: bool,
+		mut steps: Option<&mut super::exit::Steps>) -> Result<TakenServed, Error>
+	{
 		self.keepers_acknowledged(info, entries)?;
 		self.no_foreign_acks(info, entries)?;
 		let now = self.now()?;
@@ -457,6 +468,34 @@ impl Wallet {
 		let mut restored: Vec<Value> = vec![];
 		let mut taken: BTreeMap<String, Taken> = BTreeMap::new();
 		let mut trees: BTreeMap<(String, u32), (Value, Batch)> = BTreeMap::new();
+
+		// The transactions the server names for every coin to be checked,
+		// with where each is and its block's header, read together in a few
+		// batches ahead of the checks, which then find them read: the checks
+		// are the same, only the requests that make them fewer.
+		// The published trees of their rounds are asked of the operator
+		// first, each once, so that the chain is read after the last request
+		// to the operator rather than looked at again after each one.
+		let mut named: BTreeSet<Txid> = BTreeSet::new();
+		let mut batches: BTreeSet<(String, u32)> = BTreeSet::new();
+		for e in entries {
+			if self.store.coin(e["leaf_id"].as_str().unwrap_or(""))?.is_none() && !(catching_up && self.drew_nonce_of(e)?) {
+				named.extend(Self::served_bases(e).iter().filter_map(|t| Txid::from_str(t).ok()));
+				for g in e["given"].as_array().into_iter().flatten() {
+					for f in g["participation"]["forfeits"].as_array().into_iter().flatten() {
+						named.extend(f["round_txid"].as_str().and_then(|t| Txid::from_str(t).ok()));
+					}
+				}
+				let b = &e["batch"];
+				if let (Some(t), Some(v), false) = (b["round_txid"].as_str(), b["batch_vout"].as_u64(), e["record"].as_str().unwrap_or("").is_empty()) {
+					batches.insert((t.to_string(), v as u32));
+				}
+			}
+		}
+		for (t, v) in &batches {
+			let _ = self.published_tree(&mut trees, t, *v);
+		}
+		self.chain.read_ahead_of(&named.into_iter().collect::<Vec<_>>(), &[]);
 
 		// Every coin served with a record, checked; the same leaf served twice
 		// is looked at once, its first copy.
@@ -498,6 +537,7 @@ impl Wallet {
 			}
 		}
 
+		if let Some(st) = steps.as_deref_mut() { st.lap(self, "coins"); }
 		// The coins a coin taken spends, by the transfer that made it: a
 		// received leaf is spent by its claim only once the wallet holds a coin
 		// the claim made, checked.
@@ -527,6 +567,7 @@ impl Wallet {
 			}
 		}
 
+		if let Some(st) = steps.as_deref_mut() { st.lap(self, "given"); }
 		// A leaf the lost wallet took home: its own output on the chain, found
 		// and followed as an exit would (its claim, a forfeit or a checkpoint
 		// that took it, or the exit to go on), never held live.
@@ -538,6 +579,7 @@ impl Wallet {
 			}
 		}
 
+		if let Some(st) = steps.as_deref_mut() { st.lap(self, "on_chain"); }
 		// A leaf that went over Lightning and is not given up on its owner's
 		// signature: as the payment stands. A received leaf whose claim the
 		// server recorded and has not co-signed (`sending`) is held as
@@ -552,6 +594,7 @@ impl Wallet {
 			}
 		}
 
+		if let Some(st) = steps.as_deref_mut() { st.lap(self, "htlc"); }
 		// D70: the payments into the tree asked under the mailbox key and not
 		// yet claimed, whose leaf is not held yet (held, wanted in a round, or
 		// made and not yet released): each rebuilt from what the server serves,
@@ -570,6 +613,7 @@ impl Wallet {
 			}
 		}
 
+		if let Some(st) = steps.as_deref_mut() { st.lap(self, "receives"); }
 		// What the wallet's own records say, whatever the server says of the
 		// coins they rest on: every coin a held coin's record spends was
 		// spent by the transfer that made it, which the operator co-signed.
@@ -594,10 +638,12 @@ impl Wallet {
 			}
 		}
 
+		if let Some(st) = steps.as_deref_mut() { st.lap(self, "records"); }
 		// Participations in their forfeit step: the new leaves validated as
 		// before their forfeits were signed; and the new leaves of released
 		// ones that the server does not serve, from the published tree.
 		notes.extend(self.restore_participations(&mut trees, now, &mut restored, &mut not_recovered)?);
+		if let Some(st) = steps.as_deref_mut() { st.lap(self, "participations"); }
 		Ok(TakenServed { restored, not_recovered, notes, given_elsewhere })
 	}
 
@@ -657,7 +703,7 @@ impl Wallet {
 		let info = self.server_info()?;
 		let (entries, served_receives, read_note) = self.read_served()?;
 		let TakenServed { mut restored, not_recovered, notes, given_elsewhere } =
-			self.take_served(&info, &entries, &served_receives, true)?;
+			self.take_served(&info, &entries, &served_receives, true, None)?;
 		let now = self.now()?;
 		self.store.set_meta(CAUGHT_UP, &now.to_consensus_u32().to_string())?;
 		for v in restored.iter_mut() {
@@ -689,19 +735,25 @@ impl Wallet {
 	/// only from the active chain, and used only where it pays an output the
 	/// record names; one that does not read leaves the search as it was.
 	fn take_served_bases(&mut self, e: &Value) {
-		let mut named: Vec<String> = e["bases"].as_array().into_iter().flatten()
-			.filter_map(|b| b["txid"].as_str().map(str::to_string)).collect();
-		named.extend(e["batch"]["round_txid"].as_str().map(str::to_string));
-		named.extend(e["board"]["txid"].as_str().map(str::to_string));
-		named.sort();
-		named.dedup();
-		for t in named {
+		for t in Self::served_bases(e) {
 			let Ok(txid) = Txid::from_str(&t) else { continue };
 			match self.chain.transaction(&txid) {
 				Ok(Some(tx)) => { let _ = self.hint_base(&tx); },
 				_ => {},
 			}
 		}
+	}
+
+	/// The txids the server names for coin `e`: its bases, its round, its
+	/// board's transaction.
+	fn served_bases(e: &Value) -> Vec<String> {
+		let mut named: Vec<String> = e["bases"].as_array().into_iter().flatten()
+			.filter_map(|b| b["txid"].as_str().map(str::to_string)).collect();
+		named.extend(e["batch"]["round_txid"].as_str().map(str::to_string));
+		named.extend(e["board"]["txid"].as_str().map(str::to_string));
+		named.sort();
+		named.dedup();
+		named
 	}
 
 	/// The coin `id` (`coin`), restored live, whose own output the chain
@@ -1138,7 +1190,7 @@ impl Wallet {
 			if !ok {
 				continue;
 			}
-			let from_height = self.chain.finality(&rtx).ok().and_then(|x| x.height()).unwrap_or(0).saturating_sub(100);
+			let from_height = self.chain.tx_block(&rtx).ok().flatten().map_or(0, |(_, h)| h).saturating_sub(100);
 			forfeits.push((ForfeitRow {
 				leaf_id: id.to_string(), participation: pid.clone(), round, connector_vout: vout, unlock_hash: hex(&unlock), refund_units: units,
 				margin, from_height, state: "signed".into(), note: String::new(),
@@ -1237,12 +1289,21 @@ impl Wallet {
 		not_recovered: &mut Vec<Value>) -> Result<Vec<Value>, Error>
 	{
 		let mut notes = vec![];
-		for (pid, body, given_json, wanted, state, _, round) in self.store.participations()? {
-			let restored_here = serde_json::from_str::<Value>(&body).is_ok_and(|b| b["restored"] == json!(true));
-			if !restored_here || state != "forfeiting" {
-				continue;
-			}
-			let st = match self.server.post("participation_status", &json!({"participation_id": pid})) {
+		let followed: Vec<_> = self.store.participations()?.into_iter()
+			.filter(|p| p.4 == "forfeiting" && serde_json::from_str::<Value>(&p.1).is_ok_and(|b| b["restored"] == json!(true))).collect();
+		// How each stands, asked of the operator first, then their rounds read
+		// together: the chain is read after the last request to the operator,
+		// rather than looked at again after each one.
+		let mut statuses = BTreeMap::new();
+		for p in &followed {
+			statuses.insert(p.0.clone(), self.server.post("participation_status", &json!({"participation_id": p.0})));
+		}
+		let rounds: BTreeSet<Txid> = followed.iter().filter_map(|p| p.6.clone()
+			.or_else(|| statuses.get(&p.0).and_then(|s| s.as_ref().ok()).and_then(|s| s["round"]["txid"].as_str().map(str::to_string))))
+			.filter_map(|r| Txid::from_str(&r).ok()).collect();
+		self.chain.read_ahead_of(&rounds.into_iter().collect::<Vec<_>>(), &[]);
+		for (pid, _body, given_json, wanted, _state, _, round) in followed {
+			let st = match statuses.remove(&pid).expect("asked for each") {
 				Ok(st) => st,
 				Err(e) => {
 					notes.push(json!({"participation": pid, "error": e.to_string()}));
