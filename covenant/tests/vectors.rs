@@ -267,10 +267,6 @@ impl Ctx {
 		h
 	}
 
-	fn landing(&self) -> LeafPolicy {
-		self.landing_of("landing")
-	}
-
 	/// `landing` for the `landing-1` leaf, `landing2` for the `landing-2`
 	/// leaf: the same terms, landing at output 0 or at its own index.
 	fn landing_of(&self, name: &str) -> LeafPolicy {
