@@ -113,8 +113,8 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 `balance`, `coins {held?, brief?}`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?}`, `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
-`mailbox`, `restore`, `quote {leaves?, max_fee_ppm?}`, `participate {leaves?,
-not_before?, max_fee_ppm?, shown}`, `participations`, `settle_quote {asset,
+`mailbox`, `restore`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
+not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_quote {asset,
 value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received

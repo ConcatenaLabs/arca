@@ -131,7 +131,7 @@ mod take;
 pub mod tower;
 mod wallet;
 
-pub use round::{RefreshQuote, DEFAULT_MAX_FEE_PPM};
+pub use round::{RefreshQuote, DEFAULT_MAX_FEE_PPM, MAX_PIECES};
 pub use plan::CARE_MAX_FEE_PPM;
 pub use speed::{RETRY_AFTER, WITHDRAW_AFTER};
 pub use wallet::{CoinDates, Config, Spelling, Wallet, HOME_FROM, REDOING, REFRESH_FROM, REQUEST_HOLDS, SYNC_DAILY, WITNESS_PATIENCE};

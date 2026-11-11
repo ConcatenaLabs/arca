@@ -98,6 +98,42 @@ pub const DEFAULT_MAX_FEE_PPM: u64 = 10_000;
 /// publishes.
 pub const FREE_WINDOW: u32 = 2 * 86_400;
 
+/// The most leaves of `piece` one participation cut into pieces makes: with
+/// the rest, and the last piece split in two when the rest is below the
+/// smallest leaf, at most the operator's 16 outputs.
+pub const MAX_PIECES: usize = 14;
+
+/// `value` cut into leaves for a refresh in pieces: `count` (at most
+/// [`MAX_PIECES`]) leaves of `piece` while the value lasts, then one leaf of
+/// the rest. A rest below the operator's smallest leaf `min` is not left
+/// alone: the last piece and the rest are made two leaves of half their sum
+/// each, so no leaf is above `piece` unless it is the rest after every
+/// piece. A value below one piece stays one leaf. Refused when `piece` is
+/// below twice `min`, which a split could not keep at the smallest leaf.
+pub fn pieces_of(value: u64, piece: u64, count: usize, min: u64) -> Result<Vec<u64>, Error> {
+	if piece < min.saturating_mul(2) || piece == 0 {
+		return Err(Error::Refused(format!("pieces of {} are below twice the operator's smallest leaf, {}", piece, min)));
+	}
+	if value < min {
+		return Err(Error::Refused(format!("the new leaf would hold {}, below the operator's smallest leaf {}", value, min)));
+	}
+	let n = (value / piece).min(count.min(MAX_PIECES) as u64);
+	if n == 0 {
+		return Ok(vec![value]);
+	}
+	let rest = value - n * piece;
+	let mut out = vec![piece; n as usize];
+	if rest >= min {
+		out.push(rest);
+	} else if rest > 0 {
+		out.pop();
+		let t = piece + rest;
+		out.push(t - t / 2);
+		out.push(t / 2);
+	}
+	Ok(out)
+}
+
 /// A refresh quote's coins in the participations that give them up: one per
 /// asset, or one per [`MAX_GIVEN`] coins of an asset that has more, each
 /// with its coins' value and fee as quoted (`coins[k]`'s `value` and `fee`,
@@ -160,6 +196,10 @@ pub struct RefreshQuote {
 	/// With a channel: what the wallet keeps in a plain leaf of its own
 	/// beside it, out of what the coins hold after the fee.
 	pub(crate) keep: Option<u64>,
+	/// In pieces: each asset's new value as at most this many leaves of
+	/// this value and one leaf of the rest ([`pieces_of`]); `None` for one
+	/// leaf per participation.
+	pub(crate) pieces: Option<(u64, usize)>,
 	rows: Vec<super::store::CoinRow>,
 	ids: Vec<arca_covenant::LeafId>,
 	/// The asset of each coin of `rows`.
@@ -169,6 +209,27 @@ pub struct RefreshQuote {
 }
 
 impl RefreshQuote {
+	/// The refresh in pieces ([`pieces_of`]): each asset's new value as up
+	/// to `count` leaves of `piece` and one leaf of the rest, so a program
+	/// keeps coins of a size it chooses. Refused for a channel, and when an
+	/// asset's value cannot be cut so (a piece below twice the operator's
+	/// smallest leaf). Answers the leaves each asset's participations make.
+	pub fn in_pieces(&mut self, piece: u64, count: usize) -> Result<Value, Error> {
+		if self.channel.is_some() {
+			return Err(Error::Refused("a channel's refresh is not cut into pieces".into()));
+		}
+		let mut out = serde_json::Map::new();
+		for (asset, total, fee, _) in participation_parts(&self.per, &self.assets, &self.coins, false) {
+			let min = Wallet::min_leaf(&self.info, asset)?;
+			let value = total.checked_sub(fee).ok_or_else(|| Error::Refused("the refresh fee is more than the coins hold".into()))?;
+			let leaves = pieces_of(value, piece, count, min)?;
+			let e = out.entry(asset.to_string()).or_insert_with(|| json!([]));
+			e.as_array_mut().expect("an array").extend(leaves.iter().map(|v| json!(v.to_string())));
+		}
+		self.pieces = Some((piece, count));
+		Ok(Value::Object(out))
+	}
+
 	/// Each coin given up, its fee, that fee in millionths of the coin, and
 	/// the bound it was checked against.
 	pub fn coins(&self) -> &[Value] {
@@ -781,7 +842,7 @@ impl Wallet {
 				return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
 			}
 		}
-		Ok(RefreshQuote { info, channel: None, keep: None, rows, ids, assets, per, coins })
+		Ok(RefreshQuote { info, channel: None, keep: None, pieces: None, rows, ids, assets, per, coins })
 	}
 
 	/// What refreshing a coin of `value` of `asset` whose expiry is median
@@ -817,14 +878,27 @@ impl Wallet {
 	/// refused or did not take now with its `error` (one not taken stands,
 	/// and sync posts it again); it is an error only when none was taken.
 	pub fn participate(&mut self, quote: RefreshQuote, not_before: Option<u32>) -> Result<Value, Error> {
-		let RefreshQuote { info, channel, keep, rows, ids, assets, per, coins } = quote;
+		let RefreshQuote { info, channel, keep, pieces, rows, ids, assets, per, coins } = quote;
 		let mut out = vec![];
 		let mut first_error = None;
 		let parts = participation_parts(&per, &assets, &coins, channel.is_some());
 		for (asset, total, fee, mine) in &parts {
 			let rows: Vec<&super::store::CoinRow> = mine.iter().map(|k| &rows[*k]).collect();
 			let ids: Vec<arca_covenant::LeafId> = mine.iter().map(|k| ids[*k]).collect();
-			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before, channel, keep) {
+			let values = match pieces {
+				Some((piece, count)) => match total.checked_sub(*fee).ok_or_else(|| Error::Refused("the refresh fee is more than the coins hold".into()))
+					.and_then(|v| pieces_of(v, piece, count, Self::min_leaf(&info, *asset)?)) {
+					Ok(v) => Some(v),
+					Err(e) => {
+						out.push(json!({"asset": asset.to_string(), "gives": rows.iter().map(|r| r.leaf_id.clone()).collect::<Vec<_>>(),
+							"error": e.to_string(), "note": "refused: its coins are the wallet's again, live"}));
+						first_error.get_or_insert(e);
+						continue;
+					},
+				},
+				None => None,
+			};
+			match self.participate_in(&info, *asset, *total, *fee, &rows, &ids, not_before, channel, keep, values) {
 				Ok(v) => out.push(v),
 				Err(e) => {
 					let mut entry = json!({"asset": asset.to_string(), "gives": rows.iter().map(|r| r.leaf_id.clone()).collect::<Vec<_>>(),
@@ -855,7 +929,8 @@ impl Wallet {
 	/// of `keep` beside it, the channel taking the rest.
 	#[allow(clippy::too_many_arguments)]
 	fn participate_in(&mut self, info: &Value, asset: AssetId, total: u64, fee: u64, rows: &[&super::store::CoinRow],
-		ids: &[arca_covenant::LeafId], not_before: Option<u32>, capacity: Option<u64>, keep: Option<u64>) -> Result<Value, Error>
+		ids: &[arca_covenant::LeafId], not_before: Option<u32>, capacity: Option<u64>, keep: Option<u64>, pieces: Option<Vec<u64>>)
+		-> Result<Value, Error>
 	{
 		let needs_fee_coin = self.chain.floor_per_kvb(asset)?.is_none();
 		let value = total.checked_sub(fee).ok_or_else(|| Error::Refused("the refresh fee is more than the coins hold".into()))?;
@@ -884,42 +959,75 @@ impl Wallet {
 		} else {
 			Template::Vtxo1
 		};
-		// What stays in a plain leaf beside a channel: refused unless both
-		// leaves hold at least the operator's smallest.
-		let kept = match keep.filter(|_| channel.is_some()) {
-			Some(k) if k >= min && value.saturating_sub(k) >= min => Some(k),
-			Some(k) => return Err(Error::Refused(format!("keeping {} of {} beside the channel leaves a leaf below the operator's smallest, {}",
-				k, value, min))),
-			None => None,
-		};
-		let value = value - kept.unwrap_or(0);
-		let value = value.checked_add(capacity.unwrap_or(0)).ok_or_else(|| Error::Refused("the channel's value overflows".into()))?;
-		let mut wanted = vec![Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
-			order: None, landing, channel }];
-		let mut entry = json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()});
-		if let Some(l) = &landing {
-			entry["landing"] = arca_covenant::record_json::landing_json(l);
-		}
-		if let Some(c) = &channel {
-			entry["channel"] = arca_covenant::record_json::channel_json(c);
-		}
-		if template == Template::Vtxo2 {
-			entry["template"] = json!("vtxo-2");
-		}
-		let mut nonces = vec![entry];
-		if let Some(k) = kept {
-			let n2 = super::random32();
-			let o2 = self.keys.leaf_xonly(&n2)?;
-			self.store.put_nonce(&n2, &o2.serialize(), "refresh")?;
-			let t2 = if self.asks_vtxo2() { Template::Vtxo2 } else { Template::Vtxo1 };
-			wanted.push(Wanted::Leaf { asset, value: k, template: t2, owner: o2, owner_nonce: n2, exit_delay: self.exit_delay(),
-				order: None, landing: None, channel: None });
-			let mut e2 = json!({"nonce": hex(&n2), "asset": asset.to_string(), "value": k.to_string()});
-			if t2 == Template::Vtxo2 {
-				e2["template"] = json!("vtxo-2");
+		// In pieces: one plain leaf of each value, each under a key of its
+		// own, adding up to what the coins hold after the fee.
+		let (wanted, nonces) = if let Some(values) = pieces {
+			if channel.is_some() || landing.is_some() {
+				return Err(Error::Refused(format!("a refresh in asset {} is not cut into pieces: its new leaf is a channel's or a landing's", asset)));
 			}
-			nonces.push(e2);
-		}
+			if values.is_empty() || values.iter().any(|v| *v < min) || values.iter().try_fold(0u64, |a, v| a.checked_add(*v)) != Some(value) {
+				return Err(Error::Refused(format!("pieces {:?} of asset {} do not make {}, each at least the operator's smallest leaf {}",
+					values, asset, value, min)));
+			}
+			let mut wanted = vec![];
+			let mut nonces = vec![];
+			for (k, v) in values.iter().enumerate() {
+				let (n, o) = if k == 0 {
+					(nonce, owner)
+				} else {
+					let n = super::random32();
+					let o = self.keys.leaf_xonly(&n)?;
+					self.store.put_nonce(&n, &o.serialize(), "refresh")?;
+					(n, o)
+				};
+				wanted.push(Wanted::Leaf { asset, value: *v, template, owner: o, owner_nonce: n, exit_delay: self.exit_delay(),
+					order: None, landing: None, channel: None });
+				let mut e = json!({"nonce": hex(&n), "asset": asset.to_string(), "value": v.to_string()});
+				if template == Template::Vtxo2 {
+					e["template"] = json!("vtxo-2");
+				}
+				nonces.push(e);
+			}
+			(wanted, nonces)
+		} else {
+			// What stays in a plain leaf beside a channel: refused unless both
+			// leaves hold at least the operator's smallest.
+			let kept = match keep.filter(|_| channel.is_some()) {
+				Some(k) if k >= min && value.saturating_sub(k) >= min => Some(k),
+				Some(k) => return Err(Error::Refused(format!("keeping {} of {} beside the channel leaves a leaf below the operator's smallest, {}",
+					k, value, min))),
+				None => None,
+			};
+			let value = value - kept.unwrap_or(0);
+			let value = value.checked_add(capacity.unwrap_or(0)).ok_or_else(|| Error::Refused("the channel's value overflows".into()))?;
+			let mut wanted = vec![Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(),
+				order: None, landing, channel }];
+			let mut entry = json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()});
+			if let Some(l) = &landing {
+				entry["landing"] = arca_covenant::record_json::landing_json(l);
+			}
+			if let Some(c) = &channel {
+				entry["channel"] = arca_covenant::record_json::channel_json(c);
+			}
+			if template == Template::Vtxo2 {
+				entry["template"] = json!("vtxo-2");
+			}
+			let mut nonces = vec![entry];
+			if let Some(k) = kept {
+				let n2 = super::random32();
+				let o2 = self.keys.leaf_xonly(&n2)?;
+				self.store.put_nonce(&n2, &o2.serialize(), "refresh")?;
+				let t2 = if self.asks_vtxo2() { Template::Vtxo2 } else { Template::Vtxo1 };
+				wanted.push(Wanted::Leaf { asset, value: k, template: t2, owner: o2, owner_nonce: n2, exit_delay: self.exit_delay(),
+					order: None, landing: None, channel: None });
+				let mut e2 = json!({"nonce": hex(&n2), "asset": asset.to_string(), "value": k.to_string()});
+				if t2 == Template::Vtxo2 {
+					e2["template"] = json!("vtxo-2");
+				}
+				nonces.push(e2);
+			}
+			(wanted, nonces)
+		};
 		let fees: Vec<(AssetId, u64)> = if fee > 0 { vec![(asset, fee)] } else { vec![] };
 		let nb = not_before.map(MedianTime::from_consensus).transpose().map_err(|e| Error::Refused(e.to_string()))?;
 		let id = participation_id(&self.genesis, &self.operator, ids, &wanted, &fees, nb);
@@ -2825,6 +2933,36 @@ mod tests {
 			assert_eq!(b[0], version);
 			assert!(matches!(NewRecord::from_bytes(&b), Ok(NewRecord::Tree(r)) if r == tree.record(1)), "tree, version {}", version);
 		}
+	}
+
+	#[test]
+	fn a_refresh_in_pieces_keeps_every_leaf_at_most_a_piece_but_the_rest() {
+		// Four pieces and a reserve of the rest.
+		assert_eq!(super::pieces_of(1_000, 100, 4, 10).unwrap(), vec![100, 100, 100, 100, 600]);
+		// As many pieces as the value holds: the rest is below a piece.
+		assert_eq!(super::pieces_of(450, 100, 14, 10).unwrap(), vec![100, 100, 100, 100, 50]);
+		// A rest below the smallest leaf: the last piece and it are halved.
+		assert_eq!(super::pieces_of(405, 100, 14, 10).unwrap(), vec![100, 100, 100, 53, 52]);
+		// Exactly whole pieces.
+		assert_eq!(super::pieces_of(300, 100, 14, 10).unwrap(), vec![100, 100, 100]);
+		// Less than one piece: one leaf.
+		assert_eq!(super::pieces_of(70, 100, 4, 10).unwrap(), vec![70]);
+		// At most MAX_PIECES pieces, whatever is asked; never above 16 leaves.
+		let v = super::pieces_of(10_000, 100, 99, 10).unwrap();
+		assert_eq!(v.len(), super::MAX_PIECES + 1);
+		assert_eq!(v.iter().sum::<u64>(), 10_000);
+		// Every value adds up and no leaf but a reserve rest is above the piece.
+		for value in [10u64, 99, 100, 101, 109, 110, 199, 200, 205, 1_401, 1_405, 1_499, 1_500, 1_509] {
+			let v = super::pieces_of(value, 100, 14, 10).unwrap();
+			assert_eq!(v.iter().sum::<u64>(), value, "{}", value);
+			assert!(v.iter().all(|x| *x >= 10), "{} {:?}", value, v);
+			assert!(v.len() <= 16, "{} {:?}", value, v);
+			let whole = value / 100 <= 14;
+			assert!(!whole || v.iter().all(|x| *x <= 100), "{} {:?}", value, v);
+		}
+		// A piece below twice the smallest leaf, or a value below it, is refused.
+		assert!(super::pieces_of(1_000, 19, 4, 10).is_err());
+		assert!(super::pieces_of(9, 100, 4, 10).is_err());
 	}
 
 	#[test]

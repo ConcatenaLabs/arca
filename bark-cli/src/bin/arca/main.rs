@@ -282,13 +282,30 @@ enum Cmd {
 		leaves: Vec<String>,
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
+		/// Cuts each asset's new value into leaves of this many atoms (up
+		/// to `--pieces` of them) and one leaf of the rest, instead of one
+		/// leaf per asset: coins of a size the wallet chooses.
+		#[arg(long)]
+		piece: Option<u64>,
+		/// The most leaves of `--piece` (default and at most 14).
+		#[arg(long)]
+		pieces: Option<u64>,
 	},
 	/// Takes part in the next round with the coins named (every live coin
-	/// when none is), for one new leaf per asset.
+	/// when none is), for one new leaf per asset, or for leaves of
+	/// `--piece`.
 	#[command(alias = "refresh")]
 	Participate {
 		#[arg(long = "leaf")]
 		leaves: Vec<String>,
+		/// Cuts each asset's new value into leaves of this many atoms (up
+		/// to `--pieces` of them) and one leaf of the rest, instead of one
+		/// leaf per asset: coins of a size the wallet chooses.
+		#[arg(long)]
+		piece: Option<u64>,
+		/// The most leaves of `--piece` (default and at most 14).
+		#[arg(long)]
+		pieces: Option<u64>,
 		/// The earliest median time of a round it may run in.
 		#[arg(long)]
 		not_before: Option<u32>,
@@ -1501,10 +1518,22 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),
 		Cmd::Lightning(LightningCmd::Claim { .. }) => unreachable!("handled above"),
 		Cmd::Restore => w.restore(),
-		Cmd::Quote { leaves, max_fee_ppm } => Ok(json!({"coins": w.refresh_quote(&leaves, max_fee_ppm)?.coins()})),
-		Cmd::Participate { leaves, not_before, max_fee_ppm, shown } => {
+		Cmd::Quote { leaves, max_fee_ppm, piece, pieces } => {
+			let mut quote = w.refresh_quote(&leaves, max_fee_ppm)?;
+			match piece {
+				Some(p) => {
+					let made = quote.in_pieces(p, pieces.unwrap_or(bark::arca::MAX_PIECES as u64).min(bark::arca::MAX_PIECES as u64) as usize)?;
+					Ok(json!({"coins": quote.coins(), "pieces": made}))
+				},
+				None => Ok(json!({"coins": quote.coins()})),
+			}
+		},
+		Cmd::Participate { leaves, not_before, max_fee_ppm, piece, pieces, shown } => {
 			// The fee is shown before anything is signed.
-			let quote = w.refresh_quote(&leaves, max_fee_ppm)?;
+			let mut quote = w.refresh_quote(&leaves, max_fee_ppm)?;
+			if let Some(p) = piece {
+				quote.in_pieces(p, pieces.unwrap_or(bark::arca::MAX_PIECES as u64).min(bark::arca::MAX_PIECES as u64) as usize)?;
+			}
 			// A program that showed the fees (`quote`) goes ahead only on
 			// the very fees it showed.
 			if let Some(shown) = shown {

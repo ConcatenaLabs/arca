@@ -27,7 +27,7 @@ use super::{Config, Error, Wallet};
 /// Every command [`run`] takes, with its arguments.
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, brief?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
-	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?}, participate {leaves?, not_before?, max_fee_ppm?, shown}, \
+	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?}, deposits, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
 	refresh_received {max_fee_ppm?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
@@ -73,6 +73,24 @@ pub fn refusal(e: &Error) -> Value {
 		}
 	}
 	out
+}
+
+/// A refresh's `piece` and `pieces` (`quote`, `participate`): with `piece`,
+/// each asset's new value is cut into up to `pieces` (default and at most
+/// [`super::round::MAX_PIECES`]) leaves of `piece` atoms and one leaf of the
+/// rest; the leaves each asset makes, or `None` without `piece`.
+fn in_pieces(quote: &mut super::round::RefreshQuote, a: &Value) -> Result<Option<Value>, Error> {
+	let Some(piece) = opt_u64(&a["piece"], "the piece")? else {
+		if !a["pieces"].is_null() {
+			return Err(Error::Parse("pieces without a piece: name the size of each".into()));
+		}
+		return Ok(None);
+	};
+	let count = opt_u64(&a["pieces"], "the pieces")?.unwrap_or(super::round::MAX_PIECES as u64);
+	if count == 0 {
+		return Err(Error::Parse("pieces of 0: at least one".into()));
+	}
+	Ok(Some(quote.in_pieces(piece, count.min(super::round::MAX_PIECES as u64) as usize)?))
 }
 
 /// The name of the store of the wallet of `mnemonic`: one per wallet, named
@@ -315,14 +333,18 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"mailbox" => w.mailbox(),
 		"restore" => w.restore(),
 		"quote" => {
-			let quote = w.refresh_quote(&leaves(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)?;
-			Ok(json!({"coins": quote.coins()}))
+			let mut quote = w.refresh_quote(&leaves(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)?;
+			match in_pieces(&mut quote, a)? {
+				Some(made) => Ok(json!({"coins": quote.coins(), "pieces": made})),
+				None => Ok(json!({"coins": quote.coins()})),
+			}
 		},
 		"participate" => {
 			// The fee is shown before anything is signed: the program shows
 			// the quote, and the participation goes ahead only on the very
 			// fees it showed.
-			let quote = w.refresh_quote(&leaves(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)?;
+			let mut quote = w.refresh_quote(&leaves(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)?;
+			in_pieces(&mut quote, a)?;
 			let now = json!(quote.coins());
 			if a["shown"] != now {
 				return Err(Error::Refused(format!("the refresh fees changed since they were shown; they are now {}", now)));
