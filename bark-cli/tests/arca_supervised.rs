@@ -640,11 +640,38 @@ async fn under_the_switch_fills_and_lightning_in_a_supervised_asset_are_refused_
 			"--rate-den", "1", "--min-lot", "100000", "--expires-in-hours", "720"]);
 		let m = v.to_string() + &err;
 		println!("OLDER resting order selling Z: ok {} {}", ok, m.lines().next().unwrap_or(""));
-		for w in ["supervised", "paid to another wallet", "swapped with another wallet by a swap offer", "withdrawn to an address",
-			"sold by an order on the chain", "Nothing was co-signed"]
+		for w in ["supervised", "An up-to-date wallet can pay the asset", "swap it by a swap offer", "withdraw it to an address",
+			"sell it by an order on the chain", "taken home to its own key by their exit", "Nothing was co-signed"]
 		{
 			assert!(!ok && m.contains(w), "the operator's refusal does not say {:?}: {}", w, m);
 		}
+		// What it names for the older build until it updates: its coin of Z
+		// taken home to its own key by the coin's exit.
+		let coin = live_in(o, &z).first().cloned().expect("the older build's coin of Z");
+		let id = coin["leaf_id"].as_str().unwrap().to_string();
+		let value = atoms(&coin["value"]);
+		let e = o.ok(&["exit", &id]);
+		assert!(matches!(e["state"].as_str(), Some("unrolling" | "waiting")), "{}", e);
+		for _ in 0..8 {
+			r.produce().await;
+			if o.ok(&["exit", &id])["state"] == "waiting" {
+				break;
+			}
+		}
+		tokio::task::block_in_place(|| node::advance_mtp(&r.rt, 512));
+		let e = o.ok(&["exit", &id]);
+		assert_eq!(e["state"], "claimed", "{}", e);
+		let claim_id = elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap();
+		r.produce().await;
+		r.bury().await;
+		let claim = r.rt.client().raw_transaction(&claim_id).unwrap();
+		let landing = script_of(&r, o.ok(&["info"])["landing_address"].as_str().unwrap());
+		assert_eq!(claim.output[0].script_pubkey, landing, "the exit pays the older build's own landing key");
+		assert_eq!(claim.output[0].asset.explicit(), Some(iss.z));
+		let landed = claim.output[0].value.explicit().unwrap();
+		println!("OLDER exit under the switch: {} pays {} of {} of Z to its own landing key ({} vB)", claim_id, landed, value, claim.vsize());
+		o.ok(&["sync"]);
+		assert_eq!(o.ok(&["record", &id])["state"], "exited");
 	}
 	for &w in &all {
 		let _ = std::fs::remove_dir_all(&w.dir);
