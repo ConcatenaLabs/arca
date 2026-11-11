@@ -482,3 +482,85 @@ fn a_dead_fill_returns_the_takers_coin() {
 	c.net.pass("taker 0's own exit of its checkpoint after the delay, no operator", &cp_exit(&c, &cp0, cp0_at, y, v, &takers[0], 0));
 	c.net.print();
 }
+
+/// The maker's side of a dead fill. A fill spends the order's coin by the
+/// operator's signature alone, never through a checkpoint, so the order's
+/// coin is spent only if the fill confirms. When the taker and the operator
+/// spend the taker's checkpoint elsewhere, the fill can never confirm and
+/// the order's coin stays unspent: its maker brings it on and lands it as
+/// its own SeqDEX order, which needs no signature, one exit delay after the
+/// coin reaches the chain. The landed order is the maker's: anyone fills it
+/// only at its price, paid to the maker's script, and its refund key takes
+/// it back after its expiry (SeqDEX's program, not built here).
+#[test]
+fn a_dead_fill_leaves_the_makers_order_coin_to_land() {
+	let mut c = Arca::start();
+	y_listed(&c);
+	let (x, y) = (c.net.x, c.net.y);
+	let s = keypair("ob1 maker operator");
+	let t0 = mt(c.net.mtp() - 60);
+	let maker = keypair("ob1 maker maker");
+	let credit_keys: Vec<_> = (0..4).map(|i| keypair(&format!("ob1 maker credit {}", i))).collect();
+	let refund = keypair("ob1 maker refund");
+	let terms = order::OrderLeafTerms {
+		landed: order::SeqdexOrder {
+			terms: order::OrderTerms { asset_a: x, asset_b: y, rate_num: 2, rate_den: 1, min_lot: 1_000_000 },
+			maker: sha256(plain(&refund).as_bytes()),
+			expiry: (c.net.now() + 30 * DAY) as u32,
+			refund_key: xonly(&refund),
+			version: order::SeqdexVersion::V2,
+		},
+		credits: [0, 1, 2, 3].map(|i| xonly(&credit_keys[i]).serialize()),
+	};
+	let (issuer_x, sched_x) = c.schedule(&s);
+	let xs = vec![LeafSpec { template: Template::Order3, order: Some(terms), ..spec(&maker, "ob1 maker order", N, sha256(&label32("mox"))) },
+		spec(&keypair("ob1 maker x 1"), "ob1 maker x 1", N, sha256(&label32("mx1")))];
+	let tx_ = tree_of(&c, &s, x, Some(&sched_x), &xs);
+	let rx = round(&mut c, "round: an order-3 leaf in a batch of X", &s, &tx_.batch_output(), Some((&issuer_x, &sched_x)));
+	let (issuer_y, sched_y) = c.schedule(&s);
+	let taker = keypair("ob1 maker taker");
+	let ty = tree_of(&c, &s, y, Some(&sched_y), &[spec(&taker, "ob1 maker y 0", 3 * N, sha256(&label32("my0"))),
+		spec(&keypair("ob1 maker y 1"), "ob1 maker y 1", 3 * N, sha256(&label32("my1")))]);
+	let ry = round(&mut c, "round: the taker's leaf in a batch of Y", &s, &ty.batch_output(), Some((&issuer_y, &sched_y)));
+	let rounds = vec![rx, ry];
+	let policy = c.policy(&s);
+	let order_rec = base(&tx_, 0, &maker, label32("mox"), t0);
+	let order = order_rec.resolve(&rounds, &policy).unwrap();
+	let taker_rec = base(&ty, 0, &taker, label32("my0"), t0);
+	let taker_coin = taker_rec.resolve(&rounds, &policy).unwrap();
+	let leaf = |w: &str| party(&format!("ob1 maker {}", w), delay()).1;
+	let f = make_fill(&order_rec, &order, &taker_rec, &taker_coin, &taker, &leaf("t x"), &leaf("t change"), 4_000_000, &s);
+	let credit = CoinRecord::Fill(Box::new(FillCoin { fill: f, index: 0, leaf: FillLeaf::Credit { owner_nonce: label32("mcredit") } }))
+		.resolve(&rounds, &policy).unwrap();
+	let ValidOrigin::Fill { inputs, .. } = &credit.origin else { unreachable!() };
+	let t_in = inputs[0].clone();
+
+	// The taker and the operator spend the taker's checkpoint elsewhere.
+	let t_at = bring(&mut c, "the taker's path", &taker_coin);
+	let fee_of = |c: &mut Arca| { let k = c.net.fee_coin(); FeeSource::Coin { outpoint: k.outpoint, coin: k.txout, fee: 4_000, change: op_true_spk() } };
+	let with_coin = |mut tx: Transaction| { let n = tx.input.len(); tx.input[n - 1].witness.script_witness = op_true_witness(); tx };
+	let fs = fee_of(&mut c);
+	let tcp = OutPoint::new(c.net.pass("the taker's checkpoint", &with_coin(t_in.checkpoint_tx(t_at, &fs).unwrap().tx)), 0);
+	let back = vec![ExplicitOutput::new(y, t_in.checkpoint_value - MARGIN, thief())];
+	let bp = TransferPlan { checkpoint_exit: true, inputs: vec![(taker_coin.clone(), t_in.checkpoint_value)], outputs: back.clone() };
+	let d = bp.reassignment_message(0).unwrap().digest;
+	let second = ValidInput { reassignment_pair: Pair { operator: sig(&s, &d), owner: sig(&taker, &d) }, ..t_in.clone() };
+	c.net.pass("ATTACK taker + operator: a second spend of the taker's checkpoint",
+		&reassignment_tx(&[second], &back, &[tcp], &FeeSource::Reserve).unwrap().tx);
+
+	// The fill can never confirm; the order's coin is unspent.
+	let order_at = bring(&mut c, "the order's path, by the maker's authorisations", &order);
+	let fs = fee_of(&mut c);
+	c.net.refuse("neg the fill, its taker's checkpoint spent", &with_coin(credit.fill_tx(order_at, &[tcp], &fs).unwrap().tx), GONE);
+	let op = order.leaf.order_policy().unwrap();
+	let fs = fee_of(&mut c);
+	let early = with_coin(op.landing_tx(order_at, order.value, &fs).unwrap().tx);
+	c.net.refuse("neg the maker lands its order before the exit delay", &early, EARLY);
+	c.net.wait_csv(&order_at.txid, delay());
+	let fs = fee_of(&mut c);
+	let land = with_coin(op.landing_tx(order_at, order.value, &fs).unwrap().tx);
+	c.net.pass("the maker lands its whole order coin as its own SeqDEX order, no signature", &land);
+	assert_eq!(land.output[0], op.landed_output(order.value).txout(), "the landed order holds the whole coin, for the same terms");
+	assert_eq!(order.value, N);
+	c.net.print();
+}
