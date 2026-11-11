@@ -981,7 +981,8 @@ async fn proceeds_of_a_counted_coin_keep_its_place_beside_an_older_arriving_paym
 	let p = summary("CP15 A holds", &a);
 	assert_eq!((place_of(&p, &first).as_str(), place_of(&p, &second).as_str()), ("counted", "arriving"), "{}", p);
 	a.ok(&["require-checkpoint-exit", "on"]);
-	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "300000"]);
+	// C pays twice what A gives, at the node's rates.
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "600000"]);
 	let acc = c.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
 	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
 	a.ok(&["sync"]);
@@ -991,16 +992,40 @@ async fn proceeds_of_a_counted_coin_keep_its_place_beside_an_older_arriving_paym
 		place_of(&p, &second), p["spendable"]);
 	assert_eq!(place_of(&p, &got), "counted", "it takes the place of the counted X it was bought with");
 	assert_eq!(place_of(&p, &second), "arriving", "a later payment does not jump ahead of what the wallet already had");
-	assert_eq!(p["spendable"][y.to_string()], "300000", "{}", p);
+	assert_eq!(p["spendable"][y.to_string()], "600000", "{}", p);
+	// The Y counts what the X given for it was worth, not what it is worth:
+	// with the change of the shaping, the wallet counts no more than the
+	// counted payment it started from.
 	let counted: u128 = p["instant_limit"]["counted"].as_str().unwrap().parse().unwrap();
-	assert!(counted <= worth(&r, x, 1_000_000), "within the limit: {}", counted);
+	println!("CP15: counted {} (the first payment was worth {}; the Y is worth {})", counted, worth(&r, x, 600_000), worth(&r, y, 600_000));
+	assert!(counted <= worth(&r, x, 600_000), "the trade's gain counts nothing: {}", counted);
 	// Its place lets it be traded on; what stops it here is the protocol's
 	// depth limit (a board, the shaped give coin and the trade), which a
 	// refresh clears, never its place.
 	let why = a.refused(&["swap", "offer", "--give-asset", &y.to_string(), "--give", "200000", "--want-asset", &x.to_string(), "--want",
 		"200000"], "depth limit");
 	assert!(!why.contains("arriving"), "{}", why);
-	for w in [&a, &c, &s, &s2] {
+	let after = summary("CP15 after the refused offer", &a);
+	assert_eq!(place_of(&after, &got), "counted", "the refused offer moved nothing: {}", after);
+	// Paying itself out of the Y (here, to send a part of it on) does not
+	// make the trade's gain count.
+	pay(&a, &s, y, 100_000);
+	let after = summary("CP15 after A pays out of the Y", &a);
+	let counted_after: u128 = after["instant_limit"]["counted"].as_str().unwrap().parse().unwrap();
+	assert!(counted_after <= counted, "an own payment out of the Y counts no more than the Y did: {} > {}", counted_after, counted);
+	// A restore from the phrase alone keeps no caps: it counts again from
+	// the operator's record, oldest first, and never past the limit.
+	let d2 = Arca::new("CP15 A2");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	d2.ok(&["create", "--server", &r.url(), "--node-url", &r.node_url(), "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1", "--mnemonic", mnemonic.trim()]);
+	library(&d2, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	d2.ok(&["sync"]);
+	let p2 = summary("CP15 restored", &d2);
+	let counted2: u128 = p2["instant_limit"]["counted"].as_str().unwrap().parse().unwrap();
+	println!("CP15 restored: counted {}; the Y is {}, the later payment {}", counted2, place_of(&p2, &got), place_of(&p2, &second));
+	assert!(counted2 <= worth(&r, x, 1_000_000), "a restore counts within the limit: {}", counted2);
+	for w in [&a, &c, &s, &s2, &d2] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

@@ -49,7 +49,8 @@
 //! its owner's exit on every checkpoint paid for one. What one trade pays
 //! the wallet counts, all together, at most what the coins given were worth
 //! when it took their place; what the trade brought beyond that counts
-//! nothing against the limit. A coin that
+//! nothing against the limit, and the wallet's own payments out of such a
+//! coin carry that bound on. A coin that
 //! arrives is refreshed at the next round ([`Wallet::refresh_needed`]), and
 //! is then `settled`.
 //!
@@ -367,13 +368,19 @@ impl Wallet {
 					continue;
 				}
 				sticky.insert(coins[i].0.leaf_id.clone());
-				if trade {
-					// The coins one trade pays the wallet (what it bought, and any
-					// change) share what was given: each counts at most what is
-					// left of it, in the order the wallet holds them.
+				// The coins one transfer pays the wallet out of counted coins
+				// share what those coins counted: each counts at most what is
+				// left of it, in the order the wallet holds them. A trade's is
+				// what the coins given were worth then; an own payment's carries
+				// on the caps of the coins it spent, so paying itself never
+				// turns a trade's gain into counted value.
+				if trade || given.iter().any(|g| caps.contains_key(&g.leaf_id)) {
 					let mut key: Vec<String> = given.iter().map(|g| g.leaf_id.clone()).collect();
 					key.sort();
-					let left = budget.entry(key).or_insert_with(|| given.iter().map(|g| worth(g).unwrap_or(0)).sum());
+					let left = budget.entry(key).or_insert_with(|| given.iter().map(|g| {
+						let w = worth(g).unwrap_or(0);
+						if trade { w } else { caps.get(&g.leaf_id).map_or(w, |c| w.min(*c)) }
+					}).sum());
 					let cap = worth(&coins[i].0).unwrap_or(0).min(*left);
 					*left -= cap;
 					caps.insert(coins[i].0.leaf_id.clone(), cap);
@@ -423,9 +430,11 @@ impl Wallet {
 			coins[*i].2 = place;
 		}
 		if grew || pruned {
-			self.store.set_meta(INSTANT_COUNTED, &serde_json::to_string(&sticky).expect("a set"))?;
+			// Both at once: a coin counted for a trade is never kept without
+			// the most it counts.
 			let caps: BTreeMap<String, String> = caps.into_iter().map(|(k, v)| (k, v.to_string())).collect();
-			self.store.set_meta(INSTANT_COUNTED_CAPS, &serde_json::to_string(&caps).expect("a map"))?;
+			self.store.set_metas(&[(INSTANT_COUNTED, serde_json::to_string(&sticky).expect("a set")),
+				(INSTANT_COUNTED_CAPS, serde_json::to_string(&caps).expect("a map"))])?;
 		}
 		Ok(Places { limit: Some(limit), coins, counted, unvalued: unvalued.into_iter().collect(), channels })
 	}

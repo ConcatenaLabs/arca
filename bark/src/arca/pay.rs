@@ -2289,6 +2289,18 @@ impl Wallet {
 		let leaf = self.own_leaf_of("shaped", info, asset, need)?;
 		let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
 		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(&probe), true, min, 0, false, old_reader, Spend::Trade)?;
+		// The coin made is one reassignment deeper than the deepest it comes
+		// from, and a trade tries a coin out of round alone only with room
+		// for two more below the depth limit ([`fit_order`]): refused before
+		// anything moves, rather than paid and then refused.
+		if let Some(limit) = depth_limit(info) {
+			let deep: u64 = inputs.iter().filter(|i| i.coin.hops + 3 > limit).map(|i| i.coin.value).sum();
+			if deep > 0 {
+				return Err(Error::Refused(format!("the wallet's coins of asset {} that would make a coin of exactly the {} this trade \
+					gives hold {} too near the operator's depth limit of reassignments since a round, so the coin made could not be \
+					traded; they trade again once refreshed in a round, and nothing moved", asset, need, deep)));
+			}
+		}
 		let mut outs = vec![Out { asset, value: need, leaf, mailbox, until: None }];
 		if change > 0 {
 			outs.push(Out { asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });

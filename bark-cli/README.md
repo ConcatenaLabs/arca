@@ -314,7 +314,8 @@ and a board whose registration never reached the server, are not recovered.
   the change of the wallet's own payment out of one, and what a trade with
   its owner's exit on every checkpoint paid for one, which counts (with any
   change of that trade) at most what the coins given were worth; what the
-  trade brought beyond that counts nothing against the limit. A channel coin counts the wallet's side of it
+  trade brought beyond that counts nothing against the limit, and the
+  wallet's own payments out of such a coin carry that bound on. A channel coin counts the wallet's side of it
   alone, and with a limit set is arriving: it is the wallet's to spend once
   its close has made it a coin. With a limit set, the wallet spends no
   arriving coin but in a refresh, which it names to the operator so the
