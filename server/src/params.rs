@@ -368,6 +368,11 @@ pub const ORDER_BLOCK_SECONDS: u32 = 60;
 /// The default cap on a transfer's margins, as a multiple of the least.
 pub const MAX_MARGIN_MULTIPLE: u64 = 25;
 
+/// What a holder of a supervised asset can do with it when the operator
+/// refuses something it does not serve in it: words a page shows as they are.
+pub const SUPERVISED_INSTEAD: &str = "The asset can still be paid to another wallet, swapped with another wallet by a swap offer, \
+	withdrawn to an address on the chain, or sold by an order on the chain that the wallet places. Nothing was co-signed.";
+
 impl Params {
 	/// The specification's parameters: an exit delay of 36 to 48 hours and a
 	/// depth limit of 5.
@@ -520,7 +525,8 @@ impl Params {
 			(None, None) => Ok(()),
 			(None, Some(_)) => Err(format!("asset {} is not supervised: its leaves are not landing leaves", asset)),
 			(Some(_), None) => Err(format!("asset {} is supervised: every leaf of it is a landing leaf, naming the landing its owner's \
-				exit pays, where a freeze of the asset binds", asset)),
+				exit pays, where a freeze of the asset binds, and an up-to-date wallet asks for such leaves itself. {}", asset,
+				SUPERVISED_INSTEAD)),
 			(Some(s), Some(l)) => {
 				if self.landing_2_only && !l.own_index {
 					return Err(format!("this operator makes landing-2 leaves only (info.landing_2_only): a leaf of asset {} lands at its \

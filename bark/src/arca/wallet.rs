@@ -2307,6 +2307,16 @@ impl Wallet {
 		amount(&a["min_leaf"], "min_leaf")
 	}
 
+	/// The refusal of something the operator does not serve in supervised
+	/// `asset` (`what` it is), saying what its holder can do with the asset
+	/// instead: words a page shows as they are, so they name no command.
+	pub(crate) fn supervised_refusal(asset: AssetId, what: &str) -> Error {
+		Error::Refused(format!("asset {} is supervised (its issuer can freeze it): {}, as the coin it would make would be out of \
+			the freeze's reach. The asset can still be paid to another wallet, swapped with another wallet by a swap offer, \
+			withdrawn to an address on the chain, or sold by an order on the chain that this wallet places. Nothing was signed.",
+			asset, what))
+	}
+
 	/// The landing a new leaf of `asset` the wallet asks for or takes must
 	/// carry: `Some` for a supervised asset, at the wallet's landing key with
 	/// the allowance the operator publishes, `landing-2` (landing at its own

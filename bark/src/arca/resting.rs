@@ -199,6 +199,14 @@ impl Wallet {
 
 	fn rest_plan(&mut self, info: &Value, ask: &RestAsk, max_fee_ppm: Option<u64>) -> Result<(Value, RestPlan), Error> {
 		let (a, b) = (ask.sell, ask.want);
+		// The operator holds no resting order in a supervised asset: the
+		// order's leaf, and the credits its fills make, pay keys a freeze
+		// cannot follow. Refused here, before anything moves.
+		for x in [a, b] {
+			if self.landing_rule(info, x)?.is_some() {
+				return Err(Self::supervised_refusal(x, "the operator holds no resting order in the Arca that sells it or is paid in it"));
+			}
+		}
 		let terms = OrderTerms { asset_a: a, asset_b: b, rate_num: ask.rate_num, rate_den: ask.rate_den, min_lot: ask.min_lot };
 		terms.check().map_err(|e| Error::Refused(e.to_string()))?;
 		if ask.amount < ask.min_lot {

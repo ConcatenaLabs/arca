@@ -721,7 +721,7 @@ impl Participations {
 		let paid_in = o.landed.terms.asset_b;
 		if p.supervised(&paid_in).is_some() {
 			return Err(ParticipationError::OutOfBounds(format!("output {}: an order paid in asset {}, which is supervised: each credit \
-				is a vtxo-1 leaf, out of a freeze's reach", j, paid_in)));
+				is a vtxo-1 leaf, out of a freeze's reach. {}", j, paid_in, crate::params::SUPERVISED_INSTEAD)));
 		}
 		if !p.assets.contains(&paid_in) {
 			return Err(ParticipationError::Assets(format!("output {}: an order paid in asset {}, which is not served by this operator: \
@@ -1158,7 +1158,7 @@ impl Participations {
 			// pays its maker by a script path a freeze cannot follow.
 			if p.supervised(&a).is_some() {
 				return Err(ParticipationError::OutOfBounds(format!("asset {} is supervised: a take of an on-chain order is not served in \
-					it, as its leaf would be vtxo-1, out of a freeze's reach", a)));
+					it, as its leaf would be vtxo-1, out of a freeze's reach. {}", a, crate::params::SUPERVISED_INSTEAD)));
 			}
 		}
 

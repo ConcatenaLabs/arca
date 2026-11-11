@@ -129,8 +129,7 @@ impl Wallet {
 		// follow): refused here, before the wallet pays itself a coin for it.
 		for x in [a, b] {
 			if self.landing_rule(info, x)?.is_some() {
-				return Err(Error::Refused(format!("asset {} is supervised: the operator takes no on-chain order in it, as the leaf a \
-					take makes would be out of a freeze's reach; nothing was signed", x)));
+				return Err(Self::supervised_refusal(x, "the operator fills no order on the chain in it"));
 			}
 		}
 		let min = Self::min_leaf(info, a)?;

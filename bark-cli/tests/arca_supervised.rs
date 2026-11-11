@@ -500,10 +500,17 @@ async fn a_holder_takes_part_of_a_supervised_balance_out_and_keeps_the_rest_land
 async fn under_the_switch_fills_and_lightning_in_a_supervised_asset_are_refused_before_signing() {
 	let mut r = Running::start().await;
 	let iss = serve_z(&mut r).await;
+	// The bond posted and an instant limit set: a take gives a coin of
+	// exactly its price, paid to itself first when it holds none.
+	post_bond(&mut r, 1_000_000_000_000).await;
 	let (z, x) = (iss.z.to_string(), r.x.to_string());
 	let (url, node_url) = (r.url(), r.node_url());
 	let (a, b) = (Arca::new("SFA"), Arca::new("SFB"));
-	for w in [&a, &b] {
+	// An older build, when one is named: the operator's own refusals, which
+	// only a wallet that does not refuse first meets, say what instead too.
+	let older = std::env::var("ARCA_CLI_OLDER").ok().map(|p| Arca::built_from("SFO", std::path::Path::new(&p)));
+	let all: Vec<&Arca> = [Some(&a), Some(&b), older.as_ref()].into_iter().flatten().collect();
+	for &w in &all {
 		w.ok(&create_args(&url, &node_url));
 		for (asset, v) in [(iss.z, 4_000_000), (r.x, 4_000_000)] {
 			let s = script(&w.ok(&["address"]));
@@ -512,16 +519,17 @@ async fn under_the_switch_fills_and_lightning_in_a_supervised_asset_are_refused_
 	}
 	r.produce().await;
 	for asset in [&z, &x] {
-		for w in [&a, &b] {
+		for &w in &all {
 			w.ok(&["board", asset, "1500000"]);
 		}
 		r.produce().await;
 	}
 	r.bury().await;
 	r.synced().await;
-	for w in [&a, &b] {
+	for &w in &all {
 		r.wait("the boards credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
 		w.ok(&["sync"]);
+		w.ok(&["instant-limit", "1000000000000"]);
 	}
 	r.config.landing_2_only = true;
 	r.restart_server().await;
@@ -562,7 +570,8 @@ async fn under_the_switch_fills_and_lightning_in_a_supervised_asset_are_refused_
 	let before = (states(&a), states(&b));
 	let (ok, v, err) = b.run_full(&["order", "fill", &offer, "--amount", "200000"]);
 	println!("FILL of an order selling Z: ok {} {} {}", ok, v, err.lines().last().unwrap_or(""));
-	assert!(!ok && (v.to_string() + &err).contains("supervised"), "{} {}", v, err);
+	assert!(!ok, "{}", v);
+	says_what_instead(&v);
 	for w in [&a, &b] {
 		w.ok(&["sync"]);
 	}
@@ -574,7 +583,8 @@ async fn under_the_switch_fills_and_lightning_in_a_supervised_asset_are_refused_
 		let (ok, v, err) = w.run_full(&["order", "rest", "--sell", sell, "--amount", "200000", "--for", want, "--rate-num", "1",
 			"--rate-den", "1", "--min-lot", "100000", "--expires-in-hours", "720"]);
 		println!("RESTING order selling {} for {}: ok {} {} {}", sell, want, ok, v, err.lines().last().unwrap_or(""));
-		assert!(!ok && (v.to_string() + &err).contains("supervised"), "{} {}", v, err);
+		assert!(!ok, "{}", v);
+		says_what_instead(&v);
 		w.ok(&["sync"]);
 		assert_eq!(states(w), before, "every coin keeps its state after the refused resting order");
 	}
@@ -595,12 +605,48 @@ async fn under_the_switch_fills_and_lightning_in_a_supervised_asset_are_refused_
 	let (ok, v, err) = b.run_full(&["lightning", "receive", &z, "100000"]);
 	println!("LIGHTNING receive in Z: ok {} {} {}", ok, v, err.lines().last().unwrap_or(""));
 	assert!(!ok, "{}", v);
-	assert!((v.to_string() + &err).contains("no Lightning node in asset"), "{} {}", v, err);
+	says_what_instead(&v);
 	for w in [&a, &b] {
 		w.ok(&["sync"]);
 	}
 	assert_eq!((states(&a), states(&b)), before, "every coin keeps its state after the refused Lightning attempts");
-	for w in [&a, &b] {
+
+	// ---- What the refusals name instead, each run once in Z ----------------------
+	// Paid to another wallet.
+	let req = b.ok(&["receive", "--asset", &z, "--amount", "100000"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req]);
+	let s = b.ok(&["sync"]);
+	assert_eq!(s["mailbox"]["accepted"].as_array().map(|v| v.len()), Some(1), "B takes the payment of Z: {}", s);
+	println!("INSTEAD: paid 100000 of Z to another wallet");
+	// Swapped with another wallet by a swap offer: A gives Z for B's X.
+	let offer = a.ok(&["swap", "offer", "--give-asset", &z, "--give", "100000", "--want-asset", &x, "--want", "100000"]);
+	let acc = b.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	println!("INSTEAD: swapped 100000 of Z for X by a swap offer");
+	// Withdrawn to an address on the chain.
+	let addr = b.ok(&["address"])["address"].as_str().unwrap().to_string();
+	b.ok(&["sync"]);
+	let out = b.ok(&["offboard", "--asset", &z, "--amount", "100000", "--address", &addr]);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.iter().map(|b| b.offboards).sum::<usize>(), 1, "the round pays the withdrawal: {}", out);
+	println!("INSTEAD: withdrew 100000 of Z to an address, paid by round {}", built[0].tx.txid());
+	// Sold by an order on the chain the wallet places: A's order rests above.
+	println!("INSTEAD: A's order on the chain selling Z rests ({})", order);
+
+	// ---- The operator's own refusals, met by the older build ------------------
+	if let Some(o) = &older {
+		o.ok(&["sync"]);
+		let (ok, v, err) = o.run_full(&["order", "rest", "--sell", &z, "--amount", "200000", "--for", &x, "--rate-num", "1",
+			"--rate-den", "1", "--min-lot", "100000", "--expires-in-hours", "720"]);
+		let m = v.to_string() + &err;
+		println!("OLDER resting order selling Z: ok {} {}", ok, m.lines().next().unwrap_or(""));
+		for w in ["supervised", "paid to another wallet", "swapped with another wallet by a swap offer", "withdrawn to an address",
+			"sold by an order on the chain", "Nothing was co-signed"]
+		{
+			assert!(!ok && m.contains(w), "the operator's refusal does not say {:?}: {}", w, m);
+		}
+	}
+	for &w in &all {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
@@ -986,4 +1032,17 @@ async fn with_an_instant_limit_a_refusal_names_its_cause_and_nothing_moves_first
 	for w in [&a, &o] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+/// A refusal of something not served in a supervised asset says what its
+/// holder can do instead, and that nothing was signed, naming no command.
+fn says_what_instead(v: &Value) {
+	let m = v["error"]["message"].as_str().unwrap_or("");
+	for w in ["supervised", "paid to another wallet", "swapped with another wallet by a swap offer", "withdrawn to an address",
+		"sold by an order on the chain", "Nothing was signed"]
+	{
+		assert!(m.contains(w), "the refusal does not say {:?}: {}", w, m);
+	}
+	assert!(!m.contains("arca ") && !m.contains('`'), "the refusal names a command: {}", m);
+	println!("REFUSED, saying what instead: {}", m);
 }
