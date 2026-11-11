@@ -69,6 +69,11 @@ the server and the chain hold of it, every record checked, as `arca create
 --mnemonic` does (`bark-cli/README.md`, Restoring from the mnemonic). It
 returns once the coins that make the balance are checked; the coins given up
 for good, the wallet's history, are checked a step at each `sync` after it.
+While they are, `balance` carries `history: {"loading": true, "left": N}`: a
+page shows its activity as still loading until it is gone. The restore leaves
+the watchtowers' deposits owed (`deposits.owed`): the page runs `deposits` as
+soon as `restore` returns, and a `sync` makes them first while they are owed.
+`restore {at_once: true}` checks everything before it returns instead.
 
 ## Why a workspace of its own
 
