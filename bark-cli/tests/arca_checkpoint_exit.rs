@@ -91,8 +91,24 @@ fn rpc(r: &Running, method: &str, params: &[Value]) -> Value {
 	r.rt.client().call(method, params).unwrap()
 }
 
+/// The node's UTXO scan for `spk`. The node runs one scan at a time, and a
+/// watchtower a test starts scans the same node: a scan refused as already
+/// in progress is asked again.
+fn scan(r: &Running, spk: &Script) -> Value {
+	let start = std::time::Instant::now();
+	loop {
+		match r.rt.client().call::<Value>("scantxoutset", &[json!("start"), json!([format!("raw({})", hex(spk.as_bytes()))])]) {
+			Ok(v) => return v,
+			Err(e) if e.to_string().contains("Scan already in progress") && start.elapsed() < std::time::Duration::from_secs(60) => {
+				std::thread::sleep(std::time::Duration::from_millis(200));
+			},
+			Err(e) => panic!("scantxoutset: {}", e),
+		}
+	}
+}
+
 fn find_unspent(r: &Running, out: &elements::TxOut) -> OutPoint {
-	let found = rpc(r, "scantxoutset", &[json!("start"), json!([format!("raw({})", hex(out.script_pubkey.as_bytes()))])]);
+	let found = scan(r, &out.script_pubkey);
 	let u = found["unspents"].as_array().unwrap().first().unwrap_or_else(|| panic!("nothing pays {}", hex(out.script_pubkey.as_bytes())));
 	OutPoint::new(elements::Txid::from_str(u["txid"].as_str().unwrap()).unwrap(), u["vout"].as_u64().unwrap() as u32)
 }
@@ -656,8 +672,8 @@ async fn a_watchtower_holds_the_trade_before_it_is_done_and_answers_a_pull_out()
 	let start = Instant::now();
 	let at = loop {
 		r.produce().await;
-		let scan = rpc(&r, "scantxoutset", &[json!("start"), json!([format!("raw({})", hex(out.script_pubkey.as_bytes()))])]);
-		if let Some(u) = scan["unspents"].as_array().and_then(|u| u.first()) {
+		let found = scan(&r, &out.script_pubkey);
+		if let Some(u) = found["unspents"].as_array().and_then(|u| u.first()) {
 			break format!("{}:{}", u["txid"].as_str().unwrap(), u["vout"]);
 		}
 		assert!(start.elapsed() < Duration::from_secs(120), "the watchtower did not answer C's checkpoint: {}",
