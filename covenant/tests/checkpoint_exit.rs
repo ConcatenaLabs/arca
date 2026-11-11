@@ -32,6 +32,15 @@ use common::net::*;
 use common::round::*;
 use common::*;
 
+/// One node at a time in this binary: the harness picks each node's ports
+/// by binding and releasing them, so nodes started at once can be handed the
+/// same port and answer for each other.
+static ONE_NODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_node() -> std::sync::MutexGuard<'static, ()> {
+	ONE_NODE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 const SIG: &str = "Invalid Schnorr signature";
 const GONE: &str = "bad-txns-inputs-missingorspent";
 const EARLY: &str = "non-BIP68-final";
@@ -225,6 +234,7 @@ fn y_listed(c: &Arca) {
 
 #[test]
 fn a_dead_swap_returns_each_coin_by_its_checkpoint_exit() {
+	let _one = one_node();
 	let mut c = Arca::start();
 	y_listed(&c);
 	let (x, y) = (c.net.x, c.net.y);
@@ -251,6 +261,7 @@ fn a_dead_swap_returns_each_coin_by_its_checkpoint_exit() {
 
 #[test]
 fn a_dead_swap_in_batches_with_a_sweep() {
+	let _one = one_node();
 	let mut c = Arca::start();
 	y_listed(&c);
 	let (x, y) = (c.net.x, c.net.y);
@@ -280,6 +291,7 @@ fn a_dead_swap_in_batches_with_a_sweep() {
 
 #[test]
 fn a_dead_swap_of_vtxo2_coins() {
+	let _one = one_node();
 	let mut c = Arca::start();
 	y_listed(&c);
 	let (x, y) = (c.net.x, c.net.y);
@@ -311,6 +323,7 @@ fn a_dead_swap_of_vtxo2_coins() {
 /// record without any exit is not its encoding.
 #[test]
 fn the_exit_flag_is_signed_and_has_one_encoding() {
+	let _one = one_node();
 	let mut c = Arca::start();
 	let x = c.net.x;
 	let s = keypair("ob1 flag operator");
@@ -405,6 +418,7 @@ fn make_fill(order_rec: &CoinRecord, order: &ValidCoin, coin_rec: &CoinRecord, c
 
 #[test]
 fn a_dead_fill_returns_the_takers_coin() {
+	let _one = one_node();
 	let mut c = Arca::start();
 	y_listed(&c);
 	let (x, y) = (c.net.x, c.net.y);
@@ -494,6 +508,7 @@ fn a_dead_fill_returns_the_takers_coin() {
 /// it back after its expiry (SeqDEX's program, not built here).
 #[test]
 fn a_dead_fill_leaves_the_makers_order_coin_to_land() {
+	let _one = one_node();
 	let mut c = Arca::start();
 	y_listed(&c);
 	let (x, y) = (c.net.x, c.net.y);
