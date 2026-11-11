@@ -29,7 +29,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?}, deposits, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
-	refresh_received {max_fee_ppm?}, withdraw_participation {participation}, refusals, \
+	refresh_received {max_fee_ppm?}, refresh_needed {idle_seconds?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
@@ -236,7 +236,7 @@ fn reads_only(command: &str) -> bool {
 		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
 		| "info" | "supply" | "leaf_template" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
 		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
-		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote")
+		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed")
 }
 
 /// What `arca` runs before a command: the witness (unless the command stays
@@ -401,6 +401,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.speed_up(txid, opt_asset(&a["fee_asset"])?, opt_u64(&a["rate"], "the rate")?, opt_u64(&a["max_fee"], "the most it may pay")?)
 		},
 		"refresh_received" => w.refresh_received(opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		"refresh_needed" => w.refresh_needed(opt_u64(&a["idle_seconds"], "the idle seconds")?),
 		"withdraw_participation" => w.withdraw_participation(req_str(&a["participation"], "the participation")?),
 		"refusals" => w.refusals(),
 		// The order as the relay serves it: its JSON, as text or as an
