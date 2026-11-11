@@ -1898,6 +1898,14 @@ either (refused, naming the reason, when it has no other). In a swap, its
 own leaves are `landing-2` only where the other side reads it: an offer's,
 whose taker is not known yet, once the operator makes `landing-2` only
 (`info.landing_2_only`); an acceptance's when the offer names `landing-2`.
+A `landing-2` leaf in an offer or an acceptance names its template inside its
+landing as well, which a wallet that reads no `landing-2` takes for malformed:
+it refuses such an offer before it signs anything, where it would otherwise
+read the leaf as `landing-1` and sign a swap that cannot complete. While the
+operator makes `landing-2` only, the wallet likewise refuses, before signing,
+an offer of such an asset from a wallet that names no `landing-2` among the
+formats it reads, and an offer that pays its maker a `landing-1` leaf (one
+made before the switch): the operator co-signs neither swap.
 A `landing-1` coin it holds is spent and refreshed as ever, into
 `landing-2`. It pays such an asset only to a request that names a landing,
 takes a coin only when its landing is the wallet's own with the published
@@ -2855,7 +2863,16 @@ pays the landing key, explicitly in Z, all but at most the allowance, every
 output explicit; the node shows the landed coin frozen, `balance` counts it
 under `sequentia_onchain_frozen`, and the wallet keeps it out of a board. Once
 the issuer lifts the freeze, a board spends the landed coin, and once the
-lifting is final the holder pays from that board in the tree.
+lifting is final the holder pays from that board in the tree. With
+`ARCA_CLI_OLDER` naming an `arca` built from a library that reads no
+`landing-2`, two more tests run this build beside it: payments both ways, a
+round, the operator's `landing_2_only` and a restore; and, with the switch on,
+swaps in both roles, an offer made before the switch, and the older build's
+payment and refresh, each refused before the side that cannot complete it
+signs, the older build's coins keeping their states. Without it they are
+skipped:
+
+    ARCA_CLI_OLDER=/path/to/older/arca cargo test -p arca-cli --test arca_supervised
 
 `tests/arca_operator_for_browsers.rs` is not a test that ends: ignored by
 default, it starts the scenarios' server and keeps it running for a wallet
