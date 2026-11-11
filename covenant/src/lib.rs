@@ -223,6 +223,8 @@ pub enum Error {
 	HtlcDelays { operator: u16, owner: u16 },
 	#[error("an htlc-1 leaf has no exit: it is spent by its claim, its refund or its collaborative path")]
 	HtlcHasNoExit,
+	#[error("this checkpoint has no exit: only its owner and the operator together spend it")]
+	CheckpointHasNoExit,
 	#[error("a vtxo-1 leaf has no {0} path")]
 	NotAnHtlc(&'static str),
 	#[error("a vtxo-2 pair names {0} inputs; it names 1 to {max}", max = collab::MAX_NAMED)]

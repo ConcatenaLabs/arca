@@ -194,7 +194,23 @@ impl Collab2 {
 
 	/// [`Collab2::witness`] from the output [`Collab2::taproot_of`] builds.
 	pub fn witness_of(&self, other: Option<Script>, pair: &Pair, n: u8, m: u8) -> Vec<Vec<u8>> {
-		let tap = self.taproot_of(other);
+		self.witness_at(&self.taproot_of(other), pair, n, m)
+	}
+
+	/// The output with two leaves beside the path, the checkpoint of a coin
+	/// whose batch has a sweep and whose owner may exit it:
+	/// `TapBranch(TapBranch(F, D), TapBranch(first, second))`.
+	pub fn taproot_beside(&self, first: Script, second: Script) -> TapOutput {
+		TapOutput::with_nodes(vec![
+			(2, TapNode::Simplicity(collab_cmr())),
+			(2, TapNode::Hidden(self.data_leaf())),
+			(2, TapNode::Tapscript(first)),
+			(2, TapNode::Tapscript(second)),
+		])
+	}
+
+	/// [`Collab2::witness`] from `tap`, an output that has this path.
+	pub fn witness_at(&self, tap: &TapOutput, pair: &Pair, n: u8, m: u8) -> Vec<Vec<u8>> {
 		let cb = tap.control_block_at(&Script::from(collab_cmr().to_vec()), simplicity_version())
 			.expect("the program is a leaf of this output");
 		vec![self.witness_bytes(pair, n, m), unhex(COLLAB_PROGRAM), collab_cmr().to_vec(), cb]
@@ -274,7 +290,7 @@ mod test {
 		assert_ne!(first.digest, second.digest);
 		assert!(l.message_in(2, &[coin.clone(), other], &outs).is_err(), "the coin is one of the named inputs");
 		assert!(l.message_in(0, &vec![coin; 17], &outs).is_err(), "at most 16 named inputs");
-		let cp = CheckpointPolicy {
+		let cp = CheckpointPolicy { exit: None,
 			owner: l.owner, operator: l.operator, salt: [4; 32], chain: l.chain,
 			sweep: Some(crate::transfer::board_sweep(l.operator, l.exit_delay)), v2: true,
 		};

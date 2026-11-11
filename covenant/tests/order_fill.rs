@@ -112,7 +112,7 @@ fn make_fill(order_rec: &CoinRecord, order: &ValidCoin, coin_rec: &CoinRecord, c
 		order: order_rec.clone(),
 		signature: sig(s, &digest),
 		partial: plan.rest.is_some(),
-		inputs: vec![TransferInput {
+		inputs: vec![TransferInput { exit: false,
 			coin: coin_rec.clone(), checkpoint_value: coin.value,
 			checkpoint: Pair { operator: sig(s, &m_cp.digest), owner: sig(payer, &m_cp.digest) },
 			reassignment: Pair { operator: sig(s, &m_f.digest), owner: sig(payer, &m_f.digest) },

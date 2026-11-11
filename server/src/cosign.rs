@@ -618,7 +618,7 @@ impl Cosigner {
 		}
 
 		// The owners' signatures.
-		let plan = TransferPlan {
+		let plan = TransferPlan { checkpoint_exit: false,
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
@@ -855,7 +855,7 @@ impl Cosigner {
 		let mut records = Vec::with_capacity(m);
 		for (j, o) in req.outputs.iter().enumerate() {
 			let record = CoinRecord::Transfer(Box::new(Transfer {
-				inputs: checked.iter().zip(&req.inputs).zip(&sigs).map(|((c, i), (cp, re))| TransferInput {
+				inputs: checked.iter().zip(&req.inputs).zip(&sigs).map(|((c, i), (cp, re))| TransferInput { exit: false,
 					coin: c.record.clone(),
 					checkpoint_value: i.checkpoint_value,
 					checkpoint: Pair { operator: *cp, owner: i.checkpoint_sig },

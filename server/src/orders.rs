@@ -705,7 +705,7 @@ impl Orders {
 		}
 
 		// The taker's signatures.
-		let tplan = TransferPlan {
+		let tplan = TransferPlan { checkpoint_exit: false,
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
@@ -941,7 +941,7 @@ impl Orders {
 			order: oc.record.clone(),
 			signature: fill_sig,
 			partial: plan.rest.is_some(),
-			inputs: checked.iter().zip(&req.inputs).zip(&sigs).map(|((c, i), (cp, re))| TransferInput {
+			inputs: checked.iter().zip(&req.inputs).zip(&sigs).map(|((c, i), (cp, re))| TransferInput { exit: false,
 				coin: c.record.clone(), checkpoint_value: i.checkpoint_value,
 				checkpoint: Pair { operator: *cp, owner: i.checkpoint_sig },
 				reassignment: Pair { operator: *re, owner: i.reassignment_sig },

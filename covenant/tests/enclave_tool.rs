@@ -74,7 +74,7 @@ fn the_tool_gives_the_wallets_digests() {
 		exit_delay: common::net::delay(), htlc: None, landing: None, enclave: Some(enclave(&h2).terms(r, V)), v2: false,
 	};
 	let out2 = vec![ExplicitOutput::new(r, V, leaf2.policy(xonly(&s), chain).script_pubkey())];
-	let plan = TransferPlan { inputs: vec![(c1.clone(), V)], outputs: out2.clone() };
+	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(c1.clone(), V)], outputs: out2.clone() };
 	let a1 = enclave_keypair(&h1, &n1).unwrap();
 	let (cm, rm) = (plan.checkpoint_message(0).unwrap(), plan.reassignment_message(0).unwrap());
 	let req = |coin: &CoinRecord, to: &elements::secp256k1_zkp::Keypair, n: [u8; 32], c: [u8; 32]| json!({
@@ -97,7 +97,7 @@ fn the_tool_gives_the_wallets_digests() {
 	// Hop 2: H2's new coin back to H1, its record the reassignment's.
 	let pair = |m: &arca_covenant::CsfsMessage, owner: &elements::secp256k1_zkp::Keypair| Pair { operator: sig(&s, &m.digest), owner: sig(owner, &m.digest) };
 	let rec2 = CoinRecord::Transfer(Box::new(Transfer {
-		inputs: vec![TransferInput { coin: CoinRecord::Board(b), checkpoint_value: V, checkpoint: pair(&cm, &a1), reassignment: pair(&rm, &a1) }],
+		inputs: vec![TransferInput { exit: false, coin: CoinRecord::Board(b), checkpoint_value: V, checkpoint: pair(&cm, &a1), reassignment: pair(&rm, &a1) }],
 		outputs: out2, index: 0, leaf: leaf2,
 	}));
 	let c2 = rec2.resolve(&[board_tx], &policy).unwrap();
@@ -107,7 +107,7 @@ fn the_tool_gives_the_wallets_digests() {
 		owner: enclave_key(&xonly(&h1), &n3).unwrap(), owner_nonce: n3, creator_nonce: label32("tool c3"),
 		exit_delay: common::net::delay(), htlc: None, landing: None, enclave: Some(enclave(&h1).terms(r, V)), v2: false,
 	};
-	let plan = TransferPlan { inputs: vec![(c2, V)], outputs: vec![ExplicitOutput::new(r, V, leaf3.policy(xonly(&s), chain).script_pubkey())] };
+	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(c2, V)], outputs: vec![ExplicitOutput::new(r, V, leaf3.policy(xonly(&s), chain).script_pubkey())] };
 	let (ok, v) = tool("transfer", &req(&rec2, &h1, n3, label32("tool c3")));
 	assert!(ok, "{}", v);
 	assert_eq!(v["inputs"][0]["checkpoint_digest"], hexs(&plan.checkpoint_message(0).unwrap().digest));
