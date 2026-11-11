@@ -77,8 +77,12 @@ jobs:
       # compiled from its .proto files.
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          # protoc from its own release (the version Ubuntu ships, 3.21.12), checked against its
+          # hash: the runners' apt mirror can be unreachable for hours, and only protoc is needed.
+          curl -fsSL --retry 5 -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+          echo "3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8  /tmp/protoc.zip" | sha256sum -c -
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          protoc --version
 
       - name: Download sequentiad
         run: |
@@ -118,7 +122,7 @@ jobs:
           echo "MINT_LIMITER=$HOME/.mint-limiter/bin/mint-limiter" >> "$GITHUB_ENV"
 
       - name: Scenarios
-        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer --test arca_command_view --test arca_bond --test arca_supervised --test arca_accumulator --test arca_channel --test arca_anchor_depth --test arca_owed --test arca_watchtower --test arca_speed_up --test arca_refresh_withdraw --test arca_quote_waiting_refresh --test arca_no_sweep --test arca_mailbox_reads --test arca_batch_bases --test arca_swap_coins --test arca_block_times_reorg --test arca_refresh_pieces --test arca_checkpoint_exit --test arca_refresh_needed --test arca_coin_places -- --nocapture
+        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer --test arca_command_view --test arca_bond --test arca_supervised --test arca_accumulator --test arca_channel --test arca_anchor_depth --test arca_owed --test arca_watchtower --test arca_speed_up --test arca_refresh_withdraw --test arca_quote_waiting_refresh --test arca_no_sweep --test arca_mailbox_reads --test arca_batch_bases --test arca_swap_coins --test arca_block_times_reorg --test arca_refresh_pieces --test arca_refresh_needed --test arca_checkpoint_exit --test arca_coin_places -- --nocapture
 
   # The wallet's orders and fills, which the scenarios do not carry, and the
   # server kept running for a browser wallet (tests/arca_operator_for_browsers.rs),
@@ -149,8 +153,12 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          # protoc from its own release (the version Ubuntu ships, 3.21.12), checked against its
+          # hash: the runners' apt mirror can be unreachable for hours, and only protoc is needed.
+          curl -fsSL --retry 5 -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+          echo "3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8  /tmp/protoc.zip" | sha256sum -c -
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          protoc --version
 
       - name: Download sequentiad
         run: |

@@ -124,6 +124,9 @@ fn template_of(r: &CoinRecord) -> Option<Template> {
 /// The store key of the template the wallet asks for its own leaves.
 pub(crate) const LEAF_TEMPLATE: &str = "leaf_template";
 
+/// The store's record of [`Wallet::require_checkpoint_exit`].
+pub(crate) const REQUIRE_CHECKPOINT_EXIT: &str = "require_checkpoint_exit";
+
 impl Config {
 	/// The specification's delays: leaves asked for at 36 hours, accepted from
 	/// 36 to 48 hours.
@@ -863,6 +866,26 @@ impl Wallet {
 		}
 		let t = if self.asks_vtxo2() { "vtxo-2" } else { "vtxo-1" };
 		Ok(json!({"leaf_template": t}))
+	}
+
+	/// Whether the wallet trades only when every checkpoint of the trade has
+	/// its owner's exit, after setting it to `set` when given
+	/// ([`arca_covenant::checkpoint`]). With it on, a swap or a fill whose
+	/// operator does not offer the exit (`info.checkpoint_exit`), whose other
+	/// side does not ask for it or read the record format it makes, or one of
+	/// whose coins cannot have it, is refused before anything is signed:
+	/// such a trade would leave the wallet's given coin, should the trade
+	/// die, in a checkpoint only it and the operator can spend. Off by
+	/// default; a default-mode wallet sets it.
+	pub fn require_checkpoint_exit(&mut self, set: Option<bool>) -> Result<Value, Error> {
+		if let Some(on) = set {
+			self.store.set_meta(REQUIRE_CHECKPOINT_EXIT, if on { "1" } else { "" })?;
+		}
+		Ok(json!({"require_checkpoint_exit": self.requires_checkpoint_exit()}))
+	}
+
+	pub(crate) fn requires_checkpoint_exit(&self) -> bool {
+		matches!(self.store.meta(REQUIRE_CHECKPOINT_EXIT), Ok(Some(v)) if v == "1")
 	}
 
 	/// The binding of the leaf whose key is `key` to the wallet's mailbox

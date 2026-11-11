@@ -26,6 +26,9 @@ pub struct RestingOrderRow {
 	pub credit_nonces: [[u8; 32]; 4],
 	/// The coin it rests at now: the first coin, or a fill's remainder.
 	pub current_leaf: [u8; 32],
+	/// The coin record formats its maker's wallet reads, as it named them
+	/// when it published the order; none for an older build.
+	pub record_formats: Vec<String>,
 }
 
 /// A fill of a resting order made in the tree.
@@ -81,6 +84,7 @@ fn order_row(r: &tokio_postgres::Row) -> Result<RestingOrderRow, StoreError> {
 		record: r.get(3),
 		credit_nonces: nonces(r.get(4))?,
 		current_leaf: array32(r.get(5), "current leaf")?,
+		record_formats: r.get(6),
 	})
 }
 
@@ -99,21 +103,21 @@ fn fill_row(r: &tokio_postgres::Row) -> Result<OrderFillRow, StoreError> {
 	})
 }
 
-const ORDER_COLUMNS: &str = "order_id, maker_key, mailbox_key, record, credit_nonces, current_leaf";
+const ORDER_COLUMNS: &str = "order_id, maker_key, mailbox_key, record, credit_nonces, current_leaf, record_formats";
 const FILL_COLUMNS: &str = "transfer_id, order_id, order_leaf, seq, filled, credited, partial, m, signature";
 
 impl Store {
 	/// Records the resting order whose first coin is `order_id`, unless it is
 	/// recorded already; returns it as recorded.
 	pub async fn insert_resting_order(&self, order_id: &[u8; 32], maker_key: &[u8; 32], mailbox_key: &[u8; 32], record: &[u8],
-		credit_nonces: &[[u8; 32]; 4]) -> Result<RestingOrderRow, StoreError>
+		credit_nonces: &[[u8; 32]; 4], record_formats: &[String]) -> Result<RestingOrderRow, StoreError>
 	{
 		let conn = self.conn().await?;
 		let n: Vec<u8> = credit_nonces.iter().flatten().copied().collect();
 		conn.execute(
-			"INSERT INTO resting_order (order_id, maker_key, mailbox_key, record, credit_nonces, current_leaf)
-			 VALUES ($1, $2, $3, $4, $5, $1) ON CONFLICT (order_id) DO NOTHING",
-			&[&&order_id[..], &&maker_key[..], &&mailbox_key[..], &record, &n],
+			"INSERT INTO resting_order (order_id, maker_key, mailbox_key, record, credit_nonces, current_leaf, record_formats)
+			 VALUES ($1, $2, $3, $4, $5, $1, $6) ON CONFLICT (order_id) DO NOTHING",
+			&[&&order_id[..], &&maker_key[..], &&mailbox_key[..], &record, &n, &record_formats],
 		).await?;
 		drop(conn);
 		self.resting_order(order_id).await?.ok_or_else(|| StoreError::Corrupt("a resting order just recorded is gone".into()))

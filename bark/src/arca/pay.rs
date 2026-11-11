@@ -350,6 +350,9 @@ impl Wallet {
 		if self.asks_vtxo2() {
 			req["template"] = json!("vtxo-2");
 		}
+		// The record formats the wallet reads: a payer pays it from coins of
+		// a format it names, and from none other.
+		req["reads"] = json!(arca_covenant::RECORD_FORMATS);
 		// The wallet's channels that can be paid now, in the asset named or
 		// in every asset: a payer holding a channel in the asset pays over
 		// it at once, and otherwise to the leaf this request names.
@@ -418,14 +421,14 @@ impl Wallet {
 	pub(crate) fn choose_coins(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64)
 		-> Result<(Vec<In>, u64, u64), Error>
 	{
-		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, Spend::Pay)
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, false, Spend::Pay)
 	}
 
 	/// [`Self::choose_coins`] for a spend of `spend`.
 	pub(crate) fn choose_coins_for(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64, spend: Spend)
 		-> Result<(Vec<In>, u64, u64), Error>
 	{
-		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, spend)
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, false, spend)
 	}
 
 	/// The live coins of `asset` the wallet can pay with ([`Self::spendable`]).
@@ -625,16 +628,25 @@ impl Wallet {
 	/// would.
 	#[allow(clippy::too_many_arguments)]
 	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize, fit: bool, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
+		other_inputs: usize, fit: bool, old_reader: bool, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
-		match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, spend) {
+		let r = match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, old_reader, spend) {
 			Err(e @ Error::Refused(_)) => {
 				if self.free_refreshes(asset)? {
-					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, spend)
+					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, old_reader, spend)
 				} else {
 					Err(e)
 				}
 			},
+			r => r,
+		};
+		// Coins enough, but only of the newer format: say so.
+		match r {
+			Err(Error::Refused(_)) if old_reader
+				&& self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, false, spend).is_ok() =>
+				Err(Error::Refused(format!("the other side's wallet is an older build, which reads no coin whose past holds a checkpoint \
+					with its owner's exit, and the wallet's coins of asset {} that would pay {} are such coins: they pay it once a round \
+					refreshes them (refresh-received), or once the other side updates; nothing was signed", asset, paid))),
 			r => r,
 		}
 	}
@@ -646,12 +658,18 @@ impl Wallet {
 	/// change is none or at least the smallest leaf, and whose margins are
 	/// within the wallet's bound, pays. Only when none does are the coins
 	/// taken as a payment takes them.
+	/// With `old_reader`, the other side reads only the first coin record
+	/// format: no coin whose record is of the second (its past holds a
+	/// checkpoint with its owner's exit) is taken.
 	#[allow(clippy::too_many_arguments)]
 	fn choose_live(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize, fit: bool, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
+		other_inputs: usize, fit: bool, old_reader: bool, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		let margins = Margins::of(info, asset)?;
 		let mut candidates = self.spendable(asset, spend)?;
+		if old_reader {
+			candidates.retain(|c| c.row.record.first() != Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT));
+		}
 		let mut deep = 0u64;
 		if fit {
 			if let Some(limit) = depth_limit(info) {
@@ -988,7 +1006,9 @@ impl Wallet {
 			until,
 		};
 		let to_out = to.explicit(self);
-		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, false, Spend::Pay)?;
+		// A receiver that names no format it reads is an older build.
+		let old_reader = !Self::reads_exit_format(&req);
+		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, false, old_reader, Spend::Pay)?;
 		Ok(SendPlan { asset, value, to, to_out, inputs, margin, change, rule })
 	}
 
@@ -1320,10 +1340,10 @@ impl Wallet {
 				Err(_) => {
 					let as_of = first_expiry(&record).filter(|t| *t < now.to_consensus_u32())
 						.and_then(|t| arca_covenant::MedianTime::from_consensus(t).ok());
-					let Some(as_of) = as_of else { return Err(e) };
+					let Some(as_of) = as_of else { return Err(self.unkept(e, &record, claimed)) };
 					match self.assess(&record, &WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) }, Some((&owner, &nonce))) {
 						Ok(a) => (a, true, true),
-						Err(_) => return Err(e),
+						Err(_) => return Err(self.unkept(e, &record, claimed)),
 					}
 				},
 			},
@@ -1392,7 +1412,8 @@ impl Wallet {
 		if let Some(e) = &boards_spent {
 			if !home && !late && !due {
 				if self.cut_by_final_spend(&a.valid)? {
-					return Err(Error::Refused(format!("{}, and a final spend that is no step of the coin's path has cut it", e)));
+					let why = format!("{}, and a final spend that is no step of the coin's path has cut it", e);
+					return Err(self.dead_trade(Error::Refused(why), &a.valid, &record, claimed));
 				}
 				answer = true;
 			}
@@ -1419,7 +1440,8 @@ impl Wallet {
 		if let Some(e) = &on_chain {
 			if !late && !home && !due && !answer {
 				if self.cut_by_final_spend(&a.valid)? {
-					return Err(Error::Refused(format!("{}, and a final spend that is no step of the coin's path has cut it", e)));
+					let why = format!("{}, and a final spend that is no step of the coin's path has cut it", e);
+					return Err(self.dead_trade(Error::Refused(why), &a.valid, &record, claimed));
 				}
 				answer = true;
 			}
@@ -1491,6 +1513,12 @@ impl Wallet {
 		})?;
 		let mut out = json!({"leaf_id": id, "kind": kind_of(&record), "asset": a.valid.asset.to_string(), "value": a.valid.value.to_string(),
 			"hops": a.valid.hops, "state": state, "note": note, "from": source});
+		// A coin of a trade whose checkpoints carry their owners' exit (the
+		// taker's side of a swap, a fill's coins) goes to the wallet's
+		// watchtowers at once, before the trade shows done.
+		if bytes.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) && a.valid.has_checkpoint_exit() {
+			out["watchtowers"] = self.deposit_now(&[id.to_string()]);
+		}
 		// D57: a coin whose exit needs a fee coin the wallet does not hold
 		// says so when it is taken, as on every listing.
 		if let Some(f) = self.exit_fee(&coin, &mut None)? {
@@ -2144,8 +2172,19 @@ impl Wallet {
 		// with probes of the same shape.
 		let probe = |a: AssetId| ExplicitOutput::new(a, 1, leaf_probe());
 		let others = vec![wanted.explicit(self), probe(give_asset), probe(want_asset)];
-		self.trade_allowed(&info, true)?;
-		let (inputs, margin, change) = self.choose_for_trade(&info, give_asset, give, &others, true, min_give, 1)?;
+		if !Self::checkpoint_exit_offered(&info) {
+			self.exit_required("the operator does not offer it (info.checkpoint_exit)")?;
+		}
+		// The taker is not known yet, so the coins are chosen as ever (change
+		// already out of round first, D93). An older taker's library reads
+		// no coin record of the newer format and refuses such an offer when
+		// it reads it, before signing anything: it never holds a coin it
+		// cannot read.
+		let (inputs, margin, change) = self.choose_for_trade(&info, give_asset, give, &others, true, min_give, 1, false)?;
+		// The wallet's own coins are what the switch protects first.
+		if let Some(i) = inputs.iter().find(|i| !i.coin.exit_allowed()) {
+			self.exit_required(&format!("coin {} it would give cannot have it (its kind of leaf takes no checkpoint exit)", i.coin.id))?;
+		}
 		let mut outs = vec![wanted];
 		if change > 0 {
 			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_of("change", &info, give_asset, change)?, mailbox, until: None });
@@ -2166,6 +2205,7 @@ impl Wallet {
 		if Self::checkpoint_exit_offered(&info) {
 			offer["checkpoint_exit"] = json!(true);
 		}
+		offer["reads"] = json!(arca_covenant::RECORD_FORMATS);
 		let id = hex(&sha256::Hash::hash(offer.to_string().as_bytes()).to_byte_array());
 		self.store.atomically(|s| {
 			s.put_swap(&id, "maker", &offer.to_string())?;
@@ -2178,6 +2218,27 @@ impl Wallet {
 			"pays": Self::maker_pays(give_asset, margin, &inputs)}))
 	}
 
+	/// Whether the party whose offer, acceptance or receive request is `v`
+	/// reads the coin record format a checkpoint with its owner's exit makes
+	/// (`coin-2`): it names that format among those it reads (`reads`), or
+	/// asks for the exit. A party that says neither is an older build: no
+	/// record of that format is handed to it.
+	pub(crate) fn reads_exit_format(v: &Value) -> bool {
+		v["checkpoint_exit"] == json!(true)
+			|| v["reads"].as_array().is_some_and(|r| r.iter().any(|f| f.as_str() == Some(EXIT_RECORD_FORMAT)))
+	}
+
+	/// Refuses, before anything is signed, a trade without checkpoints with
+	/// their owners' exit when the wallet requires them
+	/// ([`Wallet::require_checkpoint_exit`]); `why` says what is missing.
+	pub(crate) fn exit_required(&self, why: &str) -> Result<(), Error> {
+		if self.requires_checkpoint_exit() {
+			return Err(Error::Refused(format!("this wallet trades only when every checkpoint of the trade has its owner's exit \
+				(require-checkpoint-exit), and {}: nothing was signed", why)));
+		}
+		Ok(())
+	}
+
 	/// Whether a swap or a fill may move its coins into checkpoints with
 	/// their owners' exit ([`arca_covenant::checkpoint`]): when the operator
 	/// co-signs them (`info.checkpoint_exit`). This library reads the record
@@ -2185,27 +2246,6 @@ impl Wallet {
 	/// (an offer's `checkpoint_exit`) or by signing so (an acceptance's).
 	pub(crate) fn checkpoint_exit_offered(info: &Value) -> bool {
 		info["checkpoint_exit"] == json!(true)
-	}
-
-	/// While the wallet sets an instant limit ([`super::places`]), a trade
-	/// only when every checkpoint in it has its owner's exit: when the
-	/// operator co-signs them, and the other side asks for them
-	/// (`other_side`; a maker asks for them itself). Else the trade would put
-	/// the coin the wallet gives in a checkpoint only it and the operator can
-	/// spend, should the other side and the operator kill the trade.
-	pub(crate) fn trade_allowed(&self, info: &Value, other_side: bool) -> Result<(), Error> {
-		if self.own_instant_limit()?.is_none() {
-			return Ok(());
-		}
-		if !Self::checkpoint_exit_offered(info) {
-			return Err(Error::Refused("this operator does not co-sign checkpoints with their owner's exit, so a trade could hold the \
-				coin given until the operator signs again; a wallet with an instant limit trades once it does".into()));
-		}
-		if !other_side {
-			return Err(Error::Refused("the other side does not ask for checkpoints with their owner's exit, so the trade could hold the \
-				coin given until the operator signs again; a wallet with an instant limit does not take it".into()));
-		}
-		Ok(())
 	}
 
 	/// [`Self::choose`] for a trade. While the wallet sets an instant limit,
@@ -2216,9 +2256,9 @@ impl Wallet {
 	/// lineage, not the trade's.
 	#[allow(clippy::too_many_arguments)]
 	fn choose_for_trade(&mut self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize) -> Result<(Vec<In>, u64, u64), Error>
+		other_inputs: usize, old_reader: bool) -> Result<(Vec<In>, u64, u64), Error>
 	{
-		let mut got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, Spend::Trade)?;
+		let mut got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, old_reader, Spend::Trade)?;
 		if self.own_instant_limit()?.is_none() || got.2 == 0 {
 			return Ok(got);
 		}
@@ -2231,8 +2271,8 @@ impl Wallet {
 			let all: Vec<&ValidCoin> = std::iter::repeat(&template).take(1 + other_inputs).collect();
 			let r = if pays_margin { self.reassignment_margin(&all, others, &margins)? } else { 0 };
 			let need = paid.checked_add(m).and_then(|v| v.checked_add(r)).ok_or_else(|| Error::Refused("a trade above 2^64 atoms".into()))?;
-			self.shape_coin(info, asset, need)?;
-			got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, Spend::Trade)?;
+			self.shape_coin(info, asset, need, old_reader)?;
+			got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, old_reader, Spend::Trade)?;
 			if got.2 == 0 {
 				return Ok(got);
 			}
@@ -2243,12 +2283,12 @@ impl Wallet {
 
 	/// Pays the wallet itself, out of round, a coin of exactly `need` of
 	/// `asset`, and the rest as change, from coins a trade may give.
-	fn shape_coin(&mut self, info: &Value, asset: AssetId, need: u64) -> Result<(), Error> {
+	fn shape_coin(&mut self, info: &Value, asset: AssetId, need: u64, old_reader: bool) -> Result<(), Error> {
 		let min = Self::min_leaf(info, asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let leaf = self.own_leaf_of("shaped", info, asset, need)?;
 		let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
-		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(&probe), true, min, 0, false, Spend::Trade)?;
+		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(&probe), true, min, 0, false, old_reader, Spend::Trade)?;
 		let mut outs = vec![Out { asset, value: need, leaf, mailbox, until: None }];
 		if change > 0 {
 			outs.push(Out { asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });
@@ -2289,6 +2329,10 @@ impl Wallet {
 				rows
 			},
 		};
+		// A swap that can never complete reads `returning` from the moment
+		// the wallet knows it and its coin is coming home, with what comes
+		// home and when (`return`), and `returned` once the claim is final.
+		let mut returns = self.returns_of()?;
 		let mut out = vec![];
 		for (id, role, offer_json, state) in rows {
 			let offer: Value = serde_json::from_str(&offer_json).map_err(|e| Error::Store(e.to_string()))?;
@@ -2297,9 +2341,84 @@ impl Wallet {
 			if role == "maker" && state == "open" {
 				v["offer"] = json!(encode(&self.spelling.offer, &offer));
 			}
+			let accept = self.store.swap(&id)?.and_then(|s| s.2).unwrap_or_default();
+			let (mine, rest): (Vec<Value>, Vec<Value>) = returns.into_iter().partition(|r| {
+				let l = r["leaf_id"].as_str().unwrap_or("-");
+				offer_json.contains(l) || accept.contains(l)
+			});
+			returns = rest;
+			if !mine.is_empty() {
+				v["state"] = json!(if mine.iter().all(|r| r["state"] == "returned") { "returned" } else { "returning" });
+				v["return"] = Self::return_summary(&mine);
+			}
 			out.push(v);
 		}
+		// Returns of trades the wallet holds no swap of (a wallet restored
+		// from its mnemonic, or a fill): each shown on its own.
+		if ids.is_none() {
+			for r in returns {
+				let state = r["state"].clone();
+				out.push(json!({"swap": null, "role": null, "state": state, "gives": {"asset": r["asset"], "value": r["value"]}, "gets": null,
+					"return": Self::return_summary(std::slice::from_ref(&r))}));
+			}
+		}
 		Ok(Value::Array(out))
+	}
+
+	/// A coin offered to the wallet that cannot be kept (`e`, why): when a
+	/// coin it rests on was spent elsewhere on the chain, the trade that made
+	/// it can never complete, and each coin the wallet gave into that trade
+	/// comes home by its checkpoint's own exit ([`Wallet::return_given`]),
+	/// however long after the trade the wallet reads it. The coin is then
+	/// refused for good, saying so: it is no longer waited for, listed as
+	/// pending or counted. Otherwise `e` stands.
+	fn unkept(&mut self, e: Error, record: &CoinRecord, leaf: &str) -> Error {
+		if !matches!(record, CoinRecord::Transfer(_) | CoinRecord::Fill(_)) {
+			return e;
+		}
+		let Ok(now) = self.now() else { return e };
+		let Ok(txs) = self.base_txs(record) else { return e };
+		let policy = self.followed_policy(first_expiry(record).unwrap_or(u32::MAX), now);
+		let Ok(coin) = self.resolve(record, &txs, &policy) else { return e };
+		self.dead_trade(e, &coin, record, leaf)
+	}
+
+	/// The refusal `e` of coin `coin` (`leaf`), offered to the wallet: when
+	/// the trade that made it can never complete (an input of it, or the
+	/// order a fill spends, was spent elsewhere on the chain), each coin the
+	/// wallet gave into that trade comes home by its checkpoint's own exit
+	/// ([`Wallet::return_given`]), and the refusal says so. Otherwise `e`.
+	fn dead_trade(&mut self, e: Error, coin: &ValidCoin, record: &CoinRecord, leaf: &str) -> Error {
+		// The coin is not kept, so each return keeps its record: the return
+		// reads the trade from it.
+		let via = record.to_bytes().ok().map(|b| (hex(&b), coin.expiry.to_consensus_u32()));
+		if let Err(r) = self.return_given_from(coin, leaf, via) {
+			let _ = self.store.refused(&format!("return of the coins given for {}", leaf), &r.to_string());
+		}
+		let back = self.returning_given(coin).unwrap_or_default();
+		if back.is_empty() {
+			return e;
+		}
+		let why = match e { Error::Refused(m) => m, other => other.to_string() };
+		Error::Refused(format!("{}: the trade that made it can never complete, and the wallet's coin(s) {} given into it come home by \
+			their checkpoint's own exit", why, back.join(", ")))
+	}
+
+	/// What a returning swap shows of its coins coming home
+	/// ([`Wallet::returns_of`]): the asset, the value coming home, the
+	/// latest time a claim of them can be made (`claim_from`, a median time,
+	/// `claim_from_estimated` while a checkpoint is not in a block yet), and
+	/// each coin.
+	fn return_summary(items: &[Value]) -> Value {
+		let value: u64 = items.iter().filter_map(|r| r["value"].as_str().and_then(|v| v.parse::<u64>().ok())).sum();
+		let mut s = json!({"asset": items[0]["asset"], "value": value.to_string(), "coins": items});
+		if let Some(t) = items.iter().filter_map(|r| r["claim_from"].as_u64()).max() {
+			s["claim_from"] = json!(t);
+		}
+		if items.iter().any(|r| r["claim_from_estimated"] == true) {
+			s["claim_from_estimated"] = json!(true);
+		}
+		s
 	}
 
 	/// Checks an offer's coins as a receiver checks a coin, and their values.
@@ -2394,7 +2513,9 @@ impl Wallet {
 		let mut others: Vec<ExplicitOutput> = o.maker_outs.iter().map(|m| m.explicit(self)).collect();
 		others.push(ExplicitOutput::new(o.give_asset, o.give, leaf_probe()));
 		others.push(ExplicitOutput::new(o.want_asset, 1, leaf_probe()));
-		let (mine, _, change) = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true, Spend::Trade)?;
+		self.swap_exit_required(&o, &info)?;
+		let (mine, _, change) = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true,
+			!Self::reads_exit_format(&o.offer), Spend::Trade)?;
 		Self::swap_depth(&info, &o, &mine)?;
 		let outputs = o.maker_outs.len() + 1 + usize::from(change > 0);
 		if outputs > arca_covenant::leaf::MAX_OUTPUTS as usize {
@@ -2403,6 +2524,18 @@ impl Wallet {
 		}
 		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
 		self.quoted(Ok(Self::swap_terms(&o, &mine, change, dates)))
+	}
+
+	/// Refuses, before anything is signed, a swap the wallet would take
+	/// without the checkpoint exit when it requires it.
+	fn swap_exit_required(&self, o: &OfferChecked, info: &Value) -> Result<(), Error> {
+		if o.offer["checkpoint_exit"] != json!(true) {
+			return self.exit_required("the maker's offer does not ask for it (an older build, or its operator does not offer it)");
+		}
+		if !Self::checkpoint_exit_offered(info) {
+			return self.exit_required("the operator does not offer it (info.checkpoint_exit)");
+		}
+		Ok(())
 	}
 
 	/// Refuses, before anything is signed, a swap whose new coins would be
@@ -2451,8 +2584,9 @@ impl Wallet {
 		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf_of("swap", &info, give_asset, give)?, mailbox, until: None });
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
-		self.trade_allowed(&info, o.offer["checkpoint_exit"] == json!(true))?;
-		let (mine, _, change) = self.choose_for_trade(&info, want_asset, want, &others, false, min_want, 0)?;
+		self.swap_exit_required(&o, &info)?;
+		let (mine, _, change) = self.choose_for_trade(&info, want_asset, want, &others, false, min_want, 0,
+			!Self::reads_exit_format(&o.offer))?;
 		Self::swap_depth(&info, &o, &mine)?;
 		if change > 0 {
 			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf_of("change", &info, want_asset, change)?, mailbox,
@@ -2485,6 +2619,9 @@ impl Wallet {
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
+		if let Some(k) = (0..plan.inputs.len()).find(|k| !plan.exit(*k)) {
+			self.exit_required(&format!("coin {} of the swap cannot have it (its kind of leaf takes no checkpoint exit)", plan.inputs[k].0.id))?;
+		}
 		let leaves: Vec<NewLeaf> = outs.iter().map(|o| o.leaf).collect();
 		let mut sigs = vec![];
 		for (k, i) in inputs.iter().enumerate().skip(n) {
@@ -2507,6 +2644,7 @@ impl Wallet {
 		if checkpoint_exit {
 			accept["checkpoint_exit"] = json!(true);
 		}
+		accept["reads"] = json!(arca_covenant::RECORD_FORMATS);
 		self.store.atomically(|s| {
 			s.put_swap(&id, "taker", &offer.to_string())?;
 			s.set_swap(&id, "accepted", Some(&accept.to_string()))?;
@@ -2622,17 +2760,23 @@ impl Wallet {
 			Some(true) => return Err(Error::Refused("the acceptance signs checkpoints with their owners' exit, which the offer did not \
 				ask for".into())),
 		};
-		// A wallet with an instant limit trades only when every checkpoint
-		// has its owner's exit: it cancels the offer rather than complete it.
-		if !checkpoint_exit && self.own_instant_limit()?.is_some() {
-			return Err(Error::Refused(format!("the other side signed this trade without its owner's exit on every checkpoint, which a \
-				wallet with an instant limit does not trade; cancel the offer (swap_cancel {})", id)));
+		if !checkpoint_exit {
+			self.exit_required("the taker signed the swap without it (an older build, or one whose operator does not offer it)")?;
+		}
+		// Every coin of the swap, the wallet's own first, must have it.
+		if let Some(i) = inputs.iter().find(|i| !i.coin.exit_allowed()) {
+			self.exit_required(&format!("coin {} of the swap cannot have it (its kind of leaf takes no checkpoint exit)", i.coin.id))?;
 		}
 		// Coins of the taker's are not the wallet's to mark: only the maker's
 		// are put to `sending`.
 		let answer = self.transfer_with(&inputs, &outs, &theirs, None, checkpoint_exit)?;
+		// The trade's coins go to the wallet's watchtowers before the swap is
+		// reported done.
+		let made: Vec<String> = answer["kept"].as_array().map(|k| k.iter().filter_map(|c| c["leaf_id"].as_str().map(String::from))
+			.collect()).unwrap_or_default();
+		let towers = self.deposit_now(&made);
 		self.store.set_swap(&id, "done", None)?;
-		Ok(json!({"swap": id, "transfer": answer, "dates": dates}))
+		Ok(json!({"swap": id, "transfer": answer, "dates": dates, "watchtowers": towers}))
 	}
 
 	/// Cancels a swap the wallet offered or accepted and has not seen
@@ -2730,9 +2874,14 @@ impl Wallet {
 	}
 }
 
+/// The record format a checkpoint with its owner's exit makes, as
+/// [`arca_covenant::RECORD_FORMATS`] names it.
+pub(crate) const EXIT_RECORD_FORMAT: &str = "coin-2";
+
 /// Whether a coin refused with `e` may be accepted later: what it rests on
 /// is not on the chain now, or the node, the server or the store did not
 /// answer.
+
 /// The store's record of [`Wallet::reread_mailbox`]: the record formats it
 /// read for, and for each key still to read, its own cursor and where it
 /// stops.

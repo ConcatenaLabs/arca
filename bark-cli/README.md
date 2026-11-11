@@ -320,12 +320,14 @@ and a board whose registration never reached the server, are not recovered.
   proceeds in no leg of a cross-chain swap paid to another party, and when
   only proceeds would pay one, puts them into the next round at once and
   goes ahead after it (they pay inside the Arca, over Lightning and on the
-  chain at once); trades only when every checkpoint has its owner's exit;
-  gives into a swap a coin of exactly its amount, paying itself one first
+  chain at once); gives into a swap a coin of exactly its amount, paying itself one first
   when it holds none, so no change of its own rides in it; and never refuses
   a payment for its bond (one it cannot value, or past what the bond covers,
   arrives instead). A wallet sets no limit unless its owner sets one;
   without one every received coin counts at once and nothing above applies.
+  A wallet that should trade only with its owner's exit on every checkpoint
+  says so apart (`require-checkpoint-exit on`), as a wallet with an instant
+  limit for people would.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
@@ -364,16 +366,42 @@ and a board whose registration never reached the server, are not recovered.
   (`info.checkpoint_exit`), each plain coin goes into a checkpoint that also
   has its owner's exit after the coin's exit delay: the maker's offer asks
   for it, the taker signs so where it can, and either side whose library
-  does not know it signs the swap without it, as before. When the re-check
-  finds a coin the wallet got from such a trade cut on the chain by another
-  spend of a coin the trade took, it takes the coin the wallet gave home:
-  its checkpoint is published from the pair the wallet signed and, once the
-  exit delay has run, claimed with the wallet's own key, no operator
-  needed. The coin shows `exiting`, then `exited`, its note saying it was
-  returned, and the swap shows `returned`; the coin the trade was to pay
-  shows the trade undone. Should the spend that cut it leave the chain and
-  the trade complete after all, the coin is held as spent by it. A wallet
-  restored from its mnemonic in the middle finishes the return. Pulling out
+  does not know it signs the swap without it, as before. The coins such a
+  trade makes have coin records of format 2 (`coin-2`), which an older
+  build cannot read, so each party says which formats it reads (`reads` on
+  a receive request, an offer and an acceptance; a resting order's
+  `maker_reads`), and a party that says nothing is taken for an older
+  build: it is paid, and traded with, from coins of format 1 only, and
+  where those cannot pay, the payment or trade is refused before anything
+  is signed. An offer, whose taker is not known when it is made, takes the
+  wallet's coins as ever; an older taker refuses one holding a format-2
+  coin when it reads it, before signing. The coins the wallet gets from such a trade go to its
+  watchtowers before the trade is reported done; the answer lists which
+  hold them (`watchtowers`), and where none does, says the trade rests on
+  the wallet answering at its next `sync` or `recheck`, within the exit
+  delay. `require-checkpoint-exit on` makes the wallet trade only with the
+  exit. When the re-check finds a coin the wallet got from such a trade cut
+  on the chain by another spend of a coin the trade took, or the mailbox
+  brings one already cut (a wallet away when the trade died, however long
+  before), it takes the coin the wallet gave home: its checkpoint is
+  published from the pair the wallet signed and, once the exit delay has
+  run, claimed with the wallet's own key, no operator needed. From that
+  moment the swap reads `returning`, its `return` saying what comes home
+  (`asset`, `value`, each coin) and when the claim can be made
+  (`claim_from`, a median time; `claim_from_estimated` while the checkpoint
+  is not in a block yet, and left out then while the node does not answer:
+  the listing reads the wallet's store alone), and `returned` once the claim
+  is final. The coin
+  given shows `exiting`, then `exited`, its note saying it was returned. The
+  coin the trade was to pay is out of the balance from the start of the
+  return, its note saying the trade was undone; one still in the mailbox is
+  refused for good, saying why, and no longer listed as pending. Should the
+  spend that cut it leave the chain and the trade complete after all, the
+  coin given is held as spent by it, the coin the trade paid is the
+  wallet's again and the swap reads `done`. A wallet restored from its
+  mnemonic, in the middle of a return or after it, shows the same: it holds
+  no swap, so each return is listed on its own (`swap` null, `gives` the
+  asset and value). Pulling out
   of a good trade this way does not work: the other side's wallet, its
   watchtower and the operator answer the early checkpoint with the trade
   inside the delay.
@@ -1934,6 +1962,7 @@ registry for both commands.
 | `supervised-check TXID:VOUT` | Reads the published batch at output `VOUT` of round `TXID` of a supervised asset, from the published tree and the chain alone (see Holding a supervised asset): the asset supervised on the wallet's node, every leaf `landing-1` with the allowance the operator publishes, every output of the round explicit, each leaf's landing and whether the node shows it frozen; `ok` and the `problems` found |
 | `supply ASSET` | For an asset the operator serves issuer-operated, the operator's supply report (`issuer_supply`): each mint of its rounds and each burn of its own, the totals, what is final, the value live in its burn-only batches and where its mint limiter stands; each mint and burn read again from the wallet's node, with what the chain says beside the operator's figure (`on_chain`, `agrees`), and `checked_on_the_node: true` only when every one agrees. It checks the transactions the report lists, not that the list is whole: a mint left out of it is found only by following the asset's reissuance token on the chain |
 | `leaf-template [vtxo-1\|vtxo-2]` | The template of the wallet's own new leaves, after setting it when one is named: its refreshes, its change and what its receive requests ask a sender for. `vtxo-1` (the default) has the tapscript collaborative path; `vtxo-2` has the Simplicity program `arca/collab-2`, whose pair also binds the coin's index and the coins it is spent beside, so one leg of a swap never moves without the other. Both exit alike, by the same script; a `vtxo-2` coin's collaborative spend is larger on the chain (556 vB against 280). Coins held keep their template until refreshed; a coin of a supervised asset is `landing-1` whatever is set, the leaves an in-tree fill of a resting order makes the wallet are `vtxo-1` (the fill request names no template), and a `vtxo-2` coin is refreshed by `sync` rather than planned |
+| `require-checkpoint-exit [on\|off]` | Whether the wallet trades only when every checkpoint of the trade has its owner's exit, after setting it when `on` or `off` is named; off by default. With it on, a swap or a fill is refused before anything is signed when the operator does not offer the exit (`info.checkpoint_exit`), when the other side's offer or acceptance does not ask for it, when a resting order's maker reads no `coin-2` record, or when a coin of the trade cannot have it (its leaf is neither plain nor `landing-1`) |
 | `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, whether the bond covers it (`covers`), and the instant budget when one is set (`instant_budget`) |
 | `instant-budget SHARE` | Sets the share of the bond's value the wallet holds out of round at most (`0.1`, or `off`): a counterparty's instant budget |
 | `instant-limit ATOMS` | Sets the wallet's instant limit, in atoms of the reference unit (or `off`): of coins received out of round, the most it counts as its own at once |
@@ -1948,7 +1977,7 @@ registry for both commands.
 | `boards` | Where each board stands, by the server and by the chain |
 | `watchtowers [URL…] [--none \| --operator \| --default URL…]` | The watchtowers the wallet deposits its coins with and where the list comes from (`setting`; `operator`, those `info` lists; or `operator and defaults`, with the program's defaults), after naming them, or the defaults, when given (see Watchtowers) |
 | `watchtower serve [--listen ADDR] [--interval S]` | Runs this wallet as a watchtower for other wallets' coins until stopped: deposits over HTTP, and a pass every `S` seconds (see Watchtowers). `watchtower pass` runs one pass; `watchtower deposits` lists the deposits held, each with its state and what was broadcast for it |
-| `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, the template it asks for when it is `vtxo-2` (`leaf-template`), the wallet's channels that can be paid now (`channels`, by asset; in the asset named, when one is), and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
+| `receive [--asset A] [--amount N]` | A single-use receive request (`arca:…`): a fresh key and owner nonce, the wallet's mailbox, the exit delay asked for, the template it asks for when it is `vtxo-2` (`leaf-template`), the coin record formats the wallet reads (`reads`; a sender pays a request without it only from coins of format 1), the wallet's channels that can be paid now (`channels`, by asset; in the asset named, when one is), and the median time it lapses at (`until`, 27 days on). A request naming an asset the operator does not serve is refused |
 | `forget-request OWNER` | Stops waiting for a payment to the unpaid receive request of key `OWNER` (as `sync`'s `schedule.receive_requests` lists it): it lapses now and no longer holds the schedule; a coin paid to it is still read by any later `sync`. `forget-request restored` ends the hold a restore puts on the schedule for requests handed out before it |
 | `send REQUEST [--amount N] [--asset A] [--route any\|channel\|leaf]` | Pays a receive request or a channel code: over the wallet's channel into the receiver's when the text names one in the asset and the wallet's can pay it (see Channel leaves); otherwise a receive request out of round, unless it has lapsed: the coins of the asset (those furthest from their exit date first), each into a checkpoint, and the reassignment into the receiver's leaf and the change. For a coin resting on a lowest node with RECLAIM-D the wallet also signs the delegation of its release to every output's owner key, so the operator can reclaim that node once the coins' holders refresh; never for an order resting again after a fill, whose key is the order's and has delegated. The server co-signs and posts the coins to the mailboxes. `route` in the answer says which |
 | `mailbox` | Reads the mailbox and validates every coin in it: the mailbox of the wallet's mailbox key and of the key of every receive request still waiting, all together, so from an operator that publishes `mailbox_reads` in its `info` a read costs a challenge and a request for each 200 keys however many requests wait, and from one that does not, each key is read alone (`mailbox_read`); each is kept or refused with its reason, and one refused for a passing reason (what it rests on not on the chain now, during a rollback, or the node not answering) is kept aside as `waiting` and checked again on every read; so is one whose record is of a format, template or template version this build does not read (`unread`), whose bytes are kept so that a later version of the wallet takes it. Once for each set of record formats the wallet reads, and so on its first sync after an update that reads a new one, the wallet reads every mailbox again from its start up to where it had read, at most ten pages a sync and the rest at the next, with the read's own cursor left where it was: it takes each coin an earlier version could not read, passes over every coin it holds or held and every notice, and says so in `note`, so a coin paid while the wallet was too old to read it shows without a `restore`. A coin read again that the wallet holds already is shown apart (`already_held`), never as taken; the read's cursor never moves back (a message at or before what was read is not read again, a page with nothing past it ends the read, and one read takes at most a hundred pages of a key, `MAILBOX_PAGES`, the rest left to the next, each said in `note`); a second record of such a coin, whose checks all pass, with other checkpoint values (the operator co-signed two checkpoint values for one coin) is kept with the wallet's refusals as evidence and reported, the coin held as it was |
@@ -2005,7 +2034,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `care [--scan N] [--expiries N] [--max-fee-ppm N] [--plan-within S] [--channels]` | With `--channels`, first reads every channel, folds its credit and opens one in each asset the operator makes them of (see Channel leaves; under `channels`). Takes up every open claim, cancels each plan whose coin has moved, and plans each coin whose first step could run within ten days (a coin of no round is refreshed in a round first; a coin of a supervised asset is left to `sync`'s refresh and counted under `supervised`); what a wallet does by itself at a sync |
 | `swap offer --give-asset A --give N --want-asset B --want M` | Offers one asset for another in one reassignment (`arca-offer:…`), holding the coins it gives and signing nothing; answers what the maker gives, gets and pays (the reassignment's margin and its coins' checkpoint margins, in the asset it gives). A swap pays from one coin alone when one can, among the coins with at least seven days left before their first expiry (or none, on a batch without a sweep): first a coin already out of round whose new coins stay at least two reassignments below the operator's depth limit, then a coin of a round or a board, each the smallest first, the first that pays it with its margins, a change of none or at least the smallest leaf (a remainder within the operator's most margin goes to the margin instead), and margins within the wallet's bound. Its change, out of round until the next round refreshes it, is then at most that coin, and the wallet's total out of round stays near a trade's size rather than a coin's. When no coin pays alone, the coins are taken as a payment takes them, furthest from their exit date first. A coin at the operator's depth limit is never taken into a swap |
 | `swap accept OFFER [--accept-near-deadline]` | Checks the maker's coins as a receiver would, adds the wallet's side, paid from its coins as `swap offer` takes them, and signs it (`arca-accept:…`). A swap whose new coins would be past the operator's depth limit (one reassignment more than the deepest coin it spends, the maker's or the wallet's) is refused before anything is signed. Every coin the swap makes rests on every coin it spends, so the coins the wallet gets carry the earliest dates among them (a batch's first expiry, a board's service expiry); they are shown before anything is signed, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed |
-| `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
+| `swap complete ACCEPT [--accept-near-deadline]`, `swap cancel ID` | The maker checks its outputs are all there, signs and has the server co-sign; the coins it gets rest on every coin the swap spends, the taker's included, so they carry the earliest dates among them, which are shown, and the swap is refused when their exit deadline is less than two days away unless `--accept-near-deadline` is passed. Before it answers, the coins it gets go to the wallet's watchtowers, and `watchtowers` says which hold them (`held`) and which none does (`not_held`, with what that means). Or a swap is given up. An offer has nothing signed in it, and its coins are freed. An acceptance does: the maker holds the taker's signatures, so the taker's coins are spent to a fresh leaf of the wallet's own, after which the acceptance can never complete; if that cannot be done, the answer says the acceptance still stands |
 | `btc-swap offer --give btc\|asset --asset A --atoms N --sats S [--lapse-seconds L]` | Offers a swap of native BTC for an asset with another wallet of the operator (see Swapping BTC for an asset); giving the asset, makes the Bitcoin invoice the taker pays. The offer's text and what the wallet gives and gets, with every fee; nothing locked |
 | `btc-swap read OFFER`, `btc-swap take OFFER`, `btc-swap complete TAKE` | What taking an offer gives and gets, with every fee; the take (asking the operator to receive under the offer's hash, or making the Bitcoin invoice), its text for the maker; the maker's completion |
 | `btc-swap follow [SWAP] [--wait S] [--claim-slice C]` | Moves the wallet's swaps on, running Bark as each needs (lock, claim, payment, claim of the leaf), for `S` seconds; one pass when 0 |

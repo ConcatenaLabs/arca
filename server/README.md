@@ -62,7 +62,9 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V42__slot_releases.sql`](schema/V42__slot_releases.sql),
 [`schema/V43__record_formats.sql`](schema/V43__record_formats.sql),
 [`schema/V44__watched_for_index.sql`](schema/V44__watched_for_index.sql),
-[`schema/V45__final_pass_indexes.sql`](schema/V45__final_pass_indexes.sql), [`schema/V46__participation_arriving.sql`](schema/V46__participation_arriving.sql)). `Store::connect` builds it
+[`schema/V45__final_pass_indexes.sql`](schema/V45__final_pass_indexes.sql),
+[`schema/V46__resting_order_reads.sql`](schema/V46__resting_order_reads.sql),
+[`schema/V47__participation_arriving.sql`](schema/V47__participation_arriving.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -897,8 +899,13 @@ anything is recorded or signed, and the owners sign the transfer again
 without it. The flag is part of the request's hash only when it is set, so a
 request without it hashes as it always did, and the coins it makes have coin
 records of format version 2, which a wallet asks for only where every party
-to the transfer reads them. Turning the setting on refuses no client: a
-wallet that never asks is served as before. The watcher answers such a
+to the transfer reads them. A wallet that never asks is served as before.
+An order's maker names the record formats its wallet reads when it publishes
+(`record_formats` on `order_publish`, shown to takers as the order's
+`maker_reads`; empty for an older build), and the server refuses
+(`out_of_bounds`) a fill that asks for the exit, or gives a coin whose record is
+of format 2, against an order whose maker did not name `coin-2`; the taker
+signs the fill again without it, from other coins. The watcher answers such a
 checkpoint seen early on the chain (see Stale exits, under The watcher).
 
 An input resting on a lowest node with RECLAIM-D (a batch built with
@@ -2928,7 +2935,12 @@ pool cannot cover what is outstanding. The operator's metrics
 the pool and what is outstanding per fee asset
 (`arca_watcher_fee_pool`, `arca_watcher_fee_outstanding`) and the board
 forfeits held back for block space or for the pool
-(`arca_watcher_forfeits_held`).
+(`arca_watcher_forfeits_held`), and the seconds since the watcher's last pass
+ended, or since it started while its first runs
+(`arca_watcher_last_pass_age_seconds`). The
+watcher answers an early checkpoint with its owner's exit within the coin's
+exit delay, so an alert on that age, well inside the shortest exit delay the
+operator takes, says when nothing is answering.
 
 ## The interface
 
