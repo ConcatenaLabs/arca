@@ -1842,7 +1842,9 @@ impl Server {
 		let chain_name = finality.call(|c| c.chain_name()).await.map_err(err("the node"))?;
 		params.no_sweep = config.batches.no_sweep || chain_name.as_deref() == Some(crate::params::MAIN_CHAIN);
 		params.checkpoint_exit = config.checkpoint_exit;
-		params.landing_2_only = config.landing_2_only;
+		// On the main chain no landing-1 leaf is ever made: its coins could
+		// share one landing output and leave past a freeze.
+		params.landing_2_only = config.landing_2_only || chain_name.as_deref() == Some(crate::params::MAIN_CHAIN);
 		if let Some(c) = config.batches.collect_after_seconds {
 			if c == 0 {
 				return Err(StartError("batches.collect_after_seconds is at least 1".into()));

@@ -2264,7 +2264,8 @@ landing is refused on a leaf of any other asset.
 
 **The operator stops making `landing-1`** with the top-level setting
 `landing_2_only = true`, which `info.landing_2_only` publishes and which
-leaves `landing-1` out of `info.templates.list`. A board, a participation and
+leaves `landing-1` out of `info.templates.list`. On the main chain it is on
+whatever the configuration says, so no `landing-1` coin is ever made there. A board, a participation and
 a transfer that would make a `landing-1` leaf are then refused
 (`out_of_bounds`, naming the setting); a `landing-1` coin already made is
 still co-signed when it moves into `landing-2` leaves, refreshed, offboarded

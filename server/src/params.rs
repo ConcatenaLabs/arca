@@ -338,7 +338,7 @@ pub struct Params {
 	/// ([`Params::check_landing`]). `landing-1` coins already made are still
 	/// spent, refreshed into `landing-2` and answered. Off until every
 	/// client of the operator reads `landing-2`
-	/// ([`arca_covenant::LANDING_2`]).
+	/// ([`arca_covenant::LANDING_2`]); always on on the main chain.
 	pub landing_2_only: bool,
 }
 
