@@ -726,6 +726,7 @@ async fn bond_info(app: &Arc<App>) -> Option<api::BondInfo> {
 		reference_value: reference.map(|v| v.to_string()),
 		instant_budget_ppm: bond.instant_budget_ppm,
 		instant_budget: reference.zip(bond.instant_budget_ppm).map(|(v, ppm)| (v as u128 * ppm as u128 / 1_000_000).to_string()),
+		instant_limit_value: bond.instant_limit_value.map(|v| v.to_string()),
 		operator: hex(&p.operator.serialize()),
 		withdraw_key: hex(&p.withdraw.serialize()),
 		notice_units: p.notice.units(),
