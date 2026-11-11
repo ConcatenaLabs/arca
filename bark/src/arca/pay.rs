@@ -1038,7 +1038,7 @@ impl Wallet {
 		// Nothing is signed for the operator without a witness of its
 		// signer's record, whatever entry point led here.
 		self.witnessed_now()?;
-		let plan = TransferPlan {
+		let plan = TransferPlan { checkpoint_exit: false,
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
@@ -2364,7 +2364,7 @@ impl Wallet {
 		let n = theirs.len();
 		let mut inputs = theirs;
 		inputs.extend(mine);
-		let plan = TransferPlan {
+		let plan = TransferPlan { checkpoint_exit: false,
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};

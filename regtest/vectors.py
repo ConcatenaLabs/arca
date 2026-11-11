@@ -148,6 +148,8 @@ T_OUT = b"\x01" + T_ID
 
 SALTS = {i: label_hash("salt", "leaf%d" % i) for i in range(NLEAVES)}
 SALT_CHECKPOINT = label_hash("salt", "checkpoint")
+SALT_CHECKPOINT_EXIT = label_hash("salt", "checkpoint with exit")
+SALT_CHECKPOINT_EXIT_SWEEP = label_hash("salt", "checkpoint with exit and sweep")
 SALT_RECV = label_hash("salt", "receiver leaf")
 SALT_CHANGE = label_hash("salt", "change leaf")
 SALT_HTLC = label_hash("salt", "htlc")
@@ -486,6 +488,15 @@ def generate():
         "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_CHECKPOINT),
         "K": hx(leaf_const(CTAG, SALT_CHECKPOINT, fold=True)), "token": hx(T_ID), "r_program": hx(R_PROG),
         "notice": W}, ctap, [("collab", 1), ("sweep", 1)])
+    xtap, _ = checkpoint_taptree(A.x, S.x, SALT_CHECKPOINT_EXIT, CTAG, None, DELAY)
+    outputs["checkpoint_exit"] = output_json("checkpoint with its owner's exit, a batch without a sweep", {
+        "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_CHECKPOINT_EXIT),
+        "K": hx(leaf_const(CTAG, SALT_CHECKPOINT_EXIT, fold=True)), "exit_delay": DELAY}, xtap, [("collab", 1), ("exit", 1)])
+    xstap, _ = checkpoint_taptree(A.x, S.x, SALT_CHECKPOINT_EXIT_SWEEP, CTAG, cp_sweep, DELAY)
+    outputs["checkpoint_exit_sweep"] = output_json("checkpoint with its owner's exit and a sweep", {
+        "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_CHECKPOINT_EXIT_SWEEP),
+        "K": hx(leaf_const(CTAG, SALT_CHECKPOINT_EXIT_SWEEP, fold=True)), "token": hx(T_ID), "r_program": hx(R_PROG),
+        "notice": W, "exit_delay": DELAY}, xstap, [("collab", 1), ("sweep", 2), ("exit", 2)])
     htap, hlv = htlc_taptree(A.x, S.x, SALT_HTLC, CTAG, sha256(PAYMENT_PREIMAGE), HTLC_TIMEOUT, DELAY,
                              HTLC_OPERATOR_DELAY)
     outputs["htlc"] = output_json("htlc-1, payment out of the tree", {
@@ -643,6 +654,14 @@ def generate():
                                leaf_spent, [(X_ID, LEAF_VALUE - 600, long_spk)], [S, A]))
     spends.append(sweep_spend("checkpoint/sweep after the notice", "checkpoint", ctap, v_cp, bytes(ctap.scriptPubKey),
                               True, False))
+    # A checkpoint with its owner's exit: the same reassignment by its
+    # collaborative path, and the owner's exit after its delay, of each shape.
+    spends.append(rebind_spend("checkpoint_exit/collab m=2, the reassignment", "checkpoint_exit", "collab", xtap, CTAG,
+                               SALT_CHECKPOINT_EXIT, txout(v_cp, xtap.scriptPubKey), re_outs, [S, A]))
+    for name, tap in (("checkpoint_exit", xtap), ("checkpoint_exit_sweep", xstap)):
+        sp = Spend([(name + "/exit", txout(v_cp, tap.scriptPubKey), DELAY)],
+                   [txout(v_cp - 600, bytes(taproot_construct(A.x).scriptPubKey)), fee_out(600)])
+        spends.append(checksig_spend(name + "/exit after its delay", name, "exit", tap, sp, 0, A))
 
     # ---- spends: the forfeit ------------------------------------------
     f_spent = txout(LEAF_VALUE - 600, ftap.scriptPubKey)
@@ -766,7 +785,8 @@ def generate():
             "radix": RADIX, "leaves": NLEAVES, "leaf_value": LEAF_VALUE, "entry_reserve": ENTRY_RESERVE,
             "node_reserve": NODE_RESERVE, "path_leaf": PATH_LEAF,
             "salts": dict([("leaf%d" % j, hx(SALTS[j])) for j in range(NLEAVES)]
-                          + [("checkpoint", hx(SALT_CHECKPOINT)), ("receiver leaf", hx(SALT_RECV)),
+                          + [("checkpoint", hx(SALT_CHECKPOINT)), ("checkpoint with exit", hx(SALT_CHECKPOINT_EXIT)),
+                             ("checkpoint with exit and sweep", hx(SALT_CHECKPOINT_EXIT_SWEEP)), ("receiver leaf", hx(SALT_RECV)),
                              ("change leaf", hx(SALT_CHANGE)), ("board", hx(SALT_BOARD)), ("landing", hx(SALT_LANDING)),
                              ("claim", hx(SALT_CLAIM))]
                           + [("htlc", hx(SALT_HTLC)), ("htlc receive", hx(SALT_HTLC_RECEIVE))]),

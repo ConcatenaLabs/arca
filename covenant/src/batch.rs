@@ -79,10 +79,15 @@ impl BatchKind {
 /// ([`crate::record::RECORD_VERSION`], [`crate::record::RECORD_VERSION_NO_SWEEP`]), and
 /// `accumulator-1` and `accumulator-4`, an accumulator batch's
 /// ([`crate::accumulator::ACCUMULATOR_RECORD_VERSION`],
-/// [`crate::accumulator::ACCUMULATOR_RECORD_VERSION_NO_SWEEP`]). A wallet names
-/// them in each participation it submits, so that an operator puts its leaves
-/// only in a batch whose record it reads ([`BatchKind::record_format`]).
-pub const RECORD_FORMATS: &[&str] = &["leaf-2", "leaf-3", "accumulator-1", "accumulator-4"];
+/// [`crate::accumulator::ACCUMULATOR_RECORD_VERSION_NO_SWEEP`]); and `coin-2`,
+/// the coin record whose checkpoints may carry their owners' exit
+/// ([`crate::transfer::COIN_RECORD_VERSION_EXIT`]). A wallet names them in each
+/// participation it submits, so that an operator puts its leaves only in a
+/// batch whose record it reads ([`BatchKind::record_format`]) and knows which
+/// wallets read a coin record of version 2; and a wallet that reads one more
+/// than its last build did reads its mailbox again for the coins that build
+/// refused.
+pub const RECORD_FORMATS: &[&str] = &["leaf-2", "leaf-3", "accumulator-1", "accumulator-4", "coin-2"];
 
 /// The leaf record formats an operator takes every participation to read,
 /// named or not: those of every wallet that ever took part in a round, before

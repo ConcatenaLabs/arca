@@ -706,7 +706,7 @@ impl Wallet {
 		let RestingFill { oc, policy, plan, filled, price, fee, change, chosen, asset_a, asset_b } = f;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let outputs = fill_outputs(&plan, &policy, (&got, filled), (change > 0).then_some((&change_leaf, asset_b, change)), self);
-		let tplan = TransferPlan { inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
+		let tplan = TransferPlan { checkpoint_exit: false, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
 		// The fill spends the order's coin at input 0 and the checkpoints
 		// after it: a vtxo-2 checkpoint's pair names them all, its own index
 		// one past its place among the checkpoints (`fill_tx`).

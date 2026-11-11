@@ -629,7 +629,7 @@ fn order_3_on_regtest() {
 			sx.witness(2, op_true_witness());
 			return InTree { fill: sx.tx, checkpoint: None, taker_leaf_tx: unl };
 		}
-		let cp = CheckpointPolicy { owner: xonly(tk), operator: xonly(&s), salt: label32(&format!("order-2 taker {} checkpoint", i)),
+		let cp = CheckpointPolicy { exit: None, owner: xonly(tk), operator: xonly(&s), salt: label32(&format!("order-2 taker {} checkpoint", i)),
 			chain: net.chain, sweep: Some(sched_y.sweep(true, false)), v2: false };
 		let cp_out = ExplicitOutput::new(net.y, ty_value, cp.script_pubkey());
 		let m_cp = tl.collab_message(net.y, ty_value, std::slice::from_ref(&cp_out)).unwrap();
@@ -812,7 +812,7 @@ fn order_3_on_regtest() {
 	let g = &makers[6];
 	let ug = unlock(&tx_, 6, &entry[6], g.order.script_pubkey());
 	let og = coin_of(ug.txid(), 0, &ug);
-	let cpg = CheckpointPolicy { owner: xonly(&g.leaf_key), operator: xonly(&s), salt: label32("order-2 G cancel checkpoint"),
+	let cpg = CheckpointPolicy { exit: None, owner: xonly(&g.leaf_key), operator: xonly(&s), salt: label32("order-2 G cancel checkpoint"),
 		chain: net.chain, sweep: Some(sched_x.sweep(true, false)), v2: false };
 	let cpo = ExplicitOutput::new(net.x, N, cpg.script_pubkey());
 	let cancel = collab(&mut net, &g.order, &og, std::slice::from_ref(&cpo), &s, &g.leaf_key);

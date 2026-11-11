@@ -199,7 +199,7 @@ pub fn resolve(held: &Held, bases: &[Transaction], policy: &WalletPolicy) -> Val
 pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64, NewLeaf)], operator: XOnlyPublicKey, chain: Chain)
 	-> Value
 {
-	let plan = TransferPlan {
+	let plan = TransferPlan { checkpoint_exit: false,
 		inputs: coins.iter().map(|(_, c, v)| (c.clone(), *v)).collect(),
 		outputs: outputs.iter().map(|(a, v, l)| ExplicitOutput::new(*a, *v, l.policy(operator, chain).script_pubkey())).collect(),
 	};

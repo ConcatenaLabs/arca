@@ -42,7 +42,7 @@ sweep, whose pruned forms also come from sequentia-contracts
 | `entry` | The hash-locked entry | Unlock into the owner's leaf with the preimage; the sweep with notice, except in a batch without one |
 | `forfeit` | The forfeit output, bound to the leaf given up and to its round | The operator's claim with the preimage and the round's connector asset; the owner's refund after the delay |
 | `forfeit` | The round's connector output (`ConnectorPolicy`) | The operator's issuance of the round's connector asset: its signature, and exactly one explicit atom with no reissuance token issued on that input |
-| `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice, except for a coin of a batch without one |
+| `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice, except for a coin of a batch without one; in a reassignment of several owners' coins, the owner's exit after the coin's own exit delay (`CheckpointPolicy::exit`) |
 | `htlc` | `htlc-1`: a leaf whose exit is a hash-locked pair, for a payment out of the tree over Lightning or into it | The leaf's collaborative path; a claim with the preimage after a relative delay; a refund after the timeout and a relative delay. The operator's delay is the shorter: out of the tree the operator claims and the owner refunds, into it the owner claims and the operator refunds |
 | `landing` | `landing-1`: the leaf of a supervised asset, whose issuer can freeze holdings by consensus rule | The leaf's collaborative path, its script pushing `K ‖ P` (`K` the salt's own, `P = hash160(L)` the landing program), so its message is `SHA256(K ‖ P ‖ …)` and a pair made for one landing spends only a leaf that lands there, while a double-sign under its salt is evidence to the equivocation bond as for any coin; the landing, which after the exit delay pays output 0 to P2WPKH of the owner's landing key `L`, explicitly in the leaf's asset, holding at least the value less the fee allowance (`LandingTerms`; 119 bytes with a 512-second delay), where a freeze of the asset binds; `landing_tx` builds it. `check_explicit` is the profile's rule for a transaction that moves a supervised asset: every output explicit |
 | `enclave` | `enclave-1`: the leaf of a restricted asset (an OpenAMP asset, whose every move needs its issuer's policy key), held only in its holders' enclaves | The leaf's collaborative path, its script pushing `K ‖ D` (`D = HASH160(Q)`, `Q` the holder's enclave program), so a pair made for one holder spends only a leaf that exits to that holder's enclave; the exit, which after the delay pays output 0 `OP_1 <Q>` explicitly in the leaf's asset, holding exactly its value (130 bytes with a 36-hour delay), the fee from a coin attached (`enclave_exit_tx`); where the asset elected clawback, the enclave's own claw leaf `<Ki> CHECKSIGVERIFY <Kp> CHECKSIG`, at once (`claw_tx`). The owner key is the holder's enclave key for the owner nonce (`enclave_key`: `lift_x(H) + t·G`, `t = SHA256(T ‖ T ‖ H ‖ n)`, `T = SHA256("Arca/enclave-key")`). `Enclave` builds the holder's enclave as openampd does; `policy_cosign_digest` is what the policy key signs beside the operator |
@@ -668,8 +668,14 @@ of another hash), and never before: the release ends its refund.
 
 A delegation names every output, so no co-receiver (a payer's change, a
 swap's other side) can release a slot without the others; and it adds no one
-a coin must trust, since the coin's senders, with the operator, could already
-spend the coins it came from twice. The chain cannot know whether a key has
+a coin must trust. The owner of any input of the reassignment, with the
+operator, could already stop it by spending that owner's own checkpoint
+elsewhere: every output of the reassignment is then void, a payer's change and
+a swap's other side included. In a swap or a fill that also strands each other
+owner's given coin in its checkpoint, which is why such a reassignment's
+checkpoints carry their owner's exit ([Out-of-round
+transfers](#out-of-round-transfers)), and the coin comes home after its exit
+delay. The chain cannot know whether a key has
 delegated: a release by a key that already did confirms as its holder's
 would, so the operator, whose signature every reclaim needs, refuses a
 release from any key whose coin has moved on. The script checks every key is
@@ -758,14 +764,41 @@ each owner signs the same output set. The checkpoint's salt is
 skipped or reordered, and the checkpoint sweeps with the notice of the batch the
 coin descends from.
 
+**A checkpoint with its owner's exit.** A reassignment of several owners'
+coins (a swap, or a fill of a resting order) completes only if every input
+reaches it. If one input's owner and the operator spend that owner's checkpoint
+elsewhere, it can never confirm, and every other owner's coin stands in a
+checkpoint only that owner and the operator can spend together. With
+`TransferPlan::checkpoint_exit` set, each coin of a plain leaf (`vtxo-1` or
+`vtxo-2`) moves instead into a checkpoint that also has the coin's own exit,
+`<delay> CSV DROP <A> CHECKSIG` after the coin's exit delay: `[collab, exit]`,
+`[collab, [sweep, exit]]` with a sweep, and for a `vtxo-2` coin `[[arca/collab-2,
+data], exit]` or `[[arca/collab-2, data], [sweep, exit]]`
+(`CheckpointPolicy::exit`, `exit_tx`, `exit_witness`). Its owner then takes a
+dead reassignment's coin home alone, one exit delay after the checkpoint
+confirms. The delay is the coin's own because every party already answers a
+leaf's exit within it: a receiver checked it against its bounds when it took
+the coin, and a good reassignment completes inside it the way a stale exit is
+answered, by publishing the other checkpoints and the reassignment. Once the
+reassignment confirms the checkpoint is spent and the exit is gone, so an owner
+can pull out of a good reassignment only against every other party and their
+watchtowers staying away for the whole delay, the same option every sender has
+against an absent receiver. A coin of a supervised or a restricted asset keeps
+the checkpoint without the exit, which would bypass its landing or its enclave.
+The checkpoint pair names the checkpoint's output, so it is made for one form
+or the other; the reassignment pair of a `vtxo-1` checkpoint names the salt and
+never the script. Measured on the node: a dead swap's checkpoint exit is 219 vB
+(227 vB from a batch with a sweep), a `vtxo-2` checkpoint into it 556 vB, and a
+swap's reassignment through two such checkpoints 583 vB.
+
 ```rust
 let receiver_leaf = NewLeaf { owner, owner_nonce, creator_nonce: random(), exit_delay };  // the request, and the sender's nonce
-let plan = TransferPlan { inputs: vec![(coin, checkpoint_value)], outputs };
+let plan = TransferPlan { inputs: vec![(coin, checkpoint_value)], outputs, checkpoint_exit: false };
 plan.admit(&mut seen)?;                               // the operator's rule, before it co-signs
 let cp = plan.checkpoint_message(0)?.digest;          // owner and operator sign both
 let re = plan.reassignment_message(0)?.digest;
 let record = CoinRecord::Transfer(Box::new(Transfer {
-	inputs: vec![TransferInput { coin: my_record, checkpoint_value, checkpoint: cp_pair, reassignment: re_pair }],
+	inputs: vec![TransferInput { coin: my_record, checkpoint_value, checkpoint: cp_pair, reassignment: re_pair, exit: plan.exit(0) }],
 	outputs: plan.outputs.clone(), index: 0, leaf: receiver_leaf,
 }));
 ```
@@ -813,7 +846,11 @@ checkpoint of it spends the board output itself, `board_checkpoint_tx`); for a
 coin a reassignment created, the reassignment's inputs (each a
 coin record, with its checkpoint's value and both pairs), its outputs, the
 coin's index and its leaf. The binary form is versioned and canonical, and the
-layout is in the `transfer` module's documentation.
+layout is in the `transfer` module's documentation: version 1, or version 2
+where a checkpoint anywhere in the record has its owner's exit, each input then
+carrying a flag. A reader that knows only version 1 refuses version 2 as a
+format it does not know, so a wallet makes such a record only with parties
+that read it.
 
 `CoinRecord::validate(rounds, policy, key, nonce)` is the receiver's check,
 from the record and the transactions its bases came from alone: every batch leaf
@@ -1231,6 +1268,19 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   not balance; the pairs do not name the other input, so a third party funding
   that side would make it confirm), and the first sender's exit fails once the
   receiver has published the checkpoint.
+- `tests/checkpoint_exit.rs`: on an anchored regtest chain, a swap of two
+  owners' coins with every checkpoint carrying its owner's exit. The
+  counterparty and the operator spend the counterparty's checkpoint elsewhere
+  (mined); the swap's reassignment is refused, the owner's exit is refused
+  before its delay, signed by the operator, signed by the counterparty and with
+  a sequence one unit short, and the owner's own exit after the delay is mined
+  with no operator signature. A good swap's reassignment completes inside the
+  delay, and the owner's exit after it is refused. The checkpoint pair rebound
+  to a checkpoint without the exit is refused. The same for a batch with a
+  sweep, for `vtxo-2` coins, and for a fill of a resting order killed by a
+  second fill the operator signs alone; every negative case refused by the
+  mempool and in a block, for its reason. The record's exit flag: flipped under
+  the same pairs, refused; version 2 with no exit anywhere, refused.
 - `tests/merge.rs`: on an anchored regtest chain, two reassignments merged into
   one transaction. Two senders pay one receive request, each drawing the
   creator nonce of the leaf it creates: the operator admits both, the receiver

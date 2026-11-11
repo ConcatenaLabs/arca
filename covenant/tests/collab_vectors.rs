@@ -108,7 +108,7 @@ fn vtxo_2_matches_the_regtest_suites_vectors() {
 		notice: Some(RelativeTime::from_sequence(sw["notice"].as_u64().unwrap() as u32).unwrap()), burn: false,
 	};
 	let c = &v["checkpoint"];
-	let cp = CheckpointPolicy {
+	let cp = CheckpointPolicy { exit: None,
 		owner: leaf.owner, operator: leaf.operator, salt: arca_covenant::transfer::checkpoint_salt(&leaf.salt), chain, sweep: Some(sweep), v2: true,
 	};
 	same("checkpoint salt", &cp.salt, &c["salt"]);

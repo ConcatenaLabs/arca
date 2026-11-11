@@ -193,14 +193,14 @@ pub fn base(tree: &Tree, i: usize, owner: &Keypair, preimage: [u8; 32], t: Media
 /// One hop: `coin`, held under `prev`, paid by `owner` to the leaf `to`.
 pub fn one_hop(prev: &CoinRecord, coin: &ValidCoin, owner: &Keypair, s: &Keypair, to: NewLeaf, chain: Chain) -> CoinRecord {
 	let cpv = coin.value - MARGIN;
-	let plan = TransferPlan {
+	let plan = TransferPlan { checkpoint_exit: false,
 		inputs: vec![(coin.clone(), cpv)],
 		outputs: vec![ExplicitOutput::new(coin.asset, cpv - MARGIN, to.policy(xonly(s), chain).script_pubkey())],
 	};
 	let cp = plan.checkpoint_message(0).unwrap().digest;
 	let re = plan.reassignment_message(0).unwrap().digest;
 	CoinRecord::Transfer(Box::new(Transfer {
-		inputs: vec![TransferInput {
+		inputs: vec![TransferInput { exit: false,
 			coin: prev.clone(), checkpoint_value: cpv,
 			checkpoint: Pair { operator: sig(s, &cp), owner: sig(owner, &cp) },
 			reassignment: Pair { operator: sig(s, &re), owner: sig(owner, &re) },

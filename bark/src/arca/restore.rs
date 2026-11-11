@@ -959,7 +959,7 @@ impl Wallet {
 			if let Some(t) = g.get("transfer") {
 				let tid = t["transfer_id"].as_str().unwrap_or("");
 				let cpv = amount(&t["checkpoint_value"], "a checkpoint value").unwrap_or(0);
-				let plan = TransferPlan { inputs: vec![(coin.clone(), cpv)], outputs: vec![] };
+				let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(coin.clone(), cpv)], outputs: vec![] };
 				let signed = plan.checkpoint_message(0).ok().zip(signature(&t["checkpoint_sig"]))
 					.is_some_and(|(m, s)| arca_covenant::sign::verify_digest(&s, &m.digest, &owner));
 				if !signed {
