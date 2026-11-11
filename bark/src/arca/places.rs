@@ -35,22 +35,29 @@
 //!   and any coin not final yet (`pending`: its round, or a block it rests
 //!   on, not certified with its anchor buried, as after an anchor
 //!   rollback), and any coin on its way home on the chain (`exiting`),
-//!   whatever its lineage.
+//!   whatever its lineage; and a channel coin, which is the wallet's only
+//!   once its close has made it a coin, counted at the wallet's side of it
+//!   alone (`channel`).
 //!
 //! Received coins are counted oldest first (by the signer's record entry of
 //! the transfer that made them, then by when the wallet stored them), until
 //! the next would pass the limit; that one and every later one are arriving.
 //! Once counted a coin stays counted while the wallet holds it, so a rise in
-//! prices never moves a coin back from counted to arriving. A coin that
+//! prices never moves a coin back from counted to arriving; and the change
+//! of the wallet's own payment out of a counted coin keeps its place,
+//! counted, ahead of every coin arriving. A coin that
 //! arrives is refreshed at the next round ([`Wallet::refresh_needed`]), and
 //! is then `settled`.
 //!
 //! With a limit set, the wallet spends no `arriving` coin but in a refresh,
-//! and no `proceeds` coin in a payment that leaves the Arca (a payment on
-//! the chain, over Lightning, the Bitcoin side of a cross-chain swap, an
-//! order on the chain): the other side there could not give its money back
-//! if the trade died. Without a limit no place restricts anything, and every
-//! received coin counts at once, as `counted`.
+//! and no `proceeds` coin in the leg of a cross-chain swap paid to another
+//! party, who could not give its money back if the trade died; when only
+//! proceeds would pay that leg, they go into the next round at once and the
+//! swap goes ahead after it. Proceeds pay everything else at once: a payment
+//! inside the Arca, one over Lightning (through the operator's own node, so
+//! the risk is the operator's, and its watcher's), one on the chain (made in
+//! a round). Without a limit no place restricts anything, and every received
+//! coin counts at once, as `counted`.
 //!
 //! The limit is the wallet's product setting: the library sets none.
 
@@ -114,14 +121,13 @@ impl Place {
 /// spend from while the wallet sets an instant limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Spend {
-	/// A payment to another wallet of the same operator, out of round.
+	/// A payment: inside the Arca, over Lightning through the operator's
+	/// node, on the chain in a round, a claim, an order or a take.
 	Pay,
 	/// A trade: a swap or an in-tree fill.
 	Trade,
-	/// Anything that leaves the Arca, or that the library does not know to
-	/// stay in it: a payment on the chain, over Lightning, the Bitcoin side
-	/// of a cross-chain swap, an order on the chain.
-	Leave,
+	/// The leg of a cross-chain swap paid to another party.
+	CrossChain,
 }
 
 /// The instant limit the wallet applies, in atoms of the reference unit.
@@ -154,6 +160,8 @@ pub struct Places {
 	pub counted: u128,
 	/// The assets of received coins the node gives no rate for.
 	pub unvalued: Vec<String>,
+	/// The channel coins, by leaf id, each counted at the wallet's side.
+	pub channels: BTreeSet<String>,
 }
 
 impl Places {
@@ -279,11 +287,22 @@ impl Wallet {
 		// A coin whose exit's claim is out is held as the claim's output on the
 		// chain, not here.
 		let rows: Vec<CoinRow> = rows.into_iter().filter(|c| !(c.state == "exiting" && c.note.starts_with("claimed by"))).collect();
-		for (i, c) in rows.into_iter().enumerate() {
+		let mut channels: BTreeSet<String> = BTreeSet::new();
+		for (i, mut c) in rows.into_iter().enumerate() {
 			let lineage = Self::record_of(&c).map(|r| self.lineage(&r)).unwrap_or(Lineage::Received);
-			// Not final yet, or on its way home on the chain: arriving, and
-			// outside the count, whatever it is.
-			let place = if matches!(c.state.as_str(), "pending" | "exiting") { Place::Arriving } else { match lineage {
+			// A channel coin counts the wallet's side of it alone, as the
+			// balance does.
+			let channel = match self.channel_worth(&c) {
+				Ok(Some(w)) => {
+					c.value = w;
+					channels.insert(c.leaf_id.clone());
+					true
+				},
+				_ => false,
+			};
+			// Not final yet, on its way home on the chain, or a channel's: with a
+			// limit set, arriving, and outside the count, whatever it is.
+			let place = if matches!(c.state.as_str(), "pending" | "exiting") || (channel && limit.is_some()) { Place::Arriving } else { match lineage {
 				Lineage::Own => Place::Settled,
 				Lineage::Trade => Place::Proceeds,
 				Lineage::Received => {
@@ -294,14 +313,33 @@ impl Wallet {
 			coins.push((c, lineage, place));
 		}
 		let Some(limit) = limit else {
-			return Ok(Places { limit: None, coins, counted: 0, unvalued: vec![] });
+			return Ok(Places { limit: None, coins, counted: 0, unvalued: vec![], channels });
 		};
 		received.sort();
 		let held: BTreeSet<String> = received.iter().map(|(_, i)| coins[*i].0.leaf_id.clone()).collect();
 		let mut sticky: BTreeSet<String> = self.store.meta(INSTANT_COUNTED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		// The change of the wallet's own payment out of a counted coin keeps
+		// its parent's place: read before the parents, spent now, leave the
+		// note.
+		let mut inherited = false;
+		let unplaced: Vec<usize> = received.iter().map(|(_, i)| *i).filter(|i| !sticky.contains(&coins[*i].0.leaf_id)).collect();
+		if !unplaced.is_empty() && !sticky.is_empty() {
+			let by_record: std::collections::HashMap<Vec<u8>, String> = self.store.coins()?.into_iter().map(|c| (c.record, c.leaf_id)).collect();
+			for i in unplaced {
+				let Ok(CoinRecord::Transfer(t)) = Self::record_of(&coins[i].0) else { continue };
+				if !t.inputs.iter().all(|x| self.is_mine(&x.coin)) {
+					continue;
+				}
+				let from_counted = t.inputs.iter().any(|x| x.coin.to_bytes().ok().and_then(|b| by_record.get(&b)).is_some_and(|id| sticky.contains(id)));
+				if from_counted {
+					sticky.insert(coins[i].0.leaf_id.clone());
+					inherited = true;
+				}
+			}
+		}
 		let before = sticky.len();
 		sticky.retain(|id| held.contains(id));
-		let pruned = sticky.len() != before;
+		let pruned = sticky.len() != before || inherited;
 		let rates = self.chain.fee_rates().unwrap_or_default();
 		let worth = |c: &CoinRow| AssetId::from_str(&c.asset).ok().and_then(|a| rates.get(&a)).filter(|r| **r > 0)
 			.map(|r| c.value as u128 * *r as u128 / 100_000_000);
@@ -341,7 +379,7 @@ impl Wallet {
 		if grew || pruned {
 			self.store.set_meta(INSTANT_COUNTED, &serde_json::to_string(&sticky).expect("a set"))?;
 		}
-		Ok(Places { limit: Some(limit), coins, counted, unvalued: unvalued.into_iter().collect() })
+		Ok(Places { limit: Some(limit), coins, counted, unvalued: unvalued.into_iter().collect(), channels })
 	}
 
 	/// The coins a selection for `spend` may not take, by leaf id: none
@@ -351,7 +389,7 @@ impl Wallet {
 		if self.own_instant_limit()?.is_none() {
 			return Ok(BTreeSet::new());
 		}
-		let barred = |p: Place| p == Place::Arriving || (spend == Spend::Leave && p == Place::Proceeds);
+		let barred = |p: Place| p == Place::Arriving || (spend == Spend::CrossChain && p == Place::Proceeds);
 		Ok(match self.places() {
 			Ok(p) => p.coins.into_iter().filter(|(_, _, p)| barred(*p)).map(|(c, ..)| c.leaf_id).collect(),
 			Err(_) => self.store.coins_in("live")?.into_iter()
@@ -360,7 +398,27 @@ impl Wallet {
 		})
 	}
 
-	/// `coin_places`: every coin the wallet holds in a place, the totals of
+	/// Gives up in the next round every live coin of `asset` placed as trade
+	/// proceeds, so that a payment only settled coins may make goes ahead
+	/// after it; answers what it gave up (0 when none, or with no limit set).
+	pub(crate) fn settle_proceeds(&mut self, asset: AssetId) -> Result<u64, Error> {
+		if self.own_instant_limit()?.is_none() {
+			return Ok(0);
+		}
+		let p = self.places()?;
+		let ids: Vec<String> = p.coins.iter().filter(|(c, _, pl)| *pl == Place::Proceeds && c.state == "live" && c.asset == asset.to_string())
+			.map(|(c, ..)| c.leaf_id.clone()).collect();
+		let value: u64 = p.coins.iter().filter(|(c, ..)| ids.contains(&c.leaf_id)).map(|(c, ..)| c.value).sum();
+		if ids.is_empty() {
+			return Ok(0);
+		}
+		let quote = self.refresh_quote(&ids, None)?;
+		self.participate(quote, None)?;
+		Ok(value)
+	}
+
+	/// `coin_places`: every coin the wallet holds in a place (with its kind:
+	/// a `board` arriving waits on its board's block and anchor), the totals of
 	/// each place by asset, what can be spent now by asset (`settled`,
 	/// `proceeds` and `counted` coins that are live), and the instant limit.
 	/// See the [module documentation](self).
@@ -371,13 +429,17 @@ impl Wallet {
 		let mut coins = vec![];
 		for (c, lineage, place) in &p.coins {
 			*totals.entry(c.asset.clone()).or_default().entry(place.name()).or_default() += c.value as u128;
-			if c.state == "live" && *place != Place::Arriving {
+			if c.state == "live" && *place != Place::Arriving && !p.channels.contains(&c.leaf_id) {
 				*spendable.entry(c.asset.clone()).or_default() += c.value as u128;
 			}
 			let hops = Self::record_of(c).map(|r| record_hops(&r)).unwrap_or(0);
-			coins.push(json!({"leaf_id": c.leaf_id, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
+			let mut v = json!({"leaf_id": c.leaf_id, "asset": c.asset, "value": c.value.to_string(), "state": c.state, "kind": c.kind,
 				"lineage": match lineage { Lineage::Own => "own", Lineage::Trade => "trade", Lineage::Received => "received" },
-				"place": place.name(), "hops": hops}));
+				"place": place.name(), "hops": hops});
+			if p.channels.contains(&c.leaf_id) {
+				v["channel"] = json!(true);
+			}
+			coins.push(v);
 		}
 		let totals: serde_json::Map<String, Value> = totals.into_iter()
 			.map(|(a, m)| (a, json!(m.into_iter().map(|(k, v)| (k.to_string(), json!(v.to_string()))).collect::<serde_json::Map<_, _>>())))

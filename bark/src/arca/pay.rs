@@ -418,13 +418,19 @@ impl Wallet {
 	pub(crate) fn choose_coins(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64)
 		-> Result<(Vec<In>, u64, u64), Error>
 	{
-		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, Spend::Leave)
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, Spend::Pay)
 	}
 
-	/// The live coins of `asset` the wallet can pay with ([`Self::spendable`])
-	/// in a payment that may leave the Arca.
+	/// [`Self::choose_coins`] for a spend of `spend`.
+	pub(crate) fn choose_coins_for(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64, spend: Spend)
+		-> Result<(Vec<In>, u64, u64), Error>
+	{
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, spend)
+	}
+
+	/// The live coins of `asset` the wallet can pay with ([`Self::spendable`]).
 	pub(crate) fn spendable_coins(&self, asset: AssetId) -> Result<Vec<In>, Error> {
-		self.spendable(asset, Spend::Leave)
+		self.spendable(asset, Spend::Pay)
 	}
 
 	/// The live coins of `asset` a participation, a take or an offboard may

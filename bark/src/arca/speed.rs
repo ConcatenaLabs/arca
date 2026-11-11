@@ -567,6 +567,13 @@ impl Wallet {
 	/// Answers what it gave up (`participations`), one per asset, and every
 	/// coin it left as it is, with why (`left`).
 	pub fn refresh_received(&mut self, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		self.refresh_received_of(max_fee_ppm, None)
+	}
+
+	/// [`Self::refresh_received`], of the coins `only` names alone when it
+	/// names any: what one rule of [`Self::refresh_needed`] asks for (its
+	/// `arriving` coins), the rest staying live to pay with.
+	pub fn refresh_received_of(&mut self, max_fee_ppm: Option<u64>, only: Option<&[String]>) -> Result<Value, Error> {
 		let info = self.server_info()?;
 		let withdraws = Self::operator_withdraws(&info);
 		let wall = wall_now();
@@ -575,6 +582,9 @@ impl Wallet {
 		let mut left = vec![];
 		for c in self.store.coins_in("live")? {
 			if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) {
+				continue;
+			}
+			if only.is_some_and(|o| !o.contains(&c.leaf_id)) {
 				continue;
 			}
 			let record = Self::record_of(&c)?;

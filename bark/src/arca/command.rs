@@ -29,7 +29,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?, channels?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?}, deposits, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
-	refresh_received {max_fee_ppm?}, refresh_needed {idle_seconds?}, withdraw_participation {participation}, refusals, \
+	refresh_received {max_fee_ppm?, leaves?}, refresh_needed {idle_seconds?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
@@ -411,7 +411,11 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 				.map_err(|e| Error::Parse(format!("the transaction: {}", e)))?;
 			w.speed_up(txid, opt_asset(&a["fee_asset"])?, opt_u64(&a["rate"], "the rate")?, opt_u64(&a["max_fee"], "the most it may pay")?)
 		},
-		"refresh_received" => w.refresh_received(opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		// `leaves`: those coins alone (what one rule of refresh_needed names).
+		"refresh_received" => {
+			let only: Option<Vec<String>> = a["leaves"].as_array().map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
+			w.refresh_received_of(opt_u64(&a["max_fee_ppm"], "the fee bound")?, only.as_deref())
+		},
 		"refresh_needed" => w.refresh_needed(opt_u64(&a["idle_seconds"], "the idle seconds")?),
 		"withdraw_participation" => w.withdraw_participation(req_str(&a["participation"], "the participation")?),
 		"refusals" => w.refusals(),
