@@ -63,7 +63,7 @@ pub const RETRY_AFTER: u64 = 600;
 /// ([`Wallet::refresh_needed`]).
 pub const REFRESH_IDLE: u64 = 120;
 /// The rules [`Wallet::refresh_needed`] weighs, by name, in its order.
-pub const REFRESH_RULES: [&str; 4] = ["depth", "exposure", "expiry", "idle"];
+pub const REFRESH_RULES: [&str; 5] = ["arriving", "depth", "exposure", "expiry", "idle"];
 
 /// The wall-clock time, in seconds.
 fn wall_now() -> u64 {
@@ -469,13 +469,18 @@ impl Wallet {
 	/// received coin given up in a round is not the wallet's to spend until
 	/// that round is final, so a wallet in use refreshes only when it must:
 	///
+	/// - `arriving`: while the wallet sets an instant limit
+	///   ([`super::places`]), a received coin past it, or one the node does
+	///   not value: it is the wallet's to spend once a round has refreshed
+	///   it, so it goes into the next;
 	/// - `depth`: a received coin one reassignment short of the operator's
 	///   depth limit, which cannot be paid on again out of round;
 	/// - `exposure`: more than half of what the wallet may hold out of round
-	///   ([`Self::exposure`]: its instant budget, else the bond), over every
-	///   asset at the node's rates; or, when the node does not price an
-	///   asset held out of round or the bond's own, always: what cannot be
-	///   valued is refreshed;
+	///   (its instant limit while it sets one, counting its counted coins;
+	///   else [`Self::exposure`]: its instant budget, else the bond), over
+	///   every asset at the node's rates; or, without an instant limit, when
+	///   the node does not price an asset held out of round or the bond's
+	///   own, always: what cannot be valued is refreshed;
 	/// - `expiry`: a received coin inside its refresh window
 	///   ([`CoinDates`]: from `refresh_from` until its exit deadline);
 	/// - `idle`: the person has left the wallet alone `idle_seconds` of at
@@ -496,6 +501,15 @@ impl Wallet {
 			}
 		}
 		let mut reasons = vec![];
+		let places = if self.own_instant_limit()?.is_some() { Some(self.places()?) } else { None };
+		if let Some(p) = &places {
+			let arriving: Vec<String> = p.coins.iter().filter(|(c, _, pl)| *pl == super::places::Place::Arriving && c.state == "live")
+				.map(|(c, ..)| c.leaf_id.clone()).collect();
+			if !arriving.is_empty() {
+				reasons.push(json!({"rule": "arriving", "coins": arriving,
+					"why": "a received coin is past the wallet's instant limit, or not valued by its node: it is the wallet's once refreshed"}));
+			}
+		}
 		if !received.is_empty() {
 			if let Some(limit) = super::pay::depth_limit(&info) {
 				let deep: Vec<String> = received.iter().filter(|(_, r)| super::wallet::record_hops(r) + 1 >= limit)
@@ -505,7 +519,14 @@ impl Wallet {
 						"why": format!("a received coin is one reassignment short of the operator's depth limit, {}", limit)}));
 				}
 			}
-			if let Some(e) = self.exposure()? {
+			if let Some(l) = places.as_ref().and_then(|p| p.limit.as_ref().map(|l| (l, p.counted))) {
+				let (limit, counted) = l;
+				if counted.saturating_mul(2) > limit.value {
+					reasons.push(json!({"rule": "exposure", "held": counted.to_string(), "limit": limit.value.to_string(),
+						"why": format!("the wallet counts {} of its instant limit of {} (reference atoms at its node's rates), past half", counted,
+						limit.value)}));
+				}
+			} else if let Some(e) = self.exposure()? {
 				if !e.unpriced.is_empty() {
 					reasons.push(json!({"rule": "exposure", "unpriced": e.unpriced, "why": format!("the wallet's node does not price {}: what it holds \
 						out of round cannot be weighed against what it may hold, so it is refreshed", e.unpriced.join(", "))}));
@@ -546,6 +567,13 @@ impl Wallet {
 	/// Answers what it gave up (`participations`), one per asset, and every
 	/// coin it left as it is, with why (`left`).
 	pub fn refresh_received(&mut self, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		self.refresh_received_of(max_fee_ppm, None)
+	}
+
+	/// [`Self::refresh_received`], of the coins `only` names alone when it
+	/// names any: what one rule of [`Self::refresh_needed`] asks for (its
+	/// `arriving` coins), the rest staying live to pay with.
+	pub fn refresh_received_of(&mut self, max_fee_ppm: Option<u64>, only: Option<&[String]>) -> Result<Value, Error> {
 		let info = self.server_info()?;
 		let withdraws = Self::operator_withdraws(&info);
 		let wall = wall_now();
@@ -554,6 +582,9 @@ impl Wallet {
 		let mut left = vec![];
 		for c in self.store.coins_in("live")? {
 			if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) {
+				continue;
+			}
+			if only.is_some_and(|o| !o.contains(&c.leaf_id)) {
 				continue;
 			}
 			let record = Self::record_of(&c)?;

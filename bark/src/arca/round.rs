@@ -1377,16 +1377,31 @@ impl Wallet {
 		// new leaves only into batches whose records it reads: a wallet that
 		// names none is never given a slot of an accumulator batch without a
 		// sweep. Not part of the participation's id either.
+		//
+		// And, to an operator that reads it (`info.participations.arriving`),
+		// which coins it gives up are payments arriving
+		// ([`super::places`]): an operator whose records bear the names out
+		// runs that refresh ahead of the others, and past its in-flight cap up
+		// to twice it.
 		let told;
 		let reads = |key: &str| info.as_ref().is_some_and(|i| i["participations"][key].as_bool() == Some(true));
+		let arriving: Vec<String> = if reads("arriving") && call == "submit_participation" && self.own_instant_limit()?.is_some() {
+			let p = self.places()?;
+			given.iter().filter(|l| p.of(l) == Some(super::places::Place::Arriving)).cloned().collect()
+		} else {
+			vec![]
+		};
 		let body = match (reads("forfeits_before_broadcast"), reads("record_formats")) {
-			(before, formats) if (before || formats) && call != "take_order" && body.is_object() => {
+			(before, formats) if (before || formats || !arriving.is_empty()) && call != "take_order" && body.is_object() => {
 				let mut b = body.clone();
 				if before {
 					b["forfeits_before_broadcast"] = json!(true);
 				}
 				if formats && call == "submit_participation" {
 					b["record_formats"] = json!(arca_covenant::RECORD_FORMATS);
+				}
+				if !arriving.is_empty() {
+					b["arriving"] = json!(arriving);
 				}
 				told = b;
 				&told

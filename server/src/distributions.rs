@@ -339,6 +339,7 @@ impl Participations {
 			// The holder's wallet named no format here: it is taken to read
 			// those every wallet reads.
 			record_formats: vec![],
+			arriving: vec![],
 			id,
 			unlock_hash: sha256_bytes(&preimage),
 			preimage,

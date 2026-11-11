@@ -549,6 +549,7 @@ impl Receives {
 			// The holder's wallet named no format here: it is taken to read
 			// those every wallet reads.
 			record_formats: vec![],
+			arriving: vec![],
 			id, unlock_hash, preimage, not_before: None, refund_delay_units: 1, inputs: vec![], fees: vec![],
 			outputs: vec![ParticipationOutput {
 				asset: r.new.asset,

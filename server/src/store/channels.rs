@@ -155,6 +155,30 @@ pub(crate) async fn check_seen<C: GenericClient>(c: &C, seen: &[ChannelSeen]) ->
 }
 
 impl Store {
+	/// What the operator holds on its own side of its `channel-1` leaves of
+	/// `asset` together, at their opening: the leaves live or being made,
+	/// and those wanted by a participation not yet run.
+	pub async fn channel_capacity_outstanding(&self, asset: &[u8; 32]) -> Result<u64, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT o.channel FROM participation_output o
+			 JOIN participation p ON p.participation_id = o.participation_id
+			 LEFT JOIN leaf l ON l.leaf_id = o.leaf_id
+			 WHERE o.channel IS NOT NULL AND o.asset = $1 AND o.active
+			   AND ((o.leaf_id IS NULL AND p.state IN ('pending', 'issued'))
+			     OR (l.state IS NOT NULL AND l.state IN ('pending', 'live')))",
+			&[&&asset[..]],
+		).await?;
+		let mut total = 0u64;
+		for r in rows {
+			let c: Vec<u8> = r.get(0);
+			let cap = c.get(..8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes)
+				.ok_or_else(|| StoreError::Corrupt("a channel's terms".into()))?;
+			total = total.saturating_add(cap);
+		}
+		Ok(total)
+	}
+
 	/// The latest state of channel `leaf` past its opening, signed or not.
 	pub async fn channel_latest(&self, leaf: &[u8; 32]) -> Result<Option<ChannelStateRow>, StoreError> {
 		let conn = self.conn().await?;

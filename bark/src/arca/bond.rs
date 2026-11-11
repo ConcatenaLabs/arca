@@ -32,15 +32,18 @@
 //! none, and values the bond at its node's rate whatever its asset.
 //!
 //! What counts against the budget is what the operator, with someone other
-//! than the wallet, could take by signing a second spend: each coin whose
-//! lineage holds an input of a reassignment or a fill that the wallet does
-//! not own (a payment received, what a swap or a fill paid it, change from
-//! one included), at its whole value. A coin of the wallet's own lineage
-//! alone (its round's and boards' coins, its own change from paying out of
-//! them) counts nothing. A coin on its way into a swap whose checkpoint has
-//! its owner's exit is judged by its own lineage, since it comes home if the
-//! swap never completes; one whose checkpoint has none counts as a coin
-//! received out of round does.
+//! than the wallet, could take from it by signing a second spend: each coin
+//! of `received` lineage ([`super::places::Lineage`]) at its whole value: a
+//! payment received, and what a trade paid the wallet (change included)
+//! when some checkpoint of the trade has no owner's exit. A coin of the
+//! wallet's own lineage (its round's and boards' coins, its own change from
+//! paying out of them) counts nothing, and neither does a coin of `trade`
+//! lineage, what a trade with its owner's exit on every checkpoint paid it:
+//! if that trade dies, the coin the wallet gave comes home by its exit. A
+//! coin on its way into a swap whose checkpoint has its owner's exit is
+//! judged by its own lineage, since it comes home if the swap never
+//! completes; one whose checkpoint has none counts as a coin received out
+//! of round does.
 //!
 //! The wallet keeps the operator's signature over every message of its
 //! coins' lineage ([`arca_covenant::bond::cosigned_by`]) and writes it as
@@ -91,8 +94,12 @@ pub const INSTANT_BUDGET: &str = "instant_budget";
 pub const FIRST_SCAN: u64 = 20_000;
 /// How many blocks `watch-bond` reads before it notes how far it read.
 pub const SCAN_CHUNK: u64 = 128;
-/// How long one `watch-bond` reads blocks before it stops and says more is
-/// left (`scanned.more`): the next run reads on from where it stopped.
+/// The store key prefix under which a coin's evidence is kept once read
+/// (`watch_bond`), by its leaf id: a coin's record never changes.
+pub const EVIDENCE_KEY: &str = "bond_evidence:";
+/// How long one `watch-bond` reads blocks, and reads coins' evidence not
+/// kept yet, before it stops and says more is left (`scanned.more`,
+/// `evidence_unread`): the next run reads on from where it stopped.
 pub const SCAN_SLICE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A coin's lifetime, the longest a coin the operator makes lives from its
@@ -287,18 +294,19 @@ impl Wallet {
 	}
 
 	/// Whether the coin `c` is at risk out of round: whether the operator,
-	/// with someone other than the wallet, could take it by signing a second
-	/// spend.
+	/// with someone other than the wallet, could take it from the wallet by
+	/// signing a second spend.
 	///
-	/// - A coin whose lineage, back to the rounds and boards it rests on,
-	///   holds an input of a reassignment or a fill that the wallet does not
-	///   own (a payment received, a swap's or a fill's coins, change
-	///   included) is at risk at its whole value: that input's owner and the
-	///   operator can spend it elsewhere, and every coin the reassignment
-	///   made is void.
-	/// - A coin of the wallet's own lineage alone (a round's or a board's, or
-	///   its own change from paying out of one) is not: only the wallet's key
-	///   spends it.
+	/// - A coin of `received` lineage ([`super::places::Lineage`]): a
+	///   payment received, or what a trade paid the wallet (change included)
+	///   when some checkpoint of the trade has no owner's exit, is at risk at
+	///   its whole value: another input's owner and the operator can spend it
+	///   elsewhere, and every coin the reassignment made is void.
+	/// - A coin of the wallet's own lineage (a round's or a board's, or its
+	///   own change from paying out of one) is not: only the wallet's key
+	///   spends it. Nor is a coin of `trade` lineage: what a trade with its
+	///   owner's exit on every checkpoint paid the wallet. Should that trade
+	///   die, the coin the wallet gave comes home by its exit.
 	/// - A coin on its way into a swap or a fill (`offered`, `sending`,
 	///   `given`) whose checkpoint has its owner's exit is judged by its own
 	///   lineage: if the trade never completes, the coin comes home by that
@@ -314,23 +322,7 @@ impl Wallet {
 			return Ok(false);
 		}
 		let record = Self::record_of(c)?;
-		Ok(self.foreign_in_lineage(&record))
-	}
-
-	/// Whether `record`'s lineage holds an input of a reassignment, or the
-	/// order of a fill, whose coin is not the wallet's own.
-	fn foreign_in_lineage(&self, record: &arca_covenant::CoinRecord) -> bool {
-		use arca_covenant::CoinRecord;
-		let mine = |r: &CoinRecord| {
-			let (owner, nonce) = super::wallet::owner_of(r);
-			self.keys.leaf_xonly(&nonce).is_ok_and(|k| k == owner)
-		};
-		match record {
-			CoinRecord::Transfer(t) => t.inputs.iter().any(|i| !mine(&i.coin) || self.foreign_in_lineage(&i.coin)),
-			CoinRecord::Fill(f) => !mine(&f.fill.order) || self.foreign_in_lineage(&f.fill.order)
-				|| f.fill.inputs.iter().any(|i| !mine(&i.coin) || self.foreign_in_lineage(&i.coin)),
-			CoinRecord::Leaf { .. } | CoinRecord::Board(_) | CoinRecord::Accumulator { .. } => false,
-		}
+		Ok(self.lineage(&record) == super::places::Lineage::Received)
 	}
 
 	/// Whether the coin `c`, on its way into a swap, goes into a checkpoint
@@ -431,6 +423,23 @@ impl Wallet {
 	/// one; a refusal when the bond is required and does not stand, or does
 	/// not cover what the wallet would hold out of round.
 	pub(crate) fn bond_gate(&self, incoming: Option<(AssetId, u64)>) -> Result<Option<String>, Error> {
+		// A wallet with an instant limit ([`super::places`]) never refuses a
+		// payment here: what it counts at once is within its limit, and
+		// anything past it, or that it cannot value, arrives and counts only
+		// after its round, so the bond is the safety of nothing above the
+		// limit. The refusal is said instead.
+		let gate = self.bond_gate_strict(incoming);
+		if self.own_instant_limit()?.is_some() {
+			if let Err(Error::Refused(why)) = &gate {
+				return Ok(Some(format!("{}; with an instant limit the payment is taken, and counts once its round has made it the \
+					wallet's own", why)));
+			}
+		}
+		gate
+	}
+
+	/// [`Self::bond_gate`] without an instant limit.
+	fn bond_gate_strict(&self, incoming: Option<(AssetId, u64)>) -> Result<Option<String>, Error> {
 		let info = self.server_info()?;
 		let s = self.bond_standing(&info)?;
 		let seen = self.store.meta(BOND_SEEN)?.is_some();
@@ -584,40 +593,75 @@ impl Wallet {
 	/// Every message the operator key signed that the wallet's coins rest
 	/// on, as evidence lines: what the wallet hands a watcher.
 	pub fn bond_evidence(&self) -> Result<Vec<Value>, Error> {
-		Ok(self.evidence_by_coin()?.into_iter().map(|(line, _, _)| line).collect())
+		Ok(self.evidence_by_coin()?.0.into_iter().map(|(line, _, _)| line).collect())
 	}
 
-	/// [`Self::bond_evidence`], each line with the transactions the coins
-	/// that carry it rest on: a spend of a script that pushes the line's
-	/// salt descends from them, so it is in no block before theirs.
-	fn evidence_by_coin(&self) -> Result<Vec<(Value, Vec<Txid>, Vec<OutPoint>)>, Error> {
+	/// The evidence of every coin the wallet holds or held out of round:
+	/// each line its operator co-signed under a salt, with the base
+	/// transactions and root outputs of the coin's lineage. A coin's record
+	/// never changes, so what it yields is kept in the store by its leaf id
+	/// ([`EVIDENCE_KEY`]) once read, and read again only for coins not kept
+	/// yet: at most for [`SCAN_SLICE`] a call, the rest at the next, so a
+	/// wallet of a long history is never held for minutes ahead of a
+	/// person's command. Answers the evidence and how many coins are left
+	/// unread (their salts are watched from their own base once read, as a
+	/// salt new to a run always is).
+	fn evidence_by_coin(&self) -> Result<(Vec<(Value, Vec<Txid>, Vec<OutPoint>)>, usize), Error> {
 		let now = self.now()?;
+		let started = web_time::Instant::now();
 		let mut seen: BTreeMap<([u8; 32], Vec<u8>), usize> = BTreeMap::new();
 		let mut out: Vec<(Value, Vec<Txid>, Vec<OutPoint>)> = vec![];
+		let mut left = 0usize;
+		let mut keep: Vec<(String, String)> = vec![];
 		for c in self.store.coins()? {
 			if c.kind != "transfer" && c.kind != "fill" {
 				continue;
 			}
-			let Ok(record) = Self::record_of(&c) else { continue };
-			let Ok(txs) = self.base_txs(&record) else { continue };
-			let policy: WalletPolicy = self.followed_policy(c.expiry, now);
-			let Ok(valid) = self.resolve(&record, &txs, &policy) else { continue };
-			let bases: Vec<Txid> = txs.iter().map(|t| t.txid()).collect();
-			let roots = valid.roots();
-			for e in bond::cosigned_by(&valid) {
-				match seen.get(&(e.salt, e.signed.rest.clone())) {
+			let key = format!("{}{}", EVIDENCE_KEY, c.leaf_id);
+			let kept: Option<Value> = self.store.meta(&key)?.and_then(|v| serde_json::from_str(&v).ok());
+			let (lines, bases, roots): (Vec<Value>, Vec<Txid>, Vec<OutPoint>) = match kept {
+				Some(k) => {
+					let lines = k["lines"].as_array().cloned().unwrap_or_default();
+					let bases = k["bases"].as_array().into_iter().flatten().filter_map(|t| t.as_str().and_then(|t| Txid::from_str(t).ok())).collect();
+					let roots = k["roots"].as_array().into_iter().flatten().filter_map(|o| o.as_str().and_then(|o| OutPoint::from_str(o).ok())).collect();
+					(lines, bases, roots)
+				},
+				None => {
+					if started.elapsed() >= SCAN_SLICE {
+						left += 1;
+						continue;
+					}
+					let Ok(record) = Self::record_of(&c) else { continue };
+					let Ok(txs) = self.base_txs(&record) else { continue };
+					let policy: WalletPolicy = self.followed_policy(c.expiry, now);
+					let Ok(valid) = self.resolve(&record, &txs, &policy) else { continue };
+					let bases: Vec<Txid> = txs.iter().map(|t| t.txid()).collect();
+					let roots = valid.roots();
+					let lines: Vec<Value> = bond::cosigned_by(&valid).iter().map(|e| evidence_line(&e.salt, &e.signed)).collect();
+					keep.push((key, json!({"lines": lines, "bases": bases.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+						"roots": roots.iter().map(|o| o.to_string()).collect::<Vec<_>>()}).to_string()));
+					(lines, bases, roots)
+				},
+			};
+			for line in lines {
+				let Ok((salt, signed)) = read_line(&line) else { continue };
+				match seen.get(&(salt, signed.rest.clone())) {
 					Some(&i) => {
 						out[i].1.extend(bases.iter().copied());
 						out[i].2.extend(roots.iter().copied());
 					},
 					None => {
-						seen.insert((e.salt, e.signed.rest.clone()), out.len());
-						out.push((evidence_line(&e.salt, &e.signed), bases.clone(), roots.clone()));
+						seen.insert((salt, signed.rest.clone()), out.len());
+						out.push((line, bases.clone(), roots.clone()));
 					},
 				}
 			}
 		}
-		Ok(out)
+		if !keep.is_empty() {
+			let entries: Vec<(&str, String)> = keep.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+			self.store.set_metas(&entries)?;
+		}
+		Ok((out, left))
 	}
 
 	/// The lowest height of a block that holds one of `bases`; past the tip
@@ -645,7 +689,7 @@ impl Wallet {
 		// Every line counts only when the operator key signed it.
 		let mut by_salt: BTreeMap<[u8; 32], Vec<Signed>> = BTreeMap::new();
 		let (mut good, mut bad) = (0usize, 0usize);
-		let own = self.evidence_by_coin()?;
+		let (own, unread) = self.evidence_by_coin()?;
 		// The signatures read from the chain and the mempool before: kept, so
 		// a stretch of the chain noted as read is never read again.
 		let mut found: Vec<Value> = self.store.meta(BOND_FOUND)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
@@ -794,7 +838,7 @@ impl Wallet {
 		}
 		self.store.set_meta(BOND_SLASHES, &serde_json::to_string(&slashes).expect("a map"))?;
 		Ok(json!({
-			"state": s.state, "why": s.why, "evidence": {"lines": good, "refused": bad, "from_chain": from_chain, "salts": by_salt.len()},
+			"state": s.state, "why": s.why, "evidence": {"lines": good, "refused": bad, "from_chain": from_chain, "salts": by_salt.len(), "unread": unread},
 			"scanned": scanned,
 			"conflicts": conflicts.iter().map(|e| json!({"salt": hex(&e.salt), "a": evidence_line(&e.salt, &e.a), "b": evidence_line(&e.salt, &e.b)}))
 				.collect::<Vec<_>>(),

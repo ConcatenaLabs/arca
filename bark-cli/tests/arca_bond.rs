@@ -70,7 +70,7 @@ async fn post(r: &mut Running, policy: &BondPolicy, w: &elements::secp256k1_zkp:
 	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
 	let op = OutPoint::new(tx.txid(), vout);
 	r.config.bond = Some(BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice_units(),
-		outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None });
+		outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None, instant_limit_value: None });
 	r.restart_server().await;
 	r.synced().await;
 	op
