@@ -391,7 +391,7 @@ fn a_round_of_vtxo_2_leaves_transfers_refreshes_and_exits() {
 	lb.v2 = true;
 	let (kd, ld) = party("swap to owner 1", delay());
 	let cpv = LEAF - MARGIN;
-	let plan = TransferPlan {
+	let plan = TransferPlan { checkpoint_exit: false,
 		inputs: vec![(coins[1].clone(), cpv), (coins[3].clone(), cpv)],
 		outputs: vec![
 			ExplicitOutput::new(x, cpv - MARGIN, ld.policy(xonly(&s), c.net.chain).script_pubkey()),
@@ -401,7 +401,7 @@ fn a_round_of_vtxo_2_leaves_transfers_refreshes_and_exits() {
 	let input_of = |k: usize, rec: &CoinRecord, key: &elements::secp256k1_zkp::Keypair| {
 		let cpd = plan.checkpoint_message(k).unwrap().digest;
 		let red = plan.reassignment_message(k).unwrap().digest;
-		TransferInput { coin: rec.clone(), checkpoint_value: cpv, checkpoint: Pair { operator: sig(&s, &cpd), owner: sig(key, &cpd) },
+		TransferInput { exit: false, coin: rec.clone(), checkpoint_value: cpv, checkpoint: Pair { operator: sig(&s, &cpd), owner: sig(key, &cpd) },
 			reassignment: Pair { operator: sig(&s, &red), owner: sig(key, &red) } }
 	};
 	let swap_inputs = vec![input_of(0, &records[1], &owners[1]), input_of(1, &records[3], &owners[3])];

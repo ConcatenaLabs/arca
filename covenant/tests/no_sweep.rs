@@ -248,7 +248,7 @@ fn a_batch_without_a_sweep_is_recovered_without_one() {
 	let coin6 = base6.resolve(std::slice::from_ref(&round_a), &strict).unwrap();
 	assert_eq!(coin6.expiry, transfer::NEVER);
 	let first = match &coin6.origin { ValidOrigin::Leaf { valid, .. } => valid.clone(), _ => unreachable!() };
-	let cp = CheckpointPolicy { owner: first.branch.leaf.owner, operator: xonly(&s), salt: transfer::checkpoint_salt(&first.branch.leaf.salt),
+	let cp = CheckpointPolicy { exit: None, owner: first.branch.leaf.owner, operator: xonly(&s), salt: transfer::checkpoint_salt(&first.branch.leaf.salt),
 		chain, sweep: None, v2: false };
 	assert_eq!(cp.script_pubkey(), TapOutput::new(vec![(0, cp.collab_script())]).script_pubkey(), "a checkpoint: [collab]");
 	let (_d, d_leaf) = party("ns receiver", delay());

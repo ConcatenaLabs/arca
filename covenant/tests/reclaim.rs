@@ -447,7 +447,7 @@ fn the_holders_of_coins_paid_out_of_round_release_the_node() {
 	// Hop 1: A0 pays B, keeps A0c.
 	let (b, a0c) = (Party::new("RD B", delay()), Party::new("RD A0 change", delay()));
 	let cp1 = coins[0].value - MARGIN;
-	let plan1 = TransferPlan { inputs: vec![(coins[0].clone(), cp1)], outputs: vec![out(&b, 7_000_000), out(&a0c, cp1 - 7_000_000 - MARGIN)] };
+	let plan1 = TransferPlan { checkpoint_exit: false, inputs: vec![(coins[0].clone(), cp1)], outputs: vec![out(&b, 7_000_000), out(&a0c, cp1 - 7_000_000 - MARGIN)] };
 	let p1 = sign_plan(&plan1, &[&old.owners[0]], &s);
 	let d1 = Delegation::for_reassignment(&coins[0], &plan1.outputs, &[b.leaf, a0c.leaf]).unwrap();
 	assert_eq!(Delegation::for_reassignment(&coins[0], &plan1.outputs, &[a0c.leaf, b.leaf]).unwrap_err(),
@@ -462,7 +462,7 @@ fn the_holders_of_coins_paid_out_of_round_release_the_node() {
 	// Hop 2: B pays C, keeps Bc.
 	let (cc, bc) = (Party::new("RD C", delay()), Party::new("RD B change", delay()));
 	let cp2 = b_coin.value - MARGIN;
-	let plan2 = TransferPlan { inputs: vec![(b_coin.clone(), cp2)], outputs: vec![out(&cc, 5_000_000), out(&bc, cp2 - 5_000_000 - MARGIN)] };
+	let plan2 = TransferPlan { checkpoint_exit: false, inputs: vec![(b_coin.clone(), cp2)], outputs: vec![out(&cc, 5_000_000), out(&bc, cp2 - 5_000_000 - MARGIN)] };
 	let p2 = sign_plan(&plan2, &[&b.key], &s);
 	let d2 = Delegation::for_reassignment(&b_coin, &plan2.outputs, &[cc.leaf, bc.leaf]).unwrap();
 	let c_rec = record_for(&plan2, &[&b_rec], &p2, 0, cc.leaf);
@@ -474,7 +474,7 @@ fn the_holders_of_coins_paid_out_of_round_release_the_node() {
 	// The swap: A2 and A3 into X2 and X3.
 	let (x2, x3) = (Party::new("RD X2", delay()), Party::new("RD X3", delay()));
 	let (cpa, cpb) = (coins[2].value - MARGIN, coins[3].value - MARGIN);
-	let plan3 = TransferPlan { inputs: vec![(coins[2].clone(), cpa), (coins[3].clone(), cpb)],
+	let plan3 = TransferPlan { checkpoint_exit: false, inputs: vec![(coins[2].clone(), cpa), (coins[3].clone(), cpb)],
 		outputs: vec![out(&x2, cpb - MARGIN), out(&x3, cpa - MARGIN)] };
 	let p3 = sign_plan(&plan3, &[&old.owners[2], &old.owners[3]], &s);
 	let d3 = Delegation::for_reassignment(&coins[2], &plan3.outputs, &[x2.leaf, x3.leaf]).unwrap();

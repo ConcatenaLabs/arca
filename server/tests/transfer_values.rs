@@ -47,7 +47,7 @@ async fn one_transfer_with_other_checkpoint_values_is_refused() {
 	// The signer itself, asked for the other value's checkpoint with the
 	// owner's signature over it (as a server whose database lost the first
 	// transfer would ask), refuses: one spend under a salt.
-	let plan = TransferPlan {
+	let plan = TransferPlan { checkpoint_exit: false,
 		inputs: vec![(v.clone(), kept - 1)],
 		outputs: outputs.iter().map(|(a, val, l)| ExplicitOutput::new(*a, *val, l.policy(xonly(&r.s), r.chain).script_pubkey())).collect(),
 	};

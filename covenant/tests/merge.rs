@@ -97,10 +97,10 @@ fn bring_all(c: &mut Arca, label: &str, senders: &[Sender]) -> Vec<OutPoint> {
 /// What a sender's wallet builds to pay `outputs` from its whole coin less a
 /// margin, and the record of output `index` for `leaf`, both pairs signed.
 fn pay(sd: &Sender, s: &Keypair, outputs: Vec<ExplicitOutput>, index: u8, leaf: NewLeaf) -> (TransferPlan, CoinRecord) {
-	let plan = TransferPlan { inputs: vec![(sd.coin.clone(), sd.coin.value - MARGIN)], outputs };
+	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(sd.coin.clone(), sd.coin.value - MARGIN)], outputs };
 	let (cp, re) = (plan.checkpoint_message(0).unwrap().digest, plan.reassignment_message(0).unwrap().digest);
 	let rec = CoinRecord::Transfer(Box::new(Transfer {
-		inputs: vec![TransferInput {
+		inputs: vec![TransferInput { exit: false,
 			coin: sd.base.clone(), checkpoint_value: sd.coin.value - MARGIN,
 			checkpoint: Pair { operator: sig(s, &cp), owner: sig(&sd.key, &cp) },
 			reassignment: Pair { operator: sig(s, &re), owner: sig(&sd.key, &re) },
@@ -322,13 +322,13 @@ fn outputs_repeated_by_a_sender_are_refused_and_would_merge() {
 	let d_leaf = new_leaf(&d, "D");
 	let (c0, c1) = (v - MARGIN, v - 2 * MARGIN);
 	let d_out = ExplicitOutput::new(x, c0 + c1 - MARGIN, d_leaf.policy(xonly(&s), chain).script_pubkey());
-	let plan = TransferPlan { inputs: vec![(k0.clone(), c0), (k1.clone(), c1)], outputs: vec![d_out] };
+	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(k0.clone(), c0), (k1.clone(), c1)], outputs: vec![d_out] };
 	let pairs: Vec<(Pair, Pair)> = (0..2).map(|i| {
 		let (cp, re) = (plan.checkpoint_message(i).unwrap().digest, plan.reassignment_message(i).unwrap().digest);
 		(Pair { operator: sig(&s, &cp), owner: sig(&r, &cp) }, Pair { operator: sig(&s, &re), owner: sig(&r, &re) })
 	}).collect();
 	let d_rec = CoinRecord::Transfer(Box::new(Transfer {
-		inputs: [(&rec0, c0), (&rec1, c1)].iter().zip(&pairs).map(|((rec, cv), (cp, re))| TransferInput {
+		inputs: [(&rec0, c0), (&rec1, c1)].iter().zip(&pairs).map(|((rec, cv), (cp, re))| TransferInput { exit: false,
 			coin: (*rec).clone(), checkpoint_value: *cv, checkpoint: *cp, reassignment: *re,
 		}).collect(),
 		outputs: plan.outputs.clone(), index: 0, leaf: d_leaf,

@@ -231,7 +231,7 @@ fn checkpoint_chain(net: &mut Net, external: bool) {
 
 	// Every collaborative signature is made now, before the round exists.
 	let margin = if external { 0 } else { FEE };
-	let cp = CheckpointPolicy { owner: xonly(a), operator: xonly(&s_key), salt: label32(&format!("{} checkpoint", tag)),
+	let cp = CheckpointPolicy { exit: None, owner: xonly(a), operator: xonly(&s_key), salt: label32(&format!("{} checkpoint", tag)),
 		chain: net.chain, sweep: Some(sched.sweep(true, false)), v2: false };
 	let v_cp = LEAF - margin;
 	let cp_out = ExplicitOutput::new(net.x, v_cp, cp.script_pubkey());

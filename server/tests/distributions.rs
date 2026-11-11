@@ -599,7 +599,7 @@ async fn vesting_claims_move_only_after_their_vest_time() {
 	let c0 = held0.record.resolve(std::slice::from_ref(&round0), &r.policy()).unwrap();
 	let (to, _) = new_leaf(&keypair("VS holder 0, after V"));
 	let leaf0 = c0.leaf.clone();
-	let plan = arca_covenant::transfer::TransferPlan { inputs: vec![(c0.clone(), kept)],
+	let plan = arca_covenant::transfer::TransferPlan { checkpoint_exit: false, inputs: vec![(c0.clone(), kept)],
 		outputs: vec![arca_covenant::ExplicitOutput::new(x, kept - 2_000, to.policy(xonly(&r.s), r.chain).script_pubkey())] };
 	let ok = r.http.post("cosign_transfer", &transfer_body(&[(&held0, c0, kept)], &[(x, kept - 2_000, to)], xonly(&r.s), r.chain)).ok();
 	// The operator's checkpoint signature is over the vest-1 message, K ‖ V.

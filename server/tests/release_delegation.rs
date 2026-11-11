@@ -853,7 +853,7 @@ fn fill_body(r: &Running, st: &Value, order: &Coin, paid: &Coin, filled: u64, go
 	outputs.extend(plan.rest.clone());
 	outputs.push(ExplicitOutput::new(r.x, filled, got.policy(s, r.chain).script_pubkey()));
 	outputs.push(ExplicitOutput::new(v.asset, change_value, change.policy(s, r.chain).script_pubkey()));
-	let tplan = arca_covenant::TransferPlan { inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
+	let tplan = arca_covenant::TransferPlan { checkpoint_exit: false, inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
 	let mut named = vec![oc.output().txout()];
 	named.push(tplan.checkpoint_output(0).txout());
 	let cp = sign_digest(&paid.held.key, &tplan.checkpoint_message(0).unwrap().digest, &random32());
@@ -1218,7 +1218,7 @@ async fn a_paid_sends_leaf_is_released_by_its_sender() {
 	let kept = v.value - 2_000;
 	let outs = [(x, 400_000, hl), (x, kept - 2_000 - 400_000, cl)];
 	let outputs: Vec<ExplicitOutput> = outs.iter().map(|(a, val, l)| ExplicitOutput::new(*a, *val, l.policy(xonly(&r.s), r.chain).script_pubkey())).collect();
-	let plan = TransferPlan { inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
+	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
 	let sk = &c[0].held.key;
 	let d = Delegation::for_reassignment(&v, &outputs, &[hl, cl]).unwrap();
 	let req = TransferRequest {

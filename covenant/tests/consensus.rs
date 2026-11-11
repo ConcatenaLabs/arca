@@ -875,7 +875,7 @@ fn entry_forfeit_cases(f: &F, book: &mut Book) {
 fn checkpoint_swap_cases(f: &F, book: &mut Book) {
 	// The checkpoint and the reassignment, both signed before anything exists.
 	let leaf = f.leaf(&f.a, "cp leaf");
-	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp"), chain: f.chain, sweep: Some(f.schedule.sweep(true, false)), v2: false };
+	let cp = CheckpointPolicy { exit: None, owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp"), chain: f.chain, sweep: Some(f.schedule.sweep(true, false)), v2: false };
 	let cp_out = ExplicitOutput::new(f.x, LEAF - FEE, cp.script_pubkey());
 	let m1 = leaf.collab_message(f.x, LEAF, std::slice::from_ref(&cp_out)).unwrap();
 	let recv = ExplicitOutput::new(f.x, 7_000_000, f.leaf(&f.b, "cp recv").script_pubkey());
@@ -1064,7 +1064,7 @@ fn builder_cases(f: &F, book: &mut Book) {
 	let lowest = NodePolicy::new(children.clone(), xonly(&f.s), keys.clone(), Some(f.schedule.sweep(true, false)), Some(f.chain)).unwrap();
 	let entry = EntryPolicy { unlock_hash: label32("h"), asset: f.x, value: LEAF, leaf_program: f.leaf(&f.a, "salt").program(),
 		sweep: Some(f.schedule.sweep(true, false)) };
-	let cp = CheckpointPolicy { owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp salt"), chain: f.chain,
+	let cp = CheckpointPolicy { exit: None, owner: xonly(&f.a), operator: xonly(&f.s), salt: label32("cp salt"), chain: f.chain,
 		sweep: Some(f.schedule.sweep(true, false)), v2: false };
 	let swept = vec![
 		batch.sweepable(fake_outpoint("batch"), value).unwrap(),
