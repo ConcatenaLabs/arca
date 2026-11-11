@@ -1568,6 +1568,23 @@ impl CoinRecord {
 		Ok(w)
 	}
 
+	/// Whether the record holds a `landing-2` leaf anywhere: the coin's own
+	/// leaf or a leaf in its past (a leaf record of template `landing` version
+	/// 2, a board record of format 5, a coin record's tag 9). A library that
+	/// does not read `landing-2` refuses such a record whole
+	/// ([`crate::LANDING_2`]), so a wallet gives such a coin, or a coin made
+	/// from one, only to a party that names `landing-2` among the formats it
+	/// reads.
+	pub fn has_landing_2(&self) -> bool {
+		match self {
+			CoinRecord::Leaf { record, .. } => record.template == crate::Template::Landing2,
+			CoinRecord::Accumulator { record, .. } => record.template == crate::Template::Landing2,
+			CoinRecord::Board(b) => b.landing.is_some_and(|l| l.own_index),
+			CoinRecord::Transfer(t) => t.leaf.landing.is_some_and(|l| l.own_index) || t.inputs.iter().any(|i| i.coin.has_landing_2()),
+			CoinRecord::Fill(f) => f.fill.order.has_landing_2() || f.fill.inputs.iter().any(|i| i.coin.has_landing_2()),
+		}
+	}
+
 	/// Whether any checkpoint in the record has its owner's exit, so that
 	/// it is written in format version 2 ([`COIN_RECORD_VERSION_EXIT`]).
 	pub fn has_checkpoint_exit(&self) -> bool {
