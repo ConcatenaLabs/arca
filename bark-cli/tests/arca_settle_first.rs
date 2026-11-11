@@ -17,6 +17,8 @@
 //!    arriving; the round that settles it is taken back out of the chain by
 //!    a Bitcoin anchor rollback while the wallet waits: nothing is lost, the
 //!    wallet waits on, and pays once the round is final again.
+//! 5. An offboard past the instant limit's counted coins, from a payment
+//!    still arriving: settled first, then quoted and asked as any offboard.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -449,6 +451,49 @@ async fn a_payment_from_a_payment_arriving_settles_first_and_an_anchor_rollback_
 	}
 	assert!(paid, "the payment goes once the round is final again");
 	for w in [&s, &a, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 5. An offboard from a payment still arriving.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offboard_from_a_payment_arriving_settles_first_then_goes() {
+	let mut r = Running::start_with(|cfg, _, _| { cfg.finality.anchor_depth = 0; cfg.watcher.enabled = false }).await;
+	let x = r.x;
+	post_bond(&mut r).await;
+	let (s, a) = (Arca::new("SF5 S"), Arca::new("SF5 A"));
+	boarded(&mut r, &s, &[(x, 4_000_000)]).await;
+	create(&r, &a);
+	library(&a, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	let arriving = pay(&s, &a, x, 2_000_000);
+	assert_eq!(coin_line(&a, &arriving)["place"], "arriving");
+	let to = a.ok(&["address"]);
+	let address = to["address"].as_str().unwrap().to_string();
+	let xs = x.to_string();
+	// At the quote and at the offboard: settle first, naming the coin.
+	assert_eq!(settle_first_named(&a, &["offboard", "--asset", &xs, "--amount", "500000", "--address", &address, "--quote"]),
+		vec![arriving.clone()]);
+	assert_eq!(settle_first_named(&a, &["offboard", "--asset", &xs, "--amount", "500000", "--address", &address]), vec![arriving.clone()]);
+	// More than the wallet holds at all is still a plain refusal.
+	let (ok, v) = a.run(&["offboard", "--asset", &xs, "--amount", "5000000", "--address", &address, "--quote"]);
+	println!("SF5: more than held: {}", v);
+	assert!(!ok && v["error"]["kind"] != "settle_first", "{}", v);
+	settle_through(&r, &a, &[arriving.clone()], "SF5").await;
+	// Through: the same offboard is quoted and asked on that quote.
+	let q = a.ok(&["offboard", "--asset", &xs, "--amount", "500000", "--address", &address, "--quote"]);
+	println!("SF5: quoted once settled: {}", q);
+	let asked = a.ok(&["offboard", "--asset", &xs, "--amount", "500000", "--address", &address, "--shown", &q.to_string()]);
+	println!("SF5: asked: {}", asked);
+	assert!(asked["offboard"].as_str().is_some(), "{}", asked);
+	rounds_final(&r).await;
+	a.ok(&["sync"]);
+	let list = a.ok(&["offboards"]);
+	println!("SF5: offboards: {}", list);
+	assert!(list.as_array().unwrap().iter().any(|o| o["offboard"] == asked["offboard"] && o["state"] != "not_made"), "{}", list);
+	for w in [&s, &a] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

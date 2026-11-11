@@ -131,6 +131,15 @@ impl Wallet {
 		}
 		let Some((fee, change)) = done else {
 			let need = amount.saturating_add(refresh).saturating_add(offboard);
+			// Coins the wallet holds as its own that a participation gives up
+			// only once a round has made them final or settled them (arriving
+			// past the instant limit, not final yet): said so, naming them, so
+			// a program settles them and asks again. The depth limit bars no
+			// coin here, a round giving every coin up whatever its depth.
+			let held = self.round_first(info, asset, super::places::Spend::Pay, None, super::pay::Reads::ALL)?;
+			if let Some(e) = self.settle_first_of(asset, total, need, held) {
+				return Err(e);
+			}
 			return Err(self.short_of(asset, need.saturating_sub(total).max(1), format!("the wallet's live coins of asset {} hold {} and \
 				an offboard of {} and its fee need {} (refresh {}, offboard {}), with any change at least the operator's smallest leaf \
 				of {}: board or receive more, or pay less", asset, total, amount, need, refresh, offboard, min))?);

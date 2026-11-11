@@ -336,16 +336,18 @@ and a board whose registration never reached the server, are not recovered.
   says so apart (`require-checkpoint-exit on`), as a wallet with an instant
   limit for people would.
 - **A spend that waits only for a round.** When the coins a payment, a
-  trade or its quote may take now fall short, and coins the wallet holds as
+  trade, an offboard or its quote may take now fall short, and coins the wallet holds as
   its own would cover it once a round has refreshed them (at the operator's
   depth limit, which no out-of-round spend may pass; arriving; trade
   proceeds asked to pay a cross-chain leg; of the record format an older
   build on the other side does not read; not final yet), or a part sale
   would shape a coin from one within three reassignments of that limit, the
   refusal is of kind `settle_first` and names those coins (`coins`), at the
-  quote as at the spend. A supervised asset paid or traded to a side that
-  reads no `landing-2` is never answered so: a round makes every leaf of it
-  `landing-2`, which that side reads no better, so the refusal stays plain. `settle-first --coin LEAF…` (or `--asset ASSET`,
+  quote as at the spend. An offboard gives its coins up in a round, so for
+  it only coins arriving or not final yet count. A supervised asset paid or
+  traded to a side that reads no `landing-2` is never answered so: a round
+  makes every leaf of it `landing-2`, which that side reads no better, so
+  the refusal stays plain. `settle-first --coin LEAF…` (or `--asset ASSET`,
   every coin of it that waits for a round) puts them through the next round
   for coins of the wallet's own, each at the refresh's fee; asked again it
   gives up nothing twice, and answers `ready` once they are through, when
