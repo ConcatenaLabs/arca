@@ -117,6 +117,12 @@ pub struct Config {
 	/// How batches are built; trees alone when absent.
 	#[serde(default)]
 	pub batches: BatchesSection,
+	/// Whether the operator co-signs transfers whose checkpoints carry their
+	/// owners' exit, which a wallet asks for in a swap or a fill where the
+	/// other party reads the record format it makes ([`Params::checkpoint_exit`]).
+	/// Off when absent: no wallet is offered it.
+	#[serde(default)]
+	pub checkpoint_exit: bool,
 }
 
 /// How batches are built.
@@ -1829,6 +1835,7 @@ impl Server {
 		// stays away keeps its coin whatever the operator does.
 		let chain_name = finality.call(|c| c.chain_name()).await.map_err(err("the node"))?;
 		params.no_sweep = config.batches.no_sweep || chain_name.as_deref() == Some(crate::params::MAIN_CHAIN);
+		params.checkpoint_exit = config.checkpoint_exit;
 		if let Some(c) = config.batches.collect_after_seconds {
 			if c == 0 {
 				return Err(StartError("batches.collect_after_seconds is at least 1".into()));

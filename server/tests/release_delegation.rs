@@ -1221,7 +1221,7 @@ async fn a_paid_sends_leaf_is_released_by_its_sender() {
 	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
 	let sk = &c[0].held.key;
 	let d = Delegation::for_reassignment(&v, &outputs, &[hl, cl]).unwrap();
-	let req = TransferRequest {
+	let req = TransferRequest { checkpoint_exit: false,
 		inputs: vec![InputRequest { leaf_id: v.id, checkpoint_value: kept,
 			checkpoint_sig: sign_digest(sk, &plan.checkpoint_message(0).unwrap().digest, &random32()),
 			reassignment_sig: sign_digest(sk, &plan.reassignment_message(0).unwrap().digest, &random32()),

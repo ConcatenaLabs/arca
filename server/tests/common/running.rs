@@ -126,6 +126,9 @@ impl Running {
 			bond: None,
 			lightning: Default::default(),
 			batches: Default::default(),
+			// The operator offers checkpoints with their owners' exit; a test
+			// of an operator that does not turns it off.
+			checkpoint_exit: true,
 		};
 		// `ARCA_TEST_NO_SWEEP=1` runs a suite with batches without a sweep,
 		// every round held for its forfeits ([`super::rounds::round_final`]

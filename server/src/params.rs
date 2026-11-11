@@ -324,6 +324,14 @@ pub struct Params {
 	/// spend of a coin resting on it (`[batches] collect_after_seconds`):
 	/// the service horizon ([`crate::watcher`]).
 	pub collect_after_seconds: u32,
+	/// Whether the operator co-signs a transfer whose checkpoints carry their
+	/// owners' exit (`checkpoint_exit`): a swap's or a fill's checkpoints,
+	/// so that a reassignment of several owners' coins that can never
+	/// complete gives each owner its coin back without the operator
+	/// ([`arca_covenant::checkpoint`]). Its coins' records are coin record
+	/// format version 2, which a wallet asks for only where every party
+	/// reads it.
+	pub checkpoint_exit: bool,
 }
 
 /// The name the node gives the main chain (`getblockchaininfo`'s `chain`),
@@ -372,6 +380,7 @@ impl Params {
 			channel_window: spec.max_exit_delay,
 			no_sweep: false,
 			collect_after_seconds: COLLECT_AFTER_SECONDS,
+			checkpoint_exit: false,
 		};
 		p.set_delays();
 		p

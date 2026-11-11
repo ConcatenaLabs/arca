@@ -79,6 +79,7 @@ pub(super) async fn order_fill(State(app): State<Arc<App>>, body: Result<Bytes, 
 	let t = transfer_request(&req.inputs, &req.outputs)?;
 	let done = app.orders.fill(&FillRequest {
 		order: leaf_id(&req.order)?, coin: leaf_id(&req.coin)?, filled: amount(&req.filled)?, inputs: t.inputs, outputs: t.outputs,
+		checkpoint_exit: req.checkpoint_exit,
 	}).await?;
 	Ok(Json(api::OrderFilled {
 		transfer_id: hex(&done.transfer_id),

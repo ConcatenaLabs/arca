@@ -115,6 +115,9 @@ pub struct FillRequest {
 	pub inputs: Vec<InputRequest>,
 	/// The taker's leaves: first the one of what it fills, then its change.
 	pub outputs: Vec<OutputRequest>,
+	/// Each taker coin of a plain leaf moves into a checkpoint with its
+	/// owner's exit, as the taker signed ([`arca_covenant::checkpoint`]).
+	pub checkpoint_exit: bool,
 }
 
 impl FillRequest {
@@ -143,6 +146,11 @@ impl FillRequest {
 			e.input(&o.mailbox.unwrap_or(o.leaf.owner).serialize());
 			e.input(&o.until.unwrap_or(0).to_le_bytes());
 		}
+		// Checkpoints with their owners' exit: a request without hashes as
+		// it always did.
+		if self.checkpoint_exit {
+			e.input(&[0xfb, 1]);
+		}
 		sha256::Hash::from_engine(e).to_byte_array()
 	}
 
@@ -153,9 +161,11 @@ impl FillRequest {
 	/// checkpoint's value and its owner's two signatures) and each taker leaf
 	/// (asset, value, owner, owner nonce, creator nonce, exit delay units,
 	/// its mailbox and lapse when named), integers little-endian. A taker
-	/// leaf of a fill is `vtxo-1`, so no `htlc-1` terms are kept.
+	/// leaf of a fill is `vtxo-1`, so no `htlc-1` terms are kept. A request
+	/// whose checkpoints carry their owners' exit is version 2, the same
+	/// bytes after its version.
 	pub fn to_bytes(&self) -> Vec<u8> {
-		let mut b = vec![1u8];
+		let mut b = vec![if self.checkpoint_exit { 2u8 } else { 1u8 }];
 		b.extend_from_slice(&self.order.0);
 		b.extend_from_slice(&self.coin.0);
 		b.extend_from_slice(&self.filled.to_le_bytes());
@@ -202,9 +212,11 @@ impl FillRequest {
 		};
 		let a32 = |s: &[u8]| -> [u8; 32] { s.try_into().expect("32 bytes") };
 		let u64_of = |s: &[u8]| u64::from_le_bytes(s.try_into().expect("8 bytes"));
-		if take(1)?[0] != 1 {
-			return Err("a fill request of an unknown version".into());
-		}
+		let checkpoint_exit = match take(1)?[0] {
+			1 => false,
+			2 => true,
+			_ => return Err("a fill request of an unknown version".into()),
+		};
 		let order = LeafId(a32(take(32)?));
 		let coin = LeafId(a32(take(32)?));
 		let filled = u64_of(take(8)?);
@@ -243,7 +255,7 @@ impl FillRequest {
 		if at != b.len() {
 			return Err("a fill request with bytes after its end".into());
 		}
-		Ok(FillRequest { order, coin, filled, inputs, outputs })
+		Ok(FillRequest { order, coin, filled, inputs, outputs, checkpoint_exit })
 	}
 }
 
@@ -562,6 +574,10 @@ impl Orders {
 		if ids.len() != n || ids.contains(&req.coin) {
 			return Err(OrderError::Malformed("a coin is given twice".into()));
 		}
+		if req.checkpoint_exit && !self.params.checkpoint_exit {
+			return Err(OrderError::Cosign(CosignError::NotServed("this operator co-signs no checkpoint with its owner's exit \
+				(info.checkpoint_exit is false): the taker signs the fill again without it".into())));
+		}
 		let transfer = req.hash();
 		if let Some(f) = self.store.order_fill_by_transfer(&transfer).await? {
 			if f.signature.is_some() {
@@ -679,7 +695,8 @@ impl Orders {
 		let dummy = Signature::from_slice(&[1; 64]).expect("64 bytes");
 		let pair = Pair { operator: dummy, owner: dummy };
 		let sized: Vec<ValidInput> = checked.iter().zip(&req.inputs).map(|(c, i)| ValidInput {
-			coin: c.coin.clone(), checkpoint: c.coin.checkpoint(), checkpoint_value: i.checkpoint_value, checkpoint_pair: pair,
+			coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed()),
+			checkpoint_value: i.checkpoint_value, checkpoint_pair: pair,
 			reassignment_pair: pair,
 		}).collect();
 		if !recorded {
@@ -705,7 +722,7 @@ impl Orders {
 		}
 
 		// The taker's signatures.
-		let tplan = TransferPlan { checkpoint_exit: false,
+		let tplan = TransferPlan { checkpoint_exit: req.checkpoint_exit,
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
@@ -745,7 +762,7 @@ impl Orders {
 		let fill_digest = op.fill_digest(oc.coin.value, &txouts).map_err(internal)?;
 
 		// The new coins' ids.
-		let parts: Vec<(LeafId, [u8; 32])> = checked.iter().map(|c| (c.coin.id, c.coin.checkpoint().taproot().program())).collect();
+		let parts: Vec<(LeafId, [u8; 32])> = checked.iter().enumerate().map(|(k, c)| (c.coin.id, tplan.checkpoint(k).taproot().program())).collect();
 		let hash = fill_hash((oc.coin.id, oc.coin.leaf.program()), &parts, &outputs);
 		let credit_leaf = op.credit_leaf().expect("the plan holds a credit key");
 		let rest_leaf = op.next().leaf();
@@ -941,7 +958,7 @@ impl Orders {
 			order: oc.record.clone(),
 			signature: fill_sig,
 			partial: plan.rest.is_some(),
-			inputs: checked.iter().zip(&req.inputs).zip(&sigs).map(|((c, i), (cp, re))| TransferInput { exit: false,
+			inputs: checked.iter().zip(&req.inputs).zip(&sigs).enumerate().map(|(k, ((c, i), (cp, re)))| TransferInput { exit: tplan.exit(k),
 				coin: c.record.clone(), checkpoint_value: i.checkpoint_value,
 				checkpoint: Pair { operator: *cp, owner: i.checkpoint_sig },
 				reassignment: Pair { operator: *re, owner: i.reassignment_sig },
