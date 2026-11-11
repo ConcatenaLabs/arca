@@ -97,12 +97,32 @@ pub struct Config {
 	pub expect: Option<super::registry::Expected>,
 }
 
+/// Whether the operator makes `landing-2` leaves, as its `info` lists its
+/// templates: a wallet then asks for its own leaves of a supervised asset in
+/// `landing-2`, which lands at its own index.
+pub(crate) fn makes_landing_2(info: &Value) -> bool {
+	info["templates"]["list"].as_array().is_some_and(|l| l.iter().any(|t| t.as_str() == Some(arca_covenant::LANDING_2)))
+}
+
+/// Whether the operator makes `landing-2` leaves only (`info.landing_2_only`):
+/// every client of it reads them, so a leaf of the wallet's whose record
+/// another party parses (a trade's) is `landing-2` too.
+pub(crate) fn landing_2_only(info: &Value) -> bool {
+	info["landing_2_only"] == serde_json::json!(true)
+}
+
+/// Whether the party that wrote `v` (a receive request, an offer, an
+/// acceptance) names `landing-2` among the formats it reads.
+pub(crate) fn reads_landing_2(v: &Value) -> bool {
+	v["reads"].as_array().is_some_and(|r| r.iter().any(|f| f.as_str() == Some(arca_covenant::LANDING_2)))
+}
+
 /// The template of the leaf a coin record names: what `coins` shows of it.
 fn template_of(r: &CoinRecord) -> Option<Template> {
 	// A leaf made by a transfer or a fill, by its terms.
 	let new_leaf = |l: &arca_covenant::NewLeaf| match (&l.htlc, &l.landing, &l.enclave, l.v2) {
 		(Some(_), ..) => Template::Htlc1,
-		(None, Some(_), ..) => Template::Landing1,
+		(None, Some(l), ..) => if l.own_index { Template::Landing2 } else { Template::Landing1 },
 		(None, None, Some(_), _) => Template::Enclave1,
 		(None, None, None, true) => Template::Vtxo2,
 		(None, None, None, false) => Template::Vtxo1,
@@ -854,8 +874,8 @@ impl Wallet {
 	/// when given: `vtxo-1`, whose collaborative path is tapscript, or
 	/// `vtxo-2`, whose collaborative path is the Simplicity program
 	/// `arca/collab-2`, which also binds the coin's index and the inputs its
-	/// signers name. Both exit alike. A leaf of a supervised asset is
-	/// `landing-1` whatever is set. Coins already held keep their template
+	/// signers name. Both exit alike. A leaf of a supervised asset is a
+	/// landing leaf whatever is set ([`Wallet::landing_rule`]). Coins already held keep their template
 	/// until they are refreshed.
 	pub fn leaf_template(&mut self, set: Option<&str>) -> Result<Value, Error> {
 		if let Some(t) = set {
@@ -2288,12 +2308,14 @@ impl Wallet {
 	}
 
 	/// The landing a new leaf of `asset` the wallet asks for or takes must
-	/// carry: `Some` for a supervised asset, `landing-1` at the wallet's
-	/// landing key with the allowance the operator publishes; `None` for any
-	/// other asset. Whether an asset is supervised is the chain's: the
+	/// carry: `Some` for a supervised asset, at the wallet's landing key with
+	/// the allowance the operator publishes, `landing-2` (landing at its own
+	/// index) where the operator makes it ([`makes_landing_2`]) and
+	/// `landing-1` from an operator that does not; `None` for any other
+	/// asset. Whether an asset is supervised is the chain's: the
 	/// wallet's own node must list it as `info` says, or the wallet takes no
 	/// leaf of it, since an operator that serves a supervised asset in plain
-	/// leaves, or a plain asset in landing-1 leaves, says what the chain does
+	/// leaves, or a plain asset in landing leaves, says what the chain does
 	/// not.
 	pub(crate) fn landing_rule(&self, info: &Value, asset: AssetId) -> Result<Option<arca_covenant::Landing>, Error> {
 		let served = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()));
@@ -2308,7 +2330,7 @@ impl Wallet {
 				of it", asset))),
 			(Some(s), true) => {
 				let allowance = amount(&s["landing_allowance"], "landing_allowance")?;
-				Ok(Some(arca_covenant::Landing { program: self.keys.landing_program()?, allowance, own_index: false }))
+				Ok(Some(arca_covenant::Landing { program: self.keys.landing_program()?, allowance, own_index: makes_landing_2(info) }))
 			},
 		}
 	}
@@ -2333,8 +2355,9 @@ impl Wallet {
 	/// kind, is rebuilt from its parts ([`super::round::rebuild_batch`]) and
 	/// its batch output compared
 	/// with the round's on the wallet's node; then the asset must be
-	/// supervised on the wallet's node, every leaf `landing-1` with the
-	/// allowance the operator publishes for the asset, and every output of
+	/// supervised on the wallet's node, every leaf a landing leaf
+	/// (`landing-1` or `landing-2`) with the allowance the operator
+	/// publishes for the asset, and every output of
 	/// the round explicit. Each leaf is listed with where it lands and
 	/// whether the node shows that landing frozen. `ok` only when every check
 	/// holds; `problems` says which did not.
@@ -2375,8 +2398,8 @@ impl Wallet {
 		let mut leaves = vec![];
 		use super::round::{LeafTerms, NewRecord};
 		for (i, r) in (0..tree.len()).map(|i| NewRecord::of(&tree, i)).enumerate() {
-			let Some(l) = r.landing().copied().filter(|_| r.template() == Template::Landing1) else {
-				problems.push(format!("leaf {} is {}, not landing-1", i, r.template()));
+			let Some(l) = r.landing().copied().filter(|l| r.template() == l.template()) else {
+				problems.push(format!("leaf {} is {}, not a landing leaf", i, r.template()));
 				leaves.push(json!({"index": i, "template": r.template().to_string(), "value": r.value().to_string()}));
 				continue;
 			};
@@ -4051,7 +4074,7 @@ impl Wallet {
 		let key = self.keys.leaf(&owner_nonce)?;
 		let owner = key.x_only_public_key().0;
 		self.store.put_nonce(&owner_nonce, &owner.serialize(), "board")?;
-		// A board of a supervised asset converts into a landing-1 leaf at the
+		// A board of a supervised asset converts into a landing leaf at the
 		// wallet's landing key.
 		let landing = self.landing_rule(&info, asset)?;
 		let record = BoardRecord { enclave: None,
