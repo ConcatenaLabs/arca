@@ -706,7 +706,12 @@ impl Wallet {
 		let RestingFill { oc, policy, plan, filled, price, fee, change, chosen, asset_a, asset_b } = f;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let outputs = fill_outputs(&plan, &policy, (&got, filled), (change > 0).then_some((&change_leaf, asset_b, change)), self);
-		let tplan = TransferPlan { checkpoint_exit: false, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
+		// The taker's coins into checkpoints with their owners' exit where
+		// the operator co-signs them: a fill the maker and the operator never
+		// complete then gives them back (`arca_covenant::checkpoint`). The
+		// maker's order coin is spent only if the fill confirms.
+		let checkpoint_exit = Self::checkpoint_exit_offered(&info);
+		let tplan = TransferPlan { checkpoint_exit, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
 		// The fill spends the order's coin at input 0 and the checkpoints
 		// after it: a vtxo-2 checkpoint's pair names them all, its own index
 		// one past its place among the checkpoints (`fill_tx`).
@@ -742,7 +747,10 @@ impl Wallet {
 		if change > 0 {
 			taker.push(leaf_json(asset_b, change, &change_leaf));
 		}
-		let body = json!({"order": order, "coin": oc.id.to_string(), "filled": filled.to_string(), "inputs": inputs, "outputs": taker});
+		let mut body = json!({"order": order, "coin": oc.id.to_string(), "filled": filled.to_string(), "inputs": inputs, "outputs": taker});
+		if checkpoint_exit {
+			body["checkpoint_exit"] = json!(true);
+		}
 		let given: Vec<String> = chosen.iter().map(|c| c.row.leaf_id.clone()).collect();
 		self.store.atomically(|s| {
 			for l in &given {

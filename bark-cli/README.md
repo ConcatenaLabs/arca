@@ -317,6 +317,26 @@ and a board whose registration never reached the server, are not recovered.
   and the wallet takes the coin on-chain at once, publishing what it holds
   (the checkpoint from a converted board's leaf, then the reassignment)
   before any exit delay runs out.
+- **A swap or a fill that can never complete gives the wallet's coin back.**
+  A swap, or a fill of a resting order, is one reassignment of several
+  owners' coins, so one owner and the operator could stop it by spending
+  that owner's checkpoint elsewhere. Where the operator offers it
+  (`info.checkpoint_exit`), each plain coin goes into a checkpoint that also
+  has its owner's exit after the coin's exit delay: the maker's offer asks
+  for it, the taker signs so where it can, and either side whose library
+  does not know it signs the swap without it, as before. When the re-check
+  finds a coin the wallet got from such a trade cut on the chain by another
+  spend of a coin the trade took, it takes the coin the wallet gave home:
+  its checkpoint is published from the pair the wallet signed and, once the
+  exit delay has run, claimed with the wallet's own key, no operator
+  needed. The coin shows `exiting`, then `exited`, its note saying it was
+  returned, and the swap shows `returned`; the coin the trade was to pay
+  shows the trade undone. Should the spend that cut it leave the chain and
+  the trade complete after all, the coin is held as spent by it. A wallet
+  restored from its mnemonic in the middle finishes the return. Pulling out
+  of a good trade this way does not work: the other side's wallet, its
+  watchtower and the operator answer the early checkpoint with the trade
+  inside the delay.
 - **Finality** is the node's: a round or board is final when its block is
   certified by the committee and its Bitcoin anchor buried as many blocks as
   the operator's `info` publishes (`finality.anchor_depth`; 2 for an operator

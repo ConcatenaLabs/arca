@@ -1017,28 +1017,31 @@ impl Wallet {
 	/// the server to co-sign the whole transfer, and takes the answer. `theirs`
 	/// carries the signatures of inputs another owner signed, by index.
 	fn transfer(&mut self, inputs: &[In], outs: &[Out], theirs: &[Theirs]) -> Result<Value, Error> {
-		self.transfer_with(inputs, outs, theirs, None)
+		self.transfer_with(inputs, outs, theirs, None, false)
 	}
 
 	/// [`Self::transfer`] paying `invoice` over Lightning: its outputs make
 	/// the `htlc-1` leaf of the payment, and it goes to `lightning_send`.
 	pub(crate) fn transfer_paying(&mut self, inputs: &[In], outs: &[Out], invoice: &str) -> Result<Value, Error> {
-		self.transfer_with(inputs, outs, &[], Some(json!({"invoice": invoice})))
+		self.transfer_with(inputs, outs, &[], Some(json!({"invoice": invoice})), false)
 	}
 
 	/// [`Self::transfer`] claiming a leaf received over Lightning: the
 	/// payment's preimage goes with it, to `lightning_receive_claim`.
 	pub(crate) fn transfer_claiming(&mut self, inputs: &[In], outs: &[Out], hash: &str, preimage: &[u8; 32]) -> Result<Value, Error> {
-		self.transfer_with(inputs, outs, &[], Some(json!({"payment_hash": hash, "preimage": hex(preimage)})))
+		self.transfer_with(inputs, outs, &[], Some(json!({"payment_hash": hash, "preimage": hex(preimage)})), false)
 	}
 
-	fn transfer_with(&mut self, inputs: &[In], outs: &[Out], theirs: &[Theirs], extra: Option<Value>)
+	/// `checkpoint_exit` moves each coin of a plain leaf into a checkpoint
+	/// with its owner's exit, as a swap whose parties both read the record
+	/// format it makes asks ([`Wallet::checkpoint_exit_offered`]).
+	fn transfer_with(&mut self, inputs: &[In], outs: &[Out], theirs: &[Theirs], extra: Option<Value>, checkpoint_exit: bool)
 		-> Result<Value, Error>
 	{
 		// Nothing is signed for the operator without a witness of its
 		// signer's record, whatever entry point led here.
 		self.witnessed_now()?;
-		let plan = TransferPlan { checkpoint_exit: false,
+		let plan = TransferPlan { checkpoint_exit,
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
@@ -1064,6 +1067,9 @@ impl Wallet {
 			ins.push(j);
 		}
 		let mut body = json!({"inputs": ins, "outputs": outs.iter().map(|o| { let mut j = o.json(); j["mailbox"] = json!(hex(&o.mailbox.serialize())); j }).collect::<Vec<_>>()});
+		if checkpoint_exit {
+			body["checkpoint_exit"] = json!(true);
+		}
 		for (k, v) in extra.as_ref().and_then(|e| e.as_object()).into_iter().flatten() {
 			body[k] = v.clone();
 		}
@@ -2123,7 +2129,7 @@ impl Wallet {
 		if change > 0 {
 			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_of("change", &info, give_asset, change)?, mailbox, until: None });
 		}
-		let offer = json!({
+		let mut offer = json!({
 			"kind": OFFER_KIND.name, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
 			"give": {"asset": give_asset.to_string(), "value": give.to_string()},
 			"want": {"asset": want_asset.to_string(), "value": want.to_string()},
@@ -2132,6 +2138,13 @@ impl Wallet {
 				"checkpoint_value": i.checkpoint_value.to_string()})).collect::<Vec<_>>(),
 			"outputs": outs.iter().map(Out::json).collect::<Vec<_>>(),
 		});
+		// The maker reads the record format of checkpoints with their
+		// owners' exit, and the operator co-signs them: a taker that reads it
+		// too signs the swap so. One that does not ignores the field, signs
+		// the swap without them, and the maker completes it so.
+		if Self::checkpoint_exit_offered(&info) {
+			offer["checkpoint_exit"] = json!(true);
+		}
 		let id = hex(&sha256::Hash::hash(offer.to_string().as_bytes()).to_byte_array());
 		self.store.atomically(|s| {
 			s.put_swap(&id, "maker", &offer.to_string())?;
@@ -2142,6 +2155,15 @@ impl Wallet {
 		})?;
 		Ok(json!({"swap": id, "offer": encode(&self.spelling.offer, &offer), "details": offer, "gives": offer["give"], "gets": offer["want"],
 			"pays": Self::maker_pays(give_asset, margin, &inputs)}))
+	}
+
+	/// Whether a swap or a fill may move its coins into checkpoints with
+	/// their owners' exit ([`arca_covenant::checkpoint`]): when the operator
+	/// co-signs them (`info.checkpoint_exit`). This library reads the record
+	/// format they make (`coin-2`); the other party says it does by asking
+	/// (an offer's `checkpoint_exit`) or by signing so (an acceptance's).
+	pub(crate) fn checkpoint_exit_offered(info: &Value) -> bool {
+		info["checkpoint_exit"] == json!(true)
 	}
 
 	/// What a maker's coins leave for a swap's fees, in the asset it gives:
@@ -2361,10 +2383,13 @@ impl Wallet {
 			}
 		}
 		let OfferChecked { offer, theirs, .. } = o;
+		// Checkpoints with their owners' exit, where the maker asked for them
+		// and the operator co-signs them.
+		let checkpoint_exit = offer["checkpoint_exit"] == json!(true) && Self::checkpoint_exit_offered(&info);
 		let n = theirs.len();
 		let mut inputs = theirs;
 		inputs.extend(mine);
-		let plan = TransferPlan { checkpoint_exit: false,
+		let plan = TransferPlan { checkpoint_exit,
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
@@ -2380,13 +2405,16 @@ impl Wallet {
 			}
 			sigs.push(j);
 		}
-		let accept = json!({
+		let mut accept = json!({
 			"kind": ACCEPT_KIND.name, "swap": id,
 			"inputs": inputs.iter().map(|i| json!({"leaf_id": i.coin.id.to_string(), "record": hex(&i.row.record),
 				"checkpoint_value": i.checkpoint_value.to_string()})).collect::<Vec<_>>(),
 			"outputs": outs.iter().map(Out::json).collect::<Vec<_>>(),
 			"signatures": sigs,
 		});
+		if checkpoint_exit {
+			accept["checkpoint_exit"] = json!(true);
+		}
 		self.store.atomically(|s| {
 			s.put_swap(&id, "taker", &offer.to_string())?;
 			s.set_swap(&id, "accepted", Some(&accept.to_string()))?;
@@ -2494,9 +2522,17 @@ impl Wallet {
 		if theirs.len() != inputs.len() - n {
 			return Err(Error::Refused("the acceptance does not sign every one of the taker's inputs".into()));
 		}
+		// The taker signed checkpoints with their owners' exit only where the
+		// offer asked for them.
+		let checkpoint_exit = match accept["checkpoint_exit"].as_bool() {
+			None | Some(false) => false,
+			Some(true) if offer["checkpoint_exit"] == json!(true) => true,
+			Some(true) => return Err(Error::Refused("the acceptance signs checkpoints with their owners' exit, which the offer did not \
+				ask for".into())),
+		};
 		// Coins of the taker's are not the wallet's to mark: only the maker's
 		// are put to `sending`.
-		let answer = self.transfer(&inputs, &outs, &theirs)?;
+		let answer = self.transfer_with(&inputs, &outs, &theirs, None, checkpoint_exit)?;
 		self.store.set_swap(&id, "done", None)?;
 		Ok(json!({"swap": id, "transfer": answer, "dates": dates}))
 	}
