@@ -285,6 +285,13 @@ and a board whose registration never reached the server, are not recovered.
   and the operator's, the bond's value, the budget, what the wallet holds
   out of round, and the `room` left, each in atoms of the reference unit, and
   that room in atoms of each asset the node prices, `room_atoms`).
+  What counts as held out of round is what the operator, with someone other
+  than the wallet, could take by signing twice: each coin whose lineage
+  holds an input the wallet does not own (a payment received, what a swap
+  or a fill paid it, change from one included), at its whole value. The
+  wallet's own change from paying out of its round's or board's coins
+  counts nothing, and so does a coin it gives into a swap whose checkpoint
+  has its owner's exit, which comes home should the swap never complete.
   A wallet sets no budget unless its owner sets one.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
