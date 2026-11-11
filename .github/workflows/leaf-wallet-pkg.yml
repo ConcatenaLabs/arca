@@ -27,8 +27,12 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          # protoc from its own release (the version Ubuntu ships, 3.21.12), checked against its
+          # hash: the runners' apt mirror can be unreachable for hours, and only protoc is needed.
+          curl -fsSL --retry 5 -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+          echo "3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8  /tmp/protoc.zip" | sha256sum -c -
+          sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          protoc --version
           cargo install --locked wasm-pack --version 0.13.1
 
       - name: Build
