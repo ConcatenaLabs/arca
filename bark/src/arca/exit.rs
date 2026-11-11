@@ -1996,6 +1996,16 @@ impl Wallet {
 		// What each step cost (milliseconds, and requests of the node and of
 		// the operator): `cost_by_step`, for a program that logs a slow sync.
 		let mut steps = Steps::start(self);
+		// Deposits a restore left owed, before anything else: the coins it
+		// took are safe with a watchtower only once they are made, and none
+		// of them waits on the operator ([`super::tower::DEPOSITS_OWED`]).
+		let owed = self.store.meta(super::tower::DEPOSITS_OWED)?.is_some();
+		let owed_deposits = if owed && with_deposits {
+			Some(self.progress_deposits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})))
+		} else { None };
+		if owed_deposits.is_some() {
+			steps.lap(self, "owed deposits");
+		}
 		// The witness first, patiently: after a rollback of the operator's
 		// signer's record the wallet does only what it does on the chain, and
 		// while no witness succeeds it takes no coin and signs no spend
@@ -2119,7 +2129,9 @@ impl Wallet {
 		// every deposit of a coin no longer the wallet's withdrawn: none of
 		// it needs the operator.
 		self.exits_meanwhile();
-		let deposits = if with_deposits {
+		let deposits = if let Some(d) = owed_deposits {
+			d
+		} else if with_deposits {
 			self.progress_deposits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { json!({"note": "left to the command deposits"}) };
 		steps.lap(self, "deposits");

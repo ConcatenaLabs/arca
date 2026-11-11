@@ -91,6 +91,11 @@ pub(crate) const HISTORY_NOTE: &str = "the coins the server serves as given up f
 	left is 0: they make the wallet's history, and none is counted until it is checked. A coin the server serves as unspent that one of \
 	the records it serves names as spent waits with them";
 
+/// What a restore says of the watchtowers' deposits it leaves owed.
+pub(crate) const DEPOSITS_NOTE: &str = "the coins restored are deposited with the watchtowers right after the restore returns (the \
+	command deposits, which the program runs at once); until they are, a coin rests on this wallet alone to answer anything published \
+	on the chain against it, and every sync makes them first while they are owed";
+
 /// One coin the restore could not take, and why.
 fn missed(leaf: &str, why: impl Into<String>) -> Value {
 	json!({"leaf_id": leaf, "why": why.into()})
@@ -152,6 +157,15 @@ impl Wallet {
 	/// mnemonic; run again, it takes only what it does not hold. Refuses, and
 	/// restores nothing, while the operator's keeper set is not acknowledged.
 	pub fn restore(&mut self) -> Result<Value, Error> {
+		self.restore_with(false)
+	}
+
+	/// [`Self::restore`]; with `at_once`, every coin served is checked
+	/// before it returns, the wallet's history with the rest, and its `sync`
+	/// makes the watchtowers' deposits: for a program that wants the whole
+	/// history checked before anything else, at the cost of the time it
+	/// takes.
+	pub fn restore_with(&mut self, at_once: bool) -> Result<Value, Error> {
 		let mut steps = super::exit::Steps::start(self);
 		let info = self.server_info()?;
 		let (entries, served_receives, read_note) = self.read_served()?;
@@ -163,7 +177,7 @@ impl Wallet {
 		// whole restore, whichever coin it comes with.
 		self.keepers_acknowledged(&info, &entries)?;
 		self.no_foreign_acks(&info, &entries)?;
-		let (now_entries, history) = self.split_history(&entries)?;
+		let (now_entries, history) = if at_once { (entries.clone(), vec![]) } else { self.split_history(&entries)? };
 		self.keep_history(&history)?;
 		let TakenServed { mut restored, not_recovered, mut notes, given_elsewhere: _ } =
 			self.take_served(&info, &now_entries, &served_receives, false, Some(&mut steps))?;
@@ -214,15 +228,24 @@ impl Wallet {
 		steps.lap(self, "plans");
 		// A restore has just read everything a catch-up would.
 		self.store.set_meta(CAUGHT_UP, &now.to_consensus_u32().to_string())?;
-		let sync = self.sync_with(true, true, false)?;
+		// The watchtowers' deposits are not waited for: they are noted as
+		// owed, made at once after the restore returns (the command
+		// `deposits`), and first by any `sync` while they are owed.
+		if !at_once {
+			self.store.set_meta(super::tower::DEPOSITS_OWED, &now.to_consensus_u32().to_string())?;
+		}
+		let sync = self.sync_with(true, at_once, false)?;
 		steps.lap(self, "sync");
 		let left = self.history_left()?;
 		let mut out = json!({
 			"served": entries.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes, "mailbox": mailbox_read,
-			"plans": plans, "history": {"left": left, "note": self.spelling.say(HISTORY_NOTE)},
+			"plans": plans, "history": {"left": left, "loading": left > 0, "note": self.spelling.say(HISTORY_NOTE)},
 			"requests": {"lapses_at": until.max(held_until), "note": self.spelling.say(RESTORED_NOTE)},
 			"sync": sync,
 		});
+		if !at_once {
+			out["deposits"] = json!({"owed": true, "note": self.spelling.say(DEPOSITS_NOTE)});
+		}
 		if let Some(n) = read_note {
 			out["note"] = json!(n);
 		}
@@ -801,12 +824,11 @@ impl Wallet {
 		let (mut now, mut later) = (vec![], vec![]);
 		// The coins of the history whose records name each coin.
 		let mut namers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+		// A coin held already (a restore run again, after one cut short) is
+		// split as any other: one of the history is settled by how it was
+		// given up ([`Self::settle_held_history`]), never left counted.
 		for e in entries {
 			let id = e["leaf_id"].as_str().unwrap_or("");
-			if self.store.coin(id)?.is_some() {
-				now.push(e.clone());
-				continue;
-			}
 			let by: BTreeSet<String> = record(e).and_then(|r| named.get(&owner_of(&r).1).cloned()).unwrap_or_default()
 				.into_iter().filter(|b| b != id).collect();
 			if Self::given_for_good(e) || !by.is_empty() {
@@ -907,7 +929,14 @@ impl Wallet {
 		}
 		let info = self.server_info()?;
 		let step: Vec<Value> = all.iter().take(HISTORY_STEP).cloned().collect();
-		let TakenServed { mut restored, not_recovered, mut notes, given_elsewhere: _ } = self.take_served(&info, &step, &[], false, None)?;
+		// A step cut short (the program closed, the link lost) may have taken
+		// a coin and not yet applied how it was given up: such a coin is
+		// settled first, as a coin held by another way is, so a step resumed
+		// never leaves it counted.
+		let (unheld, mut notes) = self.settle_held_history(&step)?;
+		let TakenServed { mut restored, not_recovered, notes: taken_notes, given_elsewhere: _ } =
+			self.take_served(&info, &unheld, &[], false, None)?;
+		notes.extend(taken_notes);
 		notes.extend(self.held_records_spend()?);
 		let (rest, settled) = self.settle_held_history(&all[step.len().min(all.len())..])?;
 		notes.extend(settled);
@@ -919,8 +948,9 @@ impl Wallet {
 				v["state"] = json!(c.state);
 			}
 		}
+		let left = self.history_left()?;
 		Ok(Some(json!({"checked": step.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes,
-			"left": self.history_left()?})))
+			"left": left, "loading": left > 0})))
 	}
 
 	/// The coins that held coins' records spend in a transfer, among those

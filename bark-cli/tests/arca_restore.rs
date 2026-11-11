@@ -1148,6 +1148,14 @@ fn block_height(r: &Running, txid: &str) -> u64 {
 	h["height"].as_u64().unwrap()
 }
 
+/// The list of a restore's history a store holds, as stored.
+fn history_list(w: &Arca) -> Vec<(String, String)> {
+	let db = rusqlite::Connection::open(w.dir.join("arca.sqlite")).unwrap();
+	["restore_history", "restore_history_ids"].iter()
+		.map(|k| (k.to_string(), db.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get::<_, String>(0)).unwrap()))
+		.collect()
+}
+
 /// A store's birthday: the height its reads of the chain start from.
 fn birthday(w: &Arca) -> u64 {
 	let db = rusqlite::Connection::open(w.dir.join("arca.sqlite")).unwrap();
@@ -1217,6 +1225,13 @@ async fn a_long_history_is_restored_after_the_balance() {
 		assert_eq!(coin_of(&a2, id), Value::Null, "spent coin {} is not held before its step", id);
 	}
 	assert_eq!(birthday(&a2), block_height(&r, &board_tx), "the birthday is the board's block");
+	// While the history fills, the balance says so: an activity view reads
+	// it as still loading, never as complete.
+	let bal = a2.ok(&["balance"]);
+	assert_eq!(bal["history"], json!({"loading": true, "left": history}), "{}", bal);
+	assert!(a.ok(&["balance"])["history"].is_null(), "A's history is whole");
+	assert_eq!(restore["deposits"]["owed"], true, "{}", restore);
+	let list_before = history_list(&a2);
 
 	let step = a2.ok(&["restore-history"]);
 	println!("LH A2's first step: checked {} | left {} | notes {}", step["checked"], step["left"], step["notes"]);
@@ -1230,6 +1245,32 @@ async fn a_long_history_is_restored_after_the_balance() {
 	assert_eq!(checked.len() as u64, history as u64 - left, "every coin off the list is held");
 	assert!(checked.iter().all(|c| c["state"] == "spent"), "each of them spent: {:?}", checked);
 	assert_eq!(tree_balance(&a2), tree_balance(&a), "a step moves no balance");
+
+	// The same step cut short (the program closed mid-step): the coins it
+	// took are held as it took them, before how each was given up was
+	// applied, and the list is as before the step. The step run again
+	// resumes the list where it stopped: it settles those coins first, and
+	// nothing it took is left counted.
+	let cut: Vec<String> = checked.iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	{
+		let db = rusqlite::Connection::open(a2.dir.join("arca.sqlite")).unwrap();
+		for id in &cut {
+			db.execute("UPDATE coin SET state = 'live', spent_by = NULL, note = '' WHERE leaf_id = ?1", [id]).unwrap();
+		}
+		for (k, v) in &list_before {
+			db.execute("INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2", [k, v]).unwrap();
+		}
+	}
+	assert_ne!(tree_balance(&a2), tree_balance(&a), "cut short, the coins the step took are counted");
+	let resumed = a2.ok(&["restore-history"]);
+	println!("LH A2's step resumed after one cut short: checked {} | left {} | restored {}", resumed["checked"], resumed["left"],
+		resumed["restored"]);
+	assert_eq!(resumed["left"], left, "the list resumes where the step stopped: {}", resumed);
+	assert_eq!(resumed["restored"], json!([]), "nothing taken twice: {}", resumed);
+	for id in &cut {
+		assert_eq!(coin_of(&a2, id)["state"], "spent", "coin {} settled again", id);
+	}
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "resumed, nothing it took is counted");
 
 	// A restore run again, as after one cut short: nothing twice.
 	let again = a2.ok(&["restore"]);
@@ -1264,7 +1305,27 @@ async fn a_long_history_is_restored_after_the_balance() {
 	assert!(diff.is_empty(), "A2's coins are A's: {:?}", diff);
 	assert_eq!(tree_balance(&a2), tree_balance(&a));
 	assert_eq!(birthday(&a2), block_height(&r, &board_tx));
-	for w in [&a, &a2, &b] {
+	assert!(a2.ok(&["balance"])["history"].is_null(), "the history is whole: no longer loading");
+
+	// The reference: A3, restored from the same mnemonic with every coin
+	// checked before the restore returns, as a restore did before the
+	// history waited. A2's store, its history complete, is A3's: every coin
+	// and every field of it, the birthday too.
+	let a3 = Arca::new("LHA3");
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic, "--restore-at-once"]);
+	let made3 = a3.ok(&args);
+	assert!(made3["restore"]["error"].is_null(), "{}", made3["restore"]);
+	assert_eq!(made3["restore"]["history"]["left"], 0, "{}", made3["restore"]["history"]);
+	a2.ok(&["sync"]);
+	a3.ok(&["sync"]);
+	let (c2, c3) = (a2.ok(&["coins"]), a3.ok(&["coins"]));
+	println!("LH coins differing (A3 at once | A2 stepped): {:?}", differences(&c3, &c2));
+	assert_eq!(by_id(&c2), by_id(&c3), "A2's coins are byte for byte those of the restore that checks everything at once");
+	assert_eq!(serde_json::to_string(&by_id(&c2)).unwrap(), serde_json::to_string(&by_id(&c3)).unwrap());
+	assert_eq!(birthday(&a2), birthday(&a3));
+	assert_eq!(tree_balance(&a2), tree_balance(&a3));
+	for w in [&a, &a2, &a3, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
