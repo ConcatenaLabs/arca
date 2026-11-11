@@ -464,6 +464,11 @@ pub struct ParticipationsInfo {
 	/// slot of an accumulator batch without a sweep (`accumulator-4`).
 	#[serde(default)]
 	pub record_formats: bool,
+	/// The operator reads `arriving` on a participation: a refresh of
+	/// payments arriving runs ahead of other refreshes, and the in-flight
+	/// cap does not hold it.
+	#[serde(default)]
+	pub arriving: bool,
 }
 
 /// The dates a board, and every coin resting on it, carries: those of a batch
@@ -600,6 +605,11 @@ pub struct ChannelsInfo {
 	pub capacity: String,
 	/// The credit window every channel leaf carries, in 512-second units.
 	pub window_units: u16,
+	/// The most the operator holds on its own side of all its channel leaves
+	/// of the asset together, in its atoms; absent for no total. A channel
+	/// past it opens only once others close.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub total: Option<String>,
 }
 
 /// What the operator serves of a supervised asset.
@@ -1904,6 +1914,14 @@ pub struct SubmitParticipation {
 	/// part of the participation's id.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub record_formats: Vec<String>,
+	/// The coins among `inputs` the wallet names as payments arriving
+	/// (received out of round, past what it counts as its own at once), by
+	/// leaf id, when the operator reads them (`info.participations.arriving`):
+	/// a refresh giving up only coins received out of round that names some
+	/// runs ahead of other refreshes and is not held by the in-flight cap.
+	/// Not part of the participation's id.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub arriving: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

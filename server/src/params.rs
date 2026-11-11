@@ -90,6 +90,10 @@ pub struct AssetParams {
 	/// The most the operator puts on its own side of a `channel-1` leaf in
 	/// the asset ([`crate::channels`]); zero, the default, makes none.
 	pub channel_capacity: Amount,
+	/// The most the operator holds on its own side of all its `channel-1`
+	/// leaves of the asset together, open or being opened: a participation
+	/// that would open past it is refused. No total when `None`.
+	pub channel_total: Option<Amount>,
 	/// Set when the operator serves the asset as a restricted asset in its
 	/// issuer's tree: its leaves are `enclave-1`, and its policy server
 	/// co-signs beside the operator ([`crate::restricted`]).
@@ -520,6 +524,14 @@ impl Params {
 		let a = self.assets.get(asset).ok_or_else(|| format!("asset {} is not served by this operator", asset))?;
 		a.channel_capacity.atoms(self.rates.last(asset)).ok_or_else(|| format!("asset {}'s channel capacity is a value in the \
 			reference unit, and the operator has no rate for it yet", asset))
+	}
+
+	/// The asset's total channel capacity in its atoms
+	/// ([`AssetParams::channel_total`]): `None` for no total; a total set as a
+	/// value with no rate yet counts as 0, so no channel opens on a guess.
+	pub fn channel_capacity_total(&self, asset: &AssetId) -> Option<u64> {
+		let a = self.assets.get(asset)?;
+		a.channel_total.map(|c| c.atoms(self.rates.last(asset)).unwrap_or(0))
 	}
 
 	/// The asset's in-flight cap in its atoms ([`AssetParams::in_flight_cap`]):
