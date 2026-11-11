@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use common::cli::Arca;
 use common::node::{self, op_true};
 use common::running::{keypair, Running, MIN_LEAF};
-use server::server::AssetSection;
+use server::server::{AssetSection, Server};
 use server::store::RoundState;
 
 fn hex(b: &[u8]) -> String {
@@ -483,6 +483,126 @@ async fn a_holder_takes_part_of_a_supervised_balance_out_and_keeps_the_rest_land
 	assert_eq!(change[0]["template"], json!("landing-2"), "{}", change[0]);
 	assert_eq!(change[0]["landing"], landing, "{}", change[0]);
 	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// Fills and Lightning between two wallets holding a supervised asset Z,
+/// with the operator's `landing_2_only` on. Neither is served in Z, by
+/// design: a take's leaf, an `order-3` leaf and its credits, and an `htlc-1`
+/// leaf all pay keys a freeze cannot follow. Each attempt is refused before
+/// anything is signed, and every coin of both wallets keeps its state.
+///
+/// - A places an order on the chain selling Z (its change a `landing-2`
+///   leaf); B's take of it is refused (`supervised`).
+/// - A resting order selling Z, and one paid in Z, are refused.
+/// - The operator refuses to start with a Lightning leg in Z, so it makes
+///   no invoice in Z and pays none: B's receive in Z is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_the_switch_fills_and_lightning_in_a_supervised_asset_are_refused_before_signing() {
+	let mut r = Running::start().await;
+	let iss = serve_z(&mut r).await;
+	let (z, x) = (iss.z.to_string(), r.x.to_string());
+	let (url, node_url) = (r.url(), r.node_url());
+	let (a, b) = (Arca::new("SFA"), Arca::new("SFB"));
+	for w in [&a, &b] {
+		w.ok(&create_args(&url, &node_url));
+		for (asset, v) in [(iss.z, 4_000_000), (r.x, 4_000_000)] {
+			let s = script(&w.ok(&["address"]));
+			r.pay_to(s, asset, v);
+		}
+	}
+	r.produce().await;
+	for asset in [&z, &x] {
+		for w in [&a, &b] {
+			w.ok(&["board", asset, "1500000"]);
+		}
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	for w in [&a, &b] {
+		r.wait("the boards credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+		w.ok(&["sync"]);
+	}
+	r.config.landing_2_only = true;
+	r.restart_server().await;
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+
+	// ---- A fill: an order on the chain selling Z, and B's take ---------------
+	let placed = a.ok(&["order", "place", "--sell", &z, "--amount", "200000", "--for", &x, "--rate-num", "1", "--rate-den", "1",
+		"--expires-in-hours", "48", "--wait", "0"]);
+	let order = placed["order"].as_str().unwrap().to_string();
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.iter().map(|b| b.offboards).sum::<usize>(), 1, "the round pays the order's output");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	let a_change: Vec<Value> = live_in(&a, &z).into_iter().filter(|c| c["value"] == placed["change"]).collect();
+	assert_eq!(a_change.len(), 1, "A's change of Z: {:?}", live_in(&a, &z));
+	assert_eq!(a_change[0]["template"], json!("landing-2"), "{}", a_change[0]);
+	// The order rests on the chain once unlocked into its address (by the
+	// wallet itself after the operator's grace); `orders` then shows its offer.
+	common::node::advance_mtp(&r.rt, 900);
+	r.synced().await;
+	a.ok(&["sync"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	a.ok(&["sync"]);
+	let o = a.ok(&["orders"]).as_array().unwrap().iter().find(|o| o["order"] == order.as_str()).cloned().unwrap();
+	assert_eq!(o["state"], "resting", "{}", o);
+	let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("order-sf-{}.json", std::process::id()));
+	std::fs::write(&path, o["offer"].to_string()).unwrap();
+	let offer = format!("@{}", path.display());
+	let before = (states(&a), states(&b));
+	let (ok, v, err) = b.run_full(&["order", "fill", &offer, "--amount", "200000"]);
+	println!("FILL of an order selling Z: ok {} {} {}", ok, v, err.lines().last().unwrap_or(""));
+	assert!(!ok && (v.to_string() + &err).contains("supervised"), "{} {}", v, err);
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	assert_eq!((states(&a), states(&b)), before, "every coin keeps its state after the refused take");
+
+	// ---- Resting orders: selling Z, and paid in Z ------------------------------
+	for (w, sell, want) in [(&a, &z, &x), (&b, &x, &z)] {
+		let before = states(w);
+		let (ok, v, err) = w.run_full(&["order", "rest", "--sell", sell, "--amount", "200000", "--for", want, "--rate-num", "1",
+			"--rate-den", "1", "--min-lot", "100000", "--expires-in-hours", "720"]);
+		println!("RESTING order selling {} for {}: ok {} {} {}", sell, want, ok, v, err.lines().last().unwrap_or(""));
+		assert!(!ok && (v.to_string() + &err).contains("supervised"), "{} {}", v, err);
+		w.ok(&["sync"]);
+		assert_eq!(states(w), before, "every coin keeps its state after the refused resting order");
+	}
+
+	// ---- Lightning in Z ----------------------------------------------------------
+	let mut with_leg = r.config.clone();
+	with_leg.listen = "127.0.0.1:0".into();
+	for s in with_leg.assets.iter_mut().filter(|s| s.asset == z) {
+		s.lightning = Some(server::server::LegSection::at("/nonexistent/lightning-rpc"));
+	}
+	let refused = match Server::start(&with_leg).await {
+		Ok(_) => panic!("the operator started with a Lightning leg in supervised Z"),
+		Err(e) => e.to_string(),
+	};
+	println!("REFUSED a Lightning leg in Z: {}", refused);
+	assert!(refused.contains("no Lightning leg serves it"), "{}", refused);
+	let before = (states(&a), states(&b));
+	let (ok, v, err) = b.run_full(&["lightning", "receive", &z, "100000"]);
+	println!("LIGHTNING receive in Z: ok {} {} {}", ok, v, err.lines().last().unwrap_or(""));
+	assert!(!ok, "{}", v);
+	assert!((v.to_string() + &err).contains("no Lightning node in asset"), "{} {}", v, err);
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	assert_eq!((states(&a), states(&b)), before, "every coin keeps its state after the refused Lightning attempts");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
 }
 
 /// Serves a new supervised asset Z, its signer reading freezes from a node

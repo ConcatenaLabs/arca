@@ -124,6 +124,15 @@ impl Wallet {
 
 	fn quote_of(&self, o: &Order, info: &Value, amount: Option<u64>, max_fee_ppm: Option<u64>) -> Result<(Value, Option<String>), Error> {
 		let (a, b) = (o.terms.asset_a, o.terms.asset_b);
+		// The operator serves no take in a supervised asset (the taker's leaf
+		// is vtxo-1 and the order pays its maker by a path a freeze cannot
+		// follow): refused here, before the wallet pays itself a coin for it.
+		for x in [a, b] {
+			if self.landing_rule(info, x)?.is_some() {
+				return Err(Error::Refused(format!("asset {} is supervised: the operator takes no on-chain order in it, as the leaf a \
+					take makes would be out of a freeze's reach; nothing was signed", x)));
+			}
+		}
 		let min = Self::min_leaf(info, a)?;
 		Self::min_leaf(info, b)?;
 		let filled = amount.unwrap_or(o.locked);
