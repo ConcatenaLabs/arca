@@ -926,6 +926,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		watchtowers: app.params.watchtowers.clone(),
 		batches: api::BatchesInfo { no_sweep: app.params.no_sweep, collect_after_seconds: app.params.collect_after_seconds },
 		mailbox_reads: MAX_MAILBOX_READS as u32,
+		checkpoint_exit: app.params.checkpoint_exit,
 	})
 }
 
@@ -1054,7 +1055,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 			until: o.until,
 		});
 	}
-	Ok(TransferRequest { inputs: ins, outputs })
+	Ok(TransferRequest { inputs: ins, outputs, checkpoint_exit: false })
 }
 
 async fn cosigned_json(app: &App, done: &crate::cosign::Cosigned) -> Result<api::Cosigned, Refusal> {
@@ -1076,7 +1077,9 @@ async fn cosigned_json(app: &App, done: &crate::cosign::Cosigned) -> Result<api:
 
 async fn cosign_transfer(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::Cosigned>, Refusal> {
 	let req: api::CosignTransfer = parse(body, app.max_request)?;
-	let done = app.cosigner.cosign(&transfer_request(&req.inputs, &req.outputs)?).await?;
+	let mut transfer = transfer_request(&req.inputs, &req.outputs)?;
+	transfer.checkpoint_exit = req.checkpoint_exit;
+	let done = app.cosigner.cosign(&transfer).await?;
 	Ok(Json(cosigned_json(&app, &done).await?))
 }
 

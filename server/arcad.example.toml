@@ -43,6 +43,16 @@ holding_back_unauthenticated = false
 # none on a timer.
 round_interval_seconds = 60
 
+# Whether swaps and fills may move each owner's coin into a checkpoint that
+# also has the owner's own exit after its exit delay, so that a swap that can
+# never complete gives every coin back without the operator. A wallet asks for
+# it only where every party to the swap reads the record format it makes; one
+# that never asks is served as before, so turning it on refuses no client.
+# The watcher answers such a checkpoint published early by bringing the other
+# inputs on and publishing the reassignment inside the delay. Changed only by
+# a restart.
+checkpoint_exit = false
+
 # The exit delay bounds, in 512-second units: [min, max]. The default is the
 # specification's 36 to 48 hours, [254, 338]. Changed only by a restart; they
 # bound the leaves made from then on, and what was taken before is finished

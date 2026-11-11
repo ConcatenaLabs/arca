@@ -1357,13 +1357,17 @@ impl Watcher {
 	/// The inputs and committed outputs of the transfer `transfer_id`, from
 	/// the record of a coin it made.
 	async fn transfer_parts(&self, transfer_id: &[u8; 32]) -> Result<(Vec<arca_covenant::ValidInput>, Vec<ExplicitOutput>), WatcherError> {
+		match self.transfer_coin(transfer_id).await?.origin {
+			ValidOrigin::Transfer { inputs, outputs, .. } | ValidOrigin::Fill { inputs, outputs, .. } => Ok((inputs, outputs)),
+			_ => Err(WatcherError::Build(format!("transfer {} made no coin of a transfer", hex(transfer_id)))),
+		}
+	}
+
+	/// The first coin the transfer `transfer_id` made, resolved.
+	async fn transfer_coin(&self, transfer_id: &[u8; 32]) -> Result<ValidCoin, WatcherError> {
 		let t = self.store.transfer(transfer_id).await?.ok_or_else(|| WatcherError::Build(format!("transfer {} is not known", hex(transfer_id))))?;
 		let first = t.outputs.first().ok_or_else(|| WatcherError::Build("a transfer with no outputs".into()))?;
-		let coin = self.coin(&first.0).await?;
-		match coin.origin {
-			ValidOrigin::Transfer { inputs, outputs, .. } | ValidOrigin::Fill { inputs, outputs, .. } => Ok((inputs, outputs)),
-			_ => Err(WatcherError::Build(format!("coin {} is not an output of a transfer", hex(&first.0)))),
-		}
+		self.coin(&first.0).await
 	}
 
 	/// The first coin the fill `transfer_id` of a resting order made,
@@ -1402,26 +1406,44 @@ impl Watcher {
 	async fn answer_fill(&self, transfer_id: &[u8; 32], bring: bool) -> Result<(), WatcherError> {
 		let coin = self.fill_coin(transfer_id).await?;
 		let ValidOrigin::Fill { order, inputs, outputs, .. } = &coin.origin else { unreachable!("a fill's coin") };
-		let Some(order_at) = self.unspent_at(&order.leaf.script_pubkey()).await? else { return Ok(()) };
-		if self.spending(&order_at).await? {
-			return Ok(());
+		let order_at = self.unspent_at(&order.leaf.script_pubkey()).await?;
+		if let Some(o) = order_at {
+			if self.spending(&o).await? {
+				return Ok(());
+			}
 		}
 		let now = self.now().await?;
 		let mut at = vec![];
-		let mut missing = false;
+		let mut missing = vec![];
+		let mut exit_open = false;
 		for i in inputs {
 			match self.unspent_at(&i.checkpoint_output().script_pubkey).await? {
-				Some(op) if !self.spending(&op).await? => at.push(op),
-				Some(_) => return Ok(()),
-				None => {
-					missing = true;
-					if bring && self.unspent_at(&i.coin.leaf.script_pubkey()).await?.is_none() {
-						Box::pin(self.bring_on_chain(&i.coin, now)).await?;
-					}
+				Some(op) if !self.spending(&op).await? => {
+					exit_open |= i.checkpoint.exit.is_some();
+					at.push(op);
 				},
+				Some(_) => return Ok(()),
+				None => missing.push(i),
 			}
 		}
-		if missing {
+		// A taker's checkpoint with its owner's exit on the chain gives the
+		// taker's coin back once its delay has run: the fill is then the
+		// operator's to complete, every other taker coin brought on as for
+		// a stale exit of the order's coin.
+		if bring || exit_open {
+			for i in &missing {
+				if self.unspent_at(&i.coin.leaf.script_pubkey()).await?.is_none() {
+					Box::pin(self.bring_on_chain(&i.coin, now)).await?;
+				}
+			}
+		}
+		let Some(order_at) = order_at else {
+			if exit_open {
+				Box::pin(self.bring_on_chain(order, now)).await?;
+			}
+			return Ok(());
+		};
+		if !missing.is_empty() {
 			return Ok(());
 		}
 		// What the inputs hold beyond the outputs, per asset: the fill's
@@ -1454,6 +1476,15 @@ impl Watcher {
 
 	/// Publishes the reassignment of the transfer that spent the coin
 	/// `input_leaf`, once every checkpoint it spends is on the chain unspent.
+	///
+	/// A checkpoint with its owner's exit ([`arca_covenant::checkpoint`])
+	/// gives its coin back to its owner once its exit delay has run, so one
+	/// on the chain is answered as a stale exit is: every other input is
+	/// brought on (one step a pass; once its leaf is there, its checkpoint
+	/// follows as the answer to its stale exit), and the reassignment goes
+	/// out once all are there, inside the delay. Unanswered, the owner's exit
+	/// would void every coin the reassignment made, those the operator holds
+	/// (a forfeit, a payment to it) among them.
 	async fn publish_reassignment(&self, input_leaf: &[u8; 32]) -> Result<(), WatcherError> {
 		let t = match self.store.spent_by_transfer(input_leaf).await? {
 			Some(t) => t,
@@ -1464,6 +1495,8 @@ impl Watcher {
 		}
 		let (inputs, outputs) = self.transfer_parts(&t).await?;
 		let mut at = vec![];
+		let mut missing = vec![];
+		let mut exit_open = false;
 		for i in &inputs {
 			let script = i.checkpoint_output().script_pubkey;
 			let mut found = None;
@@ -1474,9 +1507,23 @@ impl Watcher {
 				}
 			}
 			match found {
-				Some(op) if !self.spending(&op).await? => at.push(op),
-				_ => return Ok(()),
+				Some(op) if !self.spending(&op).await? => {
+					exit_open |= i.checkpoint.exit.is_some();
+					at.push(op);
+				},
+				Some(_) => return Ok(()),
+				None => missing.push(i),
 			}
+		}
+		if !missing.is_empty() {
+			if exit_open {
+				// A coin the reassignment made brings every input on: a
+				// board's checkpoint from the board output, a leaf's path.
+				let now = self.now().await?;
+				let made = self.transfer_coin(&t).await?;
+				Box::pin(self.bring_on_chain(&made, now)).await?;
+			}
+			return Ok(());
 		}
 		// The margins of every input, per asset: one pays the fee, or a
 		// wallet coin pays and they go to its change.

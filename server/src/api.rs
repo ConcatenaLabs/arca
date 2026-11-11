@@ -195,6 +195,11 @@ pub struct Info {
 	/// whose wallets read each key's mailbox with `mailbox_read`.
 	#[serde(default)]
 	pub mailbox_reads: u32,
+	/// Whether the operator co-signs a transfer or a fill whose checkpoints
+	/// carry their owners' exit (`checkpoint_exit` in the request): false
+	/// for an operator that does not, or a server that predates it.
+	#[serde(default)]
+	pub checkpoint_exit: bool,
 }
 
 /// How the operator builds its batches.
@@ -955,6 +960,12 @@ pub struct BatchRound {
 pub struct CosignTransfer {
 	pub inputs: Vec<TransferInput>,
 	pub outputs: Vec<TransferOutput>,
+	/// Each input's coin, where it is of a plain leaf, moves into a
+	/// checkpoint with its owner's exit ([`Info::checkpoint_exit`]); the
+	/// owners' signatures are over that checkpoint. Absent or false: none
+	/// does.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub checkpoint_exit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1348,6 +1359,10 @@ pub struct OrderFill {
 	pub inputs: Vec<TransferInput>,
 	/// The taker's leaves: of what it fills, then its change.
 	pub outputs: Vec<TransferOutput>,
+	/// Each taker coin of a plain leaf moves into a checkpoint with its
+	/// owner's exit ([`Info::checkpoint_exit`]); absent or false: none does.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub checkpoint_exit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
