@@ -382,7 +382,8 @@ the old one its notice by name once the new one is named
 for its asset, and read the operator's other limits from `info`: each asset's
 in-flight cap, and, when `BOND_INSTANT_BUDGET` is set (written into arcad's
 `[bond] instant_budget_fraction`), the share of the bond the operator suggests a maker, swap
-service or LSP hold out of round at once
+service or LSP hold out of round at once, and, when arcad's configuration
+sets `[bond] instant_limit_value`, the instant limit it suggests a wallet keep
 ([Limits an operator publishes](../server/README.md#limits-an-operator-publishes)).
 
 ## Listing the operator in the registry

@@ -261,7 +261,10 @@ max_margin_multiple = 25
 # channel_capacity (or channel_capacity_value, a value in atoms of the
 # reference unit at the asset's rate) is the most the operator puts on its own
 # side of a channel-1 leaf of the asset (README, "Channel leaves"); no channel
-# leaf of the asset is made when absent.
+# leaf of the asset is made when absent. channel_capacity_total (or
+# channel_capacity_total_value) is the most it holds on its side of all of
+# them together; a channel past it is refused until others close. No total
+# when absent.
 #
 # in_flight_cap (or in_flight_cap_value) is the most of the asset the
 # operator fronts for refreshes whose old coins have not come back yet; a
@@ -278,6 +281,7 @@ min_leaf = "1000"
 # lightning_base = "0"
 # min_leaf_value = "100000"
 # channel_capacity = "1000000"
+# channel_capacity_total = "300000000"
 # in_flight_cap = "500000000"
 # [assets.rate]
 # source = "file"
@@ -308,6 +312,7 @@ min_leaf = "1000"
 # outpoint = "<txid>:<vout>"
 # notice = "<txid>:<vout>"
 # instant_budget_fraction = 0.1   # optional: the share of the bond suggested to counterparties
+# instant_limit_value = "50000000000"   # optional: the instant limit suggested to wallets, in atoms of the reference unit
 
 # Takes of on-chain orders (take_order): no order is taken, or filled in a
 # round, whose maker can refund it within order_margin_seconds, an order

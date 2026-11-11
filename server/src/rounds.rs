@@ -2265,11 +2265,16 @@ impl Rounds {
 	{
 		let mut chosen: Vec<ParticipationRow> = vec![];
 		let mut count = 0usize;
+		// A refresh of payments arriving goes first: its owner waits on this
+		// round to have the payment at all. The rest keep their order.
+		let mut rows = Vec::with_capacity(ids.len());
 		for id in ids {
-			let row = match self.store.participation(id).await? {
-				Some(r) => r,
-				None => continue,
-			};
+			if let Some(r) = self.store.participation(id).await? {
+				rows.push(r);
+			}
+		}
+		rows.sort_by_key(|r| r.arriving.is_empty());
+		for row in rows {
 			if row.state != ParticipationState::Pending || row.fill.is_some() || Self::asset_of(&row) != Some(asset) {
 				continue;
 			}
@@ -2689,6 +2694,23 @@ impl Rounds {
 		let mut asks = Vec::with_capacity(chosen.len());
 		for row in &chosen {
 			let mut ask = CapAsk::default();
+			// A refresh that names payments arriving and gives up only coins
+			// received out of round is never held by the cap: its owner has
+			// the payment only once a round refreshes it, and a coin out of
+			// round is what the bond and its holder want refreshed soonest.
+			// A wallet can name only coins out of round, so it carries no
+			// round's coin past the cap this way.
+			if !row.arriving.is_empty() {
+				let mut out_of_round = true;
+				for i in row.inputs.iter().filter(|i| !i.returned) {
+					let kind = match self.store.leaf(&i.leaf_id).await? {
+						Some(l) => CoinRecord::from_bytes(&l.record).ok().map(|r| matches!(r, CoinRecord::Transfer(_) | CoinRecord::Fill(_))),
+						None => None,
+					};
+					out_of_round &= kind == Some(true);
+				}
+				ask.exempt |= out_of_round;
+			}
 			for i in row.inputs.iter().filter(|i| !i.returned) {
 				let asset = AssetId::from_byte_array(i.asset);
 				if !caps.contains_key(&asset) {
@@ -4655,7 +4677,7 @@ mod tests {
 
 	fn take(n: u8, at: OutPoint, terms: &FillOrder, locked: u64, filled: u64, shared: bool) -> ParticipationRow {
 		ParticipationRow {
-			record_formats: vec![],
+			record_formats: vec![], arriving: vec![],
 			id: [n; 32], unlock_hash: [0; 32], preimage: [0; 32], attempt: 0, round_id: None, state: ParticipationState::Pending,
 			not_before: None, refund_delay_units: 1, inputs: vec![], outputs: vec![], fees: vec![], waiting: None, void_reason: None,
 			fill: Some(FillRow {
