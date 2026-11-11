@@ -45,7 +45,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?, brief?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
-	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
+	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, instant_limit {value}, coin_places, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
 	fee_asset?}, channel_code {address?}, leaf_template {template?}, require_checkpoint_exit {on?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
 	address | script, fee_asset?, max_fee_ppm?, shown?}, offboards";
@@ -236,7 +236,7 @@ fn reads_only(command: &str) -> bool {
 		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
 		| "info" | "supply" | "leaf_template" | "require_checkpoint_exit" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
 		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
-		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed")
+		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed" | "coin_places")
 }
 
 /// What `arca` runs before a command: the witness (unless the command stays
@@ -297,6 +297,16 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			};
 			w.set_instant_budget_text(&share)
 		},
+		// Atoms of the reference unit, as text or a number, or "off".
+		"instant_limit" => {
+			let value = match &a["value"] {
+				Value::String(t) => t.clone(),
+				Value::Number(n) => n.to_string(),
+				_ => return Err(Error::Parse("the value is missing: atoms of the reference unit, or \"off\"".into())),
+			};
+			w.set_instant_limit_text(&value)
+		},
+		"coin_places" => w.coin_places(),
 		"watch_bond" => {
 			let lines = a["evidence"].as_array().cloned().unwrap_or_default();
 			let fee = a["fee_asset"].as_str().map(asset).transpose()?;

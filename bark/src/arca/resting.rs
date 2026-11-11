@@ -229,7 +229,7 @@ impl Wallet {
 		// refresh that waits is taken back first when the live coins fall
 		// short.
 		self.free_when_short(a, ask.amount)?;
-		let coins = self.coins_to_give(a)?;
+		let coins = self.coins_to_give(a, super::places::Spend::Trade)?;
 		// The schedule charges nothing when it has neither a rate nor a base:
 		// then no coin needs reading for its date.
 		let free = schedule["refresh_ppm"].as_u64().unwrap_or(0) == 0
@@ -655,7 +655,7 @@ impl Wallet {
 		// maker reads no coin record of the newer format.
 		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
 		let mut unread = 0u64;
-		for mut c in self.coins_to_give(asset_b)? {
+		for mut c in self.coins_to_give(asset_b, super::places::Spend::Trade)? {
 			if c.row.expiry < order_expiry {
 				continue;
 			}

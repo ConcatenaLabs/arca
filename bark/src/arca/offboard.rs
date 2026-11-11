@@ -114,7 +114,7 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		let (mut total, mut refresh) = (0u64, 0u64);
 		let mut done = None;
-		for c in self.coins_to_give(asset)? {
+		for c in self.coins_to_give(asset, super::places::Spend::Leave)? {
 			if chosen.len() == super::round::MAX_GIVEN {
 				return Err(Self::too_many_coins(asset, total, amount.saturating_add(refresh).saturating_add(offboard)));
 			}
