@@ -770,7 +770,7 @@ def connector_taptree(s_x):
     return tap, {"issue": issue}
 
 
-def checkpoint_taptree(a_x, s_x, salt, ctag, sweep, exit_delay=None):
+def checkpoint_taptree(a_x, s_x, salt, ctag, sweep, exit_delay=None, exit_script=None):
     """Checkpoint output: the leaf's collaborative path with the checkpoint's
     own salt, and the sweep with notice of its batch; for a coin of a batch
     without a sweep (sweep None), the collaborative path alone.
@@ -779,10 +779,13 @@ def checkpoint_taptree(a_x, s_x, salt, ctag, sweep, exit_delay=None):
     operand), the coin's exit script beside them: [collab, exit] without a
     sweep, [collab, [sweep, exit]] with one. A reassignment of several
     owners' coins that can never complete then gives each owner its coin
-    back alone after the delay (T28)."""
+    back alone after the delay (T28). A landing-1 coin's checkpoint exits by
+    its landing instead (exit_script, landing_exit over the checkpoint's
+    value less the coin's allowance), so a supervised coin still lands where
+    its issuer's freeze binds."""
     collab = collab3_loop(a_x, s_x, salt, ctag, fold=True)
     if exit_delay is not None:
-        ex = exit_leaf(a_x, exit_delay)
+        ex = exit_script if exit_script is not None else exit_leaf(a_x, exit_delay)
         if sweep is None:
             tap = taproot_construct(NUMS, [("collab", collab), ("exit", ex)])
             return tap, {"collab": collab, "exit": ex}

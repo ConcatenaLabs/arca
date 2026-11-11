@@ -709,7 +709,7 @@ impl Orders {
 		let dummy = Signature::from_slice(&[1; 64]).expect("64 bytes");
 		let pair = Pair { operator: dummy, owner: dummy };
 		let sized: Vec<ValidInput> = checked.iter().zip(&req.inputs).map(|(c, i)| ValidInput {
-			coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed()),
+			coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed(), i.checkpoint_value),
 			checkpoint_value: i.checkpoint_value, checkpoint_pair: pair,
 			reassignment_pair: pair,
 		}).collect();

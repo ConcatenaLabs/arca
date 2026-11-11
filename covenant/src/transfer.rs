@@ -60,7 +60,8 @@
 //! script, and the tag keeps that salt apart from every leaf's. The checkpoint
 //! sweeps with the notice of the batch the coin descends from (for a coin from
 //! a reassignment of several, the first input's, recursively). In a
-//! reassignment of several owners' coins, each coin of a plain leaf may move
+//! reassignment of several owners' coins, each coin of a plain leaf or of a
+//! supervised asset may move
 //! into a checkpoint with its owner's exit ([`TransferPlan::checkpoint_exit`],
 //! [`crate::checkpoint`]), which gives the coin back alone if the reassignment
 //! can never complete.
@@ -502,7 +503,7 @@ pub enum TransferError {
 	NotAnOrder,
 	#[error("the fill: {0}")]
 	Fill(String),
-	#[error("input {0}: a checkpoint with its owner's exit holds a coin of a plain leaf only (vtxo-1 or vtxo-2)")]
+	#[error("input {0}: a checkpoint with its owner's exit holds a coin of a plain leaf (vtxo-1 or vtxo-2) or a landing-1 leaf only")]
 	CheckpointExit(usize),
 }
 
@@ -778,20 +779,29 @@ impl ValidCoin {
 	/// The checkpoint this coin moves into when transferred: its own salt,
 	/// the sweep of the batch it descends from, and no exit.
 	pub fn checkpoint(&self) -> CheckpointPolicy {
-		self.checkpoint_of(false)
+		self.checkpoint_of(false, self.value)
 	}
 
 	/// [`ValidCoin::checkpoint`], with its owner's exit after the coin's own
-	/// exit delay when `exit` is set ([`crate::checkpoint`]).
-	pub fn checkpoint_of(&self, exit: bool) -> CheckpointPolicy {
+	/// exit delay when `exit` is set ([`crate::checkpoint`]), for a
+	/// checkpoint keeping `value`: a `landing-1` coin's exit is its landing,
+	/// at least `value` less the coin's allowance.
+	pub fn checkpoint_of(&self, exit: bool, value: u64) -> CheckpointPolicy {
+		let exit = exit.then(|| crate::checkpoint::CheckpointExit {
+			delay: self.leaf.exit_delay,
+			landing: self.leaf.landing.map(|l| crate::LandingTerms {
+				min_value: value.saturating_sub(self.value.saturating_sub(l.min_value)), ..l
+			}),
+		});
 		CheckpointPolicy {
 			owner: self.leaf.owner, operator: self.leaf.operator, salt: checkpoint_salt(&self.leaf.salt),
-			chain: self.leaf.chain, sweep: self.sweep, v2: self.leaf.v2, exit: exit.then_some(self.leaf.exit_delay),
+			chain: self.leaf.chain, sweep: self.sweep, v2: self.leaf.v2, exit,
 		}
 	}
 
 	/// Whether this coin may move into a checkpoint with its owner's exit:
-	/// a coin of a plain leaf ([`crate::checkpoint::exit_allowed`]).
+	/// a coin of a plain leaf or a `landing-1` leaf
+	/// ([`crate::checkpoint::exit_allowed`]).
 	pub fn exit_allowed(&self) -> bool {
 		crate::checkpoint::exit_allowed(&self.leaf)
 	}
@@ -1017,7 +1027,7 @@ pub struct TransferPlan {
 	pub inputs: Vec<(ValidCoin, u64)>,
 	/// The committed outputs.
 	pub outputs: Vec<ExplicitOutput>,
-	/// Whether each coin of a plain leaf moves into a checkpoint with its
+	/// Whether each coin of a plain or a `landing-1` leaf moves into a checkpoint with its
 	/// owner's exit ([`crate::checkpoint`]); a coin of any other leaf moves
 	/// into one without, as every coin does when this is not set. A
 	/// reassignment of several owners' coins sets it, where every party
@@ -1033,7 +1043,7 @@ impl TransferPlan {
 
 	/// The checkpoint of input `i`.
 	pub fn checkpoint(&self, i: usize) -> CheckpointPolicy {
-		self.inputs[i].0.checkpoint_of(self.exit(i))
+		self.inputs[i].0.checkpoint_of(self.exit(i), self.inputs[i].1)
 	}
 
 	/// The checkpoint output of input `i`.
@@ -1132,7 +1142,7 @@ fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[Expl
 		if input.exit && !coin.exit_allowed() {
 			return Err(TransferError::CheckpointExit(k + first));
 		}
-		named.push(ExplicitOutput::new(coin.asset, input.checkpoint_value, coin.checkpoint_of(input.exit).script_pubkey()).txout());
+		named.push(ExplicitOutput::new(coin.asset, input.checkpoint_value, coin.checkpoint_of(input.exit, input.checkpoint_value).script_pubkey()).txout());
 	}
 	let mut out = Vec::with_capacity(inputs.len());
 	for (k, (input, coin)) in inputs.iter().zip(coins).enumerate() {
@@ -1140,7 +1150,7 @@ fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[Expl
 		if input.checkpoint_value == 0 || input.checkpoint_value > coin.value {
 			return Err(TransferError::CheckpointValue { value: input.checkpoint_value, coin: coin.value });
 		}
-		let checkpoint = coin.checkpoint_of(input.exit);
+		let checkpoint = coin.checkpoint_of(input.exit, input.checkpoint_value);
 		let cp_out = ExplicitOutput::new(coin.asset, input.checkpoint_value, checkpoint.script_pubkey());
 		coin.leaf.verify(coin.asset, coin.value, &[cp_out], &input.checkpoint)
 			.map_err(|error| TransferError::Pair { input: k, pair: "checkpoint", error })?;
@@ -1421,7 +1431,7 @@ impl CoinRecord {
 				// leaf is the policy's operator's, on the policy's chain.
 				let coins = t.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
 				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().zip(&t.inputs)
-					.map(|(c, i)| (c.id, c.checkpoint_of(i.exit).taproot().program())).collect();
+					.map(|(c, i)| (c.id, c.checkpoint_of(i.exit, i.checkpoint_value).taproot().program())).collect();
 				let values: Vec<u64> = t.inputs.iter().map(|i| i.checkpoint_value).collect();
 				let spend = spend_hash(&parts, &values, &t.outputs);
 				for (k, coin) in coins.iter().enumerate() {
@@ -1490,7 +1500,7 @@ impl CoinRecord {
 				op.judge(&txouts, 0, order.value, fill.partial).map_err(|e| TransferError::Fill(e.to_string()))?;
 				let coins = fill.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
 				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().zip(&fill.inputs)
-					.map(|(c, i)| (c.id, c.checkpoint_of(i.exit).taproot().program())).collect();
+					.map(|(c, i)| (c.id, c.checkpoint_of(i.exit, i.checkpoint_value).taproot().program())).collect();
 				let mut values = vec![order.value];
 				values.extend(fill.inputs.iter().map(|i| i.checkpoint_value));
 				let hash = fill_hash((order.id, order.leaf.program()), &parts, &fill.outputs);

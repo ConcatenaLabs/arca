@@ -874,7 +874,7 @@ of several owners' coins, so if one owner and an operator signed a second
 spend of that owner's checkpoint, the reassignment could never confirm and
 each other owner's coin would stand in a checkpoint only it and the operator
 can spend together. A transfer or a fill that sets `checkpoint_exit` moves each
-coin of a plain leaf into a checkpoint that also has the coin's own exit
+coin of a plain leaf or of a supervised asset into a checkpoint that also has the coin's own exit (a supervised coin's is its landing)
 after its exit delay (`arca-covenant`'s `checkpoint`), and its owners sign
 that checkpoint. The server co-signs such a request only with the top-level
 setting `checkpoint_exit = true`, which `info.checkpoint_exit` publishes; when

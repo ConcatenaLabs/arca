@@ -78,10 +78,13 @@ fn policies() -> Vec<Policy> {
 		Policy::Node(NodePolicy::new(children.clone(), s, owners.clone(), None, Some(chain())).unwrap()
 			.with_reclaim_lock(MedianTime::from_consensus(1_790_000_000).unwrap()).unwrap()),
 		Policy::Checkpoint(CheckpointPolicy { exit: None, owner: a, operator: s, salt: label32("cp2"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: true }),
-		Policy::Checkpoint(CheckpointPolicy { exit: Some(sch.notice), owner: a, operator: s, salt: label32("cp3"), chain: chain(), sweep: None, v2: false }),
-		Policy::Checkpoint(CheckpointPolicy { exit: Some(sch.notice), owner: a, operator: s, salt: label32("cp4"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: false }),
-		Policy::Checkpoint(CheckpointPolicy { exit: Some(sch.notice), owner: a, operator: s, salt: label32("cp5"), chain: chain(), sweep: None, v2: true }),
-		Policy::Checkpoint(CheckpointPolicy { exit: Some(sch.notice), owner: a, operator: s, salt: label32("cp6"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: true }),
+		Policy::Checkpoint(CheckpointPolicy { exit: Some(arca_covenant::CheckpointExit::plain(sch.notice)), owner: a, operator: s, salt: label32("cp3"), chain: chain(), sweep: None, v2: false }),
+		Policy::Checkpoint(CheckpointPolicy { exit: Some(arca_covenant::CheckpointExit::plain(sch.notice)), owner: a, operator: s, salt: label32("cp4"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: false }),
+		Policy::Checkpoint(CheckpointPolicy { exit: Some(arca_covenant::CheckpointExit::plain(sch.notice)), owner: a, operator: s, salt: label32("cp5"), chain: chain(), sweep: None, v2: true }),
+		Policy::Checkpoint(CheckpointPolicy { exit: Some(arca_covenant::CheckpointExit::plain(sch.notice)), owner: a, operator: s, salt: label32("cp6"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: true }),
+		Policy::Checkpoint(CheckpointPolicy { exit: Some(arca_covenant::CheckpointExit { delay: sch.notice,
+			landing: Some(arca_covenant::LandingTerms { program: [9; 20], asset: asset("Z"), min_value: 97_000 }) }),
+			owner: a, operator: s, salt: label32("cp7"), chain: chain(), sweep: Some(sch.sweep(true, false)), v2: false }),
 		Policy::Offboard(OffboardPolicy {
 			unlock_hash: label32("h"), destination: ExplicitOutput::new(asset("X"), 1_000, Script::from(vec![0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])),
 			operator: s, reclaim_delay: sch.notice,
@@ -122,8 +125,8 @@ fn malformed_encodings_are_refused() {
 	b[0] = 2;
 	assert_eq!(Policy::decode(&b), Err(DecodeError::Version(2)));
 	let mut b = leaf.clone();
-	b[1] = 19;
-	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(19)));
+	b[1] = 20;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::PolicyType(20)));
 	// a key that is not on the curve: x = 0xff..ff is above the field size
 	let mut b = leaf.clone();
 	b[2..34].copy_from_slice(&[0xff; 32]);
