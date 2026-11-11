@@ -1320,10 +1320,10 @@ impl Wallet {
 				Err(_) => {
 					let as_of = first_expiry(&record).filter(|t| *t < now.to_consensus_u32())
 						.and_then(|t| arca_covenant::MedianTime::from_consensus(t).ok());
-					let Some(as_of) = as_of else { return Err(e) };
+					let Some(as_of) = as_of else { return Err(self.unkept(e, &record, claimed)) };
 					match self.assess(&record, &WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) }, Some((&owner, &nonce))) {
 						Ok(a) => (a, true, true),
-						Err(_) => return Err(e),
+						Err(_) => return Err(self.unkept(e, &record, claimed)),
 					}
 				},
 			},
@@ -1392,7 +1392,8 @@ impl Wallet {
 		if let Some(e) = &boards_spent {
 			if !home && !late && !due {
 				if self.cut_by_final_spend(&a.valid)? {
-					return Err(Error::Refused(format!("{}, and a final spend that is no step of the coin's path has cut it", e)));
+					let why = format!("{}, and a final spend that is no step of the coin's path has cut it", e);
+					return Err(self.dead_trade(Error::Refused(why), &a.valid, &record, claimed));
 				}
 				answer = true;
 			}
@@ -1419,7 +1420,8 @@ impl Wallet {
 		if let Some(e) = &on_chain {
 			if !late && !home && !due && !answer {
 				if self.cut_by_final_spend(&a.valid)? {
-					return Err(Error::Refused(format!("{}, and a final spend that is no step of the coin's path has cut it", e)));
+					let why = format!("{}, and a final spend that is no step of the coin's path has cut it", e);
+					return Err(self.dead_trade(Error::Refused(why), &a.valid, &record, claimed));
 				}
 				answer = true;
 			}
@@ -2254,6 +2256,10 @@ impl Wallet {
 				rows
 			},
 		};
+		// A swap that can never complete reads `returning` from the moment
+		// the wallet knows it and its coin is coming home, with what comes
+		// home and when (`return`), and `returned` once the claim is final.
+		let mut returns = self.returns_of()?;
 		let mut out = vec![];
 		for (id, role, offer_json, state) in rows {
 			let offer: Value = serde_json::from_str(&offer_json).map_err(|e| Error::Store(e.to_string()))?;
@@ -2262,9 +2268,84 @@ impl Wallet {
 			if role == "maker" && state == "open" {
 				v["offer"] = json!(encode(&self.spelling.offer, &offer));
 			}
+			let accept = self.store.swap(&id)?.and_then(|s| s.2).unwrap_or_default();
+			let (mine, rest): (Vec<Value>, Vec<Value>) = returns.into_iter().partition(|r| {
+				let l = r["leaf_id"].as_str().unwrap_or("-");
+				offer_json.contains(l) || accept.contains(l)
+			});
+			returns = rest;
+			if !mine.is_empty() {
+				v["state"] = json!(if mine.iter().all(|r| r["state"] == "returned") { "returned" } else { "returning" });
+				v["return"] = Self::return_summary(&mine);
+			}
 			out.push(v);
 		}
+		// Returns of trades the wallet holds no swap of (a wallet restored
+		// from its mnemonic, or a fill): each shown on its own.
+		if ids.is_none() {
+			for r in returns {
+				let state = r["state"].clone();
+				out.push(json!({"swap": null, "role": null, "state": state, "gives": {"asset": r["asset"], "value": r["value"]}, "gets": null,
+					"return": Self::return_summary(std::slice::from_ref(&r))}));
+			}
+		}
 		Ok(Value::Array(out))
+	}
+
+	/// A coin offered to the wallet that cannot be kept (`e`, why): when a
+	/// coin it rests on was spent elsewhere on the chain, the trade that made
+	/// it can never complete, and each coin the wallet gave into that trade
+	/// comes home by its checkpoint's own exit ([`Wallet::return_given`]),
+	/// however long after the trade the wallet reads it. The coin is then
+	/// refused for good, saying so: it is no longer waited for, listed as
+	/// pending or counted. Otherwise `e` stands.
+	fn unkept(&mut self, e: Error, record: &CoinRecord, leaf: &str) -> Error {
+		if !matches!(record, CoinRecord::Transfer(_) | CoinRecord::Fill(_)) {
+			return e;
+		}
+		let Ok(now) = self.now() else { return e };
+		let Ok(txs) = self.base_txs(record) else { return e };
+		let policy = self.followed_policy(first_expiry(record).unwrap_or(u32::MAX), now);
+		let Ok(coin) = self.resolve(record, &txs, &policy) else { return e };
+		self.dead_trade(e, &coin, record, leaf)
+	}
+
+	/// The refusal `e` of coin `coin` (`leaf`), offered to the wallet: when
+	/// the trade that made it can never complete (an input of it, or the
+	/// order a fill spends, was spent elsewhere on the chain), each coin the
+	/// wallet gave into that trade comes home by its checkpoint's own exit
+	/// ([`Wallet::return_given`]), and the refusal says so. Otherwise `e`.
+	fn dead_trade(&mut self, e: Error, coin: &ValidCoin, record: &CoinRecord, leaf: &str) -> Error {
+		// The coin is not kept, so each return keeps its record: the return
+		// reads the trade from it.
+		let via = record.to_bytes().ok().map(|b| (hex(&b), coin.expiry.to_consensus_u32()));
+		if let Err(r) = self.return_given_from(coin, leaf, via) {
+			let _ = self.store.refused(&format!("return of the coins given for {}", leaf), &r.to_string());
+		}
+		let back = self.returning_given(coin).unwrap_or_default();
+		if back.is_empty() {
+			return e;
+		}
+		let why = match e { Error::Refused(m) => m, other => other.to_string() };
+		Error::Refused(format!("{}: the trade that made it can never complete, and the wallet's coin(s) {} given into it come home by \
+			their checkpoint's own exit", why, back.join(", ")))
+	}
+
+	/// What a returning swap shows of its coins coming home
+	/// ([`Wallet::returns_of`]): the asset, the value coming home, the
+	/// latest time a claim of them can be made (`claim_from`, a median time,
+	/// `claim_from_estimated` while a checkpoint is not in a block yet), and
+	/// each coin.
+	fn return_summary(items: &[Value]) -> Value {
+		let value: u64 = items.iter().filter_map(|r| r["value"].as_str().and_then(|v| v.parse::<u64>().ok())).sum();
+		let mut s = json!({"asset": items[0]["asset"], "value": value.to_string(), "coins": items});
+		if let Some(t) = items.iter().filter_map(|r| r["claim_from"].as_u64()).max() {
+			s["claim_from"] = json!(t);
+		}
+		if items.iter().any(|r| r["claim_from_estimated"] == true) {
+			s["claim_from_estimated"] = json!(true);
+		}
+		s
 	}
 
 	/// Checks an offer's coins as a receiver checks a coin, and their values.

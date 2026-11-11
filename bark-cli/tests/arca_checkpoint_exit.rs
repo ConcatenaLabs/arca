@@ -275,26 +275,34 @@ fn board_key(w: &Arca, board: &str) -> elements::secp256k1_zkp::Keypair {
 /// complete. Where C's checkpoint is.
 async fn kill(r: &mut Running, sw: &Swapped, tag: &str) -> OutPoint {
 	let a_gets = valid(r, &sw.a, &sw.a_gets, &sw.bases);
-	let ins = inputs(&a_gets);
-	let ci = ins.iter().find(|i| i.coin.id.to_string() == sw.c_board).expect("C's board is an input").clone();
+	kill_input(r, &a_gets, &sw.c, &sw.c_board, tag).await
+}
+
+/// The owner of board `board` (in wallet `w`), an input of the trade that
+/// made `made`, and the operator spend its checkpoint elsewhere: the trade
+/// can never complete. Where that checkpoint is.
+async fn kill_input(r: &mut Running, made: &ValidCoin, w: &Arca, board: &str, tag: &str) -> OutPoint {
+	let ins = inputs(made);
+	let ci = ins.iter().find(|i| i.coin.id.to_string() == board).expect("the board is an input").clone();
 	assert!(ci.checkpoint.exit.is_some());
-	// Everything first: any run of C's own wallet (each re-checks on start)
-	// would answer C's checkpoint with the swap, as an honest wallet does.
-	let ck = board_key(&sw.c, &sw.c_board);
+	// Everything first: any run of the owner's wallet (each re-checks on
+	// start) would answer its checkpoint with the trade, as an honest wallet
+	// does.
+	let ck = board_key(w, board);
 	let (op, out, key) = fee_coin(r, &format!("{} attack fee", tag)).await;
 	let back = vec![ExplicitOutput::new(ci.coin.asset, ci.checkpoint_value, Script::from(vec![0x51]))];
 	let plan = TransferPlan { checkpoint_exit: true, inputs: vec![(ci.coin.clone(), ci.checkpoint_value)], outputs: back.clone() };
 	let d = plan.reassignment_message(0).unwrap().digest;
 	let sig = |k: &elements::secp256k1_zkp::Keypair| arca_covenant::sign::sign_digest(k, &d, &[0; 32]);
 	let second = ValidInput { reassignment_pair: Pair { operator: sig(&keypair("operator")), owner: sig(&ck) }, ..ci.clone() };
-	let cp = publish_board_checkpoint(r, &ci, &format!("{}: C's checkpoint from its board", tag), true).await;
+	let cp = publish_board_checkpoint(r, &ci, &format!("{}: {}'s checkpoint from its board", tag, w.name), true).await;
 	let mut tx = reassignment_tx(&[second], &back, &[cp], &FeeSource::Coin { outpoint: op, coin: out.clone(), fee: 3_000,
 		change: bark::arca::keys::p2wpkh(&key) }).unwrap().tx;
 	let k = tx.input.iter().position(|x| x.previous_output == op).unwrap();
 	sign_p2wpkh(&mut tx, k, &out, &key);
 	let id = r.rt.client().send_raw_transaction(&tx).expect("the second reassignment relays");
 	r.produce().await;
-	println!("{}: ATTACK C + operator: a second reassignment of C's checkpoint {} ({} vB)", tag, id, tx.vsize());
+	println!("{}: ATTACK {} + operator: a second reassignment of its checkpoint {} ({} vB)", tag, w.name, id, tx.vsize());
 	cp
 }
 
@@ -349,6 +357,21 @@ impl Drop for Tower {
 	}
 }
 
+/// `w`'s swaps, as the library lists them.
+fn swaps_of(w: &Arca) -> Value {
+	tokio::task::block_in_place(|| {
+		let mut ww = bark::arca::Wallet::open(&w.dir).expect("open the wallet");
+		bark::arca::command::run(&mut ww, "swaps", &json!({})).map(|v| v["result"].clone()).unwrap()
+	})
+}
+
+/// The one swap of `w`'s in state `state`, or that returns coin `given`.
+fn returning_swap(w: &Arca, given: &str) -> Value {
+	let all = swaps_of(w);
+	all.as_array().unwrap().iter().find(|s| s["return"]["coins"].to_string().contains(given)).cloned()
+		.unwrap_or_else(|| panic!("{}: no swap returns coin {}: {}", w.name, given, all))
+}
+
 fn watcher_off() -> impl FnOnce(&mut server::server::Config, AssetId, AssetId) {
 	|c, _, _| c.watcher.enabled = false
 }
@@ -372,6 +395,12 @@ async fn a_dead_swap_returns_the_makers_coin_by_its_checkpoint() {
 	assert_eq!(y["state"], "lost", "{}", y);
 	let why = y["note"].as_str().unwrap_or("");
 	assert!(why.contains("the trade that made it was undone") || why.contains("the trade that made it can never complete"), "{}", y);
+	let ret = returning_swap(&sw.a, &sw.a_board);
+	println!("CE1: A's swap while the return waits: {}", ret);
+	assert_eq!(ret["state"], "returning", "{}", ret);
+	assert_eq!(ret["return"]["asset"], r.x.to_string());
+	assert!(ret["return"]["value"].as_str().unwrap().parse::<u64>().unwrap() >= 300_000, "{}", ret);
+	assert!(ret["return"]["claim_from"].is_u64(), "{}", ret);
 	let bal = sw.a.ok(&["balance"]);
 	println!("CE1: A's balance while the return waits: {}", bal);
 	assert!(bal["held"][r.y.to_string()].is_null() || bal["held"][r.y.to_string()] == "0", "{}", bal);
@@ -386,10 +415,7 @@ async fn a_dead_swap_returns_the_makers_coin_by_its_checkpoint() {
 	assert_ne!(y["state"], "live", "the coin the dead swap was to pay is not shown as held");
 	let why = y["note"].as_str().unwrap_or("");
 	assert!(why.contains("was undone") || why.contains("the trade that made it can never complete"), "{}", y);
-	let swaps = tokio::task::block_in_place(|| {
-		let mut w = bark::arca::Wallet::open(&sw.a.dir).expect("open the wallet");
-		bark::arca::command::run(&mut w, "swaps", &json!({})).map(|v| v["result"].clone()).unwrap()
-	});
+	let swaps = swaps_of(&sw.a);
 	println!("CE1: A's swaps at the end: {}", swaps);
 	assert!(swaps.as_array().unwrap().iter().any(|s| s["state"] == "returned"), "the swap is recorded as returned: {}", swaps);
 	// A restore once the claim is final: the given coin reads as exited, by
@@ -407,6 +433,9 @@ async fn a_dead_swap_returns_the_makers_coin_by_its_checkpoint() {
 	println!("CE1: the restored wallet's return of the board A gave: {}", after);
 	assert_eq!(after["state"], "exited", "{}", after);
 	assert_eq!(coin_of(&a2, &sw.a_board)["state"], "exited");
+	let ret = returning_swap(&a2, &sw.a_board);
+	println!("CE1: the restored wallet's swaps: {}", ret);
+	assert_eq!(ret["state"], "returned", "{}", ret);
 	let y = coin_of(&a2, &sw.a_gets);
 	println!("CE1: the restored wallet's coin of Y: {}", y);
 	assert_ne!(y["state"], "live", "{}", y);
@@ -437,8 +466,12 @@ async fn a_restore_in_the_middle_of_a_return_finishes_it() {
 	let given = coin_of(&a2, &sw.a_board);
 	println!("CE2: A2's view of the board A gave: {}", given);
 	assert_eq!(given["state"], "exiting", "{}", given);
+	let ret = returning_swap(&a2, &sw.a_board);
+	println!("CE2: A2's swaps while the return waits: {}", ret);
+	assert_eq!((ret["state"].as_str(), ret["return"]["asset"].as_str()), (Some("returning"), Some(r.x.to_string().as_str())), "{}", ret);
 	let done = finish_return(&r, &a2, &sw.a_board, "CE2").await;
 	assert_eq!(done["state"], "exited", "{}", done);
+	assert_eq!(returning_swap(&a2, &sw.a_board)["state"], "returned");
 	for w in [&sw.a, &sw.c, &a2] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
@@ -516,11 +549,13 @@ async fn old_and_new_wallets_swap_without_the_exit_in_both_roles() {
 	sw3.a.refused(&["send", &req, "--amount", "100000", "--asset", &ys], "older build");
 	// The older build makes an offer; C3's coins of Y are all of the newer
 	// format.
-	let offer = o.ok(&["swap", "offer", "--give-asset", &xs, "--give", "100000", "--want-asset", &ys, "--want", "100000"])["offer"]
-		.as_str().unwrap().to_string();
+	let o_offer = o.ok(&["swap", "offer", "--give-asset", &xs, "--give", "100000", "--want-asset", &ys, "--want", "100000"]);
+	let offer = o_offer["offer"].as_str().unwrap().to_string();
 	sw3.c.refused(&["swap", "accept", &offer], "older build");
 	sw3.c.ok(&["require-checkpoint-exit", "on"]);
 	sw3.c.refused(&["swap", "accept", &offer], "the maker's offer does not ask for it");
+	// O's coin of X is held for that offer: given up, it pays the next.
+	o.ok(&["swap", "cancel", o_offer["swap"].as_str().expect("the offer's swap id")]);
 	// The older build takes an offer made from coins of the newer format:
 	// its library reads no such record, and nothing is signed.
 	let offer3 = sw3.a.ok(&["swap", "offer", "--give-asset", &ys, "--give", "100000", "--want-asset", &xs, "--want", "100000"])["offer"]
@@ -669,6 +704,61 @@ async fn older_parties_get_no_coin_of_the_newer_format() {
 	let done = d.ok(&["swap", "complete", &acc]);
 	println!("CE8: the swap D required the exit for completes: {}", done["watchtowers"]);
 	for w in [&sw.a, &sw.c, &b, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A taker away when its trade died: A, the maker, and the operator spend
+/// A's checkpoint elsewhere before C's wallet ever reads the coin the swap
+/// pays it. C's wallet runs again more than three days later: the coin in
+/// its mailbox is refused for good, and the coin C gave comes home by its
+/// checkpoint's own exit. The swap reads `returning`, with what comes home
+/// and when, until the claim is final, then `returned`; the coin of X it
+/// was to get is neither counted nor listed as pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taker_away_when_its_trade_died_gets_its_coin_back_days_later() {
+	let mut r = Running::start_with(watcher_off()).await;
+	let url = r.url();
+	let (x, y) = (r.x, r.y);
+	let (a, c) = (Arca::new("CE9 A"), Arca::new("CE9 C"));
+	let a_board = boarded(&mut r, &a, &url, x, 2_000_000).await;
+	let c_board = boarded(&mut r, &c, &url, y, 2_000_000).await;
+	let bases = vec![board_tx(&r, &a, &a_board), board_tx(&r, &c, &c_board)];
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "400000"])
+		["offer"].as_str().unwrap().to_string();
+	let acc = c.ok(&["swap", "accept", &offer])["accept"].as_str().unwrap().to_string();
+	a.ok(&["swap", "complete", &acc]);
+	a.ok(&["sync"]);
+	let a_gets = a.ok(&["coins"]).as_array().unwrap().iter()
+		.find(|k| k["asset"] == y.to_string() && k["state"] == "live").expect("A's coin of Y")["leaf_id"].as_str().unwrap().to_string();
+	let made = valid(&r, &a, &a_gets, &bases);
+	kill_input(&mut r, &made, &a, &a_board, "CE9").await;
+	common::node::advance_mtp(&r.rt, 3 * 86_400 + 600);
+	r.produce().await;
+	r.bury().await;
+	println!("CE9: three days and more later, C's wallet runs again");
+	let s = c.ok(&["sync"]);
+	println!("CE9: C's sync, its mailbox: {}", s["mailbox"]);
+	c.ok(&["recheck"]);
+	let given = coin_of(&c, &c_board);
+	println!("CE9: the board C gave: {}", given);
+	assert_eq!(given["state"], "exiting", "{}", given);
+	let ret = returning_swap(&c, &c_board);
+	println!("CE9: C's swap: {}", ret);
+	assert_eq!(ret["state"], "returning", "{}", ret);
+	assert_eq!(ret["return"]["asset"], y.to_string());
+	assert!(ret["return"]["claim_from"].is_u64(), "{}", ret);
+	let bal = c.ok(&["balance"]);
+	println!("CE9: C's balance while the return waits: {}", bal);
+	assert!(bal["arca"][x.to_string()].is_null(), "the coin of X the dead swap was to pay is not counted: {}", bal);
+	let again = c.ok(&["sync"]);
+	assert!(!again.to_string().contains("\"pending\":[{"), "nothing of the dead swap is listed as pending: {}", again);
+	let done = finish_return(&r, &c, &c_board, "CE9").await;
+	assert_eq!(done["state"], "exited", "{}", done);
+	let ret = returning_swap(&c, &c_board);
+	println!("CE9: C's swap at the end: {}", ret);
+	assert_eq!(ret["state"], "returned", "{}", ret);
+	for w in [&a, &c] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

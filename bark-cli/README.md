@@ -338,19 +338,26 @@ and a board whose registration never reached the server, are not recovered.
   hold them (`watchtowers`), and where none does, says the trade rests on
   the wallet answering at its next `sync` or `recheck`, within the exit
   delay. `require-checkpoint-exit on` makes the wallet trade only with the
-  exit. When the re-check
-  finds a coin the wallet got from such a trade cut on the chain by another
-  spend of a coin the trade took, it takes the coin the wallet gave home:
-  its checkpoint is published from the pair the wallet signed and, once the
-  exit delay has run, claimed with the wallet's own key, no operator
-  needed. The coin shows `exiting`, then `exited`, its note saying it was
-  returned, and the swap shows `returned`; the coin the trade was to pay
-  is out of the balance from the start of the return, its note saying the
-  trade was undone. Should the spend that cut it leave the chain and the
-  trade complete after all, the coin given is held as spent by it and the
-  coin the trade paid is the wallet's again. A wallet restored from its
-  mnemonic in the middle finishes the return, and one restored after it
-  shows the coin exited. Pulling out
+  exit. When the re-check finds a coin the wallet got from such a trade cut
+  on the chain by another spend of a coin the trade took, or the mailbox
+  brings one already cut (a wallet away when the trade died, however long
+  before), it takes the coin the wallet gave home: its checkpoint is
+  published from the pair the wallet signed and, once the exit delay has
+  run, claimed with the wallet's own key, no operator needed. From that
+  moment the swap reads `returning`, its `return` saying what comes home
+  (`asset`, `value`, each coin) and when the claim can be made
+  (`claim_from`, a median time; `claim_from_estimated` while the checkpoint
+  is not in a block yet), and `returned` once the claim is final. The coin
+  given shows `exiting`, then `exited`, its note saying it was returned. The
+  coin the trade was to pay is out of the balance from the start of the
+  return, its note saying the trade was undone; one still in the mailbox is
+  refused for good, saying why, and no longer listed as pending. Should the
+  spend that cut it leave the chain and the trade complete after all, the
+  coin given is held as spent by it, the coin the trade paid is the
+  wallet's again and the swap reads `done`. A wallet restored from its
+  mnemonic, in the middle of a return or after it, shows the same: it holds
+  no swap, so each return is listed on its own (`swap` null, `gives` the
+  asset and value). Pulling out
   of a good trade this way does not work: the other side's wallet, its
   watchtower and the operator answer the early checkpoint with the trade
   inside the delay.
