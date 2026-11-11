@@ -84,6 +84,54 @@ fn i64_of(v: u64) -> i64 {
 	i64::try_from(v).expect("a chain height or time fits in i64")
 }
 
+/// The common table expressions, for a statement's `WITH`, that end in
+/// `unfinal (txid)`: of the transactions `finals` selects (a query of one
+/// column, `txid`), those not final as the store follows the chain. A
+/// transaction is final when the lowest block of the followed chain that
+/// holds it passes both tests: it is at or under the highest certified block
+/// (when `$1`, a boolean, says certification is required), and the tip's
+/// anchor is at least `$2` (the anchor depth) Bitcoin blocks above its own.
+/// One in no block is not final.
+///
+/// The statement reads what can fail a test, not the whole history:
+///
+/// - The blocks that fail a test are those above the highest certified one
+///   (every block, when none is) and those whose anchor is fewer than `$2`
+///   under the tip's, found through `block (height)` and
+///   `block (anchor_height)`. They are taken as one array first, so the
+///   planner sizes what follows by its length.
+/// - A transaction whose lowest block fails is held by one of those blocks,
+///   so the candidates are what they hold (`tx_block (block_hash)`). Each
+///   one's lowest block is then looked up over all its blocks, through
+///   `tx_block`'s key: a transaction also held by a lower block that passes
+///   is final.
+/// - A transaction in no block is found by an anti-join of `finals` with
+///   `tx_block`. `tx_block` names only stored blocks (its foreign key, which
+///   a rollback cascades), so a transaction without a row there is in no
+///   block. This term reads every row `finals` selects; with an index on the
+///   state it reads only indexes.
+///
+/// It assumes nothing about how the chain changed since the last pass: it is
+/// a function of the tables as one snapshot shows them, like the statement it
+/// replaced, which `tests/final_passes.rs` keeps as its oracle.
+pub(super) fn unfinal_with(finals: &str) -> String {
+	format!(
+		"tip AS (SELECT anchor_height AS a FROM block ORDER BY height DESC LIMIT 1),
+		 cert AS (SELECT max(height) AS h FROM block WHERE certified),
+		 near AS (SELECT DISTINCT t.txid FROM tx_block t WHERE t.block_hash = ANY (ARRAY(
+		           SELECT hash FROM block WHERE $1 AND height > coalesce((SELECT h FROM cert), -1)
+		           UNION ALL SELECT hash FROM block WHERE anchor_height > (SELECT a FROM tip) - $2))),
+		 loc AS (SELECT near.txid, l.height, l.anchor_height FROM near, LATERAL (
+		           SELECT b.height, b.anchor_height FROM tx_block t JOIN block b ON b.hash = t.block_hash
+		           WHERE t.txid = near.txid ORDER BY b.height LIMIT 1) l),
+		 unfinal AS (SELECT loc.txid FROM loc, tip, cert
+		             WHERE ((NOT $1 OR loc.height <= cert.h) AND GREATEST(tip.a - loc.anchor_height, 0) >= $2) IS NOT TRUE
+		             UNION ALL
+		             SELECT f.txid FROM ({}) f WHERE NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = f.txid))",
+		finals,
+	)
+}
+
 /// Records what `scan` found inside `tx`: sightings of Arca scripts and of
 /// the nodes and entries of every batch, and spends of watched outpoints,
 /// `seen_in` the mempool or a block.
