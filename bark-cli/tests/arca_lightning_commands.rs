@@ -15,6 +15,11 @@
 //! preimage over, and `sync` claims the leaf. The claim leaves exactly what
 //! the quote said, and the payer's coins fall by exactly what its quote said.
 //!
+//! A payment's coins given up in a refresh that waits for a round still pay
+//! it: `lightning_pay_quote` counts them and says which refresh the payment
+//! takes back first (`takes_back`), taking nothing back itself, and
+//! `lightning_pay` takes the refresh back and pays with them.
+//!
 //! Needs what the other scenarios need, and `LIGHTNINGD_EXEC`.
 
 mod common;
@@ -226,4 +231,98 @@ async fn a_payment_under_a_hash_through_the_commands_moves_exactly_what_its_quot
 	}
 	assert_eq!(x_before - live(&p, &xs), num(&pq["spends"]), "the payer spent exactly what its quote said");
 	println!("LC moved: P -{} X, Q +{} X", num(&pq["spends"]), num(&rq["claimed"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payment_takes_back_a_waiting_refresh_of_its_coins_and_pays_with_them() {
+	let Some(lnd) = lightningd("a_payment_takes_back_a_waiting_refresh_of_its_coins_and_pays_with_them") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
+	}).await;
+	let x = r.x;
+	let xs = x.to_string();
+	let ox = tokio::task::block_in_place(|| {
+		let ox = node(&r.rt, &mut r.purse, &lnd, "lto", true, x, 2_000_000_000);
+		let px = node(&r.rt, &mut r.purse, &lnd, "ltp", true, x, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
+		drop(px);
+		ox
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if a.asset == xs {
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("X's leg up", || g.leg(&x, true).is_ok()).await;
+	let (url, node_url) = (r.url(), r.node_url());
+	let create = ["create", "--server", &url, "--node-url", &node_url, "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1"];
+	let p = Arca::new("LTP");
+	p.ok(&create);
+	let s = script(&p.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	p.ok(&["board", &xs, "3000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || p.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	p.ok(&["sync"]);
+	let q = Arca::new("LTQ");
+	q.ok(&create);
+
+	// P gives its only coin up in a refresh the operator holds pending.
+	let coin = p.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["state"] == "live" && c["asset"] == xs.as_str()).unwrap()["leaf_id"]
+		.as_str().unwrap().to_string();
+	let qq = ok(&p, "quote", json!({"leaves": [coin]}));
+	let part = ok(&p, "participate", json!({"leaves": [coin], "shown": qq["coins"]}));
+	let pid = part["participations"][0]["participation"].as_str().unwrap().to_string();
+	assert_eq!(part["participations"][0]["state"], "pending", "{}", part);
+	assert_eq!(live(&p, &xs), 0, "nothing live: the coin is given up");
+
+	let inv = ok(&q, "lightning_receive", json!({"asset": xs, "amount": "100000"}));
+	let invoice = inv["invoice"].as_str().unwrap().to_string();
+
+	// The quote counts the coin and names the refresh, taking nothing back.
+	let pq = ok(&p, "lightning_pay_quote", json!({"invoice": invoice, "asset": xs}));
+	println!("LT the payment's quote: gives {} takes_back {}", pq["gives"], pq["takes_back"]);
+	assert_eq!(pq["takes_back"], json!([{"participation": pid, "coins": [coin]}]), "{}", pq);
+	assert_eq!(pq["gives"], json!([coin]), "{}", pq);
+	let st = ok(&p, "participations", json!({}));
+	let mine = st.as_array().unwrap().iter().find(|x| x["participation"] == pid.as_str()).unwrap().clone();
+	assert_eq!(mine["state"], "pending", "the quote took nothing back: {}", mine);
+
+	// The payment takes the refresh back first and pays with the coin.
+	let paying = ok(&p, "lightning_pay", json!({"invoice": invoice, "asset": xs, "shown": pq}));
+	println!("LT paying: {}", paying["paying"]);
+	let st = ok(&p, "participations", json!({}));
+	let mine = st.as_array().unwrap().iter().find(|x| x["participation"] == pid.as_str()).unwrap().clone();
+	println!("LT the refresh after the payment: {}", mine["state"]);
+	assert_eq!(mine["state"], "void", "taken back: {}", mine);
+	let c = p.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == coin.as_str()).cloned().unwrap_or(Value::Null);
+	assert!(c.is_null() || c["state"] != "given" && c["state"] != "live", "the coin paid: {}", c);
+	println!("LT the coin after the payment: {}", c["state"]);
+	let body = json!({"participation_id": pid});
+	let resp = minreq::post(format!("{}/v1/participation_status", r.url())).with_header("Content-Type", "application/json")
+		.with_body(body.to_string()).send().unwrap();
+	let st: Value = serde_json::from_str(resp.as_str().unwrap()).unwrap();
+	println!("LT the operator's refresh: {} ({})", st["state"], st["void_reason"]);
+	assert_eq!(st["state"], "void", "the operator voided the refresh: {}", st);
+	for w in [&p, &q] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
 }
