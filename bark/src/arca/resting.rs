@@ -654,11 +654,13 @@ impl Wallet {
 		// An order an older build published names no format it reads: its
 		// maker reads no coin record of the newer format.
 		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
+		let mut unread = 0u64;
 		for mut c in self.coins_to_give(asset_b)? {
 			if c.row.expiry < order_expiry {
 				continue;
 			}
 			if !maker_reads && c.row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
+				unread = unread.saturating_add(c.coin.value);
 				continue;
 			}
 			if chosen.len() == super::round::MAX_GIVEN {
@@ -678,6 +680,13 @@ impl Wallet {
 			}
 		}
 		let Some((fee, change)) = done else {
+			// Coins enough, but of a format the order's maker cannot read:
+			// say so, as a payment or a swap with an older build does.
+			if unread > 0 && kept.saturating_add(unread) > price {
+				return Err(Error::Refused(format!("the order's maker runs an older build, which reads no coin whose past holds a checkpoint \
+					with its owner's exit, and the wallet's coins of asset {} that would pay this fill of {} are such coins: they pay it \
+					once a round refreshes them (refresh-received), or once the maker updates; nothing was signed", asset_b, filled)));
+			}
 			return Err(self.short_of(asset_b, price.saturating_sub(kept).max(1), format!("the wallet's live coins of asset {} that expire \
 				no earlier than the order's coin (median time {}) keep {} past their checkpoints; the fill of {} costs {} and its fee, with \
 				change of none or at least {}", asset_b, order_expiry, kept, filled, price, min))?);

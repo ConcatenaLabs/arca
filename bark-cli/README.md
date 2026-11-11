@@ -347,7 +347,9 @@ and a board whose registration never reached the server, are not recovered.
   moment the swap reads `returning`, its `return` saying what comes home
   (`asset`, `value`, each coin) and when the claim can be made
   (`claim_from`, a median time; `claim_from_estimated` while the checkpoint
-  is not in a block yet), and `returned` once the claim is final. The coin
+  is not in a block yet, and left out then while the node does not answer:
+  the listing reads the wallet's store alone), and `returned` once the claim
+  is final. The coin
   given shows `exiting`, then `exited`, its note saying it was returned. The
   coin the trade was to pay is out of the balance from the start of the
   return, its note saying the trade was undone; one still in the mailbox is

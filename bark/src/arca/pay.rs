@@ -2161,6 +2161,10 @@ impl Wallet {
 		// it reads it, before signing anything: it never holds a coin it
 		// cannot read.
 		let (inputs, margin, change) = self.choose(&info, give_asset, give, &others, true, min_give, 1, true, false)?;
+		// The wallet's own coins are what the switch protects first.
+		if let Some(i) = inputs.iter().find(|i| !i.coin.exit_allowed()) {
+			self.exit_required(&format!("coin {} it would give cannot have it (its kind of leaf takes no checkpoint exit)", i.coin.id))?;
+		}
 		let mut outs = vec![wanted];
 		if change > 0 {
 			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_of("change", &info, give_asset, change)?, mailbox, until: None });
@@ -2547,7 +2551,7 @@ impl Wallet {
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
 		if let Some(k) = (0..plan.inputs.len()).find(|k| !plan.exit(*k)) {
-			self.exit_required(&format!("coin {} of the swap cannot have it (its leaf is neither plain nor landing-1)", plan.inputs[k].0.id))?;
+			self.exit_required(&format!("coin {} of the swap cannot have it (its kind of leaf takes no checkpoint exit)", plan.inputs[k].0.id))?;
 		}
 		let leaves: Vec<NewLeaf> = outs.iter().map(|o| o.leaf).collect();
 		let mut sigs = vec![];
@@ -2689,6 +2693,10 @@ impl Wallet {
 		};
 		if !checkpoint_exit {
 			self.exit_required("the taker signed the swap without it (an older build, or one whose operator does not offer it)")?;
+		}
+		// Every coin of the swap, the wallet's own first, must have it.
+		if let Some(i) = inputs.iter().find(|i| !i.coin.exit_allowed()) {
+			self.exit_required(&format!("coin {} of the swap cannot have it (its kind of leaf takes no checkpoint exit)", i.coin.id))?;
 		}
 		// Coins of the taker's are not the wallet's to mark: only the maker's
 		// are put to `sending`.

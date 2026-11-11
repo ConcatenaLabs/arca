@@ -24,6 +24,10 @@
 //!   swap is reported done, and with both wallets away it answers the
 //!   taker's checkpoint published early by bringing the maker's on and
 //!   publishing the reassignment.
+//! - A taker holding only coins of the newer format fills an older
+//!   maker's resting order: refused before signing, naming the older build;
+//!   a taker with a coin of the older format fills it, and the maker reads
+//!   its credit.
 //! - Older parties as their texts show them (an offer, an acceptance, a
 //!   receive request without the fields this build adds): no coin of the
 //!   newer format goes to them, and the wallet that requires the exit
@@ -759,6 +763,106 @@ async fn a_taker_away_when_its_trade_died_gets_its_coin_back_days_later() {
 	println!("CE9: C's swap at the end: {}", ret);
 	assert_eq!(ret["state"], "returned", "{}", ret);
 	for w in [&a, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A wallet holding one coin of `asset`, boarded, with `fees` of X on the
+/// chain (as `arca_resting.rs` makes them).
+async fn holder(r: &mut Running, w: Arca, asset: AssetId, value: u64, fees: u64) -> Arca {
+	let (url, node) = (r.url(), r.node_url());
+	w.ok(&create_args(&url, &node));
+	let s = script(&w.ok(&["address"]));
+	r.pay_to(s.clone(), asset, value + 100_000);
+	if fees > 0 {
+		let x = r.x;
+		r.pay_to(s, x, fees);
+	}
+	r.produce().await;
+	w.ok(&["board", &asset.to_string(), &value.to_string()]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	w.ok(&["sync"]);
+	w
+}
+
+/// Runs the operator's rounds to final, then each wallet's sync.
+async fn rounds(r: &mut Running, wallets: &[&Arca]) {
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed);
+	assert!(!built.is_empty(), "a round");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	for b in &built {
+		r.round_state(&b.tx.txid(), server::store::RoundState::Final).await;
+	}
+	for w in wallets {
+		w.ok(&["sync"]);
+	}
+}
+
+/// `maker` rests `amount` of X for Y at 2/1 in lots of `lot`: the order's id.
+async fn rest(r: &mut Running, maker: &Arca, amount: u64, lot: u64) -> String {
+	let (x, y) = (r.x, r.y);
+	let args = |extra: &[&str]| -> Vec<String> {
+		let mut v: Vec<String> = ["order", "rest", "--sell", &x.to_string(), "--amount", &amount.to_string(), "--for", &y.to_string(),
+			"--rate-num", "2", "--rate-den", "1", "--min-lot", &lot.to_string(), "--expires-in-hours", "720"]
+			.iter().map(|s| s.to_string()).collect();
+		v.extend(extra.iter().map(|s| s.to_string()));
+		v
+	};
+	let q = maker.ok(&args(&["--quote"]).iter().map(|s| s.as_str()).collect::<Vec<_>>());
+	let shown = q.to_string();
+	let rested = maker.ok(&args(&["--shown", &shown]).iter().map(|s| s.as_str()).collect::<Vec<_>>());
+	rounds(r, &[maker]).await;
+	let view = maker.ok(&["order", "resting"]);
+	let mine = view["orders"].as_array().unwrap().iter().find(|o| o["rested_by"] == rested["order"]).unwrap().clone();
+	assert_eq!(mine["state"], "published", "{}", view);
+	mine["order"].as_str().unwrap().to_string()
+}
+
+/// Each coin of `w` and its state.
+fn states(w: &Arca) -> Vec<(String, String)> {
+	w.ok(&["coins"]).as_array().unwrap().iter()
+		.map(|c| (c["leaf_id"].as_str().unwrap().to_string(), c["state"].as_str().unwrap().to_string())).collect()
+}
+
+/// A taker of this build whose coins of Y are all of format 2 fills an
+/// older maker's resting order (`ARCA_CLI_OLDER`): refused before signing,
+/// naming the older build. A taker with a coin of format 1 fills it without
+/// the exit, and the older maker reads its credit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taker_of_the_newer_format_and_an_older_resting_maker() {
+	let Some(older) = std::env::var("ARCA_CLI_OLDER").ok() else {
+		println!("CE10: no ARCA_CLI_OLDER: not run");
+		return;
+	};
+	let older = std::path::PathBuf::from(older);
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = server::server::AssetSection::new(x, 1_000);
+	}).await;
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let maker = holder(&mut r, Arca::built_from("CE10 old maker", &older), x, 1_500_000, 0).await;
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 3600));
+	r.synced().await;
+	let order = rest(&mut r, &maker, 1_000_000, 100_000).await;
+	// T gets Y by a swap with the exit: its only coin of Y is of format 2.
+	let sw = swap(&mut r, "CE10", Arca::new("CE10 T"), Arca::new("CE10 C"), true).await;
+	let before = states(&sw.a);
+	sw.a.refused(&["order", "fill-resting", &order, "--amount", "100000"], "the order's maker runs an older build");
+	assert_eq!(before, states(&sw.a), "nothing of T's moved");
+	let u = holder(&mut r, Arca::new("CE10 U"), y, 1_000_000, 0).await;
+	let f = u.ok(&["order", "fill-resting", &order, "--amount", "100000"]);
+	println!("CE10: U (format-1 Y) fills: {}", f);
+	maker.ok(&["sync"]);
+	let coins = maker.ok(&["coins"]);
+	assert!(coins.as_array().unwrap().iter().any(|k| k["asset"] == y.to_string() && k["state"] == "live"),
+		"the older maker holds a live credit of Y: {}", coins);
+	for w in [&maker, &sw.a, &sw.c, &u] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

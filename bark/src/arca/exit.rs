@@ -1453,12 +1453,15 @@ impl Wallet {
 	/// complete ([`Self::return_given`]), each as the swap listing shows it:
 	/// the coin, its asset and the value coming home, when the claim can be
 	/// made (`claim_from`, a median time: from the checkpoint's block once it
-	/// is in one, else the earliest it could be, `claim_from_estimated`),
-	/// the claim once made, and whether it is final (`done`). Read from the
-	/// store, so a wallet restored from its mnemonic, or one that found the
-	/// trade dead long after, shows the same.
+	/// is in one, else the earliest it could be, `claim_from_estimated`, when
+	/// the node answers), the claim once made, and whether it is final
+	/// (`done`). Read from the store, so a wallet restored from its
+	/// mnemonic, or one that found the trade dead long after, shows the
+	/// same, and a listing never waits on the node: without it, a return
+	/// whose checkpoint has no block yet shows no `claim_from`.
 	pub(crate) fn returns_of(&self) -> Result<Vec<Value>, Error> {
-		let now = self.now()?.to_consensus_u32() as u64;
+		// The node's time, asked only when a return needs an estimate.
+		let mut now: Option<Option<u64>> = None;
 		let mut out = vec![];
 		for (leaf_id, state, txs, claim) in self.store.returns()? {
 			let Ok(v) = serde_json::from_str::<Value>(&txs) else { continue };
@@ -1476,8 +1479,10 @@ impl Wallet {
 			match v["claim_from"].as_u64() {
 				Some(t) => item["claim_from"] = json!(t),
 				None if !done => {
-					item["claim_from"] = json!(now + v["exit_delay_seconds"].as_u64().unwrap_or(0));
-					item["claim_from_estimated"] = json!(true);
+					if let Some(now) = *now.get_or_insert_with(|| self.now().ok().map(|t| t.to_consensus_u32() as u64)) {
+						item["claim_from"] = json!(now + v["exit_delay_seconds"].as_u64().unwrap_or(0));
+						item["claim_from_estimated"] = json!(true);
+					}
 				},
 				None => {},
 			}
