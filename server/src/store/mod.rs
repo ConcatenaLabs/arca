@@ -23,7 +23,7 @@
 //! `schema/V38__no_sweep_batches.sql`, `schema/V39__claim_vest.sql`,
 //! `schema/V40__held_strikes.sql`,
 //! `schema/V41__strikes_on_dropped_coins.sql`, `schema/V42__slot_releases.sql`,
-//! `schema/V43__record_formats.sql`),
+//! `schema/V43__record_formats.sql`, `schema/V44__watched_for_index.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -146,6 +146,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(41, include_str!("../../schema/V41__strikes_on_dropped_coins.sql")),
 	(42, include_str!("../../schema/V42__slot_releases.sql")),
 	(43, include_str!("../../schema/V43__record_formats.sql")),
+	(44, include_str!("../../schema/V44__watched_for_index.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before
