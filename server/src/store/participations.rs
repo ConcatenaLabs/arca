@@ -133,7 +133,8 @@ pub enum WantedKind {
 		/// An order's terms (`order-3`, or `order-2` from before it), for a
 		/// resting order.
 		order: Option<arca_covenant::OrderLeafTerms>,
-		/// `landing-1`'s landing, for a leaf of a supervised asset.
+		/// The landing, for a leaf of a supervised asset (`landing-1` or
+		/// `landing-2`, as the template names).
 		landing: Option<arca_covenant::Landing>,
 		/// `channel-1`'s terms, for a channel leaf.
 		channel: Option<arca_covenant::Channel>,
@@ -432,7 +433,9 @@ pub(super) async fn read_participation<C: tokio_postgres::GenericClient>(c: &C, 
 					},
 					None => None,
 				},
-				landing: r.get::<_, Option<Vec<u8>>>(14).map(|b| landing_of(&b)).transpose()?,
+				landing: r.get::<_, Option<Vec<u8>>>(14).map(|b| landing_of(&b)).transpose()?
+					.map(|l| Ok::<_, StoreError>(arca_covenant::Landing { own_index: r.get::<_, &str>(3) == arca_covenant::LANDING_2, ..l }))
+					.transpose()?,
 				channel: r.get::<_, Option<Vec<u8>>>(15).map(|b| channel_of(&b)).transpose()?,
 				claim: r.get::<_, Option<Vec<u8>>>(16).map(|b| claim_with_vest(&b, r.get(17))).transpose()?,
 			},

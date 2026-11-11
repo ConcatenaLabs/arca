@@ -348,7 +348,7 @@ impl WireForfeit {
 }
 
 /// What a coin's collaborative message carries after `K`, as its script
-/// does: a `landing-1` coin's landing program, a `vest-1` coin's vest time;
+/// does: a landing coin's landing program, a `vest-1` coin's vest time;
 /// nothing for any other coin, a checkpoint included.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct After {
@@ -365,7 +365,7 @@ impl After {
 		After { landing: leaf.landing.map(|l| l.program), vest: leaf.vest().map(|v| v.to_consensus_u32()) }
 	}
 
-	/// A `landing-1` coin's landing program.
+	/// A landing coin's landing program.
 	pub fn landing(program: [u8; 20]) -> After {
 		After { landing: Some(program), vest: None }
 	}
@@ -385,7 +385,7 @@ pub enum Request {
 		owner: String, owner_sig: String, salt: String, asset_in: String, value_in: String, outputs: Vec<WireOutput>,
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		forfeit: Option<WireForfeit>,
-		/// The landing program of a `landing-1` coin (20 bytes, hex), the
+		/// The landing program of a landing coin (20 bytes, hex), the
 		/// leaf of a supervised asset: the signer builds the message with it
 		/// after `K`, as the coin's script does, and signs only while its own node shows
 		/// the landing free ([`crate::supervision`]). Absent for any other

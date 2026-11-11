@@ -870,8 +870,10 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		// channel-1 is listed when the operator makes channel leaves of an asset;
 		// order-2 never: no round makes a new one, though one resting from
 		// before order-3 is still filled.
+		// landing-1 is left out once the operator makes landing-2 only.
 		templates: api::TemplatesInfo { version: 1, list: arca_covenant::Template::ALL.iter()
 			.filter(|t| **t != arca_covenant::Template::Order2)
+			.filter(|t| **t != arca_covenant::Template::Landing1 || !p.landing_2_only)
 			.filter(|t| **t != arca_covenant::Template::Channel1
 				|| p.assets.all().iter().any(|(a, _)| p.channel_capacity(a).is_ok_and(|c| c > 0)))
 			.map(|t| t.to_string()).collect() },
@@ -930,6 +932,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		batches: api::BatchesInfo { no_sweep: app.params.no_sweep, collect_after_seconds: app.params.collect_after_seconds },
 		mailbox_reads: MAX_MAILBOX_READS as u32,
 		checkpoint_exit: app.params.checkpoint_exit,
+		landing_2_only: app.params.landing_2_only,
 	})
 }
 
@@ -1031,11 +1034,14 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 					.map_err(|e| Refusal::malformed(format!("htlc operator delay: {}", e)))?,
 			}),
 		};
-		let v2 = match o.template.as_deref() {
-			None | Some("vtxo-1") => false,
-			Some("vtxo-2") if o.htlc.is_none() && o.landing.is_none() && o.enclave.is_none() => true,
+		// A landing leaf is named by its terms, landing-2 by its template too.
+		let (v2, own_index) = match o.template.as_deref() {
+			None | Some("vtxo-1") => (false, false),
+			Some("vtxo-2") if o.htlc.is_none() && o.landing.is_none() && o.enclave.is_none() => (true, false),
+			Some("landing-1") if o.landing.is_some() => (false, false),
+			Some("landing-2") if o.landing.is_some() => (false, true),
 			Some(t) => return Err(Refusal::malformed(format!("template {:?}: a transfer creates vtxo-1 or vtxo-2 leaves, htlc-1, \
-				landing-1 and enclave-1 by their terms", t))),
+				landing-1 and enclave-1 by their terms, and landing-2 by its terms and its template", t))),
 		};
 		outputs.push(OutputRequest {
 			asset: asset(&o.asset)?,
@@ -1050,7 +1056,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 				exit_delay: RelativeTime::from_units(o.exit_delay_units)
 					.map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 				htlc,
-				landing: landing_of(&o.landing)?.map(|l| l.terms(asset(&o.asset)?, amount(&o.value)?)
+				landing: landing_of(&o.landing, own_index)?.map(|l| l.terms(asset(&o.asset)?, amount(&o.value)?)
 					.map_err(|e| Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "out_of_bounds", format!("landing: {}", e))))
 					.transpose()?, v2,
 			},
@@ -1316,7 +1322,7 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 						.map_err(|e| Refusal::malformed(format!("order: {}", e)))?),
 					None => None,
 				},
-				landing: landing_of(&l.landing)?,
+				landing: landing_of(&l.landing, l.template == arca_covenant::LANDING_2)?,
 				channel: l.channel.as_ref().map(|v| arca_covenant::record_json::channel_from_json(v)
 					.map_err(|e| Refusal::malformed(format!("channel: {}", e)))).transpose()?,
 			},
@@ -1355,7 +1361,6 @@ async fn submit_participation(State(app): State<Arc<App>>, body: Result<Bytes, B
 	Ok(Json(participation_status(&status)))
 }
 
-/// A `landing-1` leaf's landing, in the record's JSON form of it.
 fn state_of(s: &api::ChannelStateJson) -> Result<arca_covenant::State, Refusal> {
 	Ok(arca_covenant::State { number: amount(&s.number)?, owner: amount(&s.owner)?, operator: amount(&s.operator)?,
 		folded: amount(&s.folded)? })
@@ -1421,9 +1426,11 @@ async fn channel_state(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectIn
 	}))
 }
 
-fn landing_of(v: &Option<serde_json::Value>) -> Result<Option<arca_covenant::Landing>, Refusal> {
+/// A landing leaf's landing, in the record's JSON form of it, for the
+/// template beside it: `landing-2` (`own_index`) or `landing-1`.
+pub(crate) fn landing_of(v: &Option<serde_json::Value>, own_index: bool) -> Result<Option<arca_covenant::Landing>, Refusal> {
 	v.as_ref().map(|v| arca_covenant::record_json::landing_from_json(v).map_err(|e| Refusal::malformed(format!("landing: {}", e))))
-		.transpose()
+		.transpose().map(|l| l.map(|l| arca_covenant::Landing { own_index, ..l }))
 }
 
 async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::ParticipationStatus>, Refusal> {
@@ -1446,7 +1453,7 @@ async fn take_order(State(app): State<Arc<App>>, body: Result<Bytes, BytesReject
 		owner_nonce: unhex32(&l.owner_nonce).map_err(Refusal::malformed)?,
 		exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 		order: None,
-		landing: landing_of(&l.landing)?,
+		landing: landing_of(&l.landing, l.template == arca_covenant::LANDING_2)?,
 		channel: None,
 	};
 	let not_before = req.not_before.map(|t| MedianTime::from_consensus(t).map_err(|e| Refusal::malformed(format!("not_before: {}", e))))

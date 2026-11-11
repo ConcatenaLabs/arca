@@ -153,7 +153,7 @@ impl Boards {
 			return Err(BoardError::OperatorKey);
 		}
 		self.params.check_value(record.asset, record.value).map_err(BoardError::OutOfBounds)?;
-		// A board of a supervised asset converts into a landing-1 leaf with
+		// A board of a supervised asset converts into a landing leaf with
 		// the published allowance, and no other asset's does.
 		self.params.check_landing(record.asset, record.value, record.landing.as_ref()).map_err(BoardError::OutOfBounds)?;
 		// A board of a restricted asset converts into an enclave-1 leaf for

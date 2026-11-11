@@ -200,6 +200,12 @@ pub struct Info {
 	/// for an operator that does not, or a server that predates it.
 	#[serde(default)]
 	pub checkpoint_exit: bool,
+	/// Whether the operator makes `landing-2` leaves only: it refuses every
+	/// participation, board and transfer that would make a `landing-1` leaf
+	/// of a supervised asset, and `templates.list` leaves `landing-1` out.
+	/// False for an operator that makes both, or a server that predates it.
+	#[serde(default)]
+	pub landing_2_only: bool,
 }
 
 /// How the operator builds its batches.
@@ -521,8 +527,9 @@ pub struct AssetInfo {
 	pub issuer: Option<IssuerInfo>,
 	/// Present when the asset is supervised on the chain (its issuer can
 	/// freeze holdings by consensus rule) and the operator serves it under
-	/// the supervised profile: every leaf of it is `landing-1`, landing in
-	/// its owner's own key with the allowance here; the operator co-signs
+	/// the supervised profile: every leaf of it is a landing leaf
+	/// (`landing-2`, or `landing-1` where `templates.list` names it),
+	/// landing in its owner's own key with the allowance here; the operator co-signs
 	/// nothing that spends a coin whose holder is frozen.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub supervised: Option<SupervisedInfo>,
@@ -620,7 +627,7 @@ pub struct ChannelsInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisedInfo {
-	/// The fee allowance every `landing-1` leaf of the asset carries, in its
+	/// The fee allowance every landing leaf of the asset carries, in its
 	/// atoms: the most of a leaf's value its landing may leave out of the
 	/// output it pays its owner.
 	pub landing_allowance: String,
@@ -1030,7 +1037,7 @@ pub struct TransferOutput {
 	/// (`lightning_send`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub htlc: Option<HtlcTermsJson>,
-	/// The landing of a `landing-1` leaf, for a leaf of a supervised asset,
+	/// The landing of a landing leaf, for a leaf of a supervised asset,
 	/// in the leaf record's JSON form (`{"program", "allowance"}`): the
 	/// program of the receiver's landing key, as its receive request names
 	/// it, and the operator's published allowance.
@@ -1038,8 +1045,9 @@ pub struct TransferOutput {
 	pub landing: Option<serde_json::Value>,
 	/// The new leaf's template, `vtxo-2` for a leaf whose collaborative path
 	/// is `arca/collab-2` (its receive request asks for it); absent or
-	/// `vtxo-1` for the tapscript path. `htlc-1`, `landing-1` and `enclave-1`
-	/// are named by their terms.
+	/// `vtxo-1` for the tapscript path; `landing-2` for a landing leaf that
+	/// lands at its own index (its receive request asks for it).
+	/// `htlc-1`, `landing-1` and `enclave-1` are named by their terms.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub template: Option<String>,
 	/// The enclave of an `enclave-1` leaf, for a leaf of a restricted asset,
@@ -1835,7 +1843,8 @@ pub struct ServedWantedLeaf {
 	/// An order leaf's terms (`order-3`, or `order-2`), a resting order.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub order: Option<serde_json::Value>,
-	/// A `landing-1` leaf's landing, a leaf of a supervised asset.
+	/// A landing leaf's landing, a leaf of a supervised asset (`landing-1`
+	/// or `landing-2`, as the template names).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub landing: Option<serde_json::Value>,
 	/// A `channel-1` leaf's terms.
@@ -1974,8 +1983,8 @@ pub struct WantedLeaf {
 	/// covered by the participation's id.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub order: Option<serde_json::Value>,
-	/// `landing-1`'s landing, for a leaf of a supervised asset (template
-	/// `landing-1`), in the leaf record's JSON form (`{"program", "allowance"}`,
+	/// The landing, for a leaf of a supervised asset (template `landing-2`,
+	/// or `landing-1`), in the leaf record's JSON form (`{"program", "allowance"}`,
 	/// `arca_covenant::record_json::landing_json`): the program of the
 	/// owner's landing key its exit pays, and the operator's published
 	/// allowance. Covered by the participation's id.
@@ -2567,7 +2576,7 @@ pub struct TreeLeaf {
 	/// An order leaf's terms (`order-3`, or `order-2`), a resting order.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub order: Option<serde_json::Value>,
-	/// A `landing-1` leaf's landing (`{"program", "allowance"}`): where its
+	/// A landing leaf's landing (`{"program", "allowance"}`): where its
 	/// owner's exit pays, the leaf of a supervised asset. Anyone, its issuer
 	/// included, reads from it where each leaf of a batch lands.
 	#[serde(default, skip_serializing_if = "Option::is_none")]

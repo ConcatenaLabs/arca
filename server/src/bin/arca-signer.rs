@@ -27,12 +27,12 @@
 //! With `--supervision-node`, the signer reads freezes of supervised assets
 //! from that node itself (`isassetfrozen`, over JSON-RPC, authenticated by
 //! the cookie file or a file holding `user:password`), independently of the
-//! server: it signs a rebindable message for a `landing-1` coin, the leaf of
+//! server: it signs a rebindable message for a landing coin, the leaf of
 //! a supervised asset, only while its node shows the coin's landing free and
 //! the asset not paused, and builds the message with that landing after `K`,
 //! as the coin's script does, so a request naming another landing gets a
 //! signature that spends nothing (`server::supervision`). Without one it signs no message
-//! for a `landing-1` coin at all.
+//! for a landing coin at all.
 //!
 //! With `--restricted`, the signer serves a restricted asset (an OpenAMP
 //! asset) held in `enclave-1` leaves, whose policy server co-signs beside the
@@ -530,12 +530,12 @@ struct State {
 	restricted: std::collections::HashMap<elements::AssetId, (XOnlyPublicKey, Option<XOnlyPublicKey>)>,
 }
 
-/// Whether `landing`, a `landing-1` coin's landing program, is free for
+/// Whether `landing`, a landing coin's landing program, is free for
 /// `asset` as the signer's own node shows it: `Err` naming why not. Without a
 /// node, nothing that names a landing is signed.
 async fn landing_free(state: &State, asset: elements::AssetId, landing: [u8; 20]) -> Result<(), String> {
 	let client = state.supervision.clone().ok_or_else(|| format!("{}: this signer reads freezes from no node (--supervision-node), so it \
-		signs no spend of a landing-1 coin, the leaf of a supervised asset", server::supervision::FROZEN))?;
+		signs no spend of a landing coin, the leaf of a supervised asset", server::supervision::FROZEN))?;
 	let script = format!("0014{}", hex(&landing));
 	let answer = tokio::task::spawn_blocking(move || {
 		client.call::<serde_json::Value>("isassetfrozen", &[serde_json::json!(asset.to_string()), serde_json::json!(script)])
@@ -544,7 +544,7 @@ async fn landing_free(state: &State, asset: elements::AssetId, landing: [u8; 20]
 		server::supervision::FROZEN, hex(&landing), asset, e))?;
 	match (v["frozen"].as_bool(), v["paused"].as_bool()) {
 		(Some(false), Some(false)) | (Some(false), None) => Ok(()),
-		(_, Some(true)) => Err(format!("{}: asset {} is paused, as the signer's node shows it: no landing-1 coin of it is spent \
+		(_, Some(true)) => Err(format!("{}: asset {} is paused, as the signer's node shows it: no landing coin of it is spent \
 			off the chain", server::supervision::FROZEN, asset)),
 		_ => Err(format!("{}: landing {} is frozen for asset {}, as the signer's node shows it: the coin is spent only by its \
 			landing", server::supervision::FROZEN, hex(&landing), asset)),
@@ -1053,7 +1053,7 @@ async fn answer(state: &State, line: &str) -> Response {
 				match (&restricted, &enclave, &landing, &forfeit) {
 					(None, Some(_), _, _) => return Err(format!("{}: asset {} is not served restricted here: no enclave-1 coin of it is \
 						co-signed", server::restricted::RESTRICTED, asset_in)),
-					(_, Some(_), Some(_), _) => return Err("a coin is enclave-1 or landing-1, not both".into()),
+					(_, Some(_), Some(_), _) => return Err("a coin is enclave-1 or a landing leaf's, not both".into()),
 					(Some(_), _, _, Some(_)) => return Err(format!("{}: asset {} is restricted: it is not refreshed in the tree, so no \
 						forfeit of it is signed", server::restricted::RESTRICTED, asset_in)),
 					_ => {},
@@ -1083,7 +1083,7 @@ async fn answer(state: &State, line: &str) -> Response {
 					return failed(e);
 				}
 			}
-			// A landing-1 coin's freeze, read from the signer's own node,
+			// A landing coin's freeze, read from the signer's own node,
 			// before anything is recorded; its message carries its landing
 			// program after `K`.
 			if let Some(l) = landing {
@@ -1093,9 +1093,9 @@ async fn answer(state: &State, line: &str) -> Response {
 				}
 			}
 			// A vest-1 coin's message carries its vest time after `K`, as its
-			// script does; no landing-1, enclave-1 or vtxo-2 coin vests.
+			// script does; no landing, enclave-1 or vtxo-2 coin vests.
 			if vest.is_some() && (landing.is_some() || enclave.is_some() || named.is_some()) {
-				return declined("a vest-1 coin is no landing-1, enclave-1 or vtxo-2 coin".into());
+				return declined("a vest-1 coin is no landing, enclave-1 or vtxo-2 coin".into());
 			}
 			let k = match (&landing, &enclave, vest) {
 				(Some(l), ..) => chain.landing_prefix(&salt, l),

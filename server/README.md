@@ -1456,7 +1456,7 @@ posted to it, an owner key its own coin. Each entry carries the coin, its
 owner key and nonce, its asset, value, fee and what is owed, the sweep, its
 state (`owed`, `claimed`, `repaid`, `withdrawn`) and, once claimed, its
 repayment participation. A wallet claims an entry with `owed_claim`: the one
-leaf it wants (`vtxo-1`, `vtxo-2`, or `landing-1` in a supervised asset, in
+leaf it wants (`vtxo-1`, `vtxo-2`, or a landing leaf in a supervised asset, in
 the coin's asset, holding exactly what is owed, under a key it proves as a
 participation's leaf, optionally bound to its mailbox key) and the swept
 coin's owner key's signature over
@@ -2283,16 +2283,47 @@ list, or serves a supervised asset issuer-operated or over Lightning, is
 refused at start and on reload. `info` publishes the profile
 (`assets[].supervised.landing_allowance`).
 
-**Every leaf is `landing-1`.** A leaf of the asset, in a batch, a board or a
-reassignment, is `landing-1` (`arca-covenant`'s `landing`): its exit, the
+**Every leaf is a landing leaf.** A leaf of the asset, in a batch, a board or
+a reassignment, is a landing leaf (`arca-covenant`'s `landing`): its exit, the
 landing, pays only P2WPKH of the owner's own landing key, explicitly in the
 asset, all but the published allowance, and its collaborative constant
-commits to that key's program as well. Its owner names the landing when the
-leaf is asked for: a participation's wanted leaf, a transfer's output and a
-board's record carry `landing` (`{"program", "allowance"}`, the leaf
-record's JSON form), with the allowance `info` publishes; any other
-template, a missing landing or another allowance is refused
-(`out_of_bounds`), and a landing is refused on a leaf of any other asset.
+commits to that key's program as well. A `landing-2` leaf's landing pays the
+output at the spending input's own index, so two of a holder's coins landed
+together each need an output of their own; a `landing-1` leaf's pays output
+0, so a holder's `landing-1` coins can share one, and one coin's worth leaves
+past the freeze. Its owner names the landing when the leaf is asked for: a
+participation's wanted leaf, a transfer's output and a board's record carry
+`landing` (`{"program", "allowance"}`, the leaf record's JSON form), with the
+allowance `info` publishes; a `landing-2` leaf is named by its template as
+well (`template: "landing-2"` on a wanted leaf or a transfer's output, board
+record format 5), and only a participation that names `landing-2` among the
+formats it reads (`record_formats`) is given one. A round puts the leaves of
+participations that do not name it in a batch of their own beside the rest,
+with no `landing-2` leaf, since a wallet rebuilds the whole published batch to
+check its own leaf and an older one cannot read a `landing-2` leaf in it. Any other template, a
+missing landing or another allowance is refused (`out_of_bounds`), and a
+landing is refused on a leaf of any other asset.
+
+**The operator stops making `landing-1`** with the top-level setting
+`landing_2_only = true`, which `info.landing_2_only` publishes and which
+leaves `landing-1` out of `info.templates.list`. On the main chain it is on
+whatever the configuration says, so no `landing-1` coin is ever made there. A board, a participation and
+a transfer that would make a `landing-1` leaf are then refused
+(`out_of_bounds`, naming the setting); a `landing-1` coin already made is
+still co-signed when it moves into `landing-2` leaves, refreshed, offboarded
+and answered on the chain. The setting is read at start. It goes on only once
+every client of the operator reads `landing-2`: the public wallets, and every
+service on the operator's host that holds coins there (makers, the Lightning
+service, watchtowers, the bridge's leaf wallet, the rewards tool), since an
+older one is refused every `landing-1` leaf it asks for. Turning it on does
+not reach a `landing-1` coin already made: its script is committed in its
+tree, so it lands at output 0 until it leaves, and a holder whose coins
+include one can still land it beside a landing at input 0 and take one
+coin's worth past a freeze. Such coins go as their holders refresh or pay
+them; a frozen holder's stay escapable until they leave. An issuer counts
+them (the operator's `participations` and `transfers` tables name each
+leaf's template) and can freeze each holder's landing key before it lands
+them, which binds whatever lands there.
 The published tree (`tree`) carries each leaf's landing, so anyone, the
 issuer included, rebuilds every leaf of a batch and reads where each lands.
 Every output of every round and transfer of the asset is explicit, as
@@ -2330,10 +2361,10 @@ holder's under the freeze.
 
 **The signer checks on its own.** `arca-signer --supervision-node <url>
 --supervision-cookie <file>` reads freezes from a node of its own. A
-co-signature for a `landing-1` coin names its landing (the signer request's
+co-signature for a landing coin names its landing (the signer request's
 `landing`): the signer builds the message with that landing after `K`, as
 the coin's script does, and refuses (`frozen`) while its node shows the landing frozen or the asset
-paused. A signer started without a node signs nothing for a `landing-1`
+paused. A signer started without a node signs nothing for a landing
 coin, so an operator serving a supervised asset runs its signer with one.
 
 ## Restricted assets
@@ -2955,7 +2986,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), and how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep) |
+| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), and how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -3144,7 +3175,7 @@ rebindable message only beside the asset's policy key's approval of that very
 message, no forfeit of the asset, and no `vtxo-2` message for it, since its
 coins are `enclave-1` (see Restricted assets). It signs no digest it is handed and no release, and
 nothing else by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. A rebindable
-message for a `landing-1` coin, the leaf of a supervised asset, names the
+message for a landing coin, the leaf of a supervised asset, names the
 coin's landing program: the signer builds the message over the constant
 that binds it, and signs only while a node of its own
 (`--supervision-node`) shows that landing free and the asset not paused (see
@@ -3871,7 +3902,15 @@ the signer refuses the coin on its own node (a signer reading no node
 refuses it too). The other holder still pays the frozen one. A pause
 refuses the other holder until its lifting is final, as the freeze's lifting
 does the first; a participation taken before a freeze is voided when its
-round is built.
+round is built. Its second test serves `landing-2`: with `landing_2_only` off,
+`info` lists both landing templates, a board converts into a `landing-2`
+leaf, a refresh into one is refused for a wallet that does not name
+`landing-2` and given to one that does, and a transfer pays one holder a
+`landing-2` leaf and another a `landing-1` leaf. With the setting on, `info`
+says so and lists no `landing-1`; a board, a refresh and a transfer into
+`landing-1` are refused, while a `landing-1` coin moves into a `landing-2`
+leaf and a `landing-2` coin pays on. With it off again, `landing-1` is
+co-signed again.
 
 `tests/restricted.rs` serves a restricted asset in its issuer's tree beside a
 stand-in for its policy server, which publishes the asset's tree terms and

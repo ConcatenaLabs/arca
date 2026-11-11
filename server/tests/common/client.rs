@@ -229,6 +229,9 @@ pub fn transfer_body_with(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId
 		}
 		if let Some(t) = &l.landing {
 			o["landing"] = arca_covenant::record_json::landing_json(&t.landing(*a, *v).unwrap());
+			if t.own_index {
+				o["template"] = json!(arca_covenant::LANDING_2);
+			}
 		}
 		if let Some(t) = &l.enclave {
 			o["enclave"] = arca_covenant::record_json::enclave_json(&t.enclave);
@@ -281,13 +284,13 @@ pub fn want_leaf(key: &Keypair, asset: AssetId, value: u64) -> (OutputRequest, [
 	}, nonce)
 }
 
-/// [`want_leaf`] for a leaf of a supervised asset: `landing-1`, landing at
-/// `landing`.
+/// [`want_leaf`] for a leaf of a supervised asset: `landing-2` or
+/// `landing-1`, as `landing` says, landing at it.
 pub fn want_landing(key: &Keypair, asset: AssetId, value: u64, landing: arca_covenant::Landing) -> (OutputRequest, [u8; 32]) {
 	hold_key(key);
 	let nonce = random32();
 	(OutputRequest::Leaf {
-		asset, value, template: arca_covenant::Template::Landing1, owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
+		asset, value, template: landing.template(), owner: xonly(key), owner_nonce: nonce, exit_delay: exit_delay(),
 		order: None, landing: Some(landing), channel: None,
 	}, nonce)
 }
@@ -495,7 +498,8 @@ fn parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), String> {
 		unlock_hash: unhex(l["unlock_hash"].as_str().unwrap()).try_into().unwrap(),
 		htlc: htlc_of(&l["htlc"]),
 		order: (!l["order"].is_null()).then(|| arca_covenant::record_json::order_terms_from_json(&l["order"], tree_asset).unwrap()),
-		landing: (!l["landing"].is_null()).then(|| arca_covenant::record_json::landing_from_json(&l["landing"]).unwrap()),
+		landing: (!l["landing"].is_null()).then(|| arca_covenant::Landing {
+			own_index: l["template"] == arca_covenant::LANDING_2, ..arca_covenant::record_json::landing_from_json(&l["landing"]).unwrap() }),
 		channel: (!l["channel"].is_null()).then(|| arca_covenant::record_json::channel_from_json(&l["channel"]).unwrap()),
 	}).collect();
 	Ok((params, leaves))

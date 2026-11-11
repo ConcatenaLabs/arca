@@ -123,6 +123,12 @@ pub struct Config {
 	/// Off when absent: no wallet is offered it.
 	#[serde(default)]
 	pub checkpoint_exit: bool,
+	/// Whether the operator makes `landing-2` leaves only, refusing every
+	/// request that would make a `landing-1` leaf ([`Params::landing_2_only`]).
+	/// Off when absent; on only once every client of the operator reads
+	/// `landing-2`.
+	#[serde(default)]
+	pub landing_2_only: bool,
 }
 
 /// How batches are built.
@@ -1865,6 +1871,9 @@ impl Server {
 		let chain_name = finality.call(|c| c.chain_name()).await.map_err(err("the node"))?;
 		params.no_sweep = config.batches.no_sweep || chain_name.as_deref() == Some(crate::params::MAIN_CHAIN);
 		params.checkpoint_exit = config.checkpoint_exit;
+		// On the main chain no landing-1 leaf is ever made: its coins could
+		// share one landing output and leave past a freeze.
+		params.landing_2_only = config.landing_2_only || chain_name.as_deref() == Some(crate::params::MAIN_CHAIN);
 		if let Some(c) = config.batches.collect_after_seconds {
 			if c == 0 {
 				return Err(StartError("batches.collect_after_seconds is at least 1".into()));

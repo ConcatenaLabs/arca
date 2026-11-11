@@ -343,7 +343,7 @@ impl TransferRequest {
 				}
 			}
 		}
-		// The landing of each landing-1 leaf, the same way.
+		// The landing of each landing leaf, the same way.
 		if self.outputs.iter().any(|o| o.leaf.landing.is_some()) {
 			e.input(&[0xfd]);
 			for o in &self.outputs {
@@ -517,8 +517,9 @@ impl Cosigner {
 				None => {},
 			}
 			// The supervised profile: a leaf of a supervised asset is
-			// landing-1 with the published allowance, and nothing else holds
-			// it; no other asset's leaf is landing-1.
+			// a landing leaf with the published allowance (landing-2 alone once
+			// the operator makes no landing-1), and nothing else holds it; no
+			// other asset's leaf is a landing leaf.
 			if o.leaf.htlc.is_some() && self.params.supervised(&o.asset).is_some() {
 				return Err(CosignError::OutOfBounds(format!("asset {} is supervised: no htlc-1 leaf holds it, as its paths pay a key a \
 					freeze cannot follow", o.asset)));
