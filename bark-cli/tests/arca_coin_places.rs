@@ -707,3 +707,99 @@ async fn cap_run(limit: bool) {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 9. A wallet cannot name its own coins as arriving, and the allowance is
+//    bounded.
+// ---------------------------------------------------------------------------
+
+/// The operator's stored participation `pid` names `leaves` as arriving: what
+/// it would hold had its wallet sent them (the server checks only that each
+/// is an input when it takes the request).
+async fn name_arriving(r: &Running, pid: &str, leaves: &[&str]) {
+	let (db, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	let id: Vec<u8> = unhex(pid);
+	let named: Vec<String> = leaves.iter().map(|l| l.to_string()).collect();
+	let n = db.execute("UPDATE participation SET arriving = $2 WHERE participation_id = $1", &[&id, &named]).await.unwrap();
+	assert_eq!(n, 1, "the participation is stored");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_naming_its_own_change_as_arriving_is_judged_as_any_refresh() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.assets[0].in_flight_cap = Some("1500000".into());
+		c.watcher.enabled = false;
+	}).await;
+	let x = r.x;
+	post_bond(&mut r, None).await;
+	let (s, h, liar, c) = (Arca::new("CP9 S"), Arca::new("CP9 H"), Arca::new("CP9 L"), Arca::new("CP9 C"));
+	boarded(&mut r, &s, &[(x, 3_000_000)]).await;
+	boarded(&mut r, &liar, &[(x, 3_000_000)]).await;
+	create(&r, &h);
+	create(&r, &c);
+	for w in [&s, &liar] {
+		w.ok(&["participate"]);
+	}
+	rounds_final(&r).await;
+	for w in [&s, &liar] {
+		w.ok(&["sync"]);
+	}
+	pay(&s, &h, x, 500_000);
+	// The liar pays C, and holds its own change out of round.
+	pay(&liar, &c, x, 300_000);
+	let change = liar.ok(&["coins"]).as_array().unwrap().iter()
+		.find(|k| k["state"] == "live" && k["kind"] == "transfer").expect("the liar's change")["leaf_id"].as_str().unwrap().to_string();
+	let hp = h.ok(&["refresh-received"])["participations"][0]["participation"].as_str().unwrap().to_string();
+	let lp = liar.ok(&["participate", "--leaf", &change])["participations"][0]["participation"].as_str().unwrap().to_string();
+	name_arriving(&r, &lp, &[&change]).await;
+	let (built, errs) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(errs.is_empty(), "{:?}", errs);
+	let (hs, ls) = (server_state(&r, &hp), server_state(&r, &lp));
+	println!("CP9 lie: {} round(s); H's refresh: {}; the liar's refresh of its own change named as arriving: {} ({})", built.len(),
+		hs["state"], ls["state"], ls["waiting"]);
+	assert_ne!(hs["state"], "pending", "{}", hs);
+	assert_eq!(ls["state"], "pending", "the lie buys no priority: {}", ls);
+	assert!(ls["waiting"].as_str().unwrap_or("").contains("in flight"), "{}", ls);
+	for w in [&s, &h, &liar, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn payments_arriving_run_past_the_cap_only_to_twice_it() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.assets[0].in_flight_cap = Some("1500000".into());
+		c.watcher.enabled = false;
+	}).await;
+	let x = r.x;
+	post_bond(&mut r, None).await;
+	let s = Arca::new("CP10 S");
+	boarded(&mut r, &s, &[(x, 8_000_000)]).await;
+	s.ok(&["participate"]);
+	rounds_final(&r).await;
+	s.ok(&["sync"]);
+	let ws: Vec<Arca> = (0..3).map(|i| Arca::new(&format!("CP10 B{}", i))).collect();
+	let mut pids = vec![];
+	for w in &ws {
+		create(&r, w);
+		library(w, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+		let k = pay(&s, w, x, 1_500_000);
+		assert_eq!(place_of(&places(w), &k), "arriving");
+	}
+	for w in &ws {
+		pids.push(w.ok(&["refresh-received"])["participations"][0]["participation"].as_str().unwrap().to_string());
+	}
+	let (built, errs) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(errs.is_empty(), "{:?}", errs);
+	let states: Vec<String> = pids.iter().map(|p| server_state(&r, p)["state"].as_str().unwrap().to_string()).collect();
+	println!("CP10: {} round(s); three refreshes of 1,500,000 arriving against a cap of 1,500,000: {:?}", built.len(), states);
+	assert_eq!(states.iter().filter(|s| *s != "pending").count(), 2, "two run, to twice the cap: {:?}", states);
+	let waiting = pids.iter().map(|p| server_state(&r, p)).find(|v| v["state"] == "pending").unwrap();
+	println!("CP10: the third: {}", waiting["waiting"]);
+	assert!(waiting["waiting"].as_str().unwrap_or("").contains("in flight"));
+	let _ = std::fs::remove_dir_all(&s.dir);
+	for w in &ws {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

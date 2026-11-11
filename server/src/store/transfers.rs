@@ -84,6 +84,31 @@ fn sig64(v: Vec<u8>) -> Result<[u8; 64], StoreError> {
 }
 
 impl Store {
+	/// Whether the coin `leaf` is the output of a transfer that paid it to
+	/// a mailbox other than its inputs': a payment from someone else, as the
+	/// operator's own records show it (each input's mailbox is the one its
+	/// owner key is bound to, or the one the transfer that made it posted it
+	/// to). A wallet's change from its own payment goes back to its own
+	/// mailbox, so it is not; nor is a coin no transfer made. An input whose
+	/// mailbox the records do not hold counts as another's.
+	pub async fn paid_by_another(&self, leaf: &[u8; 32]) -> Result<bool, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt(
+			"SELECT o.mailbox_key,
+			        ARRAY(SELECT COALESCE(m.mailbox_key, io.mailbox_key)
+			              FROM transfer_input i JOIN leaf l ON l.leaf_id = i.leaf_id
+			              LEFT JOIN leaf_mailbox m ON m.owner_key = l.owner_key
+			              LEFT JOIN transfer_output io ON io.leaf_id = i.leaf_id
+			              WHERE i.transfer_id = o.transfer_id)
+			 FROM transfer_output o WHERE o.leaf_id = $1",
+			&[&&leaf[..]],
+		).await?;
+		let Some(r) = r else { return Ok(false) };
+		let out: Vec<u8> = r.get(0);
+		let ins: Vec<Option<Vec<u8>>> = r.get(1);
+		Ok(ins.is_empty() || ins.iter().any(|m| m.as_deref() != Some(&out[..])))
+	}
+
 	/// The transfer `transfer_id`, if recorded.
 	pub async fn transfer(&self, transfer_id: &[u8; 32]) -> Result<Option<TransferRow>, StoreError> {
 		let conn = self.conn().await?;
