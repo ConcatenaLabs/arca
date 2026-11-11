@@ -320,12 +320,14 @@ and a board whose registration never reached the server, are not recovered.
   proceeds in no leg of a cross-chain swap paid to another party, and when
   only proceeds would pay one, puts them into the next round at once and
   goes ahead after it (they pay inside the Arca, over Lightning and on the
-  chain at once); trades only when every checkpoint has its owner's exit;
-  gives into a swap a coin of exactly its amount, paying itself one first
+  chain at once); gives into a swap a coin of exactly its amount, paying itself one first
   when it holds none, so no change of its own rides in it; and never refuses
   a payment for its bond (one it cannot value, or past what the bond covers,
   arrives instead). A wallet sets no limit unless its owner sets one;
   without one every received coin counts at once and nothing above applies.
+  A wallet that should trade only with its owner's exit on every checkpoint
+  says so apart (`require-checkpoint-exit on`), as a wallet with an instant
+  limit for people would.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
