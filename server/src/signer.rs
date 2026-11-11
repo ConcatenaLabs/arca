@@ -11,13 +11,10 @@
 //!   with `K = SHA256(SHA256("ArcaRbd1" ‖ genesis) ‖ salt)`, for 1 to 4
 //!   committed outputs; with the entry of the record it was recorded as.
 //!   `known` names the latest entry of the record the server's database
-//!   knows (`{"entry":…,"hash":…}`). For a coin of a restricted asset the
-//!   signer was started to serve (`--restricted`), the request also carries
-//!   `policy_sig`, the asset's policy key's approval of that very message
-//!   ([`crate::restricted`]), without which nothing of the asset is signed,
-//!   and, for an `enclave-1` coin, `enclave`, its holder's key, from which
-//!   the signer builds the message with the digest of the holder's enclave
-//!   after `K`;
+//!   knows (`{"entry":…,"hash":…}`). The fields `enclave` and `policy_sig`
+//!   are reserved: a request carrying either is refused (`declined`) with
+//!   [`arca_covenant::ENCLAVE_RETIRED`], as restricted assets stay on the
+//!   chain;
 //! - `{"op":"head"}` and `{"op":"entries","after":…,"limit":…}`: the record's
 //!   latest entry, signed ([`record_head_digest`]), and its entries after
 //!   one, for the server to check its database against at start;
@@ -407,17 +404,12 @@ pub enum Request {
 		/// knows; absent when it knows none.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		known: Option<WireEntryRef>,
-		/// The holder of an `enclave-1` coin (its registered key, x-only,
-		/// hex), the leaf of a restricted asset: the signer builds the message
-		/// with the digest of the holder's enclave after `K`, as the coin's
-		/// script does, from the asset's keys it was started with
-		/// ([`crate::restricted`]). Absent for any other coin, a checkpoint
-		/// included.
+		/// Reserved: a request carrying it is refused with
+		/// [`arca_covenant::ENCLAVE_RETIRED`]. The server never sends it.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		enclave: Option<String>,
-		/// For a message of a restricted asset, its policy key's signature
-		/// over `arca_covenant::enclave::policy_cosign_digest` of the message,
-		/// without which the signer signs nothing of the asset.
+		/// Reserved: a request carrying it is refused with
+		/// [`arca_covenant::ENCLAVE_RETIRED`]. The server never sends it.
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		policy_sig: Option<String>,
 		/// Asks only whether the signer would sign it: it makes every check
@@ -603,8 +595,8 @@ pub struct Response {
 	pub error: Option<String>,
 	/// `already_signed` when the record holds another message for the leaf;
 	/// `record_behind` or `record_differs` when the database knows a later
-	/// entry, or another; `declined` (or a restricted asset's `restricted`
-	/// or `policy`) when it refuses what the request asks ([`DECLINED`]).
+	/// entry, or another; `declined` when it refuses what the request asks
+	/// ([`DECLINED`]).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub code: Option<String>,
 	/// The entry a rebindable signature was recorded as, or the record's
@@ -2090,9 +2082,8 @@ impl SpendRecord {
 pub enum SignerError {
 	#[error("cannot reach the signer at {path}: {error}")]
 	Unreachable { path: String, error: String },
-	/// The signer refuses what the request asks ([`DECLINED`], or a
-	/// restricted asset's `restricted` or `policy`): it refuses the same
-	/// request again however often it is asked.
+	/// The signer refuses what the request asks ([`DECLINED`]): it refuses
+	/// the same request again however often it is asked.
 	#[error("the signer declined: {0}")]
 	Declined(String),
 	/// The signer answered with a failure of its own (its record not read or
@@ -2248,7 +2239,7 @@ impl SignerClient {
 				Some(RECORD_BEHIND) | Some(RECORD_DIFFERS) => SignerError::Record(e),
 				Some(STOPPED) => SignerError::Stopped(e),
 				Some(crate::supervision::FROZEN) => SignerError::Frozen(e),
-				Some(DECLINED) | Some(crate::restricted::RESTRICTED) | Some(crate::restricted::POLICY) => SignerError::Declined(e),
+				Some(DECLINED) => SignerError::Declined(e),
 				_ => SignerError::Failed(e),
 			});
 		}
@@ -2339,7 +2330,7 @@ impl SignerClient {
 	pub async fn rebind(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], after: After, asset_in: AssetId,
 		value_in: u64, outputs: &[ExplicitOutput], named: Option<WireNamed>) -> Result<Signature, SignerError>
 	{
-		signed(self.rebind_as(owner, owner_sig, salt, after, asset_in, value_in, outputs, None, None, named, false).await?).map(|(s, _)| s)
+		signed(self.rebind_as(owner, owner_sig, salt, after, asset_in, value_in, outputs, None, named, false).await?).map(|(s, _)| s)
 	}
 
 	/// [`Self::rebind`], with the entry of the record the signature was
@@ -2349,7 +2340,7 @@ impl SignerClient {
 		asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput], named: Option<WireNamed>)
 		-> Result<(Signature, Option<SignedHead>), SignerError>
 	{
-		signed(self.rebind_as(owner, owner_sig, salt, after, asset_in, value_in, outputs, None, None, named, false).await?)
+		signed(self.rebind_as(owner, owner_sig, salt, after, asset_in, value_in, outputs, None, named, false).await?)
 	}
 
 	/// Whether the signer would sign what [`Self::rebind_recorded`] asks,
@@ -2360,25 +2351,7 @@ impl SignerClient {
 	pub async fn check_rebind(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], after: After,
 		asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput], named: Option<WireNamed>) -> Result<(), SignerError>
 	{
-		self.rebind_as(owner, owner_sig, salt, after, asset_in, value_in, outputs, None, None, named, true).await.map(|_| ())
-	}
-
-	/// [`Self::rebind_recorded`] for a coin of a restricted asset: `enclave`
-	/// names the holder of an `enclave-1` coin (none for its checkpoint), and
-	/// `policy_sig` is the asset's policy key's approval of the message.
-	#[allow(clippy::too_many_arguments)]
-	pub async fn rebind_cosigned(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], enclave: Option<XOnlyPublicKey>,
-		policy_sig: &Signature, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<(Signature, Option<SignedHead>), SignerError>
-	{
-		signed(self.rebind_as(owner, owner_sig, salt, After::NONE, asset_in, value_in, outputs, None, Some((enclave, *policy_sig)), None, false).await?)
-	}
-
-	/// [`Self::check_rebind`] for what [`Self::rebind_cosigned`] asks.
-	#[allow(clippy::too_many_arguments)]
-	pub async fn check_rebind_cosigned(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], enclave: Option<XOnlyPublicKey>,
-		policy_sig: &Signature, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<(), SignerError>
-	{
-		self.rebind_as(owner, owner_sig, salt, After::NONE, asset_in, value_in, outputs, None, Some((enclave, *policy_sig)), None, true).await.map(|_| ())
+		self.rebind_as(owner, owner_sig, salt, after, asset_in, value_in, outputs, None, named, true).await.map(|_| ())
 	}
 
 	/// `S`'s signature over the rebindable message of the leaf of `owner`
@@ -2391,15 +2364,14 @@ impl SignerClient {
 		-> Result<Signature, SignerError>
 	{
 		signed(self.rebind_as(owner, owner_sig, salt, after, asset_in, value_in, std::slice::from_ref(output),
-			Some(WireForfeit::from_policy(forfeit)), None, named, false).await?).map(|(s, _)| s)
+			Some(WireForfeit::from_policy(forfeit)), named, false).await?).map(|(s, _)| s)
 	}
 
 	/// The signature and the head it was recorded as; with `check`, only
 	/// whether the signer would sign it (`None`), nothing recorded.
 	#[allow(clippy::too_many_arguments)]
 	async fn rebind_as(&self, owner: &XOnlyPublicKey, owner_sig: &Signature, salt: &[u8; 32], after: After, asset_in: AssetId,
-		value_in: u64, outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>, restricted: Option<(Option<XOnlyPublicKey>, Signature)>,
-		named: Option<WireNamed>, check: bool)
+		value_in: u64, outputs: &[ExplicitOutput], forfeit: Option<WireForfeit>, named: Option<WireNamed>, check: bool)
 		-> Result<Option<(Signature, Option<SignedHead>)>, SignerError>
 	{
 		let known = match (&self.store, check) {
@@ -2412,8 +2384,7 @@ impl SignerClient {
 			value_in: value_in.to_string(), outputs: outputs.iter().map(WireOutput::from_output).collect(), forfeit, known,
 			landing: after.landing.map(|p| hex(&p)),
 			vest: after.vest,
-			enclave: restricted.and_then(|(h, _)| h).map(|h| hex(&h.serialize())),
-			policy_sig: restricted.map(|(_, s)| hex(s.as_ref())), named, check,
+			enclave: None, policy_sig: None, named, check,
 		}).await?;
 		if check {
 			return Ok(None);

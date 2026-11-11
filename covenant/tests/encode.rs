@@ -266,3 +266,41 @@ fn witness_readers() {
 	assert_eq!(find_preimage(&w, &terms.payment_hash), Some(pre));
 	assert!(LeafPolicy { htlc: None, ..h }.claim_script().is_err());
 }
+
+/// Every wire number `enclave-1` used is reserved and reads as one named
+/// refusal, never as another form: the policy type 11, the template id 6 in
+/// either record format and by name in the JSON form, the coin record's tag 7
+/// in either format, and the board record's version 4 in either form.
+#[test]
+fn the_retired_enclave_numbers_read_as_its_refusal() {
+	let retired = |e: &dyn std::fmt::Display| assert_eq!(e.to_string(), ENCLAVE_RETIRED, "the refusal names the retirement");
+	// The policy type, after a leaf's version byte.
+	let mut b = policies()[0].encode();
+	b[1] = 11;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::Retired(ENCLAVE_RETIRED)));
+	retired(&Policy::decode(&b).unwrap_err());
+	// The template id, whatever its version, in both record formats.
+	for format in [2u8, 3] {
+		for version in [0u8, 1, 2] {
+			let e = LeafRecord::from_bytes(&[format, 6, version]).unwrap_err();
+			assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED), "format {} version {}", format, version);
+			assert_eq!(e.kind(), "template");
+			retired(&e);
+		}
+	}
+	for name in ["enclave-1", "enclave-2"] {
+		let e = name.parse::<Template>().unwrap_err();
+		assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED), "{}", name);
+	}
+	// The coin record's tag, in both formats.
+	for format in [1u8, 2] {
+		let e = CoinRecord::from_bytes(&[format, 7]).unwrap_err();
+		retired(&e);
+	}
+	// The board record's version, binary and JSON.
+	let e = BoardRecord::from_bytes(&[4]).unwrap_err();
+	assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED));
+	let e = BoardRecord::from_json(&serde_json::json!({"version": 4, "template": "board-1"})).unwrap_err();
+	assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED));
+	assert_eq!(ENCLAVE_RETIRED, "enclave-1 was retired: restricted assets stay on the chain");
+}

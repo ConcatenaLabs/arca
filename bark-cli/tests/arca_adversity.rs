@@ -1256,8 +1256,9 @@ async fn a_5xx_after_the_server_cosigned_keeps_the_payment_and_posts_it_again() 
 /// server answers 422 `declined` before it records anything, and the
 /// wallet puts its coin back (live, not `sending`), keeps the refusal once
 /// among its refusals, and posts nothing again on `sync`. The signer here
-/// holds the asset restricted, which the server serves open: it co-signs no
-/// message of the asset, a refusal it repeats however often it is asked.
+/// runs on a record of another chain: it declines every message, its
+/// owner's signature verifying under none it builds, a refusal it repeats
+/// however often it is asked.
 /// The signer as it was, the same coin pays.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_payment_the_signer_declines_is_refused_once_and_its_coin_comes_back() {
@@ -1270,9 +1271,9 @@ async fn a_payment_the_signer_declines_is_refused_once_and_its_coin_comes_back()
 	w.ok(&create_args(&url, &r.node_url()));
 	let req = w.ok(&["receive"])["request"].as_str().unwrap().to_string();
 	let genesis = r.rt.client().genesis_hash().unwrap();
-	let policy_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 	r.signer.halt();
-	r.signer.set_extra(vec!["--restricted".into(), format!("{}={}", x, policy_key)]);
+	let another_chain = r.signer.on_another_chain();
+	r.signer.set_extra(another_chain);
 	tokio::task::block_in_place(|| r.signer.resume(genesis));
 	let (ok, v) = a.run(&["send", &req, "--amount", "600000", "--asset", &x.to_string()]);
 	println!("A pays W, the signer declining it: ok={} {}", ok, v);

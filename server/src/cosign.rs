@@ -215,8 +215,6 @@ pub enum CosignError {
 	Signer(#[from] SignerError),
 	#[error(transparent)]
 	Supervision(#[from] crate::supervision::SupervisionError),
-	#[error(transparent)]
-	Restricted(#[from] crate::restricted::RestrictedError),
 	#[error("the server has not followed the chain yet")]
 	NotSynced,
 	#[error(transparent)]
@@ -261,7 +259,6 @@ impl CosignError {
 			Signer(_) => "signer_unavailable",
 			NotSynced => "not_synced",
 			Supervision(e) => e.code(),
-			Restricted(e) => e.code(),
 			Store(_) | Internal(_) => "internal",
 		}
 	}
@@ -409,55 +406,7 @@ impl Cosigner {
 	/// names ([`crate::supervision::gate`]), for a caller that checks it
 	/// before its own rules.
 	pub async fn gate(&self, leaves: &[LeafId]) -> Result<(), CosignError> {
-		crate::supervision::gate(&self.store, &self.finality, &self.params, leaves).await?;
-		Ok(crate::restricted::gate(&self.store, &self.params, leaves, "a payment over Lightning").await?)
-	}
-
-	/// The restricted profile's rules for a transfer: `None` when it moves
-	/// no restricted asset; else the asset and what the operator serves of
-	/// it, once every input is an `enclave-1` coin of one holder for the
-	/// asset's keys, every checkpoint keeps the whole coin, and the outputs
-	/// take every atom the checkpoints keep (each output is checked as a leaf
-	/// beside the others). A transfer of a restricted asset moves that asset
-	/// alone.
-	fn restricted_transfer(&self, checked: &[Checked], req: &TransferRequest)
-		-> Result<Option<(AssetId, crate::restricted::Restricted)>, CosignError>
-	{
-		let assets: std::collections::BTreeSet<AssetId> = checked.iter().map(|c| c.coin.asset)
-			.chain(req.outputs.iter().map(|o| o.asset)).collect();
-		let Some((asset, terms)) = assets.iter().find_map(|a| self.params.restricted(a).map(|r| (*a, r))) else {
-			return Ok(None);
-		};
-		if assets.len() != 1 {
-			return Err(CosignError::OutOfBounds(format!("asset {} is restricted: a transfer of it moves that asset alone, so it is \
-				not swapped in the tree", asset)));
-		}
-		let mut holder = None;
-		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
-			let e = c.coin.leaf.enclave.ok_or_else(|| CosignError::OutOfBounds(format!("input {} is a coin of restricted asset {} of \
-				template {}, not enclave-1", k, asset, c.coin.leaf.template())))?;
-			if e.enclave.policy != terms.policy || e.enclave.clawback != terms.clawback {
-				return Err(CosignError::OutOfBounds(format!("input {} is an enclave-1 coin of other keys than asset {}'s", k, asset)));
-			}
-			match holder {
-				None => holder = Some(e.enclave.holder),
-				Some(h) if h != e.enclave.holder => return Err(CosignError::OutOfBounds(format!("asset {} is restricted: a transfer of \
-					it gives up one holder's coins, and input {} is another holder's", asset, k))),
-				Some(_) => {},
-			}
-			if i.checkpoint_value != c.coin.value {
-				return Err(CosignError::Value(format!("input {}: a checkpoint of restricted asset {} keeps the whole coin, {}, not {}: \
-					no part of the asset is left for a fee, which a coin of another asset pays when the transfer is brought on the chain",
-					k, asset, c.coin.value, i.checkpoint_value)));
-			}
-		}
-		let kept: u64 = req.inputs.iter().map(|i| i.checkpoint_value).sum();
-		let paid: u64 = req.outputs.iter().map(|o| o.value).sum();
-		if paid != kept {
-			return Err(CosignError::Value(format!("the outputs take {} of restricted asset {}, and the checkpoints keep {}: a transfer of \
-				it commits every atom", paid, asset, kept)));
-		}
-		Ok(Some((asset, terms)))
+		Ok(crate::supervision::gate(&self.store, &self.finality, &self.params, leaves).await?)
 	}
 
 	/// Co-signs `req`: see the [module documentation](self). An output of the
@@ -526,17 +475,6 @@ impl Cosigner {
 			let landing = o.leaf.landing.map(|t| t.landing(o.asset, o.value)).transpose()
 				.map_err(|e| CosignError::OutOfBounds(e.to_string()))?;
 			self.params.check_landing(o.asset, o.value, landing.as_ref()).map_err(CosignError::OutOfBounds)?;
-			// The restricted profile: a leaf of a restricted asset is
-			// enclave-1 for the asset's keys and its holder's key, exiting with
-			// its whole value; nothing else holds it.
-			if let Some(t) = &o.leaf.enclave {
-				t.check_leaf(o.asset, o.value).map_err(|e| CosignError::OutOfBounds(e.to_string()))?;
-			}
-			if o.leaf.htlc.is_some() && self.params.restricted(&o.asset).is_some() {
-				return Err(CosignError::OutOfBounds(format!("asset {} is restricted: no htlc-1 leaf holds it", o.asset)));
-			}
-			self.params.check_enclave(o.asset, &o.leaf.owner, &o.leaf.owner_nonce, o.leaf.enclave.as_ref().map(|t| &t.enclave))
-				.map_err(CosignError::OutOfBounds)?;
 			if !self.params.exit_delay_ok(o.leaf.exit_delay) {
 				return Err(CosignError::OutOfBounds(format!(
 					"an exit delay of {} units; the operator takes {} to {}", o.leaf.exit_delay.units(),
@@ -620,12 +558,10 @@ impl Cosigner {
 			}
 		}
 
-		// A restricted asset's transfer leaves no margin; any other's margins
-		// are bounded. A transfer recorded passed this check when it was
-		// recorded, against the floor of that moment; the same bytes are
-		// judged as they were.
-		let restricted = self.restricted_transfer(&checked, req)?;
-		if !recorded && restricted.is_none() {
+		// The margins are bounded. A transfer recorded passed this check when
+		// it was recorded, against the floor of that moment; the same bytes
+		// are judged as they were.
+		if !recorded {
 			self.check_margins(req, &checked, &outputs).await?;
 		}
 
@@ -668,23 +604,6 @@ impl Cosigner {
 		let new_ids: Vec<LeafId> = req.outputs.iter().enumerate()
 			.map(|(j, o)| transfer_id(&parts, &outputs, j as u8, &o.leaf.policy(s, chain).program())).collect();
 
-		// A restricted asset's policy server co-signs first, after its rules:
-		// its signature over each message goes to the signer beside the
-		// request. The same request again gets the same answer from it.
-		let approval = match &restricted {
-			None => None,
-			Some((asset, terms)) => {
-				let ins: Vec<(&CoinRecord, u64)> = checked.iter().zip(&req.inputs).map(|(c, i)| (&c.record, i.checkpoint_value)).collect();
-				let outs: Vec<(AssetId, u64, NewLeaf)> = req.outputs.iter().map(|o| (o.asset, o.value, o.leaf)).collect();
-				let a = crate::restricted::approve(terms, *asset, &ins, &outs).await?;
-				for (cp, re) in &messages {
-					a.over(cp)?;
-					a.over(re)?;
-				}
-				Some((terms.clone(), a))
-			},
-		};
-
 		// A new transfer is first asked of the signer, with nothing recorded
 		// or signed: whether it would sign each message. One it refuses for
 		// what it asks is refused here and recorded nowhere, and the same
@@ -692,14 +611,11 @@ impl Cosigner {
 		let known = self.store.transfer(&transfer).await?;
 		let mut asked_first = false;
 		if known.is_none() {
-			match self.check_messages(&checked, req, &plan, &outputs, approval.as_ref().map(|(_, a)| a), &messages).await? {
+			match self.check_messages(&checked, req, &plan, &outputs).await? {
 				Ok(()) => asked_first = true,
 				Err((k, e)) if matches!(e, SignerError::Declined(_) | SignerError::Frozen(_)) => {
 					log::warn!("transfer {} refused before it was recorded: the signer refuses coin {}'s message for good: {}",
 						crate::signer::hex(&transfer), checked[k].coin.id, e);
-					if let Some((terms, a)) = &approval {
-						crate::restricted::drop(terms, &a.id).await;
-					}
 					return Err(CosignError::Signer(e));
 				},
 				// Anything else is met again below, the transfer recorded.
@@ -772,18 +688,11 @@ impl Cosigner {
 						SignerMessage { owner: cp.owner.serialize(), salt: cp.salt, digest: messages[k].1, forfeit: false },
 					]
 				}).collect();
-				let recorded = self.store.record_transfer(&transfer, &reassignment, admit, &ins, &outs, &signer_messages).await.map_err(|e| match e {
+				self.store.record_transfer(&transfer, &reassignment, admit, &ins, &outs, &signer_messages).await.map_err(|e| match e {
 					StoreError::LeafSpent(id) => CosignError::DoubleSpend(id.parse().unwrap_or(req.inputs[0].leaf_id)),
 					StoreError::LeafNotLive(id, state) => CosignError::NotLive(id.parse().unwrap_or(req.inputs[0].leaf_id), state),
 					other => other.into(),
-				});
-				if let Err(e) = recorded {
-					// Not recorded here: the policy server gives the inputs back.
-					if let Some((terms, a)) = &approval {
-						crate::restricted::drop(terms, &a.id).await;
-					}
-					return Err(e);
-				}
+				})?;
 			},
 		}
 
@@ -806,8 +715,8 @@ impl Cosigner {
 		// again. Any other error leaves the transfer recorded, for the same
 		// request to complete.
 		if !asked_first {
-			if let Err((k, e)) = self.check_messages(&checked, req, &plan, &outputs, approval.as_ref().map(|(_, a)| a), &messages).await? {
-				return Err(self.declined(e, &checked[k].coin.id, signed_part, &transfer, approval.as_ref().map(|(t, a)| (t, a))).await);
+			if let Err((k, e)) = self.check_messages(&checked, req, &plan, &outputs).await? {
+				return Err(self.declined(e, &checked[k].coin.id, signed_part, &transfer).await);
 			}
 		}
 
@@ -828,13 +737,8 @@ impl Cosigner {
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
 			let owner = c.coin.leaf.owner;
-			let cp = match &approval {
-				Some((_, a)) => self.signer.rebind_cosigned(&owner, &i.checkpoint_sig, &c.coin.leaf.salt,
-					c.coin.leaf.enclave.map(|e| e.enclave.holder), &a.over(&messages[k].0)?, c.coin.asset, c.coin.value,
-					std::slice::from_ref(&cp_out)).await,
-				None => self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, crate::signer::After::of(&c.coin.leaf),
-					c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await,
-			};
+			let cp = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, crate::signer::After::of(&c.coin.leaf),
+				c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
 			let (cp, h) = match cp {
 				Ok(x) => x,
 				// The first message of the transfer refused: nothing of it is
@@ -845,12 +749,8 @@ impl Cosigner {
 			latest(h);
 			let checkpoint = plan.checkpoint(k);
 			let named = named_for(&plan, k, n);
-			let (re, h) = match &approval {
-				Some((_, a)) => self.signer.rebind_cosigned(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None,
-					&a.over(&messages[k].1)?, c.coin.asset, plan.inputs[k].1, &outputs).await,
-				None => self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, crate::signer::After::NONE, c.coin.asset,
-					plan.inputs[k].1, &outputs, named).await,
-			}.map_err(|e| lost_spend(e, &c.coin.id))?;
+			let (re, h) = self.signer.rebind_recorded(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, crate::signer::After::NONE,
+				c.coin.asset, plan.inputs[k].1, &outputs, named).await.map_err(|e| lost_spend(e, &c.coin.id))?;
 			latest(h);
 			if !verify_digest(&cp, &messages[k].0, &s) || !verify_digest(&re, &messages[k].1, &s) {
 				return Err(CosignError::Internal("the signer signed another message than the server built".into()));
@@ -1111,7 +1011,7 @@ impl Cosigner {
 			}
 		}
 		if matches!(e, SignerError::Declined(_) | SignerError::Frozen(_)) {
-			return self.declined(e, leaf, false, transfer, None).await;
+			return self.declined(e, leaf, false, transfer).await;
 		}
 		lost_spend(e, leaf)
 	}
@@ -1120,35 +1020,19 @@ impl Cosigner {
 	/// (each input's checkpoint, then its reassignment), with nothing
 	/// recorded or signed: `Ok(Err((k, e)))` names the first input refused
 	/// and the signer's answer.
-	#[allow(clippy::too_many_arguments)]
-	async fn check_messages(&self, checked: &[Checked], req: &TransferRequest, plan: &TransferPlan, outputs: &[ExplicitOutput],
-		approval: Option<&crate::restricted::Approval>, messages: &[([u8; 32], [u8; 32])])
+	async fn check_messages(&self, checked: &[Checked], req: &TransferRequest, plan: &TransferPlan, outputs: &[ExplicitOutput])
 		-> Result<Result<(), (usize, SignerError)>, CosignError>
 	{
 		let n = checked.len();
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
 			let checkpoint = plan.checkpoint(k);
-			let asked = match approval {
-				Some(a) => {
-					let cp = self.signer.check_rebind_cosigned(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt,
-						c.coin.leaf.enclave.map(|e| e.enclave.holder), &a.over(&messages[k].0)?, c.coin.asset, c.coin.value,
-						std::slice::from_ref(&cp_out)).await;
-					match cp {
-						Ok(()) => self.signer.check_rebind_cosigned(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, None,
-							&a.over(&messages[k].1)?, c.coin.asset, plan.inputs[k].1, outputs).await,
-						e => e,
-					}
-				},
-				None => {
-					let cp = self.signer.check_rebind(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt,
-						crate::signer::After::of(&c.coin.leaf), c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
-					match cp {
-						Ok(()) => self.signer.check_rebind(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, crate::signer::After::NONE, c.coin.asset,
-							plan.inputs[k].1, outputs, named_for(plan, k, n)).await,
-						e => e,
-					}
-				},
+			let cp = self.signer.check_rebind(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt,
+				crate::signer::After::of(&c.coin.leaf), c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
+			let asked = match cp {
+				Ok(()) => self.signer.check_rebind(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, crate::signer::After::NONE, c.coin.asset,
+					plan.inputs[k].1, outputs, named_for(plan, k, n)).await,
+				e => e,
 			};
 			if let Err(e) = asked {
 				return Ok(Err((k, e)));
@@ -1162,15 +1046,13 @@ impl Cosigner {
 	/// (`signed_part` when the signer holds part of it from an earlier
 	/// request). A refusal the signer would repeat however often it is asked
 	/// ([`SignerError::is_final`]), with nothing of the transfer signed,
-	/// drops its record and gives its inputs back, and a restricted asset's
-	/// approval back to its policy server: the transfer is refused for good,
-	/// and its owner may pay the coins again. With part of it signed, the
+	/// drops its record and gives its inputs back: the transfer is refused
+	/// for good, and its owner may pay the coins again. With part of it signed, the
 	/// record stays (the database never forgets what the signer signed) and
 	/// the refusal is logged: the transfer can no longer complete, and the
 	/// coin the signer holds a spend of goes home on the chain. Any other
 	/// error leaves the record for the same request to complete.
-	async fn declined(&self, e: SignerError, leaf: &LeafId, signed_part: bool, transfer: &[u8; 32],
-		approval: Option<(&crate::restricted::Restricted, &crate::restricted::Approval)>) -> CosignError
+	async fn declined(&self, e: SignerError, leaf: &LeafId, signed_part: bool, transfer: &[u8; 32]) -> CosignError
 	{
 		if !e.is_final() {
 			return CosignError::Signer(e);
@@ -1185,9 +1067,6 @@ impl Cosigner {
 				{} input(s) given back", crate::signer::hex(transfer), leaf, e, back.len()),
 			Err(d) => log::error!("transfer {} refused for good before anything of it was signed (coin {}: {}), and its record could not \
 				be dropped: {}", crate::signer::hex(transfer), leaf, e, d),
-		}
-		if let Some((terms, a)) = approval {
-			crate::restricted::drop(terms, &a.id).await;
 		}
 		CosignError::Signer(e)
 	}

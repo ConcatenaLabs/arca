@@ -463,10 +463,9 @@ async fn signer_unreachable() {
 
 /// A transfer the signer declines for what it asks is refused for good:
 /// 422 `declined`, the same answer however often it is asked, and nothing of
-/// it kept, so the coin is its owner's to pay again. The signer here holds
-/// the coin's asset restricted, which the server serves open: it co-signs no
-/// message of the asset without its policy key's approval, a refusal it
-/// repeats forever. A new transfer is refused before it is recorded; one
+/// it kept, so the coin is its owner's to pay again. The signer here runs on
+/// a record of another chain: no owner's signature verifies under a message
+/// it builds, a refusal it repeats forever. A new transfer is refused before it is recorded; one
 /// recorded while the signer was away (503, the coin held for it) is dropped
 /// when the signer then declines it, its coin given back, and the same
 /// request after that is refused as well (`salt`: its new leaves' salts were
@@ -483,12 +482,12 @@ async fn a_transfer_the_signer_declines_is_refused_for_good() {
 	let body = transfer_body(&[(&coin, vc.clone(), VALUE - MARGIN)], &[(r.x, VALUE - 2 * MARGIN, w_leaf)], s, r.chain);
 	let genesis = r.chain.genesis_hash();
 	let key = r.s;
-	let restricted = vec!["--restricted".to_string(), format!("{}={}", r.x, hex(&xonly(&keypair("P")).serialize()))];
+	let another_chain = r.signer.on_another_chain();
 	let state = |r: &Running| {
 		let (store, id) = (r.server.store.clone(), coin.id.0);
 		async move { store.leaf(&id).await.unwrap().unwrap().state }
 	};
-	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &restricted));
+	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &another_chain));
 	for _ in 0..2 {
 		refused(r.http.post("cosign_transfer", &body), 422, "declined");
 	}
@@ -502,7 +501,7 @@ async fn a_transfer_the_signer_declines_is_refused_for_good() {
 	assert_eq!(state(&r).await, server::store::LeafState::Spent, "recorded: the coin held for the transfer");
 	// The signer back, declining it: the record dropped and the coin given
 	// back; the same request again is refused for good too.
-	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &restricted));
+	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &another_chain));
 	refused(r.http.post("cosign_transfer", &body), 422, "declined");
 	assert_eq!(state(&r).await, server::store::LeafState::Live, "the coin is given back");
 	refused(r.http.post("cosign_transfer", &body), 409, "salt");

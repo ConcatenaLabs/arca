@@ -809,22 +809,11 @@ pub struct AssetSection {
 	pub arriving_lane: Option<String>,
 	#[serde(default)]
 	pub arriving_lane_value: Option<String>,
-	/// The restricted profile ([`crate::restricted`]): the asset is a
-	/// restricted asset its issuer serves in this tree, and its policy server
-	/// co-signs beside the operator.
+	/// Reserved: a `restricted` section is refused at start with
+	/// [`arca_covenant::ENCLAVE_RETIRED`]. Restricted assets stay on the chain,
+	/// and an operator never serves one as an open asset.
 	#[serde(default)]
-	pub restricted: Option<RestrictedSection>,
-}
-
-/// A restricted asset's policy server.
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct RestrictedSection {
-	/// The policy server's base URL, as `http://host:port`.
-	pub policy_server: String,
-	/// The file holding the issuer's token for the policy server's issuer
-	/// calls, readable by the operator alone.
-	pub token_file: String,
+	pub restricted: Option<serde::de::IgnoredAny>,
 }
 
 /// A supervised asset's settings.
@@ -1586,6 +1575,10 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 	let mut list: Vec<(AssetId, AssetParams)> = vec![];
 	for a in &config.assets {
 		let id = AssetId::from_str(&a.asset).map_err(err("assets.asset"))?;
+		if a.restricted.is_some() {
+			return Err(StartError(format!("asset {}: restricted: {}. The operator does not serve a restricted asset: remove its entry",
+				id, arca_covenant::ENCLAVE_RETIRED)));
+		}
 		if list.iter().any(|(b, _)| *b == id) {
 			return Err(StartError(format!("assets: asset {} is listed twice", id)));
 		}
@@ -1641,7 +1634,7 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 			_ => Some(amount("in_flight_cap", &a.in_flight_cap, &a.in_flight_cap_value)?),
 		};
 		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity, channel_total,
-			restricted: None, in_flight_cap, arriving_lane }));
+			in_flight_cap, arriving_lane }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -1696,40 +1689,6 @@ async fn supervise(list: &mut [(AssetId, AssetParams)], config: &Config, finalit
 		}
 		log::info!("asset {} is supervised: served under the supervised profile, landing allowance {}", id, landing_allowance);
 		p.supervised = Some(crate::params::Supervised { landing_allowance });
-	}
-	Ok(())
-}
-
-/// Serves every asset whose section names a policy server under the
-/// restricted profile ([`crate::restricted`]): the asset's tree terms read
-/// from its policy server, which must name `operator` as the tree's operator.
-/// Refuses a restricted asset that is also supervised, issuer-operated or
-/// served over Lightning, none of which keeps it in `enclave-1` leaves.
-async fn restrict(list: &mut [(AssetId, AssetParams)], config: &Config, operator: elements::secp256k1_zkp::XOnlyPublicKey) -> Result<(), StartError> {
-	for (id, p) in list.iter_mut() {
-		let section = config.assets.iter().find(|s| AssetId::from_str(&s.asset).ok() == Some(*id));
-		let Some(r) = section.and_then(|s| s.restricted.clone()) else {
-			p.restricted = None;
-			continue;
-		};
-		if p.supervised.is_some() || p.issuer.is_some() || section.is_some_and(|s| s.lightning.is_some())
-			|| p.channel_capacity != crate::params::Amount::Atoms(0) {
-			return Err(StartError(format!("asset {}: restricted: a restricted asset is held in enclave-1 leaves alone, so it is not also \
-				supervised, issuer-operated, served over Lightning or in channel-1 leaves here", id)));
-		}
-		let token = std::fs::read_to_string(&r.token_file)
-			.map_err(|e| StartError(format!("asset {}: restricted.token_file {}: {}", id, r.token_file, e)))?.trim().to_string();
-		let terms = crate::restricted::tree_terms(&r.policy_server, *id).await
-			.map_err(|e| StartError(format!("asset {}: restricted: {}", id, e)))?;
-		if terms.operator != operator {
-			return Err(StartError(format!("asset {}: restricted: the policy server names {} as the operator of the asset's tree, and this \
-				operator's key is {}: it serves the asset only in a tree its issuer names it the operator of", id,
-				crate::signer::hex(&terms.operator.serialize()), crate::signer::hex(&operator.serialize()))));
-		}
-		log::info!("asset {} is restricted: served in its issuer's tree, every leaf enclave-1, policy key {}, clawback {}, policy server {}",
-			id, crate::signer::hex(&terms.policy.serialize()),
-			terms.clawback.map_or("none".to_string(), |k| crate::signer::hex(&k.serialize())), r.policy_server);
-		p.restricted = Some(crate::restricted::Restricted { policy: terms.policy, clawback: terms.clawback, server: r.policy_server, token });
 	}
 	Ok(())
 }
@@ -1840,7 +1799,6 @@ impl Server {
 		let (mut list, fee_assets) = assets_of(config)?;
 		issuers_on(&list, &fee_assets, genesis)?;
 		supervise(&mut list, config, &finality).await?;
-		restrict(&mut list, config, operator).await?;
 		let mut params = Params::new(Chain::new(genesis), operator, BTreeMap::new());
 		params.assets.set_default_fees(default_fees(config));
 		params.serve(list, fee_assets);
@@ -2179,7 +2137,6 @@ impl Server {
 		let (mut list, fee_assets) = assets_of(config)?;
 		issuers_on(&list, &fee_assets, self.params.chain.genesis_hash())?;
 		supervise(&mut list, config, &self.finality).await?;
-		restrict(&mut list, config, self.params.operator).await?;
 		let legs = legs_of(config)?;
 		let before = self.params.assets.all();
 		let removed: Vec<String> = before.iter().filter(|(a, _)| !list.iter().any(|(b, _)| b == a)).map(|(a, _)| a.to_string()).collect();
@@ -2263,5 +2220,22 @@ mod tests {
 		let d = super::LimitsSection::default();
 		assert_eq!((c.limits.witness_per_second, c.limits.witness_burst, c.limits.witness_source_per_second, c.limits.witness_source_burst),
 			(d.witness_per_second, d.witness_burst, d.witness_source_per_second, d.witness_source_burst), "the example names the defaults");
+	}
+
+	/// An asset entry with a `restricted` section, whatever it holds, stops
+	/// the server: it names the asset and the retirement, and never serves
+	/// the asset as an open one.
+	#[test]
+	fn a_restricted_section_refuses_to_start() {
+		let asset = "25b251070e29ca19043cf33ccd7324e2ddab03ecc4ae0b5e77c4fc0e5cf6c95a";
+		let example = include_str!("../arcad.example.toml").replace("<asset id>", asset);
+		let c: Config = toml::from_str(&example).expect("the example parses");
+		assert!(super::assets_of(&c).is_ok(), "the asset without the section is served");
+		for section in ["[assets.restricted]\npolicy_server = \"http://127.0.0.1:1\"\ntoken_file = \"/nonexistent\"\n", "[assets.restricted]\n"] {
+			let text = example.replacen("min_leaf = \"1000\"\n", &format!("min_leaf = \"1000\"\n{}", section), 1);
+			let c: Config = toml::from_str(&text).expect("a restricted section still parses");
+			let e = super::assets_of(&c).err().expect("a restricted section is refused").0;
+			assert!(e.contains(asset) && e.contains(arca_covenant::ENCLAVE_RETIRED), "{}", e);
+		}
 	}
 }

@@ -65,7 +65,8 @@
 //!
 //! ```text
 //! u8    format version, 2
-//! u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing), 7 (channel), 8 (claim) or 9 (vest)
+//! u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing), 7 (channel), 8 (claim) or 9 (vest);
+//!       6 is reserved and reads as ENCLAVE_RETIRED
 //! u8    template version, 1 (vtxo, htlc, landing, channel, claim, vest), or 2 or 3 (order)
 //! [32]  owner key A                   the vtxo-1 parameters
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
@@ -337,7 +338,7 @@ impl Template {
 			(Template::ORDER, v) => Err(RecordError::TemplateVersion { template: "order".into(), version: v as u64 }),
 			(Template::LANDING, v) => Err(RecordError::TemplateVersion { template: "landing".into(), version: v as u64 }),
 			(Template::CHANNEL, v) => Err(RecordError::TemplateVersion { template: "channel".into(), version: v as u64 }),
-			(Template::ENCLAVE, _) => Err(RecordError::Template(ENCLAVE_RETIRED.into())),
+			(Template::ENCLAVE, _) => Err(RecordError::Retired(ENCLAVE_RETIRED)),
 			(Template::CLAIM, v) => Err(RecordError::TemplateVersion { template: "claim".into(), version: v as u64 }),
 			(Template::VEST, v) => Err(RecordError::TemplateVersion { template: "vest".into(), version: v as u64 }),
 			(t, _) => Err(RecordError::Template(t.to_string())),
@@ -369,7 +370,7 @@ impl FromStr for Template {
 			"order" => &[Template::Order2, Template::Order3],
 			"landing" => &[Template::Landing1],
 			"channel" => &[Template::Channel1],
-			"enclave" => return Err(RecordError::Template(ENCLAVE_RETIRED.into())),
+			"enclave" => return Err(RecordError::Retired(ENCLAVE_RETIRED)),
 			"claim" => &[Template::Claim1],
 			"vest" => &[Template::Vest1],
 			_ => return Err(RecordError::Template(s.into())),
@@ -529,6 +530,10 @@ pub enum RecordError {
 	Version(u64),
 	#[error("unknown leaf template {0}")]
 	Template(String),
+	/// A reserved number of a retired form, with the sentence that names it
+	/// ([`ENCLAVE_RETIRED`]).
+	#[error("{0}")]
+	Retired(&'static str),
 	#[error("leaf template {template} has no version {version} known here")]
 	TemplateVersion { template: String, version: u64 },
 	#[error("a value of {0} is out of range")]
@@ -622,7 +627,7 @@ impl RecordError {
 				DecodeError::UnexpectedEnd => "end",
 				DecodeError::TrailingBytes(_) => "trailing",
 				DecodeError::Version(_) => "version",
-				DecodeError::PolicyType(_) => "template",
+				DecodeError::PolicyType(_) | DecodeError::Retired(_) => "template",
 				DecodeError::Key => "key",
 				DecodeError::Flag(_) => "flag",
 				DecodeError::Count(_) | DecodeError::NonCanonical => "count",
@@ -631,7 +636,7 @@ impl RecordError {
 				DecodeError::NoSweepToken => "sweep",
 			},
 			Version(_) => "version",
-			Template(_) => "template",
+			Template(_) | Retired(_) => "template",
 			TemplateVersion { .. } => "template_version",
 			Value(_) | ValueSum | Amount(_) => "value",
 			Levels(_) | Children { .. } | Owners { .. } | MemberDepth { .. } | Schedule(_) => "count",

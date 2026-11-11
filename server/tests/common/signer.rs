@@ -96,6 +96,22 @@ impl SignerProcess {
 		self.dir.join("signer.record")
 	}
 
+	/// What [`Self::restart_with`] takes to start the signer, on its key, on
+	/// a record of another chain: every message it builds then differs from
+	/// the server's, no owner's signature verifies under it, and it declines
+	/// each one, a refusal it repeats however often it is asked.
+	/// [`Self::restart`] brings it back on its own record.
+	pub fn on_another_chain(&self) -> Vec<String> {
+		use elements::hashes::Hash;
+		let genesis = BlockHash::from_byte_array([0x5a; 32]);
+		let record = self.dir.join("another-chain.record");
+		if !record.exists() {
+			let made = create_record(&self.dir.join("operator.key"), genesis, &record);
+			assert!(made.status.success(), "the record on another chain: {}", String::from_utf8_lossy(&made.stderr));
+		}
+		vec!["--genesis".into(), genesis.to_string(), "--record".into(), record.to_str().unwrap().into()]
+	}
+
 	pub fn pid(&self) -> u32 {
 		self.child.id()
 	}

@@ -405,7 +405,7 @@ impl BoardRecord {
 		let mut r = Reader::new(data);
 		let version = r.u8()?;
 		if version == BOARD_ENCLAVE_RECORD_VERSION {
-			return Err(RecordError::Template(ENCLAVE_RETIRED.into()));
+			return Err(RecordError::Retired(ENCLAVE_RETIRED));
 		}
 		if version != BOARD_RECORD_VERSION && version != BOARD_LANDING_RECORD_VERSION {
 			return Err(RecordError::Version(version as u64));
@@ -496,7 +496,7 @@ mod json {
 				fields.push("landing");
 			}
 			if named == Some(BOARD_ENCLAVE_RECORD_VERSION as u64) {
-				return Err(RecordError::Template(ENCLAVE_RETIRED.into()));
+				return Err(RecordError::Retired(ENCLAVE_RETIRED));
 			}
 			let m = object(v, "board", &fields)?;
 			let version = int(m, "version", u64::MAX)?;

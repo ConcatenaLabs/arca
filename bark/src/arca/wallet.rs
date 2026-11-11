@@ -100,12 +100,11 @@ pub struct Config {
 /// The template of the leaf a coin record names: what `coins` shows of it.
 fn template_of(r: &CoinRecord) -> Option<Template> {
 	// A leaf made by a transfer or a fill, by its terms.
-	let new_leaf = |l: &arca_covenant::NewLeaf| match (&l.htlc, &l.landing, &l.enclave, l.v2) {
+	let new_leaf = |l: &arca_covenant::NewLeaf| match (&l.htlc, &l.landing, l.v2) {
 		(Some(_), ..) => Template::Htlc1,
-		(None, Some(_), ..) => Template::Landing1,
-		(None, None, Some(_), _) => Template::Enclave1,
-		(None, None, None, true) => Template::Vtxo2,
-		(None, None, None, false) => Template::Vtxo1,
+		(None, Some(_), _) => Template::Landing1,
+		(None, None, true) => Template::Vtxo2,
+		(None, None, false) => Template::Vtxo1,
 	};
 	Some(match r {
 		CoinRecord::Leaf { record, .. } => record.template,

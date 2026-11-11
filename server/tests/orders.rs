@@ -537,8 +537,8 @@ async fn a_fill_left_half_signed() -> (Running, LeafId, Value, common::signer::S
 /// A fill the signer declines for what it asks is refused for good, 422
 /// `declined`, before anything of it is recorded: the order rests where it
 /// was with no fill, the taker's coin is its own, and the signer recorded
-/// nothing. The signer here holds the taker's asset restricted, which the
-/// server serves open, so it co-signs no message of it. Once the signer signs
+/// nothing. The signer here runs on a record of another chain, so no owner's
+/// signature verifies under a message it builds. Once the signer signs
 /// again, the same fill completes. A fill the signer cannot reach is
 /// recorded and completed later (`a_fill_the_signer_left_half_done_is_completed_by_the_server`).
 #[tokio::test(flavor = "multi_thread")]
@@ -564,8 +564,8 @@ async fn a_fill_the_signer_declines_is_refused_for_good() {
 	let good = fill_body(&r, &st, &p, (c1, c1.valid(&r)), VALUE - 1, 300_000, (&l1, &ch1), 1, &t1, None);
 	let entries = r.signer_entries().await.len();
 	let genesis = r.chain.genesis_hash();
-	let restricted = vec!["--restricted".to_string(), format!("{}={}", y, hex(&xonly(&keypair("P")).serialize()))];
-	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &restricted));
+	let another_chain = r.signer.on_another_chain();
+	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &another_chain));
 	for _ in 0..2 {
 		let a = r.http.post("order_fill", &good);
 		let (code, message) = a.refusal();
