@@ -265,6 +265,12 @@ pub struct BondInfo {
 	/// That share of `reference_value`, in atoms of the reference unit.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub instant_budget: Option<String>,
+	/// The instant limit the operator suggests a wallet hold at most, in
+	/// atoms of the reference unit (`[bond] instant_limit_value`): of coins
+	/// paid to it out of round, what it counts as its own at once. Absent
+	/// when it suggests none.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub instant_limit_value: Option<String>,
 	/// What the state rests on.
 	pub why: String,
 }
