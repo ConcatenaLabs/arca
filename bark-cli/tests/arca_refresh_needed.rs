@@ -11,6 +11,12 @@
 //!    the node's rates: `exposure`. Every asset is weighed, not only the
 //!    bond's.
 //! 4. A wallet that received nothing: nothing needed, whatever the idle time.
+//! 5. By the clock: a received coin is `expiry` only inside its own refresh
+//!    window, from `refresh_from` to its exit deadline; not before, and not
+//!    after the deadline, when the operator takes it into no round.
+//! 6. The node loses its rate for the bond's asset: what the wallet holds
+//!    out of round cannot be valued, so `exposure` (unpriced) asks for a
+//!    refresh, as the wallet's own `bond` says it is not covered.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -102,6 +108,11 @@ fn pay(from: &Arca, to: &Arca, asset: AssetId, amount: u64) -> String {
 	mb["accepted"].as_array().unwrap().last().and_then(|c| c["leaf_id"].as_str()).expect("the payee holds the coin").to_string()
 }
 
+fn mtp(r: &Running) -> u64 {
+	let v: Value = r.rt.client().call("getblockchaininfo", &[]).unwrap();
+	v["mediantime"].as_u64().unwrap()
+}
+
 fn rules(v: &Value) -> Vec<String> {
 	v["reasons"].as_array().unwrap().iter().map(|r| r["rule"].as_str().unwrap().to_string()).collect()
 }
@@ -184,6 +195,74 @@ async fn a_refresh_is_needed_only_by_its_rules() {
 	println!("RN coin of Y under half: {}", v);
 	assert_eq!(v["needed"], false, "{}", v);
 	for w in [&a, &b, &c, &d2, &n] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_expiry_rule_holds_inside_the_coins_refresh_window_only() {
+	let mut r = Running::start().await;
+	let y = r.y;
+	let a = Arca::new("RNE A");
+	boarded(&mut r, &a, &[(y, 8_000_000)]).await;
+	let mut set: Value = r.rt.client().call("getfeeexchangerates", &[]).unwrap();
+	set[y.to_string()] = json!(100_000_000u64);
+	r.rt.client().call::<Value>("setfeeexchangerates", &[set]).unwrap();
+	post_bond(&mut r).await;
+	a.ok(&["sync"]);
+	let b = Arca::new("RNE B");
+	create(&r, &b);
+	let got = pay(&a, &b, y, 100_000);
+	let c = b.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == got.as_str()).cloned().unwrap();
+	let expiry = c["expiry"].as_u64().expect("the coin's expiry");
+	let exit_by = expiry - 3 * 86_400;
+	let refresh_from = exit_by - 2 * 86_400;
+	println!("RNE expiry {} exit_by {} refresh_from {} now {}", expiry, exit_by, refresh_from, mtp(&r));
+	// Before the window, inside it, and past the exit deadline (the expiry rule only: idle 0).
+	for (label, at, want) in [("a day before its refresh window", refresh_from - 86_400, false),
+		("inside its refresh window (expiry - 4.5 d)", expiry - 4 * 86_400 - 43_200, true),
+		("past its exit deadline (expiry - 2.5 d)", expiry - 2 * 86_400 - 43_200, false)] {
+		let now = mtp(&r);
+		if at > now {
+			tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, (at - now) as u32));
+		}
+		let v = library(&b, "refresh_needed", json!({"idle_seconds": 0})).unwrap();
+		println!("RNE {} (mtp {}): {}", label, mtp(&r), v);
+		assert_eq!(rules(&v), if want { vec!["expiry".to_string()] } else { vec![] }, "{}: {}", label, v);
+	}
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_rate_for_the_bonds_asset_asks_for_a_refresh() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x, r.y);
+	let a = Arca::new("RNU A");
+	boarded(&mut r, &a, &[(x, 8_000_000), (y, 8_000_000)]).await;
+	let mut set: Value = r.rt.client().call("getfeeexchangerates", &[]).unwrap();
+	set[y.to_string()] = json!(100_000_000u64);
+	r.rt.client().call::<Value>("setfeeexchangerates", &[set.clone()]).unwrap();
+	post_bond(&mut r).await;
+	a.ok(&["sync"]);
+	let c = Arca::new("RNU C");
+	create(&r, &c);
+	pay(&a, &c, y, 100_000);
+	let v = library(&c, "refresh_needed", json!({"idle_seconds": 0})).unwrap();
+	println!("RNU every rate, a small coin: {}", v);
+	assert_eq!(v["needed"], false, "{}", v);
+	// The node loses its rate for X, the bond's asset; Y keeps its own.
+	let mut less = set.clone();
+	less.as_object_mut().unwrap().remove(&x.to_string());
+	r.rt.client().call::<Value>("setfeeexchangerates", &[less]).unwrap();
+	let v = library(&c, "refresh_needed", json!({"idle_seconds": 0})).unwrap();
+	let bond = c.ok(&["bond"]);
+	println!("RNU no rate for the bond's asset: {}; the wallet's bond covers: {}", v, bond["covers"]);
+	assert_eq!((v["needed"].as_bool(), rules(&v)), (Some(true), vec!["exposure".to_string()]), "{}", v);
+	assert_eq!(v["reasons"][0]["unpriced"], json!([x.to_string()]), "{}", v);
+	r.rt.client().call::<Value>("setfeeexchangerates", &[set]).unwrap();
+	for w in [&a, &c] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

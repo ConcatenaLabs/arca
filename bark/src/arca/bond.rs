@@ -402,10 +402,12 @@ impl Wallet {
 	/// What the wallet holds out of round against the most it may hold, both
 	/// in the reference unit at its node's rates, over every asset: its
 	/// instant budget when it sets one, else the bond's whole value. The
-	/// assets the node does not price are named apart (`unpriced`): they
-	/// cannot be weighed, so a caller treats them as past any share. `None`
-	/// while the operator posts no bond, or its bond does not stand (`sync`
-	/// then refreshes every such coin by itself, [`Self::uncovered`]).
+	/// assets the node does not price are named apart (`unpriced`), the
+	/// bond's own among them when the node has no rate for it (then `limit`
+	/// is 0): they cannot be weighed, so a caller treats them as past any
+	/// share. `None` while the operator posts no bond, or its bond does not
+	/// stand (`sync` then refreshes every such coin by itself,
+	/// [`Self::uncovered`]).
 	pub(crate) fn exposure(&self) -> Result<Option<Exposure>, Error> {
 		let info = self.server_info()?;
 		let s = self.bond_standing(&info)?;
@@ -414,19 +416,25 @@ impl Wallet {
 		}
 		let (asset, value) = (s.asset.expect("bonded"), s.value.expect("bonded"));
 		let rates = self.chain.fee_rates()?;
-		let Some(rate) = rates.get(&asset).copied() else { return Ok(None) };
-		let bond = value as u128 * rate as u128 / 100_000_000;
+		let mut unpriced = vec![];
+		let bond = match rates.get(&asset) {
+			Some(rate) => value as u128 * *rate as u128 / 100_000_000,
+			None => {
+				unpriced.push(asset.to_string());
+				0
+			},
+		};
 		let operator = info["bond"]["instant_budget_ppm"].as_u64().and_then(|p| u32::try_from(p).ok()).filter(|p| *p > 0);
 		let limit = match self.own_budget_ppm()? {
 			Some(own) => bond * operator.map_or(own, |o| o.min(own)) as u128 / 1_000_000,
 			None => bond,
 		};
 		let mut held = 0u128;
-		let mut unpriced = vec![];
 		for (a, v) in self.out_of_round()? {
 			match rates.get(&a) {
 				Some(r) => held += v as u128 * *r as u128 / 100_000_000,
-				None => unpriced.push(a.to_string()),
+				None if !unpriced.contains(&a.to_string()) => unpriced.push(a.to_string()),
+				None => {},
 			}
 		}
 		Ok(Some(Exposure { held, limit, unpriced }))

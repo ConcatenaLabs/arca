@@ -48,7 +48,7 @@ use arca_covenant::CoinRecord;
 
 use super::chain::MempoolEntry;
 use super::keys::{p2wpkh, CHANGE, RECEIVE};
-use super::wallet::{owner_of, Wallet, REFRESH_FROM};
+use super::wallet::{owner_of, CoinDates, Wallet};
 use super::Error;
 
 /// Seconds a refresh of received coins may wait at the operator, for funds
@@ -473,8 +473,11 @@ impl Wallet {
 	///   depth limit, which cannot be paid on again out of round;
 	/// - `exposure`: more than half of what the wallet may hold out of round
 	///   ([`Self::exposure`]: its instant budget, else the bond), over every
-	///   asset at the node's rates, or an asset the node does not price;
-	/// - `expiry`: a received coin within [`REFRESH_FROM`] of its expiry;
+	///   asset at the node's rates; or, when the node does not price an
+	///   asset held out of round or the bond's own, always: what cannot be
+	///   valued is refreshed;
+	/// - `expiry`: a received coin inside its refresh window
+	///   ([`CoinDates`]: from `refresh_from` until its exit deadline);
 	/// - `idle`: the person has left the wallet alone `idle_seconds` of at
 	///   least [`REFRESH_IDLE`] (the caller counts them).
 	///
@@ -504,14 +507,18 @@ impl Wallet {
 			}
 			if let Some(e) = self.exposure()? {
 				if !e.unpriced.is_empty() {
-					reasons.push(json!({"rule": "exposure", "why": format!("the wallet holds out of round assets its node does not price ({}), \
-						which cannot be weighed against what it may hold", e.unpriced.join(", "))}));
+					reasons.push(json!({"rule": "exposure", "unpriced": e.unpriced, "why": format!("the wallet's node does not price {}: what it holds \
+						out of round cannot be weighed against what it may hold, so it is refreshed", e.unpriced.join(", "))}));
 				} else if e.held.saturating_mul(2) > e.limit {
 					reasons.push(json!({"rule": "exposure", "held": e.held.to_string(), "limit": e.limit.to_string(),
 						"why": format!("the wallet holds out of round {} of the {} it may hold (reference atoms at its node's rates), past half", e.held, e.limit)}));
 				}
 			}
-			let soon: Vec<String> = received.iter().filter(|(c, _)| c.expiry != u32::MAX && c.expiry as u64 <= now as u64 + REFRESH_FROM as u64)
+			// Inside the coin's own refresh window ([`CoinDates`]): from its
+			// `refresh_from` until its exit deadline, after which the operator
+			// takes it into no round and it goes home instead.
+			let soon: Vec<String> = received.iter()
+				.filter(|(c, _)| CoinDates::of(c.expiry).is_some_and(|d| d.refresh_from <= now && now < d.exit_by))
 				.map(|(c, _)| c.leaf_id.clone()).collect();
 			if !soon.is_empty() {
 				reasons.push(json!({"rule": "expiry", "coins": soon, "why": "a received coin is close to its expiry"}));
