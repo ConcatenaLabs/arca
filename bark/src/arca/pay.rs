@@ -687,18 +687,31 @@ impl Wallet {
 			r => r,
 		};
 		// Coins enough, but only of a format the other side does not read:
-		// say so.
+		// say so, and say when coins it reads are held back only while they
+		// arrive (the wallet's instant limit), which is the cause then.
 		match r {
 			Err(Error::Refused(_)) if reads != Reads::ALL
 				&& self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, Reads::ALL, spend).is_ok() =>
+			{
+				let unread = match (reads.exit, reads.landing_2) {
+					(false, false) => "a checkpoint with its owner's exit or a landing-2 leaf",
+					(false, true) => "a checkpoint with its owner's exit",
+					_ => "a landing-2 leaf",
+				};
+				let barred = self.unspendable(spend)?;
+				let arriving: u64 = self.store.coins_in("live")?.into_iter()
+					.filter(|c| c.asset == asset.to_string() && barred.contains(&c.leaf_id) && reads.record(&c.record))
+					.map(|c| c.value).sum();
+				if arriving > 0 {
+					return Err(Error::Refused(format!("the wallet's coins of asset {} that the other side's wallet reads, {} in all, are \
+						still arriving, and a coin is given only once it has arrived (the wallet's instant limit): they pay {} once they \
+						arrive; its other coins hold in their past {}, which the other side, an older build, does not read; nothing was \
+						signed", asset, arriving, paid, unread)));
+				}
 				Err(Error::Refused(format!("the other side's wallet is an older build, which reads no coin whose past holds {}, and the \
 					wallet's coins of asset {} that would pay {} are such coins: they pay it once the other side updates{}; nothing was \
-					signed",
-					match (reads.exit, reads.landing_2) {
-						(false, false) => "a checkpoint with its owner's exit or a landing-2 leaf",
-						(false, true) => "a checkpoint with its owner's exit",
-						_ => "a landing-2 leaf",
-					}, asset, paid, if reads.exit { "" } else { ", or once a round refreshes them (refresh-received)" }))),
+					signed", unread, asset, paid, if reads.exit { "" } else { ", or once a round refreshes them (refresh-received)" })))
+			},
 			r => r,
 		}
 	}
@@ -721,12 +734,7 @@ impl Wallet {
 	{
 		let margins = Margins::of(info, asset)?;
 		let mut candidates = self.spendable(asset, spend)?;
-		if !reads.exit {
-			candidates.retain(|c| c.row.record.first() != Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT));
-		}
-		if !reads.landing_2 {
-			candidates.retain(|c| !CoinRecord::from_bytes(&c.row.record).is_ok_and(|r| r.has_landing_2()));
-		}
+		candidates.retain(|c| reads.record(&c.row.record));
 		let mut deep = 0u64;
 		if fit {
 			if let Some(limit) = depth_limit(info) {
@@ -3013,6 +3021,15 @@ impl Reads {
 	/// build that reads neither.
 	pub(crate) fn of(v: &Value) -> Reads {
 		Reads { exit: Wallet::reads_exit_format(v), landing_2: super::wallet::reads_landing_2(v) }
+	}
+
+	/// Whether a side that reads this can read a new coin whose past is the
+	/// coin record `record`: none of the second format (a checkpoint with
+	/// its owner's exit) unless it reads that, and none whose past holds a
+	/// `landing-2` leaf unless it reads that.
+	pub(crate) fn record(&self, record: &[u8]) -> bool {
+		(self.exit || record.first() != Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT))
+			&& (self.landing_2 || !CoinRecord::from_bytes(record).is_ok_and(|r| r.has_landing_2()))
 	}
 }
 

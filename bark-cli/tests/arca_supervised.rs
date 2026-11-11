@@ -653,3 +653,109 @@ async fn under_the_switch_an_older_wallet_is_refused_before_it_signs() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// Posts the operator's equivocation bond with a suggested instant limit,
+/// as `arca_coin_places` does: without it the limit a wallet applies is 0,
+/// every coin it receives stays arriving, and a trade never shapes a coin.
+async fn post_bond(r: &mut Running, limit: u64) {
+	let notice = server::bond::min_notice_seconds(server::bond::LIFETIME, arca_covenant::RelativeTime::from_units(338).unwrap())
+		.div_ceil(512) as u16;
+	let w = keypair("supervised W");
+	let s_key = keypair("operator");
+	let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
+	let policy = arca_covenant::bond::BondPolicy::new(chain, s_key.x_only_public_key().0, w.x_only_public_key().0,
+		arca_covenant::RelativeTime::from_units(notice).unwrap()).unwrap();
+	let x = r.x;
+	let tx = r.pay_to(policy.script_pubkey(), x, 50_000_000);
+	r.produce().await;
+	r.bury().await;
+	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
+	r.config.bond = Some(server::bond::BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice,
+		outpoint: Some(format!("{}:{}", tx.txid(), vout)), notice: None, instant_budget_fraction: None,
+		instant_limit_value: Some(limit.to_string()) });
+	r.restart_server().await;
+	r.synced().await;
+}
+
+/// With the operator's bond posted, so the wallet applies an instant limit
+/// and a trade gives a coin of exactly its value, shaped by a payment to
+/// itself first: beside an older build (`ARCA_CLI_OLDER`), skipped without
+/// one.
+///
+/// - The only coin of Z the older maker reads is still arriving: the
+///   refusal says so, not that the maker is an older build.
+/// - Under the switch, this build refuses the older maker's offer before
+///   anything moves: no coin is shaped first.
+/// - Under the switch, the older build refuses this build's offer, whose
+///   give coin is shaped, before it signs.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_an_instant_limit_a_refusal_names_its_cause_and_nothing_moves_first() {
+	let Some(older) = std::env::var("ARCA_CLI_OLDER").ok() else {
+		println!("LD: no ARCA_CLI_OLDER: old against new not run");
+		return;
+	};
+	let older = std::path::Path::new(&older);
+	let mut r = Running::start().await;
+	let iss = serve_z(&mut r).await;
+	post_bond(&mut r, 1_000_000_000_000).await;
+	let (z, x) = (iss.z.to_string(), r.x.to_string());
+	let (url, node_url) = (r.url(), r.node_url());
+	let (a, o) = (Arca::new("LIA"), Arca::built_from("LIO", older));
+	for w in [&a, &o] {
+		w.ok(&create_args(&url, &node_url));
+		for (asset, v) in [(iss.z, 4_000_000), (r.x, 4_000_000)] {
+			let s = script(&w.ok(&["address"]));
+			r.pay_to(s, asset, v);
+		}
+	}
+	r.produce().await;
+	for asset in [&z, &x, &x] {
+		for w in [&a, &o] {
+			w.ok(&["board", asset, "1000000"]);
+		}
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	for w in [&a, &o] {
+		r.wait("the boards credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+		w.ok(&["sync"]);
+	}
+	// A's board of Z is landing-2; the older build pays it a landing-1 coin,
+	// which arrives under a small limit.
+	a.ok(&["instant-limit", "1000"]);
+	let req = a.ok(&["receive", "--asset", &z, "--amount", "500000"])["request"].as_str().unwrap().to_string();
+	o.ok(&["send", &req]);
+	a.ok(&["sync"]);
+
+	// ---- R1: the coin the older maker reads is arriving -----------------------
+	let offer = o.ok(&["swap", "offer", "--give-asset", &x, "--give", "100000", "--want-asset", &z, "--want", "100000"]);
+	let m = a.refused(&["swap", "accept", offer["offer"].as_str().unwrap()], "still arriving");
+	println!("REFUSED, the readable coin arriving: {}", m);
+	o.ok(&["swap", "cancel", offer["swap"].as_str().unwrap()]);
+
+	// ---- R2: the switch on, the older maker's offer, nothing shaped first ----
+	a.ok(&["instant-limit", "1000000000000"]);
+	a.ok(&["sync"]);
+	r.config.landing_2_only = true;
+	r.restart_server().await;
+	a.ok(&["sync"]);
+	let before = states_of(&a, &z);
+	let offer = o.ok(&["swap", "offer", "--give-asset", &x, "--give", "100000", "--want-asset", &z, "--want", "100000"]);
+	let m = a.refused(&["swap", "accept", offer["offer"].as_str().unwrap()], "landing_2_only");
+	a.ok(&["sync"]);
+	assert_eq!(states_of(&a, &z), before, "no coin of Z was shaped or spent before the refusal");
+	println!("REFUSED the older maker's offer under the switch, A's Z coins as they were ({}): {}", before.len(), m);
+	o.ok(&["swap", "cancel", offer["swap"].as_str().unwrap()]);
+
+	// ---- F1 with a shaped give coin --------------------------------------------
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x, "--give", "150000", "--want-asset", &z, "--want", "100000"]);
+	let before = states(&o);
+	let (ok, v, _) = o.run_full(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	assert!(!ok && v.to_string().contains("landing"), "the older build took a landing-2 offer: {}", v);
+	assert_eq!(states(&o), before, "the older build's coins keep their states");
+	println!("REFUSED by the older build, this build's give coin shaped: {}", v["error"]["message"]);
+	for w in [&a, &o] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
