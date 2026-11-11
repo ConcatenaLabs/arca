@@ -62,7 +62,8 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V42__slot_releases.sql`](schema/V42__slot_releases.sql),
 [`schema/V43__record_formats.sql`](schema/V43__record_formats.sql),
 [`schema/V44__watched_for_index.sql`](schema/V44__watched_for_index.sql),
-[`schema/V45__final_pass_indexes.sql`](schema/V45__final_pass_indexes.sql)). `Store::connect` builds it
+[`schema/V45__final_pass_indexes.sql`](schema/V45__final_pass_indexes.sql),
+[`schema/V46__resting_order_reads.sql`](schema/V46__resting_order_reads.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
@@ -867,6 +868,29 @@ spent beside. The server co-signs only when every rule holds:
   most every five seconds; `null` for an asset it does not accept), so a
   wallet prices its margins as the operator bounds them, whatever its own
   node makes of the asset.
+
+**Checkpoints with their owners' exit.** A swap or a fill is one reassignment
+of several owners' coins, so if one owner and an operator signed a second
+spend of that owner's checkpoint, the reassignment could never confirm and
+each other owner's coin would stand in a checkpoint only it and the operator
+can spend together. A transfer or a fill that sets `checkpoint_exit` moves each
+coin of a plain leaf into a checkpoint that also has the coin's own exit
+after its exit delay (`arca-covenant`'s `checkpoint`), and its owners sign
+that checkpoint. The server co-signs such a request only with the top-level
+setting `checkpoint_exit = true`, which `info.checkpoint_exit` publishes; when
+it is off, a request that asks for it is refused (`out_of_bounds`) before
+anything is recorded or signed, and the owners sign the transfer again
+without it. The flag is part of the request's hash only when it is set, so a
+request without it hashes as it always did, and the coins it makes have coin
+records of format version 2, which a wallet asks for only where every party
+to the transfer reads them. A wallet that never asks is served as before.
+An order's maker names the record formats its wallet reads when it publishes
+(`record_formats` on `order_publish`, shown to takers as the order's
+`maker_reads`; empty for an older build), and the server refuses
+(`out_of_bounds`) a fill that asks for the exit, or gives a coin whose record is
+of format 2, against an order whose maker did not name `coin-2`; the taker
+signs the fill again without it, from other coins. The watcher answers such a
+checkpoint seen early on the chain (see Stale exits, under The watcher).
 
 An input resting on a lowest node with RECLAIM-D (a batch built with
 `[batches] delegated_reclaim`) carries its owner's delegation of the coin's
@@ -2587,7 +2611,16 @@ meanwhile.
   whose forfeit it stored or by a transfer it co-signed, whose leaf is seen on
   the chain unspent, in a block or the mempool, is answered at once: by its
   forfeit, or by its checkpoint; and a reassignment is published once every
-  checkpoint it spends is on the chain. A board given up and then converted
+  checkpoint it spends is on the chain. A checkpoint with its owner's exit
+  seen on the chain is answered the same way, whoever published it: it gives
+  its coin back to its owner once the exit delay has run, which would void
+  every coin the reassignment made (one the operator holds the forfeit of, or
+  was paid, among them). So the watcher brings every other input of the
+  reassignment on, one step a pass (a board's checkpoint from the board
+  output, a leaf's path by its owner's authorisations), and publishes the
+  reassignment once all its checkpoints are there, inside the delay; for a
+  fill, the order's coin and every other taker's coin are brought on and the
+  fill published. A board given up and then converted
   is the same case: its leaf appears. The answer confirms within the leaf's
   exit delay, after which its owner's exit finds the leaf spent. A coin given
   up by a step of an offline-refresh plan is answered by the step's refund:
@@ -2854,7 +2887,12 @@ pool cannot cover what is outstanding. The operator's metrics
 the pool and what is outstanding per fee asset
 (`arca_watcher_fee_pool`, `arca_watcher_fee_outstanding`) and the board
 forfeits held back for block space or for the pool
-(`arca_watcher_forfeits_held`).
+(`arca_watcher_forfeits_held`), and the seconds since the watcher's last pass
+ended, or since it started while its first runs
+(`arca_watcher_last_pass_age_seconds`). The
+watcher answers an early checkpoint with its owner's exit within the coin's
+exit delay, so an alert on that age, well inside the shortest exit delay the
+operator takes, says when nothing is answering.
 
 ## The interface
 
@@ -2875,7 +2913,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST register_board` | Registers a board record with its transaction |
 | `POST board_status` | A board's state (`pending`, `credited`, `lost`), its transaction's finality and, once that is in a block, its dates (`exit_deadline`, `expiry`) |
 | `POST batch_status` | Where a round leaf lies, by its id (`leaf_id`): the round whose batch output holds it (`rounds`, one entry: `round_txid`, `vout`, `state`); `unknown_batch` (404) for a leaf that is no round leaf. A wallet reads the round by its txid when the node's set of unspent outputs no longer finds the batch output (the watcher unrolled the batch to reclaim nodes its holders released), and takes it only if it pays the output the leaf's record names and is in the chain. A read, under the read budget |
-| `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins, with the signed head of the signer's record its last signature was recorded at (`signer_record`). An output that pays a receive request names when the request lapses (`until`, a median time, as the request carries it): once the chain's median time has reached it, the server records no transfer paying it and answers `request_lapsed` (422), naming that time, since its receiver no longer waits for the payment; a transfer recorded before it completes when it is asked again. An output without `until` is taken as any other. An input resting on a lowest node with RECLAIM-D carries its owner's delegation to the outputs' owner keys (`delegation_sig`; see Out-of-round transfers) |
+| `POST cosign_transfer` | Co-signs an out-of-round transfer and delivers its coins (each plain coin into a checkpoint with its owner's exit with `checkpoint_exit: true`, where `info.checkpoint_exit` offers it; see Out-of-round transfers), with the signed head of the signer's record its last signature was recorded at (`signer_record`). An output that pays a receive request names when the request lapses (`until`, a median time, as the request carries it): once the chain's median time has reached it, the server records no transfer paying it and answers `request_lapsed` (422), naming that time, since its receiver no longer waits for the payment; a transfer recorded before it completes when it is asked again. An output without `until` is taken as any other. An input resting on a lowest node with RECLAIM-D carries its owner's delegation to the outputs' owner keys (`delegation_sig`; see Out-of-round transfers) |
 | `POST lightning_send` | Pays a BOLT11 invoice out of the tree (see Paying an invoice out of the tree): co-signs the transfer into the payment's `htlc-1` leaf and the change, as `cosign_transfer` answers it (`cosigned`), and answers the payment (`payment`: its hash, asset, amount, fee, `htlc_leaf_id` and state) |
 | `POST lightning_send_status` | A payment out of the tree by its payment hash: `paying`, `paid` with its preimage, or `failed` with the reason |
 | `POST lightning_send_release_terms` | For a paid payment out of the tree: the lowest nodes with RECLAIM-D its `htlc-1` leaf rests on, the round its sender's releases name (the latest final round, with its transaction) and the nodes already released |
@@ -2905,7 +2943,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST cancel_plan` | Cancels the steps of a plan that have not started, on the plan's mailbox key's signature over `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ plan id)`, `T = SHA256("Arca/plan-cancel")`; a plan with a step in a round is cancelled once that round decides it |
 | `POST plan_leaf` | Takes the holder's unroll authorisations for a leaf a step of its plan made, signed by the leaf's key, and keeps the leaf's full record |
 | `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
-| `POST order_fill` | Co-signs a fill of a resting order: the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`). A taker coin resting on a lowest node with RECLAIM-D carries its delegation into the fill's outputs (`delegation_sig`) |
+| `POST order_fill` | Co-signs a fill of a resting order (each plain taker coin into a checkpoint with its owner's exit with `checkpoint_exit: true`, where `info.checkpoint_exit` offers it): the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`). A taker coin resting on a lowest node with RECLAIM-D carries its delegation into the fill's outputs (`delegation_sig`) |
 | `POST order_fill_delegation_terms` | For a signed fill, by its transfer id or the order coin it spent: the order coin it spent, the taker's leaves its maker's delegation names after the maker's own, and whether that delegation is recorded |
 | `POST order_fill_delegation` | Takes the maker's delegation of its order coin into a fill (`kept` false for a coin on no lowest node with RECLAIM-D, and for an order resting again, whose key delegated at an earlier fill) |
 | `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |

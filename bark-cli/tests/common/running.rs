@@ -165,6 +165,9 @@ impl Running {
 			bond: None,
 			lightning: Default::default(),
 			batches: Default::default(),
+			// The operator offers checkpoints with their owners' exit; a test
+			// of an operator that does not turns it off.
+			checkpoint_exit: true,
 		};
 		tune(&mut config, x, y);
 		let server = Server::start(&config).await.unwrap();

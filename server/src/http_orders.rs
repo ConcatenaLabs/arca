@@ -56,6 +56,7 @@ async fn order_json(app: &App, v: &OrderView) -> Result<api::OrderState, Refusal
 			partial: f.partial,
 			signed: f.signature.is_some(),
 		}).collect(),
+		maker_reads: v.order.record_formats.clone(),
 	})
 }
 
@@ -70,7 +71,11 @@ pub(super) async fn order_publish(State(app): State<Arc<App>>, body: Result<Byte
 	for (i, n) in req.credit_nonces.iter().enumerate() {
 		credit_nonces[i] = unhex32(n).map_err(Refusal::malformed)?;
 	}
-	let v = app.orders.publish(&PublishRequest { record, credit_nonces, mailbox: key(&req.mailbox)?, signature: sig(&req.signature)? }).await?;
+	if req.record_formats.len() > 16 || req.record_formats.iter().any(|f| f.is_empty() || f.len() > 32) {
+		return Err(Refusal::malformed("record_formats: at most 16 names, each of 1 to 32 bytes"));
+	}
+	let v = app.orders.publish(&PublishRequest { record, credit_nonces, mailbox: key(&req.mailbox)?, signature: sig(&req.signature)?,
+		record_formats: req.record_formats.clone() }).await?;
 	Ok(Json(order_json(&app, &v).await?))
 }
 
@@ -79,6 +84,7 @@ pub(super) async fn order_fill(State(app): State<Arc<App>>, body: Result<Bytes, 
 	let t = transfer_request(&req.inputs, &req.outputs)?;
 	let done = app.orders.fill(&FillRequest {
 		order: leaf_id(&req.order)?, coin: leaf_id(&req.coin)?, filled: amount(&req.filled)?, inputs: t.inputs, outputs: t.outputs,
+		checkpoint_exit: req.checkpoint_exit,
 	}).await?;
 	Ok(Json(api::OrderFilled {
 		transfer_id: hex(&done.transfer_id),

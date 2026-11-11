@@ -199,7 +199,15 @@ pub fn resolve(held: &Held, bases: &[Transaction], policy: &WalletPolicy) -> Val
 pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64, NewLeaf)], operator: XOnlyPublicKey, chain: Chain)
 	-> Value
 {
-	let plan = TransferPlan { checkpoint_exit: false,
+	transfer_body_with(coins, outputs, operator, chain, false)
+}
+
+/// [`transfer_body`], every coin of a plain leaf moving into a checkpoint
+/// with its owner's exit when `checkpoint_exit` is set.
+pub fn transfer_body_with(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64, NewLeaf)], operator: XOnlyPublicKey, chain: Chain,
+	checkpoint_exit: bool) -> Value
+{
+	let plan = TransferPlan { checkpoint_exit,
 		inputs: coins.iter().map(|(_, c, v)| (c.clone(), *v)).collect(),
 		outputs: outputs.iter().map(|(a, v, l)| ExplicitOutput::new(*a, *v, l.policy(operator, chain).script_pubkey())).collect(),
 	};
@@ -227,7 +235,11 @@ pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64
 		}
 		o
 	}).collect();
-	json!({"inputs": inputs, "outputs": outs})
+	let mut body = json!({"inputs": inputs, "outputs": outs});
+	if checkpoint_exit {
+		body["checkpoint_exit"] = json!(true);
+	}
+	body
 }
 
 /// The txid a hex string names.
