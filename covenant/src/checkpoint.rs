@@ -61,9 +61,7 @@
 //! leaf; the landed coin is a single-owner output, where the issuer's freeze
 //! and pause bind, as they bind on a coin landed from its leaf. Only a coin
 //! of a plain leaf or a `landing-1` leaf has a checkpoint with an exit
-//! ([`exit_allowed`]). A coin of a restricted asset (`enclave-1`) is never
-//! in a reassignment of several owners: a transfer of one moves that asset
-//! alone, from one holder.
+//! ([`exit_allowed`]).
 //!
 //! The checkpoint's salt differs from the leaf's, so a reassignment's
 //! signatures do not fit the leaf and a checkpoint's do not fit the checkpoint:
@@ -123,7 +121,7 @@ impl CheckpointExit {
 /// leaf (`vtxo-1`, `vtxo-2`), whose exit pays wherever its owner signs, or a
 /// `landing-1` leaf, whose checkpoint lands as the leaf does.
 pub fn exit_allowed(leaf: &LeafPolicy) -> bool {
-	leaf.htlc.is_none() && leaf.order.is_none() && leaf.enclave.is_none() && leaf.channel.is_none() && leaf.claim.is_none()
+	leaf.htlc.is_none() && leaf.order.is_none() && leaf.channel.is_none() && leaf.claim.is_none()
 }
 
 impl CheckpointPolicy {

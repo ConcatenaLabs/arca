@@ -890,7 +890,7 @@ fn joined(coins: &[&Coin]) -> Vec<Transaction> {
 fn maker_delegation(r: &Running, transfer: &str, made: &arca_covenant::ValidCoin, signer: &Keypair) -> Value {
 	let t = r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok();
 	let takers: Vec<NewLeaf> = t["takers"].as_array().unwrap().iter().map(|l| NewLeaf {
-		enclave: None, v2: false, htlc: None, landing: None,
+		v2: false, htlc: None, landing: None,
 		owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&common::client::unhex(l["owner"].as_str().unwrap())).unwrap(),
 		owner_nonce: common::client::unhex(l["owner_nonce"].as_str().unwrap()).try_into().unwrap(),
 		creator_nonce: common::client::unhex(l["creator_nonce"].as_str().unwrap()).try_into().unwrap(),
@@ -1295,7 +1295,7 @@ fn maker_delegation_unchecked(made: &arca_covenant::ValidCoin, takers: &[NewLeaf
 fn takers_of(r: &Running, transfer: &str) -> Vec<NewLeaf> {
 	let t = r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok();
 	t["takers"].as_array().unwrap().iter().map(|l| NewLeaf {
-		enclave: None, v2: false, htlc: None, landing: None,
+		v2: false, htlc: None, landing: None,
 		owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&common::client::unhex(l["owner"].as_str().unwrap())).unwrap(),
 		owner_nonce: common::client::unhex(l["owner_nonce"].as_str().unwrap()).try_into().unwrap(),
 		creator_nonce: common::client::unhex(l["creator_nonce"].as_str().unwrap()).try_into().unwrap(),

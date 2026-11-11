@@ -1385,7 +1385,7 @@ mod test {
 		OutputRequest {
 			asset: AssetId::from_byte_array([0xff; 32]),
 			value: 1_000,
-			leaf: NewLeaf { enclave: None,
+			leaf: NewLeaf {
 				owner: key.x_only_public_key().0, owner_nonce: [seed; 32], creator_nonce: [seed; 32],
 				exit_delay: RelativeTime::from_units(254).unwrap(), htlc,
 				landing: None, v2: false,
