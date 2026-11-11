@@ -232,7 +232,7 @@ impl Ctx {
 		let p = &self.output("checkpoint_landing")["params"];
 		let mut program = [0u8; 20];
 		program.copy_from_slice(&hex(&p["landing_program"]));
-		let landing = LandingTerms { program, asset: asset(&p["asset"]), min_value: p["min_value"].as_u64().unwrap() };
+		let landing = LandingTerms { program, asset: asset(&p["asset"]), min_value: p["min_value"].as_u64().unwrap(), own_index: true };
 		let cp = CheckpointPolicy {
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, sweep: None, v2: false,
 			exit: Some(CheckpointExit { delay: rel(&p["exit_delay"]), landing: Some(landing) }),
@@ -267,11 +267,14 @@ impl Ctx {
 		h
 	}
 
-	fn landing(&self) -> LeafPolicy {
-		let p = &self.output("landing")["params"];
+	/// `landing` for the `landing-1` leaf, `landing2` for the `landing-2`
+	/// leaf: the same terms, landing at output 0 or at its own index.
+	fn landing_of(&self, name: &str) -> LeafPolicy {
+		let p = &self.output(name)["params"];
 		let mut program = [0u8; 20];
 		program.copy_from_slice(&hex(&p["landing_program"]));
-		let landing = arca_covenant::Landing { program, allowance: p["allowance"].as_u64().unwrap() };
+		let own_index = name == "landing2";
+		let landing = arca_covenant::Landing { program, allowance: p["allowance"].as_u64().unwrap(), own_index };
 		let terms = landing.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
 		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
 		let l = LeafPolicy { enclave: None, claim: None,
@@ -280,10 +283,10 @@ impl Ctx {
 			channel: None, v2: false,
 		};
 		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
-		assert_eq!(l.leaf_constant(), h32(&p["K"]), "landing-1's K is the salt's own");
+		assert_eq!(l.leaf_constant(), h32(&p["K"]), "a landing leaf's K is the salt's own");
 		assert_eq!(l.collab_prefix(), hex(&p["collab_prefix"]), "its collaborative script pushes K ‖ P");
 		assert_eq!(l.collab_prefix(), [&h32(&p["K"])[..], &program[..]].concat());
-		assert_eq!(l.template(), arca_covenant::Template::Landing1);
+		assert_eq!(l.template(), if own_index { arca_covenant::Template::Landing2 } else { arca_covenant::Template::Landing1 });
 		l
 	}
 
@@ -373,8 +376,8 @@ impl Ctx {
 					("refund", h.refund_script().unwrap()),
 				]))
 			},
-			"landing" => {
-				let l = self.landing();
+			n @ ("landing" | "landing2") => {
+				let l = self.landing_of(n);
 				(l.taproot(), BTreeMap::from([("collab", l.collab_script()), ("landing", l.exit_script())]))
 			},
 			"claim" => {
@@ -391,7 +394,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 23);
+	assert_eq!(outputs.len(), 24);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();
@@ -431,7 +434,7 @@ fn every_spend_matches_its_vector_and_verifies() {
 	let ctx = Ctx::load();
 	let verifier = Verifier::consensus(ctx.genesis);
 	let spends = ctx.v["spends"].as_array().unwrap();
-	assert_eq!(spends.len(), 41);
+	assert_eq!(spends.len(), 43);
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let output = s["output"].as_str().unwrap();
@@ -591,14 +594,15 @@ fn every_spend_matches_its_vector_and_verifies() {
 					p => panic!("unknown htlc path {}", p),
 				}
 			},
-			("landing", "landing") => {
-				let l = ctx.landing();
+			(n @ ("landing" | "landing2"), "landing") => {
+				let l = ctx.landing_of(n);
 				let terms = l.landing.unwrap();
-				terms.check_output(&ExplicitOutput::from_txout(&tx.output[0]).unwrap()).unwrap();
+				let outs: Vec<ExplicitOutput> = tx.output.iter().filter_map(ExplicitOutput::from_txout).collect();
+				terms.check_outputs(0, &outs).unwrap();
 				l.exit_witness(&checksig(ctx.label_of(&l.owner)))
 			},
-			("landing", "collab") => {
-				let l = ctx.landing();
+			(n @ ("landing" | "landing2"), "collab") => {
+				let l = ctx.landing_of(n);
 				let owner = ctx.label_of(&l.owner).to_string();
 				let outs = committed(s["m"].as_u64().unwrap() as usize);
 				let msg = l.collab_message(asset_in, value_in, &outs).unwrap();

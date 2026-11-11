@@ -522,10 +522,10 @@ impl CheckpointPolicy {
 		-> Result<KeySpend, SpendError>
 	{
 		let (e, script) = self.exit.zip(self.exit_script()).ok_or(Error::CheckpointHasNoExit)?;
-		// A supervised coin's checkpoint lands as its leaf does.
+		// A supervised coin's checkpoint lands as its leaf does, at its own
+		// index: the coin is input 0.
 		if let Some(l) = &e.landing {
-			let first = outputs.first().ok_or(SpendError::Landing(crate::LandingError::Output { min: l.min_value }))?;
-			l.check_output(first).map_err(SpendError::Landing)?;
+			l.check_outputs(0, outputs).map_err(SpendError::Landing)?;
 		}
 		let spent = explicit_txout(asset, value, self.script_pubkey());
 		KeySpend::build(self.taproot(), script, vec![(coin, spent, Sequence(e.delay.to_sequence()))], outputs, fee)
@@ -536,10 +536,11 @@ impl LeafPolicy {
 	/// The exit claim of `coin`, this leaf on-chain holding `value` of
 	/// `asset`, into `outputs`: input 0's sequence is the exit delay, so it
 	/// confirms only that long after the leaf did. The owner signs
-	/// [`KeySpend::sighash`] and finishes it with its signature. A
-	/// `landing-1` leaf's exit is its landing: output 0 must be P2WPKH of its
-	/// landing program in its asset, holding at least the minimum
-	/// ([`Self::landing_tx`] builds it).
+	/// [`KeySpend::sighash`] and finishes it with its signature. A landing
+	/// leaf's exit is its landing: the output it inspects, output 0 here
+	/// where the coin is input 0, must be P2WPKH of its landing program in
+	/// its asset, holding at least the minimum ([`Self::landing_tx`] builds
+	/// it).
 	pub fn exit_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
 		-> Result<KeySpend, SpendError>
 	{
@@ -547,8 +548,7 @@ impl LeafPolicy {
 			return Err(Error::HtlcHasNoExit.into());
 		}
 		if let Some(l) = &self.landing {
-			let first = outputs.first().ok_or(SpendError::Landing(crate::LandingError::Output { min: l.min_value }))?;
-			l.check_output(first).map_err(SpendError::Landing)?;
+			l.check_outputs(0, outputs).map_err(SpendError::Landing)?;
 		}
 		if let Some(e) = &self.enclave {
 			let first = outputs.first().ok_or(SpendError::Enclave(crate::EnclaveError::Output { value: e.value }))?;
@@ -559,7 +559,7 @@ impl LeafPolicy {
 			outputs, fee)
 	}
 
-	/// The landing of `coin`, this `landing-1` leaf on-chain holding `value`
+	/// The landing of `coin`, this landing leaf on-chain holding `value`
 	/// of `asset`: output 0 pays P2WPKH of the landing program everything
 	/// but the fee. With [`FeeSource::Split`] the coin pays its own `fee`,
 	/// which must be within the allowance, and nothing goes to change; with a

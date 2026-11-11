@@ -248,7 +248,7 @@ fn p2wpkh_spend(coin: &Coin, key: &elements::secp256k1_zkp::Keypair) -> Transact
 
 /// A `landing-1` leaf spec of Z for `owner`, landing at `program`.
 fn landing_spec(owner: &Keypair, label: &str, program: [u8; 20], h: [u8; 32]) -> LeafSpec {
-	LeafSpec { template: Template::Landing1, landing: Some(Landing { program, allowance: ALLOWANCE }), ..spec(owner, label, LEAF, h) }
+	LeafSpec { template: Template::Landing1, landing: Some(Landing { program, allowance: ALLOWANCE, own_index: false }), ..spec(owner, label, LEAF, h) }
 }
 
 /// A's landing from its checkpoint `cp` at `at` (holding `value` of `asset`)
@@ -289,10 +289,10 @@ fn swap_case(c: &mut Arca, tag: &str, s: &Keypair, rounds: &[Transaction], (tz, 
 	let landing = acoin.leaf.landing.unwrap();
 	let (_, mut cz_leaf) = party(&format!("{} C gets Z", tag), delay());
 	cz_leaf.landing = Some(LandingTerms { program: hash160::Hash::hash(&keypair(&format!("{} C landing", tag)).public_key().serialize())
-		.to_byte_array(), asset: z, min_value: 1 });
+		.to_byte_array(), asset: z, min_value: 1, own_index: false });
 	let (_, ax_leaf) = party(&format!("{} A gets X", tag), delay());
 	let (az_v, ax_v) = (LEAF - MARGIN, LEAF - 2 * MARGIN);
-	cz_leaf.landing = Some(Landing { program: cz_leaf.landing.unwrap().program, allowance: ALLOWANCE }.terms(z, az_v).unwrap());
+	cz_leaf.landing = Some(Landing { program: cz_leaf.landing.unwrap().program, allowance: ALLOWANCE, own_index: false }.terms(z, az_v).unwrap());
 	let plan = TransferPlan { checkpoint_exit: true, inputs: vec![(acoin.clone(), LEAF - MARGIN), (ccoin.clone(), LEAF - MARGIN)],
 		outputs: vec![ExplicitOutput::new(z, az_v, cz_leaf.policy(xonly(s), c.net.chain).script_pubkey()),
 			ExplicitOutput::new(x, ax_v, ax_leaf.policy(xonly(s), c.net.chain).script_pubkey())] };
@@ -307,8 +307,8 @@ fn swap_case(c: &mut Arca, tag: &str, s: &Keypair, rounds: &[Transaction], (tz, 
 	let value = inputs[0].checkpoint_value;
 	let e = cp.exit.unwrap();
 	assert_eq!(e.delay, acoin.leaf.exit_delay);
-	assert_eq!(e.landing, Some(LandingTerms { min_value: value - ALLOWANCE, ..landing }), "the landing over the checkpoint's value");
-	assert_eq!(e.landing.unwrap().script_pubkey(), Landing { program: landing.program, allowance: 0 }.script_pubkey());
+	assert_eq!(e.landing, Some(LandingTerms { min_value: value - ALLOWANCE, own_index: true, ..landing }), "the landing over the checkpoint's value");
+	assert_eq!(e.landing.unwrap().script_pubkey(), Landing { program: landing.program, allowance: 0, own_index: false }.script_pubkey());
 	let _ = l;
 	let c_at = bring(c, &format!("{}/C's leaf on-chain", tag), &ccoin);
 	let fc = c.net.fee_coin();
@@ -378,7 +378,7 @@ fn a_dead_swap_returns_a_supervised_coin_by_its_landing() {
 		sup.status(&c.net, &d.cp.script_pubkey()));
 	c.net.wait_csv(&d.cp_id, delay());
 	c.net.refuse("dead/neg the landing signed by the operator", &land(&c, &d.cp, &script, d.at, z, d.value, good(d.value), &s, seq), SIG);
-	let other = Landing { program: hash160::Hash::hash(&keypair("another key").public_key().serialize()).to_byte_array(), allowance: 0 };
+	let other = Landing { program: hash160::Hash::hash(&keypair("another key").public_key().serialize()).to_byte_array(), allowance: 0, own_index: false };
 	c.net.refuse("dead/neg the landing to another key's P2WPKH", &land(&c, &d.cp, &script, d.at, z, d.value,
 		vec![explicit(z, d.value - FEE, other.script_pubkey()), fee(z, FEE)], &ak[0], seq), EQ);
 	c.net.refuse("dead/neg the landing to a taproot output", &land(&c, &d.cp, &script, d.at, z, d.value,

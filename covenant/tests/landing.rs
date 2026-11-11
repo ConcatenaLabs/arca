@@ -210,7 +210,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	let sup = issue(&mut net);
 	let (a, s, l) = (keypair("landing owner"), keypair("landing operator"), keypair("landing key"));
 	let program = hash160::Hash::hash(&l.public_key().serialize()).to_byte_array();
-	let landing = Landing { program, allowance: ALLOWANCE };
+	let landing = Landing { program, allowance: ALLOWANCE, own_index: false };
 	let land_spk = landing.script_pubkey();
 	let (chain, genesis) = (net.chain, net.genesis);
 	let leaf = |salt: &str| LeafPolicy { enclave: None, claim: None,
@@ -279,7 +279,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	let good = || vec![explicit(sup.z, V - FEE, land_spk.clone()), fee(sup.z, FEE)];
 	net.refuse("landing before its delay", &landing_tx(good(), None), "non-BIP68-final");
 	net.wait_csv(&c2.outpoint.txid, delay());
-	let other = Landing { program: hash160::Hash::hash(&keypair("another key").public_key().serialize()).to_byte_array(), allowance: 0 };
+	let other = Landing { program: hash160::Hash::hash(&keypair("another key").public_key().serialize()).to_byte_array(), allowance: 0, own_index: false };
 	net.refuse("landing to another key's P2WPKH", &landing_tx(vec![explicit(sup.z, V - FEE, other.script_pubkey()), fee(sup.z, FEE)], None),
 		"Script failed an OP_EQUALVERIFY operation");
 	net.refuse("landing to a taproot output", &landing_tx(vec![explicit(sup.z, V - FEE, op_true_spk()), fee(sup.z, FEE)], None),
@@ -332,7 +332,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 			template: Template::Landing1, owner: xonly(&owner), value: 10_000_000,
 			owner_nonce: label32(&format!("batch {} owner nonce", i)), operator_nonce: label32(&format!("batch {} operator nonce", i)),
 			exit_delay: delay(), unlock_hash: label32(&format!("batch {} unlock", i)), htlc: None, order: None,
-			landing: Some(Landing { program: [i as u8 + 1; 20], allowance: ALLOWANCE }),
+			landing: Some(Landing { program: [i as u8 + 1; 20], allowance: ALLOWANCE, own_index: false }),
 			channel: None,
 		}
 	}).collect();
@@ -371,5 +371,107 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	assert!(check_explicit(&blinded).is_err());
 	net.pass_or_mine("a round of an open asset with the same blinded output", &blinded, "min relay fee not met");
 
+	net.print();
+}
+
+/// `landing-2` on the supervised asset: a round of `Z` whose leaves are all
+/// `landing-2` confirms with every output explicit and each record checks
+/// against it; under a pause, the leaf's own script named in a freeze, a
+/// `landing-2` coin lands at its own index beside a fee coin at input 0, and
+/// the landed coin is frozen by the pause and by a freeze of its address,
+/// and spent once that is lifted.
+#[test]
+fn a_landing_2_coin_lands_at_its_own_index_where_its_freeze_binds() {
+	let mut net = Net::start();
+	let sup = issue(&mut net);
+	let (a, s, l) = (keypair("landing-2 owner"), keypair("landing-2 operator"), keypair("landing-2 key"));
+	let program = hash160::Hash::hash(&l.public_key().serialize()).to_byte_array();
+	let landing = Landing { program, allowance: ALLOWANCE, own_index: true };
+	let land_spk = landing.script_pubkey();
+	let (chain, genesis) = (net.chain, net.genesis);
+	let leaf = |salt: &str| LeafPolicy { enclave: None, claim: None,
+		owner: xonly(&a), operator: xonly(&s), salt: label32(salt), chain, exit_delay: delay(), htlc: None, order: None,
+		landing: Some(landing.terms(sup.z, V).unwrap()),
+		channel: None, v2: false,
+	};
+	assert_eq!(leaf("x").template(), Template::Landing2);
+	assert_eq!(leaf("x").exit_script().len(), 119);
+
+	// ---- a round of Z, every leaf landing-2 ---------------------------------
+	let leaves: Vec<LeafSpec> = (0..4).map(|i| {
+		let owner = keypair(&format!("landing-2 batch owner {}", i));
+		LeafSpec { claim: None,
+			template: Template::Landing2, owner: xonly(&owner), value: 10_000_000,
+			owner_nonce: label32(&format!("l2 batch {} owner nonce", i)), operator_nonce: label32(&format!("l2 batch {} operator nonce", i)),
+			exit_delay: delay(), unlock_hash: label32(&format!("l2 batch {} unlock", i)), htlc: None, order: None,
+			landing: Some(Landing { program: [i as u8 + 1; 20], allowance: ALLOWANCE, own_index: true }),
+			channel: None,
+		}
+	}).collect();
+	// A landing-1 spec carrying a landing-2 landing is refused, and the other way.
+	let mut wrong = leaves.clone();
+	wrong[1].template = Template::Landing1;
+	let issuer = net.fund(vec![explicit(net.x, 2_000_000_000, op_true_spk())]).remove(0);
+	let now = net.now();
+	let sched = ClockSchedule::new(token_of(&issuer), xonly(&s), delay(), vec![mt(now + 28 * DAY), mt(now + 56 * DAY)]).unwrap();
+	let floor = (net.rpc("getmempoolinfo", json!([]))["minrelaytxfee"].as_f64().unwrap() * 1e8).round() as u64;
+	let params = TreeParams {
+		asset: sup.z, chain: net.chain, schedule: sched.clone(), burn: false, delegated_reclaim: false, radix: 4,
+		reserve: ReserveRule::FeeRate { floor_per_kvb: floor, multiple: 4 }, min_leaf: 1,
+	};
+	assert!(Tree::build(params.clone(), &wrong).is_err(), "landing-1 named over a landing-2 landing");
+	let tree = Tree::build(params, &leaves).unwrap();
+	let coin = net.fund(vec![explicit(sup.z, tree.batch_output().value + 5_000_000, op_true_spk())]).remove(0);
+	let clear = round(&net, &issuer, &coin, &tree.batch_output(), &sched, None);
+	check_explicit(&clear).unwrap();
+	net.pass("a round of Z, every output explicit, every leaf landing-2", &clear);
+	for i in 0..4 {
+		let r = tree.record(i);
+		assert_eq!(r.template, Template::Landing2);
+		assert_eq!(arca_covenant::LeafRecord::from_bytes(&r.to_bytes().unwrap()).unwrap(), r, "the binary form keeps landing-2");
+		r.validate_round(&clear, &arca_covenant::WalletPolicy::new(net.chain, xonly(&s), mt(net.mtp()))).unwrap();
+	}
+
+	// ---- a rollback: the block holding the coin leaves the chain -------------
+	// As an anchor-driven reorganisation takes it: the coin is mined again
+	// later, and its landing waits the delay from the new block.
+	let l4 = leaf("landing-2 rolled back");
+	let c4 = net.fund(vec![explicit(sup.z, V, l4.script_pubkey())]).remove(0);
+	let block = net.rpc("getrawtransaction", json!([c4.outpoint.txid.to_string(), true]))["blockhash"].clone();
+	net.wait_csv(&c4.outpoint.txid, delay());
+	net.rpc("invalidateblock", json!([block]));
+	net.mine(1);
+	assert!(net.rt.client().confirmations(&c4.outpoint.txid).unwrap_or(0) >= 1, "the coin is in the new chain");
+	let ks = l4.landing_tx(c4.outpoint, sup.z, V, &FeeSource::Split { fee: FEE, change: Script::new() }).unwrap();
+	let early = signed(&net, ks, &a, vec![]).tx;
+	net.refuse("rollback/neg landing-2 at the old deadline, the coin in a later block", &early, "non-BIP68-final");
+	net.wait_csv(&c4.outpoint.txid, delay());
+	net.pass("rollback/landing-2 once the delay has run from the new block", &early);
+
+	// ---- under a pause, the leaf's own script named in a freeze -------------
+	let l3 = leaf("landing-2 frozen leaf");
+	let c3 = net.fund(vec![explicit(sup.z, V, l3.script_pubkey())]).remove(0);
+	let (pause, _) = sup.record(&mut net, "pause", None);
+	let _named = sup.record(&mut net, "freeze", Some(&l3.script_pubkey()));
+	net.mine(1);
+	net.wait_csv(&c3.outpoint.txid, delay());
+	// A fee coin of X at input 0, the landing-2 coin at input 1: its landing
+	// is output 1, the whole coin.
+	let fc = net.fund(vec![explicit(net.x, 50_000, op_true_spk())]).remove(0);
+	let mut sp = spend(0).coin(&fc, 0xffff_ffff).coin(&c3, delay().to_sequence())
+		.outputs(vec![explicit(net.x, 50_000 - FEE, op_true_spk()), explicit(sup.z, V, land_spk.clone()), fee(net.x, FEE)]);
+	let sg = sp.sign(&a, 1, &l3.exit_script(), genesis);
+	sp.witness(0, op_true_witness());
+	sp.witness(1, l3.exit_witness(&sg));
+	let landed_at = net.pass("landing-2 under a pause, its script named in a freeze, at input 1 landing at output 1", &sp.tx);
+	let landed = coin_of(landed_at, 1, &sp.tx);
+	net.refuse("spend of the landed coin under the pause", &p2wpkh_spend(&landed, &l), "bad-txns-asset-frozen");
+	let (freeze, target) = sup.record(&mut net, "freeze", Some(&land_spk));
+	sup.lift(&mut net, pause, &"00".repeat(32));
+	net.mine(1);
+	net.refuse("spend of the landed coin, its address frozen", &p2wpkh_spend(&landed, &l), "bad-txns-asset-frozen");
+	sup.lift(&mut net, freeze, &target);
+	net.mine(1);
+	net.pass("spend of the landed coin once its freeze is lifted", &p2wpkh_spend(&landed, &l));
 	net.print();
 }
