@@ -531,3 +531,125 @@ async fn an_older_wallet_and_this_one_pay_each_other_and_the_switch() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// Every coin of `w` with its state, as `coins` shows them.
+fn states(w: &Arca) -> std::collections::BTreeMap<String, Value> {
+	w.ok(&["coins"]).as_array().unwrap().iter().map(|c| (c["leaf_id"].as_str().unwrap().to_string(), c["state"].clone())).collect()
+}
+
+/// [`states`] of `w`'s coins of `asset`.
+fn states_of(w: &Arca, asset: &str) -> std::collections::BTreeMap<String, Value> {
+	w.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["asset"] == asset)
+		.map(|c| (c["leaf_id"].as_str().unwrap().to_string(), c["state"].clone())).collect()
+}
+
+/// Trades and payments between this build and an older one
+/// (`ARCA_CLI_OLDER`) once the operator makes `landing-2` leaves only:
+/// each is refused before the side that cannot complete it signs, and every
+/// coin of the older build keeps its state. Skipped when no older build is
+/// named.
+///
+/// - This build offers X for the supervised Z: the offer's leaf is
+///   `landing-2`, which the older build cannot parse, so it refuses the
+///   offer.
+/// - The older build offers X for Z, and Z for X: this build refuses each,
+///   since the older build's leaves are `landing-1`.
+/// - An offer this build made before the switch carries a `landing-1` leaf:
+///   a third wallet refuses it after the switch.
+/// - The older build pays this one, and refreshes: refused by the operator,
+///   its coins untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_the_switch_an_older_wallet_is_refused_before_it_signs() {
+	let Some(older) = std::env::var("ARCA_CLI_OLDER").ok() else {
+		println!("LD: no ARCA_CLI_OLDER: old against new not run");
+		return;
+	};
+	let older = std::path::Path::new(&older);
+	let mut r = Running::start().await;
+	let iss = serve_z(&mut r).await;
+	let (z, x) = (iss.z.to_string(), r.x.to_string());
+	let (url, node_url) = (r.url(), r.node_url());
+	let (a, o, c) = (Arca::new("LSA"), Arca::built_from("LSO", older), Arca::new("LSC"));
+	for w in [&a, &o, &c] {
+		w.ok(&create_args(&url, &node_url));
+		for (asset, v) in [(iss.z, 3_000_000), (r.x, 3_000_000)] {
+			let s = script(&w.ok(&["address"]));
+			r.pay_to(s, asset, v);
+		}
+	}
+	r.produce().await;
+	for asset in [&z, &x, &x] {
+		for w in [&a, &o, &c] {
+			w.ok(&["board", asset, "1000000"]);
+		}
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	for w in [&a, &o, &c] {
+		r.wait("the boards credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+		w.ok(&["sync"]);
+	}
+	// Before the switch: an offer of this build's wants Z in a landing-1
+	// leaf, its taker not known.
+	let early = a.ok(&["swap", "offer", "--give-asset", &x, "--give", "100000", "--want-asset", &z, "--want", "100000"]);
+
+	r.config.landing_2_only = true;
+	r.restart_server().await;
+	for w in [&a, &o, &c] {
+		w.ok(&["sync"]);
+	}
+
+	// ---- This build's offer, the older build its taker ---------------------
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x, "--give", "100000", "--want-asset", &z, "--want", "100000"]);
+	assert_eq!(offer["details"]["outputs"][0]["template"], json!("landing-2"), "{}", offer["details"]["outputs"][0]);
+	let before = states(&o);
+	let (ok, v, err) = o.run_full(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	println!("SWITCH ON: the older build takes this build's X-for-Z offer: ok {} {} {}", ok, v, err.lines().last().unwrap_or(""));
+	assert!(!ok, "the older build accepted a landing-2 offer: {}", v);
+	assert!(v.to_string().contains("landing"), "refused for another reason: {}", v);
+	assert_eq!(states(&o), before, "the older build's coins keep their states");
+	println!("REFUSED by the older build before signing: {}", v["error"]["message"]);
+
+	// ---- The older build's offers, this build their taker -------------------
+	for (give_asset, want_asset) in [(&x, &z), (&z, &x)] {
+		let offer = o.ok(&["swap", "offer", "--give-asset", give_asset, "--give", "100000", "--want-asset", want_asset, "--want", "100000"]);
+		let before = states(&a);
+		let m = a.refused(&["swap", "accept", offer["offer"].as_str().unwrap()], "landing_2_only");
+		assert!(m.contains("nothing was signed"), "{}", m);
+		assert_eq!(states(&a), before, "this build's coins keep their states");
+		println!("REFUSED the older build's offer of {} for {}: {}", give_asset, want_asset, m);
+		let (ok, v, err) = o.run_full(&["swap", "cancel", offer["swap"].as_str().unwrap()]);
+		println!("the older build cancels its offer: ok {} {} {}", ok, v, err.lines().last().unwrap_or(""));
+	}
+
+	// ---- An offer made before the switch -------------------------------------
+	let m = c.refused(&["swap", "accept", early["offer"].as_str().unwrap()], "landing-1 leaf");
+	println!("REFUSED an offer made before the switch: {}", m);
+	a.ok(&["swap", "cancel", early["swap"].as_str().unwrap()]);
+
+	// ---- The older build pays, and refreshes ----------------------------------
+	o.ok(&["sync"]);
+	let before = states_of(&o, &z);
+	let req = a.ok(&["receive", "--asset", &z, "--amount", "50000"])["request"].as_str().unwrap().to_string();
+	let (ok, v, err) = o.run_full(&["send", &req]);
+	assert!(!ok && (v.to_string() + &err).contains("landing_2_only"), "{} {}", v, err);
+	o.ok(&["sync"]);
+	assert_eq!(states_of(&o, &z), before, "the older build's Z coins keep their states after its refused payment");
+	// Its refresh of X goes ahead; that of Z is refused, its coin live again.
+	let p = o.ok(&["participate"]);
+	let pz = p["participations"].as_array().unwrap().iter().find(|q| q["asset"] == z.as_str()).expect("Z's participation").clone();
+	assert!(pz["error"].as_str().unwrap_or("").contains("landing_2_only"), "{}", pz);
+	o.ok(&["sync"]);
+	assert_eq!(states_of(&o, &z), before, "the older build's Z coins keep their states after its refused refresh");
+	println!("SWITCH ON: the older build's payment and refresh of Z refused, its Z coins as they were: {:?}", before);
+
+	// This build trades with a third wallet of its build under the switch.
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x, "--give", "100000", "--want-asset", &z, "--want", "100000"]);
+	let acc = c.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	println!("SWITCH ON: this build's offer taken and completed by a third wallet of this build");
+	for w in [&a, &o, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
