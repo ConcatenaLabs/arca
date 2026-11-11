@@ -332,6 +332,20 @@ and a board whose registration never reached the server, are not recovered.
   A wallet that should trade only with its owner's exit on every checkpoint
   says so apart (`require-checkpoint-exit on`), as a wallet with an instant
   limit for people would.
+- **A spend that waits only for a round.** When the coins a payment, a
+  trade or its quote may take now fall short, and coins the wallet holds as
+  its own would cover it once a round has refreshed them (at the operator's
+  depth limit, which no out-of-round spend may pass; arriving; trade
+  proceeds asked to pay a cross-chain leg; of the record format an older
+  build on the other side does not read; not final yet), or a part sale
+  would shape a coin from one within three reassignments of that limit, the
+  refusal is of kind `settle_first` and names those coins (`coins`), at the
+  quote as at the spend. `settle-first --coin LEAF…` (or `--asset ASSET`,
+  every coin of it that waits for a round) puts them through the next round
+  for coins of the wallet's own, each at the refresh's fee; asked again it
+  gives up nothing twice, and answers `ready` once they are through, when
+  the same spend goes ahead. `refresh-needed` names such coins under the
+  rule `shape` once the wallet has been left alone two minutes.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
@@ -1971,6 +1985,7 @@ registry for both commands.
 | `instant-budget SHARE` | Sets the share of the bond's value the wallet holds out of round at most (`0.1`, or `off`): a counterparty's instant budget |
 | `instant-limit ATOMS` | Sets the wallet's instant limit, in atoms of the reference unit (or `off`): of coins received out of round, the most it counts as its own at once |
 | `coin-places` | Each coin's place (`settled`, `proceeds`, `counted`, `arriving`), the totals of each place by asset, what is spendable now, and the instant limit |
+| `settle-first [--coin LEAF]… [--asset ASSET] [--max-fee-ppm N]` | Puts through the next round the coins a `settle_first` refusal named (or every coin of the asset that waits for a round): what it gave up now (`settling`), what already waits for its round (`waiting`), what is through (`done`), what the operator would not take now (`left`), and `ready` once nothing named settles or waits |
 | `bond-evidence` | Every message the operator key signed that the wallet's coins rest on, as evidence lines (`lines`): what the wallet hands a watcher |
 | `watch-bond [--evidence FILE]… [--fee-asset ASSET]` | Compares the wallet's evidence and every file's under each salt, reads the chain and the mempool for spends of the coins they name, and burns the operator's bond on two different messages under one salt: what it counted (`evidence`), what it read (`scanned`), the `conflicts`, the slash it sent (`slashed`), and each slash sent before again until final (`resent`). What each coin's lineage yields is read once and kept, as a coin's record never changes, and a run reads coins not kept yet and blocks for about five seconds at most; what is left (`evidence.unread`, `scanned.more`) is read at the next run |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |
