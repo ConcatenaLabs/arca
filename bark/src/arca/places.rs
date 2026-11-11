@@ -34,7 +34,8 @@
 //! - `arriving`: `received`, past the limit, or not valued by the node;
 //!   and any coin not final yet (`pending`: its round, or a block it rests
 //!   on, not certified with its anchor buried, as after an anchor
-//!   rollback), whatever its lineage.
+//!   rollback), and any coin on its way home on the chain (`exiting`),
+//!   whatever its lineage.
 //!
 //! Received coins are counted oldest first (by the signer's record entry of
 //! the transfer that made them, then by when the wallet stored them), until
@@ -78,7 +79,7 @@ pub const INSTANT_COUNTED: &str = "instant_counted";
 pub const INSTANT_CAP_SEEN: &str = "instant_cap_seen";
 
 /// The states of a coin that still counts as the wallet's in a place.
-pub const PLACED: [&str; 6] = ["live", "pending", "offered", "sending", "given", "forfeited"];
+pub const PLACED: [&str; 7] = ["live", "pending", "offered", "sending", "given", "forfeited", "exiting"];
 
 /// A coin's lineage, back to the rounds and boards it rests on: see the
 /// [module documentation](self). Ordered from the safest.
@@ -277,8 +278,9 @@ impl Wallet {
 		let mut received: Vec<(u64, usize)> = vec![];
 		for (i, c) in rows.into_iter().enumerate() {
 			let lineage = Self::record_of(&c).map(|r| self.lineage(&r)).unwrap_or(Lineage::Received);
-			// Not final yet: arriving, and outside the count, whatever it is.
-			let place = if c.state == "pending" { Place::Arriving } else { match lineage {
+			// Not final yet, or on its way home on the chain: arriving, and
+			// outside the count, whatever it is.
+			let place = if matches!(c.state.as_str(), "pending" | "exiting") { Place::Arriving } else { match lineage {
 				Lineage::Own => Place::Settled,
 				Lineage::Trade => Place::Proceeds,
 				Lineage::Received => {
