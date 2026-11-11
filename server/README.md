@@ -2258,7 +2258,10 @@ participation's wanted leaf, a transfer's output and a board's record carry
 allowance `info` publishes; a `landing-2` leaf is named by its template as
 well (`template: "landing-2"` on a wanted leaf or a transfer's output, board
 record format 5), and only a participation that names `landing-2` among the
-formats it reads (`record_formats`) is given one. Any other template, a
+formats it reads (`record_formats`) is given one. A round puts the leaves of
+participations that do not name it in a batch of their own beside the rest,
+with no `landing-2` leaf, since a wallet rebuilds the whole published batch to
+check its own leaf and an older one cannot read a `landing-2` leaf in it. Any other template, a
 missing landing or another allowance is refused (`out_of_bounds`), and a
 landing is refused on a leaf of any other asset.
 

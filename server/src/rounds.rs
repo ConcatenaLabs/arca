@@ -24,7 +24,10 @@
 //! leaf leaves in one transaction. Only a participation whose wallet reads
 //! that batch's record format gets a slot in it ([`Rounds::reads_accumulator`],
 //! by the formats it names); the others' leaves rest in a tree beside it, in
-//! the same round. Each batch has
+//! the same round. Likewise a supervised asset's leaves wanted by a wallet
+//! that does not name `landing-2` rest in a batch with no `landing-2` leaf,
+//! since a wallet rebuilds the whole published batch to check its own leaf.
+//! Each batch has
 //! a sweep token of its own, issued as one explicit atom with no reissuance
 //! token by one of the operator's coins, and a clock schedule of three steps
 //! (28, 56 and 84 days after the round) with a notice of 36 hours; with
@@ -1451,14 +1454,20 @@ impl Rounds {
 		// cost an output, a root and its unroll path for nothing, and show on
 		// the chain whose leaves are whose.
 		let reads = |k: usize| self.reads_accumulator(rows[k]);
+		// A supervised asset's leaves wanted by participations whose wallets
+		// do not read landing-2 rest in a batch with no landing-2 leaf: such
+		// a wallet rebuilds the whole published batch to check its own leaf,
+		// and could not read another's landing-2 leaf in it.
+		let reads_landing_2 = |k: usize| rows[k].record_formats.iter().any(|f| f == arca_covenant::LANDING_2);
 		let mut out = vec![];
 		for b in plan_batches(&leaves, room) {
 			let split = !b.own && self.may_accumulate(&b.asset);
-			let mut by: BTreeMap<(bool, Option<u32>, Option<u32>), Vec<(usize, usize)>> = BTreeMap::new();
+			let supervised = self.params.supervised(&b.asset).is_some();
+			let mut by: BTreeMap<(bool, bool, Option<u32>, Option<u32>), Vec<(usize, usize)>> = BTreeMap::new();
 			for l in b.leaves {
-				by.entry((split && !reads(l.0), vest_of(l), deadline_of(l))).or_default().push(l);
+				by.entry((split && !reads(l.0), supervised && !reads_landing_2(l.0), vest_of(l), deadline_of(l))).or_default().push(l);
 			}
-			out.extend(by.into_iter().map(|((unread, _, _), leaves)| BatchPlan { asset: b.asset, leaves, own: b.own, tree: b.tree || unread }));
+			out.extend(by.into_iter().map(|((unread, _, _, _), leaves)| BatchPlan { asset: b.asset, leaves, own: b.own, tree: b.tree || unread }));
 		}
 		Ok(out)
 	}
