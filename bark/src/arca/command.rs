@@ -47,7 +47,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
 	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
-	fee_asset?}, channel_code {address?}, leaf_template {template?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
+	fee_asset?}, channel_code {address?}, leaf_template {template?}, require_checkpoint_exit {on?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
 	address | script, fee_asset?, max_fee_ppm?, shown?}, offboards";
 
 /// A refusal as the command line prints it.
@@ -234,7 +234,7 @@ pub(crate) const ALONE_NAMED: u64 = 50;
 fn reads_only(command: &str) -> bool {
 	matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit_quote" | "schedule"
 		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
-		| "info" | "supply" | "leaf_template" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
+		| "info" | "supply" | "leaf_template" | "require_checkpoint_exit" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
 		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
 		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed")
 }
@@ -286,6 +286,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"info" => w.info(),
 		"supply" => w.supply(asset(req_str(&a["asset"], "the asset")?)?),
 		"leaf_template" => w.leaf_template(a["template"].as_str()),
+		"require_checkpoint_exit" => w.require_checkpoint_exit(a["on"].as_bool()),
 		"bond" => w.bond(),
 		"bond_evidence" => w.bond_evidence().map(|l| json!({"lines": l})),
 		"instant_budget" => {

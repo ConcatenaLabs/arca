@@ -1185,6 +1185,16 @@ impl Store {
 			.optional().map_err(db)
 	}
 
+	/// `(leaf_id, state, txs, claim)` of every exit that takes home a coin
+	/// given into a trade that can never complete (its `txs` names the coin
+	/// `via` whose record shows the trade), in the order they started.
+	#[allow(clippy::type_complexity)]
+	pub fn returns(&self) -> Result<Vec<(String, String, String, Option<String>)>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id, state, txs, claim FROM exit WHERE txs LIKE '%\"via\":%' ORDER BY rowid").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(db)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(db)
+	}
+
 	pub fn set_exit(&self, leaf_id: &str, state: &str, txs: &str, claim: Option<&str>) -> Result<(), Error> {
 		self.conn.execute("INSERT INTO exit (leaf_id, state, txs, claim) VALUES (?1, ?2, ?3, ?4)
 			ON CONFLICT(leaf_id) DO UPDATE SET state = ?2, txs = ?3, claim = COALESCE(?4, claim)",
