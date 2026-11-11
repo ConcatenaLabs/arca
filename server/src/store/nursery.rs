@@ -117,20 +117,14 @@ impl Store {
 	/// above (when `certification` is required), or with the anchor of their
 	/// block buried fewer than `anchor_depth` Bitcoin blocks under the tip's
 	/// ([`crate::chain::FinalityService::status`] while the tip's anchor is
-	/// ok). One statement, where a lookup per transaction costs a pass time in
-	/// proportion to everything the nursery ever held.
+	/// ok). One statement, which reads the recent blocks and indexes only
+	/// (`chain::unfinal_with`).
 	pub async fn nursery_final_not_final(&self, certification: bool, anchor_depth: u64) -> Result<Vec<NurseryRow>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			&format!("WITH tip AS (SELECT anchor_height FROM block ORDER BY height DESC LIMIT 1),
-			  cert AS (SELECT max(height) AS h FROM block WHERE certified),
-			  loc AS (SELECT DISTINCT ON (t.txid) t.txid, b.height, b.anchor_height FROM tx_block t
-			          JOIN block b ON b.hash = t.block_hash JOIN nursery_tx n ON n.txid = t.txid AND n.state = 'final'
-			          ORDER BY t.txid, b.height),
-			  still AS (SELECT loc.txid FROM loc, tip, cert
-			            WHERE (NOT $1 OR loc.height <= cert.h) AND GREATEST(tip.anchor_height - loc.anchor_height, 0) >= $2)
-			 SELECT {} FROM nursery_tx WHERE state = 'final' AND txid NOT IN (SELECT txid FROM still)
-			 ORDER BY created_at, txid", NURSERY_COLUMNS),
+			&format!("WITH {} SELECT {} FROM nursery_tx WHERE state = 'final' AND txid IN (SELECT txid FROM unfinal)
+				ORDER BY created_at, txid",
+				super::chain::unfinal_with("SELECT txid FROM nursery_tx WHERE state = 'final'"), NURSERY_COLUMNS),
 			&[&certification, &i64::try_from(anchor_depth).unwrap_or(i64::MAX)],
 		).await?;
 		rows.iter().map(nursery_row).collect()

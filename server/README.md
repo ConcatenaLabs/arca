@@ -59,7 +59,10 @@ The server keeps everything in one PostgreSQL database, whose schema is
 [`schema/V39__claim_vest.sql`](schema/V39__claim_vest.sql),
 [`schema/V40__held_strikes.sql`](schema/V40__held_strikes.sql),
 [`schema/V41__strikes_on_dropped_coins.sql`](schema/V41__strikes_on_dropped_coins.sql),
-[`schema/V42__slot_releases.sql`](schema/V42__slot_releases.sql)). `Store::connect` builds it
+[`schema/V42__slot_releases.sql`](schema/V42__slot_releases.sql),
+[`schema/V43__record_formats.sql`](schema/V43__record_formats.sql),
+[`schema/V44__watched_for_index.sql`](schema/V44__watched_for_index.sql),
+[`schema/V45__final_pass_indexes.sql`](schema/V45__final_pass_indexes.sql)). `Store::connect` builds it
 from nothing on an empty database and brings an older one up to date: the
 migrations are applied in order, each once, under a lock.
 
