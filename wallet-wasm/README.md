@@ -112,7 +112,7 @@ program that embeds the library calls, and takes the command line's commands, ea
 arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`, `openamp_key`,
 `balance`, `coins {held?, brief?}`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
-amount?}`, `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
+amount?, channels?}` (`channels: false` names none of the wallet's channels), `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
 `mailbox`, `restore`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_quote {asset,
 value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,

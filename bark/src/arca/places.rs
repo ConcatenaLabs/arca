@@ -276,6 +276,9 @@ impl Wallet {
 		let rows = self.store.coins_in_states(&PLACED)?;
 		let mut coins: Vec<(CoinRow, Lineage, Place)> = Vec::with_capacity(rows.len());
 		let mut received: Vec<(u64, usize)> = vec![];
+		// A coin whose exit's claim is out is held as the claim's output on the
+		// chain, not here.
+		let rows: Vec<CoinRow> = rows.into_iter().filter(|c| !(c.state == "exiting" && c.note.starts_with("claimed by"))).collect();
 		for (i, c) in rows.into_iter().enumerate() {
 			let lineage = Self::record_of(&c).map(|r| self.lineage(&r)).unwrap_or(Lineage::Received);
 			// Not final yet, or on its way home on the chain: arriving, and
