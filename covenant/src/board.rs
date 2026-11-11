@@ -60,9 +60,10 @@
 //! [32]  operator key S
 //! ```
 //!
-//! A board of a supervised asset converts into a `landing-1` leaf
+//! A board of a supervised asset converts into a landing leaf
 //! ([`crate::landing`]) instead, whose collaborative path is its own. Its
-//! record is format version 3: the fields above, then
+//! record is format version 5 for a `landing-2` leaf, or format version 3
+//! for a `landing-1` leaf: the fields above, then
 //!
 //! ```text
 //! [20]  P, the landing program: hash160 of the owner's landing key L
@@ -105,6 +106,11 @@ pub const BOARD_LANDING_RECORD_VERSION: u8 = 3;
 /// The board record format the retired `enclave-1` leaf's boards had,
 /// reserved: it reads as [`ENCLAVE_RETIRED`] and is never reused.
 pub const BOARD_ENCLAVE_RECORD_VERSION: u8 = 4;
+
+/// The board record format of a board that converts into a `landing-2`
+/// leaf: [`BOARD_LANDING_RECORD_VERSION`]'s fields. A library that does not
+/// read `landing-2` refuses it by its version.
+pub const BOARD_LANDING2_RECORD_VERSION: u8 = 5;
 
 /// A board output's policy: the leaf it converts into, and its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -214,7 +220,7 @@ pub struct BoardRecord {
 	pub chain: Chain,
 	/// The operator's key `S`.
 	pub operator: XOnlyPublicKey,
-	/// The landing of the `landing-1` leaf it converts into, for a board of a
+	/// The landing of the landing leaf it converts into, for a board of a
 	/// supervised asset; `None` for one that converts into `vtxo-1`.
 	pub landing: Option<Landing>,
 }
@@ -251,7 +257,7 @@ impl BoardRecord {
 			order: None,
 			// check() refuses an allowance not below the value.
 			landing: self.landing.map(|l| LandingTerms {
-				program: l.program, asset: self.asset, min_value: self.value.saturating_sub(l.allowance),
+				program: l.program, asset: self.asset, min_value: self.value.saturating_sub(l.allowance), own_index: l.own_index,
 			}),
 			channel: None,
 			v2: false,
@@ -289,8 +295,8 @@ impl BoardRecord {
 
 	/// The record format version it is written in.
 	pub fn version(&self) -> u8 {
-		if self.landing.is_some() {
-			BOARD_LANDING_RECORD_VERSION
+		if let Some(l) = &self.landing {
+			if l.own_index { BOARD_LANDING2_RECORD_VERSION } else { BOARD_LANDING_RECORD_VERSION }
 		} else {
 			BOARD_RECORD_VERSION
 		}
@@ -407,7 +413,7 @@ impl BoardRecord {
 		if version == BOARD_ENCLAVE_RECORD_VERSION {
 			return Err(RecordError::Retired(ENCLAVE_RETIRED));
 		}
-		if version != BOARD_RECORD_VERSION && version != BOARD_LANDING_RECORD_VERSION {
+		if version != BOARD_RECORD_VERSION && version != BOARD_LANDING_RECORD_VERSION && version != BOARD_LANDING2_RECORD_VERSION {
 			return Err(RecordError::Version(version as u64));
 		}
 		let template_id = r.u8()?;
@@ -424,10 +430,10 @@ impl BoardRecord {
 			operator: r.key()?,
 			landing: None,
 		};
-		if version == BOARD_LANDING_RECORD_VERSION {
+		if version == BOARD_LANDING_RECORD_VERSION || version == BOARD_LANDING2_RECORD_VERSION {
 			let mut program = [0u8; PROGRAM_BYTES];
 			program.copy_from_slice(r.bytes(PROGRAM_BYTES)?);
-			record.landing = Some(Landing { program, allowance: r.u64()? });
+			record.landing = Some(Landing { program, allowance: r.u64()?, own_index: version == BOARD_LANDING2_RECORD_VERSION });
 		}
 		if r.remaining() != 0 {
 			return Err(DecodeError::TrailingBytes(r.remaining()).into());
@@ -443,7 +449,8 @@ mod json {
 	use elements::{AssetId, BlockHash};
 	use serde_json::{Map, Value};
 
-	use super::{BoardRecord, BOARD_ENCLAVE_RECORD_VERSION, BOARD_LANDING_RECORD_VERSION, BOARD_RECORD_VERSION};
+	use super::{BoardRecord, BOARD_ENCLAVE_RECORD_VERSION, BOARD_LANDING2_RECORD_VERSION, BOARD_LANDING_RECORD_VERSION, BOARD_RECORD_VERSION};
+	use crate::landing::Landing;
 	use crate::message::Chain;
 	use crate::record::{RecordError, Template, ENCLAVE_RETIRED};
 	use crate::record_json::{amount, bytes32, canonical_text, display, display32, hex, int, key, object, string, strict, units};
@@ -453,7 +460,7 @@ mod json {
 		/// The JSON form: the binary form's fields, named as the leaf
 		/// record's are (`version`, `template`, `owner`, `owner_nonce`,
 		/// `operator_nonce`, `exit_delay_units`, `asset`, `value`,
-		/// `genesis_hash`, `operator`, and `landing` in format 3), with the
+		/// `genesis_hash`, `operator`, and `landing` in formats 3 and 5), with the
 		/// same conventions.
 		pub fn to_json(&self) -> Result<Value, RecordError> {
 			self.check()?;
@@ -492,7 +499,7 @@ mod json {
 				"version", "template", "owner", "owner_nonce", "operator_nonce", "exit_delay_units", "asset", "value",
 				"genesis_hash", "operator",
 			];
-			if named == Some(BOARD_LANDING_RECORD_VERSION as u64) {
+			if named == Some(BOARD_LANDING_RECORD_VERSION as u64) || named == Some(BOARD_LANDING2_RECORD_VERSION as u64) {
 				fields.push("landing");
 			}
 			if named == Some(BOARD_ENCLAVE_RECORD_VERSION as u64) {
@@ -500,7 +507,8 @@ mod json {
 			}
 			let m = object(v, "board", &fields)?;
 			let version = int(m, "version", u64::MAX)?;
-			if version != BOARD_RECORD_VERSION as u64 && version != BOARD_LANDING_RECORD_VERSION as u64 {
+			if version != BOARD_RECORD_VERSION as u64 && version != BOARD_LANDING_RECORD_VERSION as u64
+				&& version != BOARD_LANDING2_RECORD_VERSION as u64 {
 				return Err(RecordError::Version(version));
 			}
 			let template: Template = string(m, "template")?.parse()?;
@@ -514,7 +522,8 @@ mod json {
 				value: amount(m, "value")?,
 				chain: Chain::new(BlockHash::from_byte_array(display32(m, "genesis_hash")?)),
 				operator: key(m, "operator")?,
-				landing: m.get("landing").map(crate::record_json::landing_from_json).transpose()?,
+				landing: m.get("landing").map(crate::record_json::landing_from_json).transpose()?
+					.map(|l| Landing { own_index: version == BOARD_LANDING2_RECORD_VERSION as u64, ..l }),
 			};
 			record.check()?;
 			Ok(record)

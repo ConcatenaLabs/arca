@@ -44,8 +44,8 @@ sweep, whose pruned forms also come from sequentia-contracts
 | `forfeit` | The round's connector output (`ConnectorPolicy`) | The operator's issuance of the round's connector asset: its signature, and exactly one explicit atom with no reissuance token issued on that input |
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice, except for a coin of a batch without one; in a reassignment of several owners' coins, the owner's exit after the coin's own exit delay (`CheckpointPolicy::exit`) |
 | `htlc` | `htlc-1`: a leaf whose exit is a hash-locked pair, for a payment out of the tree over Lightning or into it | The leaf's collaborative path; a claim with the preimage after a relative delay; a refund after the timeout and a relative delay. The operator's delay is the shorter: out of the tree the operator claims and the owner refunds, into it the owner claims and the operator refunds |
-| `landing` | `landing-1`: the leaf of a supervised asset, whose issuer can freeze holdings by consensus rule | The leaf's collaborative path, its script pushing `K ‖ P` (`K` the salt's own, `P = hash160(L)` the landing program), so its message is `SHA256(K ‖ P ‖ …)` and a pair made for one landing spends only a leaf that lands there, while a double-sign under its salt is evidence to the equivocation bond as for any coin; the landing, which after the exit delay pays output 0 to P2WPKH of the owner's landing key `L`, explicitly in the leaf's asset, holding at least the value less the fee allowance (`LandingTerms`; 119 bytes with a 512-second delay), where a freeze of the asset binds; `landing_tx` builds it. `check_explicit` is the profile's rule for a transaction that moves a supervised asset: every output explicit |
-| `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value (a `landing-1` leaf for a board of a supervised asset) |
+| `landing` | `landing-2` and `landing-1`: the leaf of a supervised asset, whose issuer can freeze holdings by consensus rule | The leaf's collaborative path, its script pushing `K ‖ P` (`K` the salt's own, `P = hash160(L)` the landing program), so its message is `SHA256(K ‖ P ‖ …)` and a pair made for one landing spends only a leaf that lands there, while a double-sign under its salt is evidence to the equivocation bond as for any coin; the landing, which after the exit delay pays P2WPKH of the owner's landing key `L`, explicitly in the leaf's asset, holding at least the value less the fee allowance (`LandingTerms`; 119 bytes with a 512-second delay), where a freeze of the asset binds; `landing_tx` builds it. A `landing-2` leaf's landing pays the output at the spending input's own index (`LandingTerms::own_index`, `script_at_own_index`), so two landings spent together each need an output of their own; a `landing-1` leaf's pays output 0, so two `landing-1` coins of one holder, or one beside a landing at input 0, share one output and one coin's worth leaves past the freeze. `landing-1` is read and spent for the coins built under it; an operator builds `landing-2`. `check_explicit` is the profile's rule for a transaction that moves a supervised asset: every output explicit |
+| `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value (a landing leaf for a board of a supervised asset, `landing-2` in board record format 5 or `landing-1` in format 3) |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
 | `fill` | An on-chain order a round fills: SeqDEX's fill covenant (`FillOrder`), read from its terms as the relay serves them, and a holder's take of it (`Take`, its id the attestation of every coin it gives up) | FILL, which needs no signature: for the covenant at input `k`, the maker's credit at output `2k` (the price in the asset it is paid in, to the maker's program) and the order resting again at `2k+1` with its identical script after a partial fill; REFUND, the maker's after the order's lock (`refund_tx`: its lock time the order's `expiry_locktime`) |
 | `order` | `order-3` (and `order-2`): an order resting in the tree, which the operator fills with the maker offline (`OrderPolicy`), and SeqDEX's own order it lands as (`SeqdexOrder`, `seqdex/order`) | The leaf's collaborative path (`[collab, land]` beside `[fill, data]`); the landing, one exit delay after the leaf reaches the chain, into `seqdex/order` for the same terms with no signature; the fill (`arca/order-2`, Simplicity), the operator's signature over the fill's outputs (`fill_digest`) with, for the coin at input `k`, the maker's credit at `2k` to a `vtxo-1` leaf of the next credit key (`credit_leaf`) and the remainder at `2k+1` under the next salt with the credit keys moved up (`next`); at most four fills along one lineage. `plan` and `check` mirror the program; `landing_tx` builds the landing, a fee coin paying; `publish_digest` is what the leaf's key signs to publish the order to its operator |
@@ -64,7 +64,10 @@ share of leaves expected to leave on their own costs less from one output,
 never for a batch with a resting order or a channel, or a burn-only one). It
 also names the leaf record formats, by kind and version byte: `leaf-2` and
 `leaf-3` (a tree's leaf, with a sweep and without), `accumulator-1` and
-`accumulator-4` (`BatchKind::record_format`). `RECORD_FORMATS` lists those this
+`accumulator-4` (`BatchKind::record_format`), `coin-2` (the coin record whose
+checkpoints carry their owners' exit) and `landing-2` (`LANDING_2`: the
+supervised leaf landing at its own index, in a leaf record, a board record of
+format 5 or a coin record's tag 9). `RECORD_FORMATS` lists those this
 library reads, which a wallet built on it names in each participation;
 `FORMATS_EVERY_WALLET_READS` those an operator takes a participation naming
 none to read; `reads_format` tells whether a participation reads one. An
@@ -116,7 +119,7 @@ It names the leaf's template and version (`vtxo-1`; `htlc-1` with its
 payment hash, timeout, direction and operator delay; `order-3` or `order-2` with its
 order's terms: the asset it is paid in, the price and lot, the landed order's
 maker script hash, REFUND time and key, and the four credit keys;
-`landing-1` with its landing program and fee allowance; or
+`landing-2` or `landing-1` with its landing program and fee allowance; or
 `channel-1` with the operator's opening balance and the credit window;
 `claim-1` with its distribution's deadline, the lapse's fee allowance and the
 return script; `vest-1` with the same and its vest time; or
@@ -775,7 +778,7 @@ reaches it. If one input's owner and the operator spend that owner's checkpoint
 elsewhere, it can never confirm, and every other owner's coin stands in a
 checkpoint only that owner and the operator can spend together. With
 `TransferPlan::checkpoint_exit` set, each coin of a plain leaf (`vtxo-1` or
-`vtxo-2`) or of a supervised asset (`landing-1`) moves instead into a
+`vtxo-2`) or of a supervised asset (`landing-1`, `landing-2`) moves instead into a
 checkpoint that also has the coin's own exit,
 `<delay> CSV DROP <A> CHECKSIG` after the coin's exit delay: `[collab, exit]`,
 `[collab, [sweep, exit]]` with a sweep, and for a `vtxo-2` coin `[[arca/collab-2,
@@ -790,11 +793,12 @@ reassignment confirms the checkpoint is spent and the exit is gone, so an owner
 can pull out of a good reassignment only against every other party and their
 watchtowers staying away for the whole delay, the same option every sender has
 against an absent receiver. A coin of a supervised asset exits by its landing, exactly as from
-its leaf: the output at the spending input's own index pays P2WPKH of its
+a `landing-2` leaf: the output at the spending input's own index pays P2WPKH of its
 holder's landing key, in the asset, explicitly, at least the checkpoint's
 value less the coin's allowance (`CheckpointExit::landing`,
-`LandingTerms::script_at_own_index`: the leaf's landing with
-`OP_PUSHCURRENTINPUTINDEX` where it pushes 0, the same 119 bytes), so a
+`LandingTerms::script_at_own_index`: `landing-1`'s landing with
+`OP_PUSHCURRENTINPUTINDEX` where it pushes 0, the same 119 bytes, for a coin
+of either landing leaf), so a
 freeze or pause of the asset binds on the landed coin as on one landed from
 its leaf, and two landings spent together each need an output of their own.
 The checkpoint pair names the checkpoint's output, so it is made for one form
@@ -1432,7 +1436,31 @@ need `SEQUENTIA_DIR` set to a node checkout with its consensus library built
   once that is lifted. A round of the asset with a blinded output is refused in
   a block (`bad-txns-supervised-blinded`) beside the same round all explicit,
   whose `landing-1` leaves' records validate against it, and the same blinding
-  in a round of an open asset confirms.
+  in a round of an open asset confirms. The same for `landing-2`: a round of
+  the asset whose leaves are all `landing-2` confirms and each record checks
+  against it; a coin rolled back with its block lands only once the delay has
+  run from the new block (`bad-txns-nonfinal` before); under a pause, its
+  script named in a freeze, a coin at input 1 beside a fee coin lands at
+  output 1, and the landed coin is frozen as above.
+- `tests/landing_collisions.rs`: on a regtest chain, a landing spent beside
+  each covenant that can share a transaction with it, the outputs arranged so
+  that one output would serve both, each forced into a block. Two `landing-1`
+  coins of one holder sharing output 0 confirm (one coin's worth past the
+  freeze); two `landing-2` coins are refused, and each at its own index
+  confirms (398 vB). Refused (`Script failed an OP_EQUALVERIFY operation`): a
+  checkpoint's landing beside a `landing-2` coin, either way round; a
+  `landing-1` coin at input 0 beside a `landing-2` coin or a checkpoint's
+  landing; a resting order (`order-3`) landing as SeqDEX's order, either way
+  round; SeqDEX's own order filled at input 1 whose credit at output 2 is
+  another script; a `claim-1` lapse paying the landing key, either way round;
+  a rebindable pair committing output 0 to the landing key at input 0. Taken
+  by the block, and why each is no hole: a `landing-2` coin or a checkpoint's
+  landing at input 0 beside a `landing-1` coin, whose landing is output 0
+  (the `landing-1` coin's own hole, which only refreshing it closes); SeqDEX's
+  order whose maker's script is the landing key itself (the shared output
+  holds the landing's minimum at the frozen key); a `landing-2` coin at input
+  0 beside a rebindable pair committing output 0 to the landing key (no
+  operator signs a pair paying anything but leaves).
 - `tests/vtxo2.rs`: on an anchored regtest chain with Simplicity, `vtxo-2`.
   Each attack a `vtxo-1` pair allows is run against a `vtxo-1` leaf, where it
   is mined, and against a `vtxo-2` leaf, where the mempool and a block refuse

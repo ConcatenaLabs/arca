@@ -151,8 +151,8 @@
 //!         [32] the preimage of its entry's unlock hash
 //!         [64] signature, u32 time: its owner's exit authorisation
 //!   u8  1, an output of a reassignment whose leaf is vtxo-1, 3 one whose leaf is htlc-1, 5 one
-//!       whose leaf is landing-1, or 8 one whose leaf is vtxo-2 (7 is reserved: it was the retired
-//!       enclave-1, and reads as ENCLAVE_RETIRED):
+//!       whose leaf is landing-1, 8 one whose leaf is vtxo-2, or 9 one whose leaf is landing-2 (7 is
+//!       reserved, and reads as ENCLAVE_RETIRED):
 //!         u8   input count, 1 to 16, then per input:
 //!                coin (recursively), u64 the checkpoint's value,
 //!                [64] [64] the checkpoint pair (operator, owner),
@@ -164,7 +164,7 @@
 //!         [32] owner key, [32] owner nonce, [32] creator nonce (the sender's), u16 exit delay units
 //!         for tag 3 only: u8 direction (0 send, 1 receive), [32] payment hash, u32 timeout,
 //!                         u16 operator delay units
-//!         for tag 5 only: [20] the landing program, u64 the fee allowance: the landing
+//!         for tags 5 and 9 only: [20] the landing program, u64 the fee allowance: the landing
 //!                         pays at least the coin's output value less it, in its asset
 //! ```
 //!
@@ -264,7 +264,8 @@ pub struct NewLeaf {
 	pub exit_delay: RelativeTime,
 	/// `htlc-1`'s terms; `None` for a `vtxo-1` leaf.
 	pub htlc: Option<HtlcTerms>,
-	/// `landing-1`'s terms, for a leaf of a supervised asset: they name the
+	/// The landing leaf's terms (`landing-1` or `landing-2`), for a leaf of
+	/// a supervised asset: they name the
 	/// asset and the least the landing pays, so they must agree with the
 	/// output the leaf is paid ([`LandingTerms::landing`]); `None` otherwise.
 	pub landing: Option<LandingTerms>,
@@ -430,7 +431,7 @@ pub enum TransferError {
 	Spend(#[from] SpendError),
 	#[error("unknown coin record format version {0}")]
 	Version(u8),
-	#[error("a landing-1 leaf's terms: {0}")]
+	#[error("a landing leaf's terms: {0}")]
 	Landing(String),
 	#[error("the new leaf's template: {0}")]
 	Template(String),
@@ -494,7 +495,7 @@ pub enum TransferError {
 	NotAnOrder,
 	#[error("the fill: {0}")]
 	Fill(String),
-	#[error("input {0}: a checkpoint with its owner's exit holds a coin of a plain leaf (vtxo-1 or vtxo-2) or a landing-1 leaf only")]
+	#[error("input {0}: a checkpoint with its owner's exit holds a coin of a plain leaf (vtxo-1 or vtxo-2) or a landing leaf only")]
 	CheckpointExit(usize),
 }
 
@@ -774,13 +775,14 @@ impl ValidCoin {
 
 	/// [`ValidCoin::checkpoint`], with its owner's exit after the coin's own
 	/// exit delay when `exit` is set ([`crate::checkpoint`]), for a
-	/// checkpoint keeping `value`: a `landing-1` coin's exit is its landing,
-	/// at least `value` less the coin's allowance.
+	/// checkpoint keeping `value`: a landing coin's exit is its landing, at
+	/// least `value` less the coin's allowance, at the spending input's own
+	/// index for either landing leaf.
 	pub fn checkpoint_of(&self, exit: bool, value: u64) -> CheckpointPolicy {
 		let exit = exit.then(|| crate::checkpoint::CheckpointExit {
 			delay: self.leaf.exit_delay,
 			landing: self.leaf.landing.map(|l| crate::LandingTerms {
-				min_value: value.saturating_sub(self.value.saturating_sub(l.min_value)), ..l
+				min_value: value.saturating_sub(self.value.saturating_sub(l.min_value)), own_index: true, ..l
 			}),
 		});
 		CheckpointPolicy {
@@ -790,7 +792,7 @@ impl ValidCoin {
 	}
 
 	/// Whether this coin may move into a checkpoint with its owner's exit:
-	/// a coin of a plain leaf or a `landing-1` leaf
+	/// a coin of a plain leaf or a landing leaf
 	/// ([`crate::checkpoint::exit_allowed`]).
 	pub fn exit_allowed(&self) -> bool {
 		crate::checkpoint::exit_allowed(&self.leaf)
@@ -1017,7 +1019,7 @@ pub struct TransferPlan {
 	pub inputs: Vec<(ValidCoin, u64)>,
 	/// The committed outputs.
 	pub outputs: Vec<ExplicitOutput>,
-	/// Whether each coin of a plain or a `landing-1` leaf moves into a checkpoint with its
+	/// Whether each coin of a plain or a landing leaf moves into a checkpoint with its
 	/// owner's exit ([`crate::checkpoint`]); a coin of any other leaf moves
 	/// into one without, as every coin does when this is not set. A
 	/// reassignment of several owners' coins sets it, where every party
@@ -1228,7 +1230,7 @@ impl CoinRecord {
 		}
 	}
 
-	/// The landing of a `landing-1` coin, from its record alone: where its
+	/// The landing of a landing coin, from its record alone: where its
 	/// exit pays, in what, and at least how much (a leaf of a supervised
 	/// asset's batch, a board that converts into one, or a reassignment's
 	/// output); `None` for a coin of any other template. An operator reads the
@@ -1433,7 +1435,7 @@ impl CoinRecord {
 				if mine.script_pubkey != leaf.script_pubkey() {
 					return Err(TransferError::LeafMismatch);
 				}
-				// A landing-1 leaf lands in the asset it holds, all but its
+				// A landing leaf lands in the asset it holds, all but its
 				// allowance.
 				if let Some(terms) = &t.leaf.landing {
 					terms.landing(mine.asset, mine.value).map_err(|e| TransferError::Landing(e.to_string()))?;
@@ -1534,6 +1536,23 @@ impl CoinRecord {
 		Ok(w)
 	}
 
+	/// Whether the record holds a `landing-2` leaf anywhere: the coin's own
+	/// leaf or a leaf in its past (a leaf record of template `landing` version
+	/// 2, a board record of format 5, a coin record's tag 9). A library that
+	/// does not read `landing-2` refuses such a record whole
+	/// ([`crate::LANDING_2`]), so a wallet gives such a coin, or a coin made
+	/// from one, only to a party that names `landing-2` among the formats it
+	/// reads.
+	pub fn has_landing_2(&self) -> bool {
+		match self {
+			CoinRecord::Leaf { record, .. } => record.template == crate::Template::Landing2,
+			CoinRecord::Accumulator { record, .. } => record.template == crate::Template::Landing2,
+			CoinRecord::Board(b) => b.landing.is_some_and(|l| l.own_index),
+			CoinRecord::Transfer(t) => t.leaf.landing.is_some_and(|l| l.own_index) || t.inputs.iter().any(|i| i.coin.has_landing_2()),
+			CoinRecord::Fill(f) => f.fill.order.has_landing_2() || f.fill.inputs.iter().any(|i| i.coin.has_landing_2()),
+		}
+	}
+
 	/// Whether any checkpoint in the record has its owner's exit, so that
 	/// it is written in format version 2 ([`COIN_RECORD_VERSION_EXIT`]).
 	pub fn has_checkpoint_exit(&self) -> bool {
@@ -1594,7 +1613,11 @@ impl CoinRecord {
 				if t.leaf.v2 && (t.leaf.htlc.is_some() || landing.is_some()) {
 					return Err(TransferError::Template("vtxo-2 with another template's terms".into()));
 				}
-				w.push(if t.leaf.htlc.is_some() { 3 } else if landing.is_some() { 5 } else if t.leaf.v2 { 8 } else { 1 });
+				w.push(match (&landing, t.leaf.htlc.is_some()) {
+					(_, true) => 3,
+					(Some(l), false) => if l.own_index { 9 } else { 5 },
+					(None, false) => if t.leaf.v2 { 8 } else { 1 },
+				});
 				write_inputs(w, &t.inputs, depth, v2)?;
 				write_outputs(w, &t.outputs)?;
 				w.push(t.index);
@@ -1689,7 +1712,7 @@ impl CoinRecord {
 			},
 			// The retired enclave-1's tag, reserved.
 			7 => Err(DecodeError::Retired(crate::ENCLAVE_RETIRED).into()),
-			tag @ (1 | 3 | 5 | 8) => {
+			tag @ (1 | 3 | 5 | 8 | 9) => {
 				let inputs = read_inputs(r, depth, v2)?;
 				let outputs = read_outputs(r)?;
 				let m = outputs.len();
@@ -1706,10 +1729,10 @@ impl CoinRecord {
 					terms.check(leaf.exit_delay).map_err(DecodeError::from)?;
 					leaf.htlc = Some(terms);
 				}
-				if tag == 5 {
+				if tag == 5 || tag == 9 {
 					let mut program = [0u8; crate::landing::PROGRAM_BYTES];
 					program.copy_from_slice(r.bytes(crate::landing::PROGRAM_BYTES)?);
-					let l = crate::landing::Landing { program, allowance: r.u64()? };
+					let l = crate::landing::Landing { program, allowance: r.u64()?, own_index: tag == 9 };
 					let o = &outputs[index as usize];
 					leaf.landing = Some(l.terms(o.asset, o.value).map_err(|e| TransferError::Landing(e.to_string()))?);
 				}

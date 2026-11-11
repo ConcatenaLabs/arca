@@ -97,7 +97,7 @@ sample spend of every path:
   operator's issuance of that asset), the board output (`board-1`: the leaf's
   collaborative path and the owner's conversion), the checkpoint output, the
   checkpoint with its owner's exit (without and with a sweep), and
-  `htlc-1` in both directions, `landing-1`, `claim-1`): its inputs (keys, hashes, salts, the genesis hash, `T`, `R`, `W`,
+  `htlc-1` in both directions, `landing-1`, `landing-2`, `claim-1`): its inputs (keys, hashes, salts, the genesis hash, `T`, `R`, `W`,
   times, children), each script leaf with its opcodes, depth, leaf hash and
   control block, the merkle root, the output key and the scriptPubKey;
 - for each spend: a transaction, the outputs it spends, the signature hash or the
@@ -116,7 +116,8 @@ fifth with no opening balance for the operator), one whose second and third are 
 RECLAIM-D on every lowest node, and the batches without a sweep (seventeen
 with RECLAIM-D; five whose second and third are `vtxo-2`; five whose second
 and fourth are `claim-1`) and one with a sweep whose first and fifth are
-`claim-1`, it holds the inputs, the
+`claim-1`, and two of a supervised asset whose five leaves are all `landing-2`
+(with a sweep and without), it holds the inputs, the
 shape of the tree (the child count of every node), the batch output, a round
 transaction that issues the batch's token and funds it, and each exported
 leaf's salt, position, leaf id and record in both forms. It also holds

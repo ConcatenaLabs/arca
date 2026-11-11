@@ -140,6 +140,7 @@ TEMPLATE_BOARD, TEMPLATE_BOARD_VERSION = 2, 1
 TEMPLATE_HTLC, TEMPLATE_HTLC_VERSION = 3, 1
 TEMPLATE_ORDER, TEMPLATE_ORDER_VERSION = 4, 2
 TEMPLATE_LANDING, TEMPLATE_LANDING_VERSION = 5, 1
+TEMPLATE_LANDING2_VERSION = 2              # landing-2: the landing at the spending input's own index
 TEMPLATE_CHANNEL, TEMPLATE_CHANNEL_VERSION = 7, 1
 TEMPLATE_CLAIM, TEMPLATE_CLAIM_VERSION = 8, 1
 TEMPLATE_VTXO2_VERSION = 2
@@ -312,7 +313,7 @@ class Batch:
             elif lf.get("landing") is not None:
                 g = lf["landing"]
                 tap, _ = landing_taptree(lf["owner"], S, salt, ctag, SEQ_TIME | lf["exit_delay"], g["program"], p["asset"],
-                                         lf["value"], g["allowance"])
+                                         lf["value"], g["allowance"], own_index=bool(g.get("own_index")))
             elif lf.get("v2"):
                 tap = vtxo2_leaf_tap(lf, S, salt, ctag)
             elif h is None:
@@ -391,7 +392,8 @@ class Batch:
         q = lf.get("claim")
         return {
             "template": ("order", o.get("version", TEMPLATE_ORDER_VERSION)) if o else ("htlc", TEMPLATE_HTLC_VERSION) if h
-            else ("landing", TEMPLATE_LANDING_VERSION) if g else ("channel", TEMPLATE_CHANNEL_VERSION) if c
+            else ("landing", TEMPLATE_LANDING2_VERSION if g.get("own_index") else TEMPLATE_LANDING_VERSION) if g
+            else ("channel", TEMPLATE_CHANNEL_VERSION) if c
             else ("claim", TEMPLATE_CLAIM_VERSION) if q
             else ("vtxo", TEMPLATE_VTXO2_VERSION) if lf.get("v2") else ("vtxo", TEMPLATE_VTXO_VERSION),
             "htlc": h,
@@ -553,7 +555,7 @@ def txout(asset, value, spk):
 
 def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1_000, export=None,
                  expiries=(28, 56, 84), odd_delay=None, htlc=None, order=None, order_version=2, landing=None, channel=None,
-                 v2=None, delegated=False, no_sweep=False, claim=None):
+                 v2=None, delegated=False, no_sweep=False, claim=None, landing_own_index=False):
     """One batch: its inputs, the round that funds it, and the records of the
     leaves in `export` (all when None)."""
     issuer_txid = label_hash("outpoint", "%s round issuer" % name)
@@ -582,9 +584,11 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
                               "min_lot": 1_000, "maker": sha256(b"\x51\x20" + xonly("%s maker %d" % (name, i))),
                               "expiry": CREATED + 10 * DAY, "refund_key": xonly("%s refund %d" % (name, i)),
                               "credits": [xonly("%s credit %d.%d" % (name, i, k)) for k in range(4)]}
-    # landing: [leaf index]; each such leaf is a landing-1 leaf of a supervised asset.
+    # landing: [leaf index]; each such leaf is a landing-1 leaf of a supervised
+    # asset, or landing-2 with landing_own_index.
     for i in (landing or []):
-        leaves[i]["landing"] = {"program": label_hash("landing", "%s leaf %d" % (name, i))[:20], "allowance": 2_000 + i}
+        leaves[i]["landing"] = {"program": label_hash("landing", "%s leaf %d" % (name, i))[:20], "allowance": 2_000 + i,
+                                **({"own_index": True} if landing_own_index else {})}
     # channel: {leaf index: capacity}; each such leaf is a channel-1 leaf, the
     # operator's opening balance that part of its value.
     for i, capacity in (channel or {}).items():
@@ -657,7 +661,8 @@ def batch_vector(name, n, radix, burn=False, node_reserve=2_500, entry_reserve=1
                                             "window_units": lf["channel"]["window"]}} if "channel" in lf else {}),
                             **({"claim": {"deadline": lf["claim"]["deadline"], "allowance": lf["claim"]["allowance"],
                                           "return_script": lf["claim"]["return_script"].hex()}} if "claim" in lf else {}),
-                            **({"template": "vtxo-2"} if lf.get("v2") else {}))
+                            **({"template": "vtxo-2"} if lf.get("v2") else {}),
+                            **({"template": "landing-2"} if lf.get("landing", {}).get("own_index") else {}))
                        for lf in leaves],
         },
         "levels": [len(lv) for lv in b.levels],
@@ -785,7 +790,7 @@ def invalid_landing_vectors(valid_binary, valid_json):
     out = [
         ("landing-1: an allowance as large as the value", put(ALLOW, le64(value)), "landing"),
         ("landing-1: an allowance above the value", put(ALLOW, le64(value + 1)), "landing"),
-        ("landing-1, version 2", put(2, b"\x02"), "template_version"),
+        ("landing, version 3", put(2, b"\x03"), "template_version"),
     ]
 
     def edit(f):
@@ -802,6 +807,36 @@ def invalid_landing_vectors(valid_binary, valid_json):
         ("landing-1: an allowance as large as the value", edit(lambda o: o["landing"].update({"allowance": o["value"]})),
          "landing"),
         ("landing-1: an unknown field in its terms", edit(lambda o: o["landing"].update({"extra": 1})), "field"),
+    ]
+    return ([{"name": n, "binary": b.hex(), "kind": k} for n, b, k in out],
+            [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
+
+
+def invalid_landing2_vectors(valid_binary, valid_json):
+    """landing-2 records a decoder must refuse."""
+    v = bytes.fromhex(valid_binary)
+    PROG = 3 + 32 + 32 + 32 + 2
+    ALLOW = PROG + 20
+    VALUE = ALLOW + 8 + 32
+    value = struct.unpack("<Q", v[VALUE:VALUE + 8])[0]
+
+    def put(off, b):
+        return v[:off] + b + v[off + len(b):]
+
+    out = [
+        ("landing-2: an allowance as large as the value", put(ALLOW, le64(value)), "landing"),
+    ]
+
+    def edit(f):
+        o = json.loads(valid_json)
+        f(o)
+        return json_text(o)
+
+    jbad = [
+        ("landing-2 without its terms", edit(lambda o: o.pop("landing")), "field"),
+        ("landing-2: an allowance as large as the value", edit(lambda o: o["landing"].update({"allowance": o["value"]})),
+         "landing"),
+        ("landing-2: a template version 3", edit(lambda o: o.update({"template": "landing-3"})), "template_version"),
     ]
     return ([{"name": n, "binary": b.hex(), "kind": k} for n, b, k in out],
             [{"name": n, "json": t, "kind": k} for n, t, k in jbad])
@@ -956,6 +991,10 @@ def generate():
         batch_vector("five leaves without a sweep, two of them vtxo-2", 5, 4, v2=[1, 2], no_sweep=True),
         batch_vector("five leaves without a sweep, two of them claim-1", 5, 4, claim=[1, 3], no_sweep=True),
         batch_vector("five leaves, two of them claim-1", 5, 4, claim=[0, 4]),
+        batch_vector("five leaves of a supervised asset, every one landing-2", 5, 4, landing=[0, 1, 2, 3, 4],
+                     landing_own_index=True),
+        batch_vector("five leaves of a supervised asset without a sweep, every one landing-2", 5, 4, landing=[0, 1, 2, 3, 4],
+                     landing_own_index=True, no_sweep=True),
     ]
     first = batches[2]["records"][5]
     invalid, invalid_json = invalid_vectors(first["binary"], first["json"])
@@ -983,6 +1022,10 @@ def generate():
     qi, qj = invalid_claim_vectors(q["binary"], q["json"])
     invalid += qi
     invalid_json += qj
+    g2 = batches[18]["records"][3]
+    g2i, g2j = invalid_landing2_vectors(g2["binary"], g2["json"])
+    invalid += g2i
+    invalid_json += g2j
     return {
         "about": "Golden vectors for Arca's leaf record, its id and its encodings. Generated by "
                  "regtest/vectors.py from regtest/records.py; do not edit.",

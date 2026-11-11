@@ -273,7 +273,7 @@ fn mutations(r: &LeafRecord) -> Vec<(String, LeafRecord)> {
 		add("landing-1 as vtxo-1".into(), &|x| { x.landing = None; x.template = arca_covenant::Template::Vtxo1; });
 	} else if r.template == arca_covenant::Template::Vtxo1 {
 		add("vtxo-1 as landing-1".into(), &|x| {
-			x.landing = Some(arca_covenant::Landing { program: [7; 20], allowance: 1 });
+			x.landing = Some(arca_covenant::Landing { program: [7; 20], allowance: 1, own_index: false });
 			x.template = arca_covenant::Template::Landing1;
 		});
 	}

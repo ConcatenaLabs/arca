@@ -23,7 +23,7 @@
 //!   key is a Bitcoin address and a Sequentia address, as on every Sequentia
 //!   wallet.
 //! - **The landing key**, the first on-chain key, `m/84'/coin'/0'/0/0`: every
-//!   leaf the wallet holds of a supervised asset is `landing-1`, whose exit
+//!   leaf the wallet holds of a supervised asset is a landing leaf, whose exit
 //!   pays only P2WPKH of this key, where a freeze of the asset binds. One key
 //!   for every such leaf, so that a freeze of the holder's address reaches
 //!   every coin it holds, and a landed coin is an ordinary coin of the

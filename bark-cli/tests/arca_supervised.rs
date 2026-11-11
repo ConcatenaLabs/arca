@@ -10,6 +10,9 @@
 //! `frozen`); takes its coin home by its landing into its own key with
 //! `exit`, where the coin stays frozen on the chain; and, once the issuer
 //! lifts the freeze, spends that coin again and moves in the tree again.
+//! Every leaf the wallet asks for is `landing-2`, since the operator makes
+//! it. A second test runs this build beside an older one that reads no
+//! `landing-2`, both ways, and with the operator's `landing_2_only` on.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -236,10 +239,12 @@ async fn a_frozen_holder_lands_its_coin_in_its_own_key() {
 	let check = a.ok(&["supervised-check", &format!("{}:{}", round.tx.txid(), batch_vout)]);
 	assert_eq!(check["ok"], json!(true), "{}", check);
 	assert_eq!((check["supervised_on_the_node"].clone(), check["explicit"].clone()), (json!(true), json!(true)), "{}", check);
-	assert!(check["leaves"].as_array().unwrap().iter().all(|l| l["template"] == "landing-1" && atoms(&l["allowance"]) == allowance),
+	// The operator makes landing-2, so the wallet asks for it.
+	assert!(check["leaves"].as_array().unwrap().iter().all(|l| l["template"] == "landing-2" && atoms(&l["allowance"]) == allowance),
 		"{}", check);
 	assert!(check["leaves"].as_array().unwrap().iter().any(|l| l["landing"] == json!(a_landing)), "{}", check);
-	println!("CHECKED: round {} batch {} of Z: every leaf landing-1 at the published allowance, every output explicit", round.tx.txid(),
+	assert_eq!(coin["template"], json!("landing-2"), "{}", coin);
+	println!("CHECKED: round {} batch {} of Z: every leaf landing-2 at the published allowance, every output explicit", round.tx.txid(),
 		batch_vout);
 	// A supervised coin is never planned: `plan` says why, and `care` leaves
 	// it to `sync`'s refresh.
@@ -271,9 +276,11 @@ async fn a_frozen_holder_lands_its_coin_in_its_own_key() {
 	let bob = live_in(&b, &z);
 	assert_eq!(bob.len(), 1, "{:?}", bob);
 	assert_eq!(bob[0]["landing"], json!(b_landing), "{}", bob[0]);
+	assert_eq!(bob[0]["template"], json!("landing-2"), "B's request names landing-2: {}", bob[0]);
 	let alice = live_in(&a, &z);
 	assert_eq!(alice.len(), 1, "A's change: {:?}", alice);
 	assert_eq!(alice[0]["landing"], json!(a_landing), "{}", alice[0]);
+	assert_eq!(alice[0]["template"], json!("landing-2"), "{}", alice[0]);
 	let a_coin = alice[0]["leaf_id"].as_str().unwrap().to_string();
 	let a_value = atoms(&alice[0]["value"]);
 	println!("A paid B 300000 of Z out of round: B's coin lands at {}, A's change at {}", b_landing, a_landing);
@@ -366,6 +373,161 @@ async fn a_frozen_holder_lands_its_coin_in_its_own_key() {
 	b.ok(&["sync"]);
 	println!("A, its freeze lifted and final, pays B again in the tree from its new board");
 	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// Serves a new supervised asset Z, its signer reading freezes from a node
+/// of its own, as [`a_frozen_holder_lands_its_coin_in_its_own_key`] does.
+async fn serve_z(r: &mut Running) -> Issuer {
+	let iss = tokio::task::block_in_place(|| Issuer::issue(r));
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let cookie = r.signer.dir.join("node.cookie");
+	std::fs::write(&cookie, "arca:arca").unwrap();
+	r.signer.halt();
+	r.signer.set_extra(vec!["--keeper-timeout-ms".into(), "2000".into(), "--supervision-node".into(), r.node_url(),
+		"--supervision-cookie".into(), cookie.to_str().unwrap().into()]);
+	tokio::task::block_in_place(|| r.signer.resume(genesis));
+	let mut config = r.config.clone();
+	config.assets.push(AssetSection::new(iss.z, MIN_LEAF));
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	r.fund_server(iss.z, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	iss
+}
+
+/// The template of `w`'s live coin `leaf`, as `coins` shows it.
+fn template_of(w: &Arca, asset: &str, leaf: &str) -> Value {
+	live_in(w, asset).into_iter().find(|c| c["leaf_id"] == leaf).map(|c| c["template"].clone()).unwrap_or(Value::Null)
+}
+
+/// This build beside an older one (`ARCA_CLI_OLDER`, an `arca` built from a
+/// library that reads no `landing-2`), on a supervised asset Z, in both
+/// roles, and with the operator's `landing_2_only` on. Skipped when no older
+/// build is named.
+///
+/// - Each boards Z and refreshes it: this build's leaf is `landing-2`, the
+///   older one's `landing-1`.
+/// - The older build pays this one: the coin is `landing-1` (an older sender
+///   reads no `reads`), and this build takes it.
+/// - This build pays the older one: a `landing-1` leaf, from the one coin
+///   whose past holds no `landing-2` leaf, and the older build takes it; a
+///   second payment, every coin left holding one, is refused before
+///   anything is signed.
+/// - `landing_2_only` on: the older build's refresh and its payment are
+///   refused, naming the setting; this build pays a third wallet in
+///   `landing-2`.
+/// - A wallet restored from this build's mnemonic holds the same coins.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_wallet_and_this_one_pay_each_other_and_the_switch() {
+	let Some(older) = std::env::var("ARCA_CLI_OLDER").ok() else {
+		println!("LD: no ARCA_CLI_OLDER: old against new not run");
+		return;
+	};
+	let older = std::path::Path::new(&older);
+	let mut r = Running::start().await;
+	let iss = serve_z(&mut r).await;
+	let z = iss.z.to_string();
+	let (url, node_url) = (r.url(), r.node_url());
+	let (a, o, c) = (Arca::new("LDA"), Arca::built_from("LDO", older), Arca::new("LDC"));
+	for w in [&a, &o, &c] {
+		w.ok(&create_args(&url, &node_url));
+		for (asset, v) in [(iss.z, 3_000_000), (r.x, 2_000_000)] {
+			let s = script(&w.ok(&["address"]));
+			r.pay_to(s, asset, v);
+		}
+	}
+	r.produce().await;
+
+	// ---- Each boards Z and refreshes it ----------------------------------
+	for w in [&a, &o] {
+		w.ok(&["board", &z, "2000000"]);
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	for w in [&a, &o] {
+		r.wait("the boards credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+		w.ok(&["sync"]);
+		w.ok(&["participate"]);
+	}
+	let round = r.server.rounds.run_round().await.unwrap().expect("Z's round");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&round.tx.txid(), RoundState::Final).await;
+	for w in [&a, &o] {
+		let s = w.ok(&["sync"]);
+		assert!(s["participations"].as_array().unwrap().iter().all(|q| q["state"] == "released"), "{}", s);
+	}
+	let a_round = live_in(&a, &z);
+	let o_round = live_in(&o, &z);
+	assert_eq!((a_round.len(), o_round.len()), (1, 1), "{:?} {:?}", a_round, o_round);
+	assert_eq!(a_round[0]["template"], json!("landing-2"), "{}", a_round[0]);
+	assert_ne!(o_round[0]["template"], json!("landing-2"), "the older build asks for landing-1: {}", o_round[0]);
+	let a_round_id = a_round[0]["leaf_id"].as_str().unwrap().to_string();
+	println!("ROUND {}: this build's leaf landing-2, the older build's {}", round.tx.txid(), o_round[0]["template"]);
+
+	// ---- The older build pays this one ------------------------------------
+	let req = a.ok(&["receive", "--asset", &z, "--amount", "200000"])["request"].as_str().unwrap().to_string();
+	o.ok(&["send", &req]);
+	let s = a.ok(&["sync"]);
+	assert_eq!(s["mailbox"]["accepted"].as_array().map(|v| v.len()), Some(1), "{}", s);
+	let from_o = live_in(&a, &z).into_iter().find(|c| c["leaf_id"] != a_round_id.as_str()).expect("O's payment");
+	assert_eq!(from_o["template"], json!("landing-1"), "an older sender pays landing-1: {}", from_o);
+	println!("OLD PAYS NEW: the older build paid this one a landing-1 leaf, taken");
+
+	// ---- This build pays the older one ------------------------------------
+	let req = o.ok(&["receive", "--asset", &z, "--amount", "100000"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req]);
+	let s = o.ok(&["sync"]);
+	assert_eq!(s["mailbox"]["accepted"].as_array().map(|v| v.len()), Some(1), "the older build takes it: {}", s);
+	assert_eq!(a.ok(&["record", &a_round_id])["state"], "live", "the landing-2 coin did not pay the older build");
+	assert_eq!(a.ok(&["record", from_o["leaf_id"].as_str().unwrap()])["state"], "spent", "the landing-1 coin paid it");
+	let o_got = live_in(&o, &z).into_iter().find(|c| c["leaf_id"] != o_round[0]["leaf_id"]).expect("A's payment to O");
+	assert_ne!(o_got["template"], json!("landing-2"), "{}", o_got);
+	println!("NEW PAYS OLD: a landing-1 leaf, from the coin whose past holds no landing-2 leaf; the older build took it");
+	let req = o.ok(&["receive", "--asset", &z, "--amount", "50000"])["request"].as_str().unwrap().to_string();
+	let m = a.refused(&["send", &req], "landing-2 leaf");
+	println!("REFUSED new pays old, every coin holding a landing-2 leaf: {}", m);
+
+	// ---- The switch on --------------------------------------------------------
+	r.config.landing_2_only = true;
+	r.restart_server().await;
+	let req = a.ok(&["receive", "--asset", &z, "--amount", "50000"])["request"].as_str().unwrap().to_string();
+	let (ok, v, err) = o.run_full(&["send", &req]);
+	println!("SWITCH ON: the older build pays this one: {} {}", v, err.lines().last().unwrap_or(""));
+	assert!(!ok && (v.to_string() + &err).contains("landing_2_only"), "{} {}", v, err);
+	let (ok, v, err) = o.run_full(&["participate"]);
+	println!("SWITCH ON: the older build's refresh: {} {}", v, err.lines().last().unwrap_or(""));
+	assert!(!ok && (v.to_string() + &err).contains("landing_2_only"), "{} {}", v, err);
+	let c_info = c.ok(&["info"]);
+	let req = c.ok(&["receive", "--asset", &z, "--amount", "60000"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req]);
+	c.ok(&["sync"]);
+	let c_coins = live_in(&c, &z);
+	assert_eq!(c_coins.len(), 1, "{:?}", c_coins);
+	assert_eq!(c_coins[0]["template"], json!("landing-2"), "{}", c_coins[0]);
+	assert_eq!(c_coins[0]["landing"], c_info["landing_address"], "{}", c_coins[0]);
+	println!("SWITCH ON: this build paid a third wallet landing-2");
+
+	// ---- A restore ----------------------------------------------------------
+	let held: std::collections::BTreeSet<String> = live_in(&a, &z).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let a2 = Arca::new("LDA2");
+	let mut args = create_args(&url, &node_url);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	a2.ok(&args);
+	a2.ok(&["sync"]);
+	let restored: std::collections::BTreeSet<String> = live_in(&a2, &z).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	assert_eq!(restored, held, "the restored wallet holds this build's coins of Z");
+	for id in &restored {
+		assert_eq!(template_of(&a2, &z, id), template_of(&a, &z, id), "coin {}", id);
+	}
+	println!("RESTORED: {} coins of Z, with their templates", restored.len());
+	for w in [&a, &o, &c, &a2] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

@@ -1029,3 +1029,130 @@ async fn proceeds_of_a_counted_coin_keep_its_place_beside_an_older_arriving_paym
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 13. What a trade paid for counted coins, while the node cannot value it or
+//     the coins given, arrives, and the room the coins given held stays taken
+//     until a read with rates places it; no cap is written from a missing
+//     rate (arca #777).
+// ---------------------------------------------------------------------------
+
+/// A value of the wallet's store `meta` table, read from the SQLite file.
+fn meta_of(w: &Arca, key: &str) -> String {
+	let f = std::fs::read_dir(&w.dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path())
+		.find(|p| p.extension().is_some_and(|e| e == "sqlite")).expect("the wallet's store");
+	let out = std::process::Command::new("python3").args(["-I", "-c",
+		"import sqlite3,sys; r=sqlite3.connect(sys.argv[1]).execute('SELECT value FROM meta WHERE key=?',(sys.argv[2],)).fetchone(); print(r[0] if r else '')",
+		f.to_str().unwrap(), key]).output().unwrap();
+	String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// What the live coins placed `counted` are worth at the node's rates now.
+fn counted_worth(r: &Running, p: &Value) -> u128 {
+	p["coins"].as_array().unwrap().iter().filter(|c| c["place"] == "counted" && c["state"] == "live")
+		.map(|c| {
+			let a: AssetId = c["asset"].as_str().unwrap().parse().unwrap();
+			worth(r, a, c["value"].as_str().unwrap().parse().unwrap())
+		}).sum()
+}
+
+/// A holds 600,000 X counted and trades 300,000 of it, with the exit on
+/// every checkpoint, for 300,000 Y from C: answers the Y's leaf id.
+async fn trade_counted_x_for_y(r: &mut Running, tag: &str) -> (Arca, Arca, Arca, Arca, String) {
+	let (x, y) = (r.x, r.y);
+	post_bond(r, None).await;
+	let (a, c, s, s2) = (Arca::new(&format!("{} A", tag)), Arca::new(&format!("{} C", tag)), Arca::new(&format!("{} S", tag)),
+		Arca::new(&format!("{} S2", tag)));
+	create(r, &a);
+	boarded(r, &c, &[(y, 2_000_000)]).await;
+	boarded(r, &s, &[(x, 3_000_000)]).await;
+	boarded(r, &s2, &[(x, 3_000_000)]).await;
+	library(&a, "instant_limit", json!({"value": worth(r, x, 1_000_000).to_string()})).unwrap();
+	let first = pay(&s, &a, x, 600_000);
+	assert_eq!(place_of(&summary(&format!("{} A holds", tag), &a), &first), "counted");
+	a.ok(&["require-checkpoint-exit", "on"]);
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "300000"]);
+	let acc = c.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	a.ok(&["sync"]);
+	let got = newest_of(&a, y, &[]);
+	(a, c, s, s2, got)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proceeds_in_an_asset_the_node_does_not_value_arrive_and_keep_the_room() {
+	let mut r = Running::start_with(watcher_off()).await;
+	let (x, y) = (r.x, r.y);
+	let limit = worth(&r, x, 1_000_000);
+	let (a, c, s, s2, got) = trade_counted_x_for_y(&mut r, "CP16").await;
+	let p = summary("CP16 after the trade (Y unpriced)", &a);
+	let caps = meta_of(&a, "instant_counted_caps");
+	println!("CP16: Y {}… is {}; caps {}; counted {}", &got[..8], place_of(&p, &got), caps, p["instant_limit"]["counted"]);
+	assert_eq!(place_of(&p, &got), "arriving", "proceeds the node cannot value are not counted");
+	assert!(!caps.contains(&got), "no cap is written for them: {}", caps);
+	// The room the 300,000 X given held stays taken: 300,000 X of change and
+	// 300,000 reserved leave no room for 700,000 more.
+	let third = pay(&s2, &a, x, 700_000);
+	let p = summary("CP16 after a further 700,000 X", &a);
+	println!("CP16: the further payment {}… is {}", &third[..8], place_of(&p, &third));
+	assert_eq!(place_of(&p, &third), "arriving", "the room the coins given held stays taken");
+	// Y now priced as X: the trade's Y takes the coins given's place.
+	price(&r, y, rate(&r, x) as u64);
+	let p = summary("CP16 Y priced as X", &a);
+	let held = counted_worth(&r, &p);
+	println!("CP16: limit {}; counted reported {}; counted coins worth {}; caps {}; Y {}; further {}", limit, p["instant_limit"]["counted"],
+		held, meta_of(&a, "instant_counted_caps"), place_of(&p, &got), place_of(&p, &third));
+	assert_eq!(place_of(&p, &got), "counted", "once valued, the trade's Y takes the place of the X given");
+	assert_eq!(place_of(&p, &third), "arriving");
+	assert!(held <= limit, "coins counted at once are worth {} > the limit {}", held, limit);
+	for w in [&a, &c, &s, &s2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proceeds_placed_while_no_rate_is_read_wait_for_one_and_no_cap_of_zero_is_kept() {
+	let mut r = Running::start_with(watcher_off()).await;
+	let (x, y) = (r.x, r.y);
+	price(&r, y, rate(&r, x) as u64);
+	let limit = worth(&r, x, 1_000_000);
+	let saved: Value = r.rt.client().call("getfeeexchangerates", &[]).unwrap();
+	// The trade is completed and first read with no rate at the node.
+	let (a, c, s, s2, got) = {
+		post_bond(&mut r, None).await;
+		let (a, c, s, s2) = (Arca::new("CP17 A"), Arca::new("CP17 C"), Arca::new("CP17 S"), Arca::new("CP17 S2"));
+		create(&r, &a);
+		boarded(&mut r, &c, &[(y, 2_000_000)]).await;
+		boarded(&mut r, &s, &[(x, 3_000_000)]).await;
+		boarded(&mut r, &s2, &[(x, 3_000_000)]).await;
+		library(&a, "instant_limit", json!({"value": limit.to_string()})).unwrap();
+		let first = pay(&s, &a, x, 600_000);
+		assert_eq!(place_of(&summary("CP17 A holds", &a), &first), "counted");
+		a.ok(&["require-checkpoint-exit", "on"]);
+		let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "300000"]);
+		let acc = c.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+		a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+		r.rt.client().call::<Value>("setfeeexchangerates", &[json!({})]).unwrap();
+		let got = newest_of(&a, y, &[]);
+		(a, c, s, s2, got)
+	};
+	let p = summary("CP17 placed without rates", &a);
+	let caps = meta_of(&a, "instant_counted_caps");
+	println!("CP17: Y {}… is {}; caps {}", &got[..8], place_of(&p, &got), caps);
+	assert_eq!(place_of(&p, &got), "arriving");
+	assert!(!caps.contains(&got), "no cap is written from missing rates: {}", caps);
+	r.rt.client().call::<Value>("setfeeexchangerates", &[saved]).unwrap();
+	let p = summary("CP17 rates back", &a);
+	println!("CP17: Y is {}; caps {}", place_of(&p, &got), meta_of(&a, "instant_counted_caps"));
+	assert_eq!(place_of(&p, &got), "counted", "the next read with rates gives the Y the place of the X given");
+	let third = pay(&s2, &a, x, 700_000);
+	let p = summary("CP17 a further 700,000 X", &a);
+	let held = counted_worth(&r, &p);
+	println!("CP17: further payment {}; limit {}; counted reported {}; counted coins worth {}; caps {}", place_of(&p, &third), limit,
+		p["instant_limit"]["counted"], held, meta_of(&a, "instant_counted_caps"));
+	assert_eq!(place_of(&p, &third), "arriving");
+	assert!(held <= limit, "coins counted at once are worth {} > the limit {}", held, limit);
+	for w in [&a, &c, &s, &s2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

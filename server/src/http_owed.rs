@@ -66,7 +66,7 @@ pub(super) async fn owed_claim(State(app): State<Arc<App>>, body: Result<Bytes, 
 		owner_nonce: unhex32(&l.owner_nonce).map_err(Refusal::malformed)?,
 		exit_delay: RelativeTime::from_units(l.exit_delay_units).map_err(|e| Refusal::malformed(format!("exit delay: {}", e)))?,
 		order: None,
-		landing: landing_of(&l.landing)?,
+		landing: landing_of(&l.landing, l.template == arca_covenant::LANDING_2)?,
 		channel: None,
 	};
 	if l.order.is_some() || l.channel.is_some() {

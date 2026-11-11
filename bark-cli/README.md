@@ -315,7 +315,10 @@ and a board whose registration never reached the server, are not recovered.
   its owner's exit on every checkpoint paid for one, which counts (with any
   change of that trade) at most what the coins given were worth; what the
   trade brought beyond that counts nothing against the limit, and the
-  wallet's own payments out of such a coin carry that bound on. A channel coin counts the wallet's side of it
+  wallet's own payments out of such a coin carry that bound on. While the
+  node gives no rate for what a trade paid, or for a coin given for it,
+  what it paid is arriving and the room the coins given held stays taken,
+  until a read with rates places it. A channel coin counts the wallet's side of it
   alone, and with a limit set is arriving: it is the wallet's to spend once
   its close has made it a coin. With a limit set, the wallet spends no
   arriving coin but in a refresh, which it names to the operator so the
@@ -1875,16 +1878,30 @@ which freezes every holder at once. The node lists such assets
 profile, which `info` shows as the asset's `supervised` entry with its
 `landing_allowance`.
 
-The wallet holds a coin of such an asset only as a `landing-1` leaf, and only
+The wallet holds a coin of such an asset only as a landing leaf, and only
 when its own node lists the asset as supervised and the operator serves it so.
-A `landing-1` leaf's exit pays one output only: P2WPKH of the wallet's landing
+A landing leaf's exit pays one output only: P2WPKH of the wallet's landing
 key (`landing_address` in `info`), explicitly in the asset, all of the coin's
-value but at most the allowance. The wallet asks for every leaf of such an
-asset that way, in a board, a refresh, a payment it receives (its receive
-request carries the landing) and the change of a payment it sends; it pays
-such an asset only to a request that names a landing, takes a coin only when
-its landing is the wallet's own with the published allowance, and refuses a
-round of such an asset with a blinded output, which consensus refuses as well.
+value but at most the allowance. A `landing-2` leaf pays the output at its own
+index in the transaction, so two coins landed together each need an output of
+their own; a `landing-1` leaf pays output 0, so two of them can share one and
+one coin's worth leaves past a freeze. The wallet asks for every leaf of such
+an asset as `landing-2` where the operator makes it (its `info.templates.list`
+names `landing-2`), and as `landing-1` from one that does not: in a board, a
+refresh, a payment it receives (its receive request carries the landing and
+names `landing-2` among the formats it reads) and the change of a payment it
+sends. It pays a receiver `landing-2` when the request names it, and
+`landing-1` to an older wallet's request, whose wallet reads no `landing-2`
+coin, so it gives such a request no coin whose past holds a `landing-2` leaf
+either (refused, naming the reason, when it has no other). In a swap, its
+own leaves are `landing-2` only where the other side reads it: an offer's,
+whose taker is not known yet, once the operator makes `landing-2` only
+(`info.landing_2_only`); an acceptance's when the offer names `landing-2`.
+A `landing-1` coin it holds is spent and refreshed as ever, into
+`landing-2`. It pays such an asset only to a request that names a landing,
+takes a coin only when its landing is the wallet's own with the published
+allowance, and refuses a round of such an asset with a blinded output, which
+consensus refuses as well.
 The landing is one address for every coin of every supervised asset, so a
 freeze of that address reaches every coin the holder has and every one it
 receives later, as the issuer expects of an address; the price is that the
@@ -1920,8 +1937,8 @@ freeze, the wallet spends it like any other coin.
 supervised asset, as its issuer or an auditor reads one, from the published
 tree and the chain alone: the tree rebuilt from its parts and its batch output
 compared with the round on the wallet's node, the asset supervised on that
-node, every leaf `landing-1` with the allowance the operator publishes, and
-every output of the round explicit. Each leaf is listed with where it lands
+node, every leaf a landing leaf (`landing-1` or `landing-2`) with the
+allowance the operator publishes, and every output of the round explicit. Each leaf is listed with where it lands
 and whether the node shows that landing frozen; `ok` is true only when every
 check holds, and `problems` lists what did not.
 
@@ -1963,10 +1980,10 @@ registry for both commands.
 | `operators --registry URL [--genesis G]` | The operators the registry lists, each record's signature checked by the wallet (`signature: "verified"`), with what the registry says of each (`status`: `ok`, `stale` or `mismatched`, and the `differences`); a record whose signature does not verify is listed under `refused` with the reason. With `--genesis`, those of that chain only. Needs no wallet |
 | `restore` | Restores the wallet from what the server serves to its mailbox key, every record checked (see Restoring from the mnemonic), then reads the mailbox and runs `sync`: what was restored, what was not and why (`not_recovered`), what the checks found (`notes`), and the offline-refresh plans found under the mailbox key, their keys checked against the mnemonic (`plans`) |
 | `info` | The wallet's chain, operator, mailbox key and policy, the address every coin of a supervised asset lands at (`landing_address`), and what the server publishes |
-| `supervised-check TXID:VOUT` | Reads the published batch at output `VOUT` of round `TXID` of a supervised asset, from the published tree and the chain alone (see Holding a supervised asset): the asset supervised on the wallet's node, every leaf `landing-1` with the allowance the operator publishes, every output of the round explicit, each leaf's landing and whether the node shows it frozen; `ok` and the `problems` found |
+| `supervised-check TXID:VOUT` | Reads the published batch at output `VOUT` of round `TXID` of a supervised asset, from the published tree and the chain alone (see Holding a supervised asset): the asset supervised on the wallet's node, every leaf a landing leaf with the allowance the operator publishes, every output of the round explicit, each leaf's landing and whether the node shows it frozen; `ok` and the `problems` found |
 | `supply ASSET` | For an asset the operator serves issuer-operated, the operator's supply report (`issuer_supply`): each mint of its rounds and each burn of its own, the totals, what is final, the value live in its burn-only batches and where its mint limiter stands; each mint and burn read again from the wallet's node, with what the chain says beside the operator's figure (`on_chain`, `agrees`), and `checked_on_the_node: true` only when every one agrees. It checks the transactions the report lists, not that the list is whole: a mint left out of it is found only by following the asset's reissuance token on the chain |
-| `leaf-template [vtxo-1\|vtxo-2]` | The template of the wallet's own new leaves, after setting it when one is named: its refreshes, its change and what its receive requests ask a sender for. `vtxo-1` (the default) has the tapscript collaborative path; `vtxo-2` has the Simplicity program `arca/collab-2`, whose pair also binds the coin's index and the coins it is spent beside, so one leg of a swap never moves without the other. Both exit alike, by the same script; a `vtxo-2` coin's collaborative spend is larger on the chain (556 vB against 280). Coins held keep their template until refreshed; a coin of a supervised asset is `landing-1` whatever is set, the leaves an in-tree fill of a resting order makes the wallet are `vtxo-1` (the fill request names no template), and a `vtxo-2` coin is refreshed by `sync` rather than planned |
-| `require-checkpoint-exit [on\|off]` | Whether the wallet trades only when every checkpoint of the trade has its owner's exit, after setting it when `on` or `off` is named; off by default. With it on, a swap or a fill is refused before anything is signed when the operator does not offer the exit (`info.checkpoint_exit`), when the other side's offer or acceptance does not ask for it, when a resting order's maker reads no `coin-2` record, or when a coin of the trade cannot have it (its leaf is neither plain nor `landing-1`) |
+| `leaf-template [vtxo-1\|vtxo-2]` | The template of the wallet's own new leaves, after setting it when one is named: its refreshes, its change and what its receive requests ask a sender for. `vtxo-1` (the default) has the tapscript collaborative path; `vtxo-2` has the Simplicity program `arca/collab-2`, whose pair also binds the coin's index and the coins it is spent beside, so one leg of a swap never moves without the other. Both exit alike, by the same script; a `vtxo-2` coin's collaborative spend is larger on the chain (556 vB against 280). Coins held keep their template until refreshed; a coin of a supervised asset is a landing leaf whatever is set, the leaves an in-tree fill of a resting order makes the wallet are `vtxo-1` (the fill request names no template), and a `vtxo-2` coin is refreshed by `sync` rather than planned |
+| `require-checkpoint-exit [on\|off]` | Whether the wallet trades only when every checkpoint of the trade has its owner's exit, after setting it when `on` or `off` is named; off by default. With it on, a swap or a fill is refused before anything is signed when the operator does not offer the exit (`info.checkpoint_exit`), when the other side's offer or acceptance does not ask for it, when a resting order's maker reads no `coin-2` record, or when a coin of the trade cannot have it (its leaf is neither plain nor a landing leaf) |
 | `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, whether the bond covers it (`covers`), and the instant budget when one is set (`instant_budget`) |
 | `instant-budget SHARE` | Sets the share of the bond's value the wallet holds out of round at most (`0.1`, or `off`): a counterparty's instant budget |
 | `instant-limit ATOMS` | Sets the wallet's instant limit, in atoms of the reference unit (or `off`): of coins received out of round, the most it counts as its own at once |
@@ -2014,7 +2031,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `channel exit LEAF [--fee-asset A]` | Closes the channel on the chain, one step a run (see Channel leaves); `exited` once the wallet's side is swept home |
 | `speed-up TXID [--fee-asset A] [--rate R] [--max-fee N]` | Speeds up a transaction of the wallet's waiting in the mempool by a child that pays for it (see Speeding up what waits on the chain): what it spends, its fee, a second input if one paid, the child it replaced |
 | `refresh-received [--max-fee-ppm N]` | Gives up every coin received out of round in the next round for a leaf of its own (see Refreshing what it receives): the participations, and each coin left as it is with why |
-| `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf (for a leaf of an accumulator batch, its exit from the batch output where the last exit or release left it, followed from the round through each one's witness, then its entry), a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a `landing-1` leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
+| `exit LEAF [--fee-asset A] [--quote \| --shown FEES]` | With `--quote`, only says what this run would broadcast (each transaction's size, fee and what pays it, their fees by asset as `unroll`) and the claim's fee at the floor now, broadcasting and writing nothing (for an exit whose claim is out, `state: claimed` with the claim and nothing to pay); with `--shown` (that answer's `unroll`, as JSON) the path is broadcast only on those very fees, nothing broadcast when they changed. Otherwise: takes a coin on-chain from its record alone, without the server, paying what its own reserves cannot with a fee coin in the asset named or, when none is, one the wallet chooses (see Fees), whether it is live, waiting, held for a swap, given to a participation, under a forfeit whose preimage the wallet does not hold, in a transfer the server never answered, or the `htlc-1` leaf of a payment over Lightning the operator has not decided: the unroll and entry of each batch leaf (for a leaf of an accumulator batch, its exit from the batch output where the last exit or release left it, followed from the round through each one's witness, then its entry), a board's conversion, each checkpoint and reassignment; then, once the exit delay has run, the claim to one on-chain address of the wallet's (for a landing leaf, its landing key, the only output its exit can pay; for an `htlc-1` leaf, its refund, which the chain takes once the leaf's timeout has passed too). Each run starts from where the chain holds the coin's path now (whichever round pays its batch output, whatever step someone else published), goes as far as the chain allows, and remembers the fee asset; run it again, or `sync`, to go on. The coin is `exited` once its claim is final; until then the wallet follows the claim, and builds it again should it leave the chain. A coin whose path another spend the operator co-signed has cut (a coin it rests on paid twice) is refused, naming that coin and the transaction that took it |
 | `take ORDER [--amount N] [--max-fee-ppm N] [--quote \| --shown TAKE]` | Takes an on-chain order in the operator's round (see Taking an on-chain order): `ORDER` is the order as a relay serves it (its `CovenantTerms` JSON, or an offer whose settlement is one), `@FILE`, or `-` for standard input; `--amount` is how much of the asset it sells to take, all of it unless named. With `--quote`, only says what it would cost (the fill, what rests again, the price, the operator's fee, what the coins given up hold, and whether the wallet pays itself a coin of that much first); with `--shown` (that answer, as JSON) the take goes ahead only on that very fill, price and fee. Answers the take: a participation `sync` completes |
 | `order place --sell A --amount N --for B --rate-num N --rate-den D [--min-lot N] (--expires T \| --expires-in-hours H) [--maker-prog P] [--max-fee-ppm N] [--quote \| --shown QUOTE] [--wait S]` | Places an order on the chain from the wallet's leaves (see Placing an order on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change, the full price); with `--shown` (that answer, as JSON) it is placed only on that very fee and those coins. Waits up to `S` seconds (3600; 0 not at all) for the order to rest on the chain, final, and answers where (`placed`), with its terms as SeqDEX's relay serves them (`placed.relay`) |
 | `offboard --asset A --amount N (--address ADDR \| --script HEX) [--fee-asset A] [--max-fee-ppm N] [--quote \| --shown QUOTE]` | Pays an address on the chain from the wallet's leaves through the operator's next round (see Paying an address on the chain): with `--quote`, only says what it would cost (the coins, the fee and its parts, the change); with `--shown` (that answer, as JSON) it goes ahead only on that very fee and those coins. Answers the offboard, named by its participation, and `round_within_seconds` |
@@ -2826,7 +2843,7 @@ and holding it there, with the reason shown:
 the supervision descriptor (the pause capability allowed), which the operator
 serves under the supervised profile once its node lists it, and a signer that
 reads freezes from a node of its own. A holder boards Z and refreshes it, and
-`supervised-check` reads the round's batch whole (every leaf `landing-1` at
+`supervised-check` reads the round's batch whole (every leaf a landing leaf at
 the published allowance, every output explicit) and finds a batch of X not a
 supervised one; the holder pays a second holder out of round, both coins
 landing at their holders' landing keys. A freeze record then names the first

@@ -157,6 +157,7 @@ SALT_HTLC = label_hash("salt", "htlc")
 SALT_HTLC_RECEIVE = label_hash("salt", "htlc receive")
 SALT_BOARD = label_hash("salt", "board")
 SALT_LANDING = label_hash("salt", "landing")
+SALT_LANDING2 = label_hash("salt", "landing 2")
 LANDING_PROGRAM = label_hash("landing", "A")[:20]   # stands for hash160(L), the owner's landing key
 LANDING_ALLOWANCE = 2_000
 SALT_CLAIM = label_hash("salt", "claim")
@@ -524,6 +525,15 @@ def generate():
         "allowance": LANDING_ALLOWANCE, "asset": hx(X_ID), "value": LEAF_VALUE, "min_value": LEAF_VALUE - LANDING_ALLOWANCE,
         "exit_delay": DELAY, "max_outputs": M_MAX},
         gtap, [("collab", 1), ("landing", 1)])
+    g2tap, _ = landing_taptree(A.x, S.x, SALT_LANDING2, CTAG, DELAY, LANDING_PROGRAM, X_ID, LEAF_VALUE, LANDING_ALLOWANCE,
+                               own_index=True)
+    outputs["landing2"] = output_json("landing-2, a leaf of a supervised asset landing at its own index", {
+        "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_LANDING2), "chain_tag": hx(CTAG),
+        "K": hx(leaf_const(CTAG, SALT_LANDING2, fold=True)),
+        "collab_prefix": hx(landing_prefix(CTAG, SALT_LANDING2, LANDING_PROGRAM)), "landing_program": hx(LANDING_PROGRAM),
+        "allowance": LANDING_ALLOWANCE, "asset": hx(X_ID), "value": LEAF_VALUE, "min_value": LEAF_VALUE - LANDING_ALLOWANCE,
+        "exit_delay": DELAY, "max_outputs": M_MAX},
+        g2tap, [("collab", 1), ("landing", 1)])
     # A landing-1 coin's checkpoint with its owner's exit: the landing over
     # the checkpoint's value less the coin's allowance.
     cp_land_v = LEAF_VALUE - 600
@@ -755,6 +765,13 @@ def generate():
     spends.append(rebind_spend("landing/collab m=1", "landing", "collab", gtap, CTAG, SALT_LANDING, g_spent,
                                [(X_ID, LEAF_VALUE - 500, OPERATOR_SPK)], [S, A],
                                const=landing_prefix(CTAG, SALT_LANDING, LANDING_PROGRAM)))
+    # landing-2: the same, its landing at the spending input's own index.
+    g2_spent = txout(LEAF_VALUE, g2tap.scriptPubKey)
+    sp = Spend([("landing2/landing", g2_spent, DELAY)], [txout(LEAF_VALUE - 500, land_spk), fee_out(500)])
+    spends.append(checksig_spend("landing2/landing", "landing2", "landing", g2tap, sp, 0, A))
+    spends.append(rebind_spend("landing2/collab m=1", "landing2", "collab", g2tap, CTAG, SALT_LANDING2, g2_spent,
+                               [(X_ID, LEAF_VALUE - 500, OPERATOR_SPK)], [S, A],
+                               const=landing_prefix(CTAG, SALT_LANDING2, LANDING_PROGRAM)))
 
     # ---- spends: claim-1 ----------------------------------------------
     # The lapse: after the deadline and the exit delay, the output at the

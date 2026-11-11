@@ -12,9 +12,9 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 reserved (the retired `enclave-1`), 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf, 16 a `vest-1` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint, 17 a checkpoint with its owner's exit, 18 a `vtxo-2` coin's checkpoint with its owner's exit, 19 a `landing-1` coin's checkpoint with its landing), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 reserved (it reads as `ENCLAVE_RETIRED`), 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf, 16 a `vest-1` leaf, 20 a `landing-2` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint, 17 a checkpoint with its owner's exit, 18 a `vtxo-2` coin's checkpoint with its owner's exit, 19 a landing coin's checkpoint with its landing, at the spending input's own index), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
-//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `claim-1` then the deadline (u32), the return script's pin (32), the asset (32) and the least the lapse pays (u64); for `vest-1` the same, then the vest time (u32) |
+//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` and `landing-2` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `claim-1` then the deadline (u32), the return script's pin (32), the asset (32) and the least the lapse pays (u64); for `vest-1` the same, then the vest time (u32) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8: 0 none, 1 RECLAIM, 2 RECLAIM behind a vest time) and, when set, the genesis hash, then for 2 the vest time (u32) |
 //! | [`EntryPolicy`] | unlock hash, asset (32 each), value (u64), leaf program (32), sweep |
 //! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16), the leaf id given up (32), the connector asset (32) |
@@ -514,7 +514,7 @@ impl Encoding for OffboardPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
 	/// A leaf, `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3`, `order-2`,
-	/// `landing-1`, `channel-1` or `claim-1`.
+	/// `landing-1`, `landing-2`, `channel-1` or `claim-1`.
 	Leaf(LeafPolicy),
 	Node(NodePolicy),
 	Entry(EntryPolicy),
@@ -548,6 +548,7 @@ impl Encoding for Policy {
 					crate::Template::Order2 => 8,
 					crate::Template::Order3 => 13,
 					crate::Template::Landing1 => 9,
+					crate::Template::Landing2 => 20,
 					crate::Template::Htlc1 => 6,
 					crate::Template::Vtxo2 => 12,
 					crate::Template::Claim1 => 15,
@@ -607,7 +608,7 @@ impl Encoding for Policy {
 				p.order = Some(o);
 				Policy::Leaf(p)
 			},
-			9 => {
+			t @ (9 | 20) => {
 				let mut p = LeafPolicy::decode_from(r)?;
 				let mut program = [0u8; crate::landing::PROGRAM_BYTES];
 				program.copy_from_slice(r.bytes(crate::landing::PROGRAM_BYTES)?);
@@ -616,7 +617,7 @@ impl Encoding for Policy {
 				if min_value == 0 {
 					return Err(DecodeError::Count(0));
 				}
-				p.landing = Some(crate::landing::LandingTerms { program, asset, min_value });
+				p.landing = Some(crate::landing::LandingTerms { program, asset, min_value, own_index: t == 20 });
 				Policy::Leaf(p)
 			},
 			10 => {
@@ -646,7 +647,8 @@ impl Encoding for Policy {
 				if min_value == 0 {
 					return Err(DecodeError::Count(0));
 				}
-				let landing = Some(crate::landing::LandingTerms { program, asset, min_value });
+				// A checkpoint's landing is at its own index, for either leaf.
+				let landing = Some(crate::landing::LandingTerms { program, asset, min_value, own_index: true });
 				Policy::Checkpoint(CheckpointPolicy { exit: Some(crate::CheckpointExit { delay, landing }), ..p })
 			},
 			15 | 16 => {

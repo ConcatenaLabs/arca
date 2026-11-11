@@ -166,7 +166,7 @@ pub fn sync_by(expiry: u32, steps: usize) -> u32 {
 	last_expiry(expiry, steps).saturating_sub(STEP_FROM)
 }
 
-/// Whether `c` is a coin of a supervised asset: a `landing-1` leaf, or a
+/// Whether `c` is a coin of a supervised asset: a landing leaf, or a
 /// coin whose record lands as one.
 fn supervised(c: &CoinRow) -> bool {
 	CoinRecord::from_bytes(&c.record).ok().and_then(|r| r.landing()).is_some()
@@ -322,7 +322,7 @@ impl Wallet {
 			if named.contains(&c.leaf_id) || asset.is_some_and(|a| c.asset != a.to_string()) {
 				continue;
 			}
-			// A supervised asset's leaf (`landing-1`) is not planned: its
+			// A supervised asset's leaf (a landing leaf) is not planned: its
 			// operator runs no plans for it, and `sync` refreshes it. Nor is
 			// a channel leaf (`channel-1`): `care` closes a channel into a
 			// round once its expiry is within reach, for a plain leaf a plan

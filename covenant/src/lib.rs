@@ -64,9 +64,11 @@
 //!   operator fills with the maker offline under a Simplicity program, which
 //!   pays each credit to a leaf of its own, and which lands, one exit delay
 //!   after it reaches the chain, as SeqDEX's own order for the same terms;
-//! - the leaf of a supervised asset ([`landing`]): `landing-1`, whose exit
-//!   pays only P2WPKH of the owner's landing key, where a freeze of the asset
-//!   binds, and whose collaborative constant commits to that key too; and
+//! - the leaf of a supervised asset ([`landing`]): `landing-2`, whose exit
+//!   pays only P2WPKH of the owner's landing key, at the output of its own
+//!   index, where a freeze of the asset binds, and whose collaborative
+//!   constant commits to that key too, and `landing-1`, the same landing at
+//!   output 0, read and spent for the coins built under it; and
 //!   the check that a round of a supervised asset keeps every output
 //!   explicit;
 //! - offline refresh ([`plan`]): a plan of refresh steps the operator applies
@@ -143,7 +145,7 @@ pub use accumulator::{
 	Accumulator, AccumulatorError, AccumulatorParams, AccumulatorPolicy, AccumulatorRecord, AccumulatorRelease, Bitmap, Exit, ExitAuth,
 	ReleaseSpend, Released, SeenExit, SeenRelease, SeenSpend, Slot, ValidAccumulatorLeaf,
 };
-pub use batch::{reads_format, Batch, BatchKind, FORMATS_EVERY_WALLET_READS, RECORD_FORMATS};
+pub use batch::{reads_format, Batch, BatchKind, FORMATS_EVERY_WALLET_READS, LANDING_2, RECORD_FORMATS};
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signed};
 pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelSpend, ChannelTerms, State};

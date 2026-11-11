@@ -165,7 +165,7 @@ pub(crate) fn bid_share_ppm(from: u32, timeout: u32, now: u32) -> u64 {
 }
 
 /// The vsize a claim of `leaf` pays its own fee for: a plain leaf's exit is
-/// about 220 vbytes; a `landing-1` leaf's landing, its script checking the
+/// about 220 vbytes; a landing leaf's landing, its script checking the
 /// output, about 227, priced at 240; an `htlc-1` leaf's claim or refund, its
 /// longer script and a received leaf's preimage in its witness, about 250,
 /// priced at 300.
@@ -175,7 +175,7 @@ fn claim_vsize(leaf: &arca_covenant::LeafPolicy) -> u64 {
 
 impl Wallet {
 	/// Where the claim of `coin` pays: receive address `claim_index`, or, for
-	/// a `landing-1` leaf of a supervised asset, its landing, P2WPKH of the
+	/// a landing leaf of a supervised asset, its landing, P2WPKH of the
 	/// wallet's landing key, the only output its exit can pay, where a freeze
 	/// of the asset binds on the chain.
 	fn claim_script(&self, coin: &ValidCoin, claim_index: u32) -> Result<Script, Error> {

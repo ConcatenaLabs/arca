@@ -42,9 +42,10 @@
 //! each behind a relative delay: `[collab, [claim, refund]]`. Its owner's
 //! delay is the exit delay; the operator's is in its [`HtlcTerms`].
 //!
-//! A `landing-1` leaf ([`crate::landing`]), the leaf of a supervised asset,
-//! has the exit replaced by the landing, which pays only P2WPKH of the
-//! owner's landing key, where a freeze of the asset binds; its collaborative
+//! A landing leaf ([`crate::landing`]), the leaf of a supervised asset, has
+//! the exit replaced by the landing, which pays only P2WPKH of the owner's
+//! landing key, where a freeze of the asset binds: at the spending input's
+//! own index for `landing-2`, at output 0 for `landing-1`. Its collaborative
 //! constant also commits to that key's program: `[collab, landing]`.
 //!
 //! A `channel-1` leaf ([`crate::channel`]) holds a balance for each of owner
@@ -103,7 +104,7 @@ pub fn leaf_salt(owner_nonce: &[u8; 32], creator_nonce: &[u8; 32]) -> [u8; 32] {
 }
 
 /// The rebindable two-party script for the constant `k` (`K`, or a
-/// `landing-1` leaf's `K ‖ P`), shared by the leaf and the checkpoint.
+/// landing leaf's `K ‖ P`), shared by the leaf and the checkpoint.
 pub(crate) fn rebindable_two_party(owner: &XOnlyPublicKey, operator: &XOnlyPublicKey, k: &[u8]) -> Script {
 	let slot = |b: Builder, j: i64| b.output_record(j).ops(&[OP_SHA256, OP_ROT, OP_SWAP, OP_CAT, OP_SWAP]);
 	let mut b = Builder::new()
@@ -150,8 +151,9 @@ pub(crate) fn two_party_items(operator_sig: &Signature, owner_sig: &Signature, m
 }
 
 /// A leaf's policy: `vtxo-1`, or `htlc-1` when it carries [`HtlcTerms`],
-/// `order-2` when it carries [`OrderLeafTerms`], `landing-1` when it carries
-/// [`LandingTerms`], `channel-1` when it carries [`ChannelTerms`].
+/// `order-2` when it carries [`OrderLeafTerms`], `landing-1` or `landing-2`
+/// when it carries [`LandingTerms`], `channel-1` when it carries
+/// [`ChannelTerms`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeafPolicy {
 	/// The owner's key `A`.
@@ -169,8 +171,8 @@ pub struct LeafPolicy {
 	/// `order-2`'s terms: the leaf is a resting order ([`crate::order`]),
 	/// with the landing and the fill in place of the exit; `None` otherwise.
 	pub order: Option<OrderLeafTerms>,
-	/// `landing-1`'s terms: the exit pays only P2WPKH of the owner's landing
-	/// key ([`crate::landing`]); `None` otherwise.
+	/// `landing-1`'s or `landing-2`'s terms: the exit pays only P2WPKH of the
+	/// owner's landing key ([`crate::landing`]); `None` otherwise.
 	pub landing: Option<LandingTerms>,
 	/// `channel-1`'s terms: the leaf is the output of the channel's state 0
 	/// ([`crate::channel`]); `None` otherwise.
@@ -191,7 +193,7 @@ impl LeafPolicy {
 	}
 
 	/// What the collaborative script pushes and its message starts with:
-	/// `K`, for `landing-1` `K ‖ P` ([`Chain::landing_prefix`]).
+	/// `K`, for a landing leaf `K ‖ P` ([`Chain::landing_prefix`]).
 	/// For `vest-1` it is `K ‖ V` (V as u32), so a pair made for a vesting
 	/// leaf spends no leaf that does not vest at the same time.
 	pub fn collab_prefix(&self) -> Vec<u8> {
@@ -230,7 +232,7 @@ impl LeafPolicy {
 		Collab2 { owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain }
 	}
 
-	/// The exit of a `vtxo-1` leaf, or the landing of a `landing-1` leaf. An
+	/// The exit of a `vtxo-1` leaf, or the landing of a landing leaf. An
 	/// `htlc-1` leaf has none: its tree does not carry this script.
 	pub fn exit_script(&self) -> Script {
 		match &self.landing {
@@ -271,7 +273,7 @@ impl LeafPolicy {
 		}
 	}
 
-	/// `vtxo-1`: `[collab, exit]`, both at depth 1; `landing-1`: `[collab,
+	/// `vtxo-1`: `[collab, exit]`, both at depth 1; a landing leaf: `[collab,
 	/// landing]`, the same. `htlc-1`: `[collab, [claim, refund]]`.
 	/// `order-3` and `order-2`: `[[collab, land], [fill, data]]`
 	/// ([`crate::order`]), the fill the template's program.
@@ -307,7 +309,7 @@ impl LeafPolicy {
 	}
 
 	/// The template it follows: `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3` (or
-	/// `order-2`), `landing-1`, `channel-1`, `claim-1` or `vest-1`.
+	/// `order-2`), `landing-1`, `landing-2`, `channel-1`, `claim-1` or `vest-1`.
 	pub fn template(&self) -> crate::Template {
 		if self.vest().is_some() {
 			crate::Template::Vest1
@@ -319,8 +321,8 @@ impl LeafPolicy {
 			crate::Template::Vtxo2
 		} else if let Some(o) = &self.order {
 			o.template()
-		} else if self.landing.is_some() {
-			crate::Template::Landing1
+		} else if let Some(l) = &self.landing {
+			if l.own_index { crate::Template::Landing2 } else { crate::Template::Landing1 }
 		} else if self.htlc.is_some() {
 			crate::Template::Htlc1
 		} else {
@@ -373,7 +375,7 @@ impl LeafPolicy {
 
 	/// The full exit witness: the owner's signature over the exit claim, a
 	/// version 2 transaction whose input sequence is the exit delay. For a
-	/// `landing-1` leaf it is the landing's witness.
+	/// landing leaf it is the landing's witness.
 	pub fn exit_witness(&self, owner_sig: &Signature) -> Vec<Vec<u8>> {
 		self.taproot().witness(&self.exit_script(), vec![owner_sig.as_ref().to_vec()])
 	}

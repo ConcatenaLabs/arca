@@ -162,7 +162,12 @@ impl Holder {
 	}
 
 	fn landing(&self, allowance: u64) -> Landing {
-		Landing { program: self.program(), allowance }
+		Landing { program: self.program(), allowance, own_index: false }
+	}
+
+	/// The same landing, `landing-2`'s: at the spending input's own index.
+	fn landing2(&self, allowance: u64) -> Landing {
+		Landing { own_index: true, ..self.landing(allowance) }
 	}
 
 	fn script(&self) -> Script {
@@ -229,15 +234,16 @@ async fn refresh_landing(r: &mut Running, coin: &Coin, key: &Keypair, landing: L
 	round_final(r, &built.tx.txid()).await;
 	let st = status(r, &id);
 	let (new_valid, record, round) = validate_new_leaf(r, &id, 0, key, &nonce);
-	assert_eq!(record.template, Template::Landing1);
+	assert_eq!(record.template, landing.template());
 	assert_eq!(record.landing, Some(landing));
 	// The whole batch, as anyone reads it from the published tree: every
-	// leaf landing-1; and every output of its round explicit.
+	// leaf a landing leaf; and every output of its round explicit.
 	let published = r.http.post("tree", &json!({"txid": round.txid().to_string(), "vout": st["outputs"][0]["batch_vout"]})).ok();
 	let tree = try_rebuild(&published).unwrap();
-	assert!(tree.leaves().iter().all(|l| l.spec.template == Template::Landing1 && l.spec.landing.is_some()));
+	assert!(tree.leaves().iter().all(|l| matches!(l.spec.template, Template::Landing1 | Template::Landing2) && l.spec.landing.is_some()));
+	assert!(tree.leaves().iter().any(|l| l.spec.template == landing.template()));
 	for l in published["leaves"].as_array().unwrap() {
-		assert_eq!(l["template"], "landing-1", "{}", l);
+		assert!(l["template"] == "landing-1" || l["template"] == "landing-2", "{}", l);
 		assert!(l["landing"]["program"].is_string(), "{}", l);
 	}
 	arca_covenant::landing::check_explicit(&round).unwrap();
@@ -532,4 +538,128 @@ async fn a_frozen_holder_cannot_move_or_escape() {
 	assert_eq!(st["state"], "void", "{}", st);
 	assert!(st["void_reason"].as_str().unwrap_or("").contains("frozen"), "{}", st);
 	let _: (Value, XOnlyPublicKey) = (Value::Null, xonly(&a1_key));
+}
+
+/// `landing-2` on a whole server, and the operator's switch that stops it
+/// making `landing-1`.
+///
+/// With the switch off (the default) the operator makes both: `info` lists
+/// `landing-1` and `landing-2`; a board converts into a `landing-2` leaf
+/// (board record format 5); a refresh asks for `landing-2`, refused for a
+/// wallet that does not name `landing-2` among the formats it reads; a
+/// transfer pays a `landing-2` leaf, named by its template, and a
+/// `landing-1` one for an older receiver. With the switch on, `info` says so
+/// and leaves `landing-1` out, and a board, a refresh and a transfer that
+/// would make a `landing-1` leaf are refused (`out_of_bounds`), while a
+/// `landing-1` coin already made is still refreshed into `landing-2` and
+/// paid out of round into `landing-2` leaves. Off again, `landing-1` is
+/// made again.
+#[tokio::test(flavor = "multi_thread")]
+async fn landing_2_and_the_switch_that_stops_landing_1() {
+	let mut r = Running::start().await;
+	let iss = tokio::task::block_in_place(|| issue_supervised(&mut r));
+	let z = iss.z;
+	let cookie = r.signer.dir.join("node.cookie");
+	std::fs::write(&cookie, "arca:arca").unwrap();
+	let genesis = r.chain.genesis_hash();
+	let node_url = format!("http://127.0.0.1:{}/", r.rt.node.rpc_port());
+	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &["--supervision-node".into(), node_url.clone(),
+		"--supervision-cookie".into(), cookie.to_str().unwrap().into()]));
+	let mut config = r.config.clone();
+	config.assets.push(AssetSection::new(z, MIN_LEAF));
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let info = r.http.get("info").ok();
+	let zi = info["assets"].as_array().unwrap().iter().find(|a| a["asset"] == json!(z.to_string())).unwrap().clone();
+	let allowance: u64 = zi["supervised"]["landing_allowance"].as_str().unwrap().parse().unwrap();
+	let list = info["templates"]["list"].as_array().unwrap().clone();
+	println!("info, switch off: landing_2_only {}, templates {:?}", info["landing_2_only"], list);
+	assert_eq!(info["landing_2_only"], json!(false));
+	assert!(list.contains(&json!("landing-1")) && list.contains(&json!("landing-2")));
+	r.fund_wallet_in(z, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+
+	// ---- switch off: landing-2 by board, refresh and transfer --------------
+	let (alice, bob, carol) = (Holder::new("l2 alice"), Holder::new("l2 bob"), Holder::new("l2 carol"));
+	let a_board_key = keypair("l2 alice board");
+	let (record, board_tx, ok) = board_z(&mut r, z, &a_board_key, VALUE, Some(alice.landing2(allowance)));
+	ok.ok();
+	assert_eq!(record.version(), arca_covenant::board::BOARD_LANDING2_RECORD_VERSION);
+	r.produce().await;
+	r.bury().await;
+	let id = record.leaf_id();
+	let http = r.http.clone();
+	r.wait("alice's landing-2 board to be credited", || http.board_status(&id).json["state"] == "credited").await;
+	let a_board = Coin { held: Held { key: a_board_key, nonce: record.owner_nonce, id, record: CoinRecord::Board(record) }, bases: vec![board_tx] };
+	assert_eq!(a_board.valid(&r).leaf.template(), Template::Landing2);
+	// A wallet that does not name landing-2 is given none.
+	let (w, _) = want_landing(&keypair("l2 alice no name"), z, VALUE, alice.landing2(allowance));
+	let (mut body, _) = participation_body(&[&a_board.held], &[w], &[], None, xonly(&r.s), r.chain);
+	body["record_formats"] = json!(["leaf-2", "leaf-3", "accumulator-1", "accumulator-4", "coin-2"]);
+	let m = refused("a landing-2 leaf for a wallet not naming landing-2", r.http.post("submit_participation", &body), "out_of_bounds");
+	assert!(m.contains("does not name landing-2"), "{}", m);
+	let a1_key = keypair("l2 alice leaf 1");
+	let (a1, round) = refresh_landing(&mut r, &a_board, &a1_key, alice.landing2(allowance)).await;
+	println!("round {} of Z: alice's leaf landing-2, the batch rebuilt from the published tree", round.txid());
+	// Out of round: bob gets a landing-2 leaf, carol (an older wallet) a
+	// landing-1 leaf, alice's change landing-2.
+	let v = a1.valid(&r).value;
+	let (b1_key, c1_key, a2_key) = (keypair("l2 bob leaf 1"), keypair("l2 carol leaf 1"), keypair("l2 alice leaf 2"));
+	let (pay_b, pay_c) = (200_000, 150_000);
+	let to_bob = landing_leaf(&b1_key, z, pay_b, &bob.landing2(allowance));
+	let to_carol = landing_leaf(&c1_key, z, pay_c, &carol.landing(allowance));
+	let change_v = v - MARGIN - pay_b - pay_c - 2 * MARGIN;
+	let change = landing_leaf(&a2_key, z, change_v, &alice.landing2(allowance));
+	let paid = transfer(&r, &[&a1], &[(z, pay_b, to_bob), (z, pay_c, to_carol), (z, change_v, change)], MARGIN).ok();
+	let bob1 = coin_from(&r, &paid, 0, &b1_key, to_bob.owner_nonce, a1.bases.clone());
+	let carol1 = coin_from(&r, &paid, 1, &c1_key, to_carol.owner_nonce, a1.bases.clone());
+	let alice2 = coin_from(&r, &paid, 2, &a2_key, change.owner_nonce, a1.bases.clone());
+	assert_eq!(bob1.valid(&r).leaf.template(), Template::Landing2);
+	assert_eq!(carol1.valid(&r).leaf.template(), Template::Landing1);
+	assert_eq!(alice2.valid(&r).leaf.template(), Template::Landing2);
+	println!("switch off: a transfer paid bob landing-2 and carol landing-1, alice's change landing-2");
+
+	// ---- switch on ----------------------------------------------------------
+	r.config.landing_2_only = true;
+	r.restart_server().await;
+	let info = r.http.get("info").ok();
+	let list = info["templates"]["list"].as_array().unwrap().clone();
+	println!("info, switch on: landing_2_only {}, templates {:?}", info["landing_2_only"], list);
+	assert_eq!(info["landing_2_only"], json!(true));
+	assert!(!list.contains(&json!("landing-1")) && list.contains(&json!("landing-2")));
+	// No landing-1 leaf by board, refresh or transfer.
+	let (_, _, b1) = board_z(&mut r, z, &keypair("l2 dave board"), VALUE, Some(Holder::new("l2 dave").landing(allowance)));
+	let m = refused("switch on: a board into a landing-1 leaf", b1, "out_of_bounds");
+	assert!(m.contains("landing_2_only"), "{}", m);
+	let (w, _) = want_landing(&keypair("l2 carol refresh 1"), z, carol1.valid(&r).value, carol.landing(allowance));
+	let (body, _) = participation_body(&[&carol1.held], &[w], &[], None, xonly(&r.s), r.chain);
+	let m = refused("switch on: a refresh into a landing-1 leaf", r.http.post("submit_participation", &body), "out_of_bounds");
+	assert!(m.contains("landing_2_only"), "{}", m);
+	let bv = bob1.valid(&r).value;
+	let to_carol = landing_leaf(&keypair("l2 carol leaf 2"), z, bv - 2 * MARGIN, &carol.landing(allowance));
+	let m = refused("switch on: a transfer into a landing-1 leaf", transfer(&r, &[&bob1], &[(z, bv - 2 * MARGIN, to_carol)], MARGIN),
+		"out_of_bounds");
+	assert!(m.contains("landing_2_only"), "{}", m);
+	// The old coin is still spent: carol's landing-1 coin moved into a
+	// landing-2 leaf of hers, and bob's landing-2 coin paid on in landing-2.
+	let cv = carol1.valid(&r).value;
+	let c2_key = keypair("l2 carol leaf 2b");
+	let into_2 = landing_leaf(&c2_key, z, cv - 2 * MARGIN, &carol.landing2(allowance));
+	let moved = transfer(&r, &[&carol1], &[(z, cv - 2 * MARGIN, into_2)], MARGIN).ok();
+	let carol2 = coin_from(&r, &moved, 0, &c2_key, into_2.owner_nonce, carol1.bases.clone());
+	assert_eq!(carol2.valid(&r).leaf.template(), Template::Landing2);
+	let to_carol = landing_leaf(&keypair("l2 carol leaf 3"), z, bv - 2 * MARGIN, &carol.landing2(allowance));
+	transfer(&r, &[&bob1], &[(z, bv - 2 * MARGIN, to_carol)], MARGIN).ok();
+	println!("switch on: carol's landing-1 coin moved into a landing-2 leaf; bob paid carol landing-2");
+
+	// ---- switch off again ---------------------------------------------------
+	r.config.landing_2_only = false;
+	r.restart_server().await;
+	assert_eq!(r.http.get("info").ok()["landing_2_only"], json!(false));
+	let av = alice2.valid(&r).value;
+	let to_dave = landing_leaf(&keypair("l2 dave leaf"), z, av - 2 * MARGIN, &Holder::new("l2 dave").landing(allowance));
+	transfer(&r, &[&alice2], &[(z, av - 2 * MARGIN, to_dave)], MARGIN).ok();
+	println!("switch off again: a transfer into a landing-1 leaf is co-signed");
 }

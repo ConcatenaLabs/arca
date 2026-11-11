@@ -168,6 +168,7 @@ impl Running {
 			// The operator offers checkpoints with their owners' exit; a test
 			// of an operator that does not turns it off.
 			checkpoint_exit: true,
+			landing_2_only: false,
 		};
 		tune(&mut config, x, y);
 		let server = Server::start(&config).await.unwrap();

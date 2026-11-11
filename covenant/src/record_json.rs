@@ -15,7 +15,7 @@
 //!                    "rate_den", "min_lot": decimal strings, "maker": hex, "expiry": median
 //!                    time, "refund_key": hex, "credits": [4 × hex, zero once used]}, and
 //!                    for order-3 "version": 3 (absent for order-2)
-//! landing            landing-1 only: {"program": hex, 20 bytes, "allowance": decimal string}
+//! landing            landing-1 and landing-2 only: {"program": hex, 20 bytes, "allowance": decimal string}
 //! channel            channel-1 only: {"capacity": decimal string, "window_units": 512-second units}
 //! claim              claim-1 and vest-1 only: {"deadline": median time, "allowance": decimal string,
 //!                    "return_script": hex}
@@ -200,7 +200,7 @@ impl LeafRecord {
 		if matches!(named, Some(Template::Order2 | Template::Order3)) {
 			fields.push("order");
 		}
-		if named == Some(Template::Landing1) {
+		if matches!(named, Some(Template::Landing1 | Template::Landing2)) {
 			fields.push("landing");
 		}
 		if named == Some(Template::Channel1) {
@@ -239,7 +239,8 @@ impl LeafRecord {
 			None => None,
 			Some(o) => Some(order_terms_from_json(o, asset)?),
 		};
-		let landing = m.get("landing").map(landing_from_json).transpose()?;
+		let landing = m.get("landing").map(landing_from_json).transpose()?
+			.map(|l| Landing { own_index: template == Template::Landing2, ..l });
 		let channel = m.get("channel").map(channel_from_json).transpose()?;
 		let claim = m.get("claim").map(claim_from_json).transpose()?;
 		let value = amount(m, "value")?;
@@ -342,8 +343,9 @@ pub fn claim_from_json(v: &Value) -> Result<Lapse, RecordError> {
 	Ok(Lapse { deadline, allowance, return_script: elements::Script::from(bytes), vest })
 }
 
-/// `landing-1`'s landing as the record's JSON form and the server's interface
-/// write it: `{"program": hex, "allowance": decimal string}`.
+/// A landing leaf's landing as the record's JSON form and the server's
+/// interface write it: `{"program": hex, "allowance": decimal string}`. The
+/// template beside it says whether it is `landing-1` or `landing-2`.
 pub fn landing_json(l: &Landing) -> Value {
 	let mut m = Map::new();
 	m.insert("program".into(), Value::String(hex(&l.program)));
@@ -351,7 +353,8 @@ pub fn landing_json(l: &Landing) -> Value {
 	Value::Object(m)
 }
 
-/// Reads [`landing_json`].
+/// Reads [`landing_json`], as `landing-1`'s ([`Landing::own_index`]
+/// `false`): the reader sets it from the template the landing comes with.
 pub fn landing_from_json(v: &Value) -> Result<Landing, RecordError> {
 	let o = object(v, "landing", &["program", "allowance"])?;
 	let p = string(o, "program").map_err(|_| RecordError::Type("landing.program".into()))?;
@@ -364,7 +367,7 @@ pub fn landing_from_json(v: &Value) -> Result<Landing, RecordError> {
 		Value::String(_) => amount(o, "allowance").map_err(|_| RecordError::Amount("landing.allowance".into()))?,
 		_ => return Err(RecordError::Type("landing.allowance".into())),
 	};
-	Ok(Landing { program, allowance })
+	Ok(Landing { program, allowance, own_index: false })
 }
 
 /// `channel-1`'s terms as the record's JSON form and the server's interface
