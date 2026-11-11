@@ -534,7 +534,7 @@ impl Wallet {
 	/// wallet's own that pays anything at once. Coins an offline-refresh
 	/// plan keeps, a resting order's coin, a channel's and one past its
 	/// exit deadline are not among them: each has its own way.
-	pub(crate) fn round_first(&self, asset: AssetId, spend: Spend, deep: Option<usize>, old_reader: bool) -> Result<Vec<(String, u64)>, Error> {
+	pub(crate) fn round_first(&self, asset: AssetId, spend: Spend, deep: Option<usize>, old_reader: bool) -> Result<Vec<(String, u64, &'static str)>, Error> {
 		let barred = self.unspendable(spend)?;
 		let planned = self.planned_coins()?;
 		let now = self.now()?.to_consensus_u32() as u64;
@@ -547,13 +547,18 @@ impl Wallet {
 				continue;
 			}
 			let hops = Self::record_of(&row).map(|r| super::wallet::record_hops(&r)).unwrap_or(0);
-			let held = row.state == "pending"
-				|| barred.contains(&row.leaf_id)
-				|| deep.is_some_and(|d| hops >= d)
-				|| (old_reader && row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT));
-			if held {
-				out.push((row.leaf_id.clone(), row.value));
-			}
+			let why = if row.state == "pending" {
+				"not final yet"
+			} else if barred.contains(&row.leaf_id) {
+				if spend == Spend::CrossChain { "arriving, or trade proceeds, which no leg paid to another party spends" } else { "arriving" }
+			} else if deep.is_some_and(|d| hops >= d) {
+				"at the operator's depth limit of reassignments since a round"
+			} else if old_reader && row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
+				"of the record format the other side's older build does not read"
+			} else {
+				continue;
+			};
+			out.push((row.leaf_id.clone(), row.value, why));
 		}
 		Ok(out)
 	}
@@ -561,13 +566,18 @@ impl Wallet {
 	/// [`Error::SettleFirst`] for a spend of `asset` that `live` of the
 	/// coins it may take now does not cover, needing `need`, when the coins
 	/// [`Self::round_first`] names would: `None` when they would not.
-	fn settle_first_of(&self, asset: AssetId, live: u64, need: u64, held: Vec<(String, u64)>, why: &str) -> Option<Error> {
-		let more: u64 = held.iter().map(|(_, v)| *v).sum();
+	fn settle_first_of(&self, asset: AssetId, live: u64, need: u64, held: Vec<(String, u64, &'static str)>) -> Option<Error> {
+		let more: u64 = held.iter().map(|(_, v, _)| *v).sum();
+		let mut whys: Vec<&str> = held.iter().map(|(_, _, w)| *w).collect();
+		whys.dedup();
+		whys.sort();
+		whys.dedup();
+		let why = whys.join("; ");
 		if held.is_empty() || live.saturating_add(more) < need {
 			return None;
 		}
-		Some(Error::SettleFirst { asset: asset.to_string(), coins: held.into_iter().map(|(l, _)| l).collect(),
-			message: format!("the wallet's coins of asset {} that pay this now hold {}, short of the {} it takes; {} more {}, and pay it once \
+		Some(Error::SettleFirst { asset: asset.to_string(), coins: held.into_iter().map(|(l, ..)| l).collect(),
+			message: format!("the wallet's coins of asset {} that pay this now hold {}, short of the {} it takes; {} more are {}, and pay it once \
 				the operator's next round has refreshed them: settle them first (settle_first), then ask again; nothing was signed", asset,
 				live, need, more, why) })
 	}
@@ -773,10 +783,7 @@ impl Wallet {
 		// the format an older other side does not read): said so, naming
 		// them, so a program settles them and pays.
 		let held = self.round_first(asset, spend, depth_limit(info), old_reader)?;
-		if let Some(e) = self.settle_first_of(asset, kept, paid.saturating_add(margin), held,
-			"are at the operator's depth limit of reassignments since a round, arriving, trade proceeds a leg leaving the Arca may not \
-			spend, of a record format the other side does not read, or not final yet")
-		{
+		if let Some(e) = self.settle_first_of(asset, kept, paid.saturating_add(margin), held) {
 			return Err(e);
 		}
 		// Coins an offline-refresh plan names are paid out of round by no

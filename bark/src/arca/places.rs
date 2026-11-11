@@ -477,7 +477,8 @@ impl Wallet {
 	/// `settle_first`: puts through the operator's next round the coins a
 	/// spend waits for ([`Error::SettleFirst`] names them, as `coins`), or,
 	/// with `asset` alone, every coin of it that pays out of round only
-	/// after a round ([`Wallet::round_first`] for a payment). Each coin
+	/// after a round ([`Wallet::round_first`] for a payment) and every coin
+	/// of it a round of the wallet's holds now (given up, not final yet). Each coin
 	/// still live is given up in a refresh for a coin of the wallet's own
 	/// (`settling`); one already given up, or not final yet, waits for its
 	/// round as it is (`waiting`); one the wallet no longer holds is through
@@ -491,7 +492,15 @@ impl Wallet {
 			coins.to_vec()
 		} else if let Some(a) = asset {
 			let info = self.server_info()?;
-			self.round_first(a, Spend::Pay, super::pay::depth_limit(&info), false)?.into_iter().map(|(l, _)| l).collect()
+			let mut ids: Vec<String> = self.round_first(a, Spend::Pay, super::pay::depth_limit(&info), false)?.into_iter().map(|(l, ..)| l).collect();
+			// And every coin of it the wallet's own rounds hold now (given up in a
+			// refresh, or not final yet), which a spend waits for as it is.
+			for c in self.store.coins_in_states(&["given", "pending"])? {
+				if c.asset == a.to_string() && !ids.contains(&c.leaf_id) {
+					ids.push(c.leaf_id);
+				}
+			}
+			ids
 		} else {
 			return Err(Error::Parse("name the coins to settle, or the asset".into()));
 		};
