@@ -94,18 +94,24 @@ impl Store {
 	pub async fn paid_by_another(&self, leaf: &[u8; 32]) -> Result<bool, StoreError> {
 		let conn = self.conn().await?;
 		let r = conn.query_opt(
-			"SELECT o.mailbox_key,
+			"SELECT o.mailbox_key, lo.owner_key,
 			        ARRAY(SELECT COALESCE(m.mailbox_key, io.mailbox_key)
 			              FROM transfer_input i JOIN leaf l ON l.leaf_id = i.leaf_id
 			              LEFT JOIN leaf_mailbox m ON m.owner_key = l.owner_key
 			              LEFT JOIN transfer_output io ON io.leaf_id = i.leaf_id
 			              WHERE i.transfer_id = o.transfer_id)
-			 FROM transfer_output o WHERE o.leaf_id = $1",
+			 FROM transfer_output o JOIN leaf lo ON lo.leaf_id = o.leaf_id WHERE o.leaf_id = $1",
 			&[&&leaf[..]],
 		).await?;
 		let Some(r) = r else { return Ok(false) };
 		let out: Vec<u8> = r.get(0);
-		let ins: Vec<Option<Vec<u8>>> = r.get(1);
+		let owner: Vec<u8> = r.get(1);
+		let ins: Vec<Option<Vec<u8>>> = r.get(2);
+		// An output that named no mailbox is posted to its leaf's own key: a
+		// key its sender chose, which proves nothing about who holds it.
+		if out == owner {
+			return Ok(false);
+		}
 		Ok(ins.is_empty() || ins.iter().any(|m| m.as_deref() != Some(&out[..])))
 	}
 

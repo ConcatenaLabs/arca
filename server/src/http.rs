@@ -856,6 +856,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			in_flight_cap: p.in_flight_cap(a).map(|c| c.to_string()),
 			in_flight: p.in_flight_cap(a).and(in_flight.as_ref())
 				.map(|f| f.get(&a.into_inner().to_byte_array()).copied().unwrap_or(0).to_string()),
+			arriving_lane: Some(p.arriving_lane(a)).filter(|l| *l > 0).map(|l| l.to_string()),
 		}).collect(),
 		exit_delay_units: api::Bounds { min: p.min_exit_delay.units() as u32, max: p.max_exit_delay.units() as u32 },
 		depth_limit: p.depth_limit as u32,

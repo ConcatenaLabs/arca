@@ -103,6 +103,9 @@ pub struct AssetParams {
 	/// a refresh that would take it past the cap waits for a later round.
 	/// No cap when `None`.
 	pub in_flight_cap: Option<Amount>,
+	/// How far past the in-flight cap refreshes of payments arriving may
+	/// run ([`crate::rounds`]); none when `None`.
+	pub arriving_lane: Option<Amount>,
 }
 
 /// What the operator serves of a supervised asset beside the rest.
@@ -532,6 +535,13 @@ impl Params {
 	pub fn channel_capacity_total(&self, asset: &AssetId) -> Option<u64> {
 		let a = self.assets.get(asset)?;
 		a.channel_total.map(|c| c.atoms(self.rates.last(asset)).unwrap_or(0))
+	}
+
+	/// The asset's lane for payments arriving in its atoms
+	/// ([`AssetParams::arriving_lane`]): 0 for none, and for a value with no
+	/// rate yet.
+	pub fn arriving_lane(&self, asset: &AssetId) -> u64 {
+		self.assets.get(asset).and_then(|a| a.arriving_lane).and_then(|l| l.atoms(self.rates.last(asset))).unwrap_or(0)
 	}
 
 	/// The asset's in-flight cap in its atoms ([`AssetParams::in_flight_cap`]):

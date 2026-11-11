@@ -283,6 +283,7 @@ min_leaf = "1000"
 # channel_capacity = "1000000"
 # channel_capacity_total = "300000000"
 # in_flight_cap = "500000000"
+# arriving_lane = "100000000"   # how far past the cap refreshes of payments arriving may run
 # [assets.rate]
 # source = "file"
 # path = "/var/lib/arca/rates/<asset id>.json"
