@@ -119,7 +119,10 @@ value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?}`, `refresh_needed {idle_seconds?}` (whether what the wallet received out
-of round should be refreshed now, and by which rule: `depth`, `exposure`, `expiry`, `idle`),
+of round should be refreshed now, and by which rule: `arriving`, `depth`, `exposure`, `expiry`, `idle`),
+`instant_limit {value}` (the wallet's instant limit, atoms of the reference unit, or `"off"`),
+`coin_places` (each coin's place, `settled`, `proceeds`, `counted` or `arriving`, the totals by asset,
+what is spendable now, and the limit),
 `withdraw_participation {participation}`, `refusals`; a payment to an address on the chain from leaves
 (`offboard_quote {asset, amount, address | script, max_fee_ppm?}`, `offboard
 {asset, amount, address | script, fee_asset?, max_fee_ppm?, shown?}`,
