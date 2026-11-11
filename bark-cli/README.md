@@ -310,8 +310,11 @@ and a board whose registration never reached the server, are not recovered.
   suggested share is taken, and zero while the operator's bond does not
   stand. Received coins count oldest first, by the operator's record of the
   transfers that made them, until the next would pass the limit; a counted
-  coin stays counted, and the change of the wallet's own payment out of a
-  counted coin keeps its place. A channel coin counts the wallet's side of it
+  coin stays counted, and a coin made from counted coins keeps their place:
+  the change of the wallet's own payment out of one, and what a trade with
+  its owner's exit on every checkpoint paid for one, which counts (with any
+  change of that trade) at most what the coins given were worth; what the
+  trade brought beyond that counts nothing against the limit. A channel coin counts the wallet's side of it
   alone, and with a limit set is arriving: it is the wallet's to spend once
   its close has made it a coin. With a limit set, the wallet spends no
   arriving coin but in a refresh, which it names to the operator so the

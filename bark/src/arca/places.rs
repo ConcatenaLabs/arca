@@ -43,9 +43,13 @@
 //! the transfer that made them, then by when the wallet stored them), until
 //! the next would pass the limit; that one and every later one are arriving.
 //! Once counted a coin stays counted while the wallet holds it, so a rise in
-//! prices never moves a coin back from counted to arriving; and the change
-//! of the wallet's own payment out of a counted coin keeps its place,
-//! counted, ahead of every coin arriving. A coin that
+//! prices never moves a coin back from counted to arriving. A coin made from
+//! counted coins keeps their place, counted, ahead of every coin arriving:
+//! the change of the wallet's own payment out of one, and what a trade with
+//! its owner's exit on every checkpoint paid for one. What one trade pays
+//! the wallet counts, all together, at most what the coins given were worth
+//! when it took their place; what the trade brought beyond that counts
+//! nothing against the limit. A coin that
 //! arrives is refreshed at the next round ([`Wallet::refresh_needed`]), and
 //! is then `settled`.
 //!
@@ -79,6 +83,10 @@ pub const INSTANT_LIMIT: &str = "instant_limit";
 /// The received coins the wallet counted, by leaf id: counted once, a coin
 /// stays counted while the wallet holds it.
 pub const INSTANT_COUNTED: &str = "instant_counted";
+/// For each counted coin a trade bought with counted coins, by leaf id, the
+/// most it counts against the limit: what those coins were worth when it
+/// took their place (atoms of the reference unit, as text).
+pub const INSTANT_COUNTED_CAPS: &str = "instant_counted_caps";
 /// The limit the operator side allowed when it was last read (its suggestion
 /// and its bond's share, or zero for a bond that does not stand): taken while
 /// the operator or the node cannot be read, so a sync that fails moves no
@@ -318,37 +326,75 @@ impl Wallet {
 		received.sort();
 		let held: BTreeSet<String> = received.iter().map(|(_, i)| coins[*i].0.leaf_id.clone()).collect();
 		let mut sticky: BTreeSet<String> = self.store.meta(INSTANT_COUNTED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-		// The change of the wallet's own payment out of a counted coin keeps
-		// its parent's place: read before the parents, spent now, leave the
-		// note.
+		let rates = self.chain.fee_rates().unwrap_or_default();
+		let worth = |c: &CoinRow| AssetId::from_str(&c.asset).ok().and_then(|a| rates.get(&a)).filter(|r| **r > 0)
+			.map(|r| c.value as u128 * *r as u128 / 100_000_000);
+		// The most a counted coin bought in a trade counts, by leaf id: what the
+		// counted coins given for it were worth when it took their place.
+		let mut caps: BTreeMap<String, u128> = self.store.meta(INSTANT_COUNTED_CAPS)?
+			.and_then(|v| serde_json::from_str::<BTreeMap<String, String>>(&v).ok()).unwrap_or_default()
+			.into_iter().filter_map(|(k, v)| v.parse::<u128>().ok().map(|v| (k, v))).collect();
+		// A coin made from counted coins of the wallet's keeps their place,
+		// ahead of every coin arriving: read while the parents, spent now, are
+		// still in the note.
+		// - The change of the wallet's own payment out of one.
+		// - What a trade with its owner's exit on every checkpoint paid the
+		//   wallet for one: it takes the place of the coin given, and counts at
+		//   most what that coin was worth then; what it brought beyond that
+		//   counts nothing against the limit (the trade's gain, which a dead
+		//   trade takes back with the coin given coming home).
 		let mut inherited = false;
 		let unplaced: Vec<usize> = received.iter().map(|(_, i)| *i).filter(|i| !sticky.contains(&coins[*i].0.leaf_id)).collect();
 		if !unplaced.is_empty() && !sticky.is_empty() {
-			let by_record: std::collections::HashMap<Vec<u8>, String> = self.store.coins()?.into_iter().map(|c| (c.record, c.leaf_id)).collect();
+			let by_record: std::collections::HashMap<Vec<u8>, CoinRow> = self.store.coins()?.into_iter().map(|c| (c.record.clone(), c)).collect();
+			let mut budget: BTreeMap<Vec<String>, u128> = BTreeMap::new();
 			for i in unplaced {
-				let Ok(CoinRecord::Transfer(t)) = Self::record_of(&coins[i].0) else { continue };
-				if !t.inputs.iter().all(|x| self.is_mine(&x.coin)) {
+				let Ok(record) = Self::record_of(&coins[i].0) else { continue };
+				let inputs: Vec<(&CoinRecord, Option<bool>)> = match &record {
+					CoinRecord::Transfer(t) => t.inputs.iter().map(|x| (&x.coin, Some(x.exit))).collect(),
+					CoinRecord::Fill(f) => std::iter::once((&f.fill.order, None)).chain(f.fill.inputs.iter().map(|x| (&x.coin, Some(x.exit)))).collect(),
+					_ => continue,
+				};
+				let mine: Vec<&CoinRecord> = inputs.iter().filter(|(c, _)| self.is_mine(c)).map(|(c, _)| *c).collect();
+				let own_payment = mine.len() == inputs.len();
+				let trade = !own_payment && !mine.is_empty() && inputs.iter().all(|(_, e)| e.unwrap_or(true));
+				if !own_payment && !trade {
 					continue;
 				}
-				let from_counted = t.inputs.iter().any(|x| x.coin.to_bytes().ok().and_then(|b| by_record.get(&b)).is_some_and(|id| sticky.contains(id)));
-				if from_counted {
-					sticky.insert(coins[i].0.leaf_id.clone());
-					inherited = true;
+				let given: Vec<&CoinRow> = mine.iter().filter_map(|c| c.to_bytes().ok().and_then(|b| by_record.get(&b)))
+					.filter(|row| sticky.contains(&row.leaf_id)).collect();
+				if given.is_empty() {
+					continue;
 				}
+				sticky.insert(coins[i].0.leaf_id.clone());
+				if trade {
+					// The coins one trade pays the wallet (what it bought, and any
+					// change) share what was given: each counts at most what is
+					// left of it, in the order the wallet holds them.
+					let mut key: Vec<String> = given.iter().map(|g| g.leaf_id.clone()).collect();
+					key.sort();
+					let left = budget.entry(key).or_insert_with(|| given.iter().map(|g| worth(g).unwrap_or(0)).sum());
+					let cap = worth(&coins[i].0).unwrap_or(0).min(*left);
+					*left -= cap;
+					caps.insert(coins[i].0.leaf_id.clone(), cap);
+				}
+				inherited = true;
 			}
 		}
 		let before = sticky.len();
 		sticky.retain(|id| held.contains(id));
+		caps.retain(|id, _| sticky.contains(id));
 		let pruned = sticky.len() != before || inherited;
-		let rates = self.chain.fee_rates().unwrap_or_default();
-		let worth = |c: &CoinRow| AssetId::from_str(&c.asset).ok().and_then(|a| rates.get(&a)).filter(|r| **r > 0)
-			.map(|r| c.value as u128 * *r as u128 / 100_000_000);
+		let counts = |c: &CoinRow| {
+			let w = worth(c).unwrap_or(0);
+			caps.get(&c.leaf_id).map_or(w, |cap| w.min(*cap))
+		};
 		let mut counted = 0u128;
 		let mut unvalued: BTreeSet<String> = BTreeSet::new();
 		for (_, i) in &received {
 			let c = &coins[*i].0;
 			if sticky.contains(&c.leaf_id) {
-				counted += worth(c).unwrap_or(0);
+				counted += counts(c);
 			}
 		}
 		let mut grew = false;
@@ -378,6 +424,8 @@ impl Wallet {
 		}
 		if grew || pruned {
 			self.store.set_meta(INSTANT_COUNTED, &serde_json::to_string(&sticky).expect("a set"))?;
+			let caps: BTreeMap<String, String> = caps.into_iter().map(|(k, v)| (k, v.to_string())).collect();
+			self.store.set_meta(INSTANT_COUNTED_CAPS, &serde_json::to_string(&caps).expect("a map"))?;
 		}
 		Ok(Places { limit: Some(limit), coins, counted, unvalued: unvalued.into_iter().collect(), channels })
 	}

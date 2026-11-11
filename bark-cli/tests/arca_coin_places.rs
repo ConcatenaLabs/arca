@@ -957,3 +957,50 @@ async fn a_missing_rate_never_stops_receiving_the_coin_arrives() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 15. What a trade buys with counted money keeps the place of what it gave
+//     (RV35-4).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proceeds_of_a_counted_coin_keep_its_place_beside_an_older_arriving_payment() {
+	let mut r = Running::start_with(watcher_off()).await;
+	let (x, y) = (r.x, r.y);
+	let rx = rate(&r, x) as u64;
+	price(&r, y, rx);
+	post_bond(&mut r, None).await;
+	let (a, c, s, s2) = (Arca::new("CP15 A"), Arca::new("CP15 C"), Arca::new("CP15 S"), Arca::new("CP15 S2"));
+	create(&r, &a);
+	boarded(&mut r, &c, &[(y, 2_000_000)]).await;
+	boarded(&mut r, &s, &[(x, 3_000_000)]).await;
+	boarded(&mut r, &s2, &[(x, 3_000_000)]).await;
+	library(&a, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	let first = pay(&s, &a, x, 600_000);
+	let second = pay(&s2, &a, x, 600_000);
+	let p = summary("CP15 A holds", &a);
+	assert_eq!((place_of(&p, &first).as_str(), place_of(&p, &second).as_str()), ("counted", "arriving"), "{}", p);
+	a.ok(&["require-checkpoint-exit", "on"]);
+	let offer = a.ok(&["swap", "offer", "--give-asset", &x.to_string(), "--give", "300000", "--want-asset", &y.to_string(), "--want", "300000"]);
+	let acc = c.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	a.ok(&["sync"]);
+	let got = newest_of(&a, y, &[]);
+	let p = summary("CP15 after the trade", &a);
+	println!("CP15: the Y bought {}… is {}; the older payment {}… is {}; spendable {}", &got[..8], place_of(&p, &got), &second[..8],
+		place_of(&p, &second), p["spendable"]);
+	assert_eq!(place_of(&p, &got), "counted", "it takes the place of the counted X it was bought with");
+	assert_eq!(place_of(&p, &second), "arriving", "a later payment does not jump ahead of what the wallet already had");
+	assert_eq!(p["spendable"][y.to_string()], "300000", "{}", p);
+	let counted: u128 = p["instant_limit"]["counted"].as_str().unwrap().parse().unwrap();
+	assert!(counted <= worth(&r, x, 1_000_000), "within the limit: {}", counted);
+	// Its place lets it be traded on; what stops it here is the protocol's
+	// depth limit (a board, the shaped give coin and the trade), which a
+	// refresh clears, never its place.
+	let why = a.refused(&["swap", "offer", "--give-asset", &y.to_string(), "--give", "200000", "--want-asset", &x.to_string(), "--want",
+		"200000"], "depth limit");
+	assert!(!why.contains("arriving"), "{}", why);
+	for w in [&a, &c, &s, &s2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
