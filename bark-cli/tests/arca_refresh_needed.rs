@@ -142,7 +142,7 @@ async fn a_refresh_is_needed_only_by_its_rules() {
 	let v = library(&n, "refresh_needed", json!({"idle_seconds": 10_000})).unwrap();
 	println!("RN nothing received: {}", v);
 	assert_eq!(v["needed"], false, "{}", v);
-	assert_eq!(v["rules"], json!(["arriving", "depth", "exposure", "expiry", "idle"]));
+	assert_eq!(v["rules"], json!(["arriving", "depth", "exposure", "expiry", "idle", "shape"]));
 
 	// 1. A small coin of Y: nothing needed while the person is active; idle after two minutes.
 	let b = Arca::new("RN B");

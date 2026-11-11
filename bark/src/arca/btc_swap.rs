@@ -49,6 +49,7 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use elements::hashes::{sha256, Hash};
+use arca_covenant::ExplicitOutput;
 use elements::AssetId;
 use serde_json::{json, Value};
 
@@ -296,8 +297,27 @@ impl Wallet {
 		let role = if t.maker_gives == "btc" { "P" } else { "Q" };
 		let info = self.server_info()?;
 		let op_fee = self.swap_leg(&info, t.asset, t.atoms)?;
+		if role == "P" {
+			self.cross_chain_check(&info, t.asset, t.atoms, op_fee)?;
+		}
 		Ok(json!({"role": role, "asset": t.asset.to_string(), "atoms": t.atoms.to_string(), "sats": t.sats.to_string(),
 			"lapse": offer["lapse"], "shows": shows(role, &t.asset.to_string(), t.atoms, t.sats, op_fee, &bitcoin["fee"])}))
+	}
+
+	/// Whether the wallet, as P, can lock `atoms` of `asset` and the
+	/// operator's fee `op_fee` once its coins allow: what the lock itself
+	/// answers for want of a round ([`Error::SettleFirst`]: proceeds a leg
+	/// paid to another party may not spend, coins at the depth limit,
+	/// arriving), answered as the offer is read or taken, before anything
+	/// is asked or locked. Any other shortfall is the lock's to answer.
+	fn cross_chain_check(&self, info: &Value, asset: AssetId, atoms: u64, op_fee: u64) -> Result<(), Error> {
+		let _quote = self.quoting();
+		let need = atoms.saturating_add(op_fee);
+		let probe = ExplicitOutput::new(asset, need, super::pay::leaf_probe());
+		match self.choose_coins_for(info, asset, need, &probe, Self::min_leaf(info, asset)?, super::places::Spend::CrossChain) {
+			Err(e @ Error::SettleFirst { .. }) => Err(e),
+			_ => Ok(()),
+		}
 	}
 
 	/// What a taker checks of an offer: its chain, its operator (this
@@ -337,6 +357,9 @@ impl Wallet {
 		let info = self.server_info()?;
 		let op_fee = self.swap_leg(&info, t.asset, t.atoms)?;
 		let role = if t.maker_gives == "btc" { "P" } else { "Q" };
+		if role == "P" {
+			self.cross_chain_check(&info, t.asset, t.atoms, op_fee)?;
+		}
 		let mut rec = json!({"id": id, "role": role, "maker": false, "state": "taken", "asset": t.asset.to_string(),
 			"atoms": t.atoms.to_string(), "sats": t.sats.to_string(), "offer": offer, "lapse": offer["lapse"], "created_at": wall_now(),
 			"shows": shows(role, &t.asset.to_string(), t.atoms, t.sats, op_fee, &bitcoin["fee"])});
