@@ -56,6 +56,29 @@ fn parse_outpoint(s: &str) -> Result<OutPoint, Error> {
 }
 
 impl Wallet {
+	/// The wallet's own leaf for the change of a participation that gives
+	/// up coins of `asset` out of the tree (an offboard, an on-chain order,
+	/// a resting order), with the entry the store keeps of it: for a
+	/// supervised asset a landing leaf at the wallet's own landing, of the
+	/// template the operator makes ([`Wallet::landing_rule`]), since the
+	/// operator makes no other leaf of such an asset; `vtxo-1` otherwise.
+	pub(crate) fn change_wanted(&self, info: &Value, asset: AssetId, value: u64, purpose: &str) -> Result<(Wanted, Value), Error> {
+		let nonce = random32();
+		let owner = self.keys.leaf_xonly(&nonce)?;
+		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
+		let landing = self.landing_rule(info, asset)?;
+		let template = landing.map_or(Template::Vtxo1, |l| l.template());
+		let mut entry = json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": value.to_string()});
+		if let Some(l) = &landing {
+			entry["landing"] = arca_covenant::record_json::landing_json(l);
+			if l.own_index {
+				entry["template"] = json!(arca_covenant::LANDING_2);
+			}
+		}
+		Ok((Wanted::Leaf { asset, value, template, owner, owner_nonce: nonce, exit_delay: self.exit_delay(), order: None, landing,
+			channel: None }, entry))
+	}
+
 	/// The script an offboard pays: `address`, an unconfidential address of
 	/// the chain the node follows, or `script`, hex. Refused: neither or both,
 	/// a confidential address (the offboard pays an explicit output), and a
@@ -193,12 +216,9 @@ impl Wallet {
 		let mut wanted_json = vec![json!({"offboard": {"asset": asset.to_string(), "value": amount.to_string(),
 			"script": hex(script.as_bytes()), "margin": plan.margin.to_string()}})];
 		if plan.change > 0 {
-			let nonce = random32();
-			let owner = self.keys.leaf_xonly(&nonce)?;
-			self.store.put_nonce(&nonce, &owner.serialize(), "offboard change")?;
-			wanted.push(Wanted::Leaf { asset, value: plan.change, template: Template::Vtxo1, owner, owner_nonce: nonce,
-				exit_delay: self.exit_delay(), order: None, landing: None, channel: None });
-			wanted_json.push(json!({"nonce": hex(&nonce), "asset": asset.to_string(), "value": plan.change.to_string()}));
+			let (w, entry) = self.change_wanted(&info, asset, plan.change, "offboard change")?;
+			wanted.push(w);
+			wanted_json.push(entry);
 		}
 		let fees = vec![(asset, plan.fee)];
 		let ids: Vec<LeafId> = plan.coins.iter().map(|c| c.coin.id).collect();

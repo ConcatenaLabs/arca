@@ -334,12 +334,9 @@ impl Wallet {
 		let mut wanted_json = vec![json!({"nonce": hex(&nonce), "asset": ask.sell.to_string(), "value": ask.amount.to_string(),
 			"order": terms_json})];
 		if plan.change > 0 {
-			let n = random32();
-			let o = self.keys.leaf_xonly(&n)?;
-			self.store.put_nonce(&n, &o.serialize(), "order change")?;
-			wanted.push(Wanted::Leaf { asset: ask.sell, value: plan.change, template: Template::Vtxo1, owner: o, owner_nonce: n,
-				exit_delay: self.exit_delay(), order: None, landing: None, channel: None });
-			wanted_json.push(json!({"nonce": hex(&n), "asset": ask.sell.to_string(), "value": plan.change.to_string()}));
+			let (w, entry) = self.change_wanted(&info, ask.sell, plan.change, "order change")?;
+			wanted.push(w);
+			wanted_json.push(entry);
 		}
 		let fees = vec![(ask.sell, plan.fee)];
 		let ids: Vec<LeafId> = plan.coins.iter().map(|c| c.coin.id).collect();
