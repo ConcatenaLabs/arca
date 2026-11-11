@@ -295,6 +295,12 @@ impl Wallet {
 	/// second coin to it is refused. A request naming an asset is refused
 	/// when the operator does not serve it.
 	pub fn receive(&mut self, asset: Option<AssetId>, value: Option<u64>) -> Result<Value, Error> {
+		self.receive_with(asset, value, true)
+	}
+
+	/// [`Self::receive`]; with `channels` false the request names none of
+	/// the wallet's channels, so every payment to it comes as a coin.
+	pub fn receive_with(&mut self, asset: Option<AssetId>, value: Option<u64>, channels: bool) -> Result<Value, Error> {
 		if let Some((at, why)) = self.rolled_back()? {
 			return Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the wallet \
 				asks for no payment through this operator", at, why)));
@@ -347,8 +353,10 @@ impl Wallet {
 		// The wallet's channels that can be paid now, in the asset named or
 		// in every asset: a payer holding a channel in the asset pays over
 		// it at once, and otherwise to the leaf this request names.
-		let channels: serde_json::Map<String, Value> = self.usable_channels()?.into_iter()
-			.filter(|(a, _)| asset.is_none_or(|x| x == *a)).map(|(a, (l, _))| (a.to_string(), json!(l))).collect();
+		let channels: serde_json::Map<String, Value> = if !channels { serde_json::Map::new() } else {
+			self.usable_channels()?.into_iter()
+				.filter(|(a, _)| asset.is_none_or(|x| x == *a)).map(|(a, (l, _))| (a.to_string(), json!(l))).collect()
+		};
 		if !channels.is_empty() {
 			req["channels"] = Value::Object(channels);
 		}

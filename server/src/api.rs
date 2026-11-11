@@ -465,8 +465,8 @@ pub struct ParticipationsInfo {
 	#[serde(default)]
 	pub record_formats: bool,
 	/// The operator reads `arriving` on a participation: a refresh of
-	/// payments arriving runs ahead of other refreshes, and the in-flight
-	/// cap does not hold it.
+	/// payments arriving, as its records bear them out, runs ahead of other
+	/// refreshes and past the in-flight cap, up to twice it.
 	#[serde(default)]
 	pub arriving: bool,
 }
@@ -1907,9 +1907,9 @@ pub struct SubmitParticipation {
 	/// The coins among `inputs` the wallet names as payments arriving
 	/// (received out of round, past what it counts as its own at once), by
 	/// leaf id, when the operator reads them (`info.participations.arriving`):
-	/// a refresh giving up only coins received out of round that names some
-	/// runs ahead of other refreshes and is not held by the in-flight cap.
-	/// Not part of the participation's id.
+	/// a refresh whose names the operator's records bear out runs ahead of
+	/// other refreshes and past the in-flight cap, up to twice it. Not part
+	/// of the participation's id.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub arriving: Vec<String>,
 }

@@ -547,6 +547,10 @@ struct CapAsk {
 	given: HashSet<[u8; 32]>,
 	/// Whether the cap never holds it.
 	exempt: bool,
+	/// Whether it refreshes payments arriving (checked against the
+	/// operator's records): it runs while what is in flight stays within
+	/// twice the cap.
+	arriving: bool,
 }
 
 /// What the in-flight cap makes of a participation.
@@ -600,6 +604,11 @@ impl<'a> CapJudge<'a> {
 	/// would take past its cap, what is in flight of it, and what running
 	/// would take that to.
 	fn over(&self, group: &[&CapAsk]) -> Option<(AssetId, u64, u64)> {
+		self.over_times(group, 1)
+	}
+
+	/// [`Self::over`] against `times` the cap.
+	fn over_times(&self, group: &[&CapAsk], times: u64) -> Option<(AssetId, u64, u64)> {
 		let mut opens: BTreeMap<AssetId, u64> = BTreeMap::new();
 		let mut assets: BTreeSet<AssetId> = BTreeSet::new();
 		for a in group {
@@ -623,7 +632,7 @@ impl<'a> CapJudge<'a> {
 		}
 		assets.into_iter().find_map(|a| {
 			let f = self.flight.get(&a).copied().unwrap_or(0);
-			let cap = self.caps[&a];
+			let cap = self.caps[&a].saturating_mul(times);
 			let net = opens.get(&a).copied().unwrap_or(0).saturating_sub(returns.get(&a).copied().unwrap_or(0));
 			(net > 0 && f.saturating_add(net) > cap && !(f == 0 && cap > 0)).then(|| (a, f, f.saturating_add(net)))
 		})
@@ -770,7 +779,7 @@ impl<'a> CapJudge<'a> {
 		let mut runs = vec![false; asks.len()];
 		let mut waiting = vec![];
 		for (i, ask) in asks.iter().enumerate() {
-			if ask.exempt || self.over(&[ask]).is_none() {
+			if ask.exempt || self.over(&[ask]).is_none() || (ask.arriving && self.over_times(&[ask], ARRIVING_TIMES).is_none()) {
 				self.take(&[ask]);
 				runs[i] = true;
 			} else {
@@ -851,6 +860,11 @@ fn broken_sets(ids: &HashSet<[u8; 32]>, sets: &[Vec<[u8; 32]>]) -> HashSet<[u8; 
 /// of them cannot run in the round ([`Rounds::whole_sets`]).
 const SET_WAITS: &str = "This refresh waits for a later round: it brings a node back together with other holders' refreshes, and one \
 	of them cannot run in this round. Nothing is lost meanwhile.";
+
+/// How many times its asset's in-flight cap a refresh of payments arriving
+/// may take what is in flight to ([`Rounds::within_cap`]): it runs past the
+/// cap, but never past this, whatever a wallet names.
+pub const ARRIVING_TIMES: u64 = 2;
 
 /// How close to its first expiry a coin given up must be for its refresh to
 /// run whatever the in-flight cap ([`Rounds::within_cap`]): six days, a day
@@ -2265,16 +2279,18 @@ impl Rounds {
 	{
 		let mut chosen: Vec<ParticipationRow> = vec![];
 		let mut count = 0usize;
-		// A refresh of payments arriving goes first: its owner waits on this
+		// A refresh of payments arriving, as the operator's records show them
+		// ([`Self::refreshes_arriving`]), goes first: its owner waits on this
 		// round to have the payment at all. The rest keep their order.
 		let mut rows = Vec::with_capacity(ids.len());
 		for id in ids {
 			if let Some(r) = self.store.participation(id).await? {
-				rows.push(r);
+				let first = self.refreshes_arriving(&r).await?;
+				rows.push((!first, r));
 			}
 		}
-		rows.sort_by_key(|r| r.arriving.is_empty());
-		for row in rows {
+		rows.sort_by_key(|(later, _)| *later);
+		for (_, row) in rows {
 			if row.state != ParticipationState::Pending || row.fill.is_some() || Self::asset_of(&row) != Some(asset) {
 				continue;
 			}
@@ -2694,23 +2710,16 @@ impl Rounds {
 		let mut asks = Vec::with_capacity(chosen.len());
 		for row in &chosen {
 			let mut ask = CapAsk::default();
-			// A refresh that names payments arriving and gives up only coins
-			// received out of round is never held by the cap: its owner has
-			// the payment only once a round refreshes it, and a coin out of
-			// round is what the bond and its holder want refreshed soonest.
-			// A wallet can name only coins out of round, so it carries no
-			// round's coin past the cap this way.
-			if !row.arriving.is_empty() {
-				let mut out_of_round = true;
-				for i in row.inputs.iter().filter(|i| !i.returned) {
-					let kind = match self.store.leaf(&i.leaf_id).await? {
-						Some(l) => CoinRecord::from_bytes(&l.record).ok().map(|r| matches!(r, CoinRecord::Transfer(_) | CoinRecord::Fill(_))),
-						None => None,
-					};
-					out_of_round &= kind == Some(true);
-				}
-				ask.exempt |= out_of_round;
-			}
+			// A refresh that names payments arriving runs while what is in
+			// flight stays within [`ARRIVING_TIMES`] the cap, where any other
+			// waits at the cap: its owner has the payment only once a round
+			// refreshes it, and a coin out of round is what the bond and its
+			// holder want refreshed soonest. It counts so only when it gives
+			// up nothing but coins out of round and the operator's own records
+			// show each coin it names paid to it by someone else
+			// ([`Store::paid_by_another`]): a wallet that names its own
+			// change, or a round's coin, is judged as any refresh is.
+			ask.arriving = self.refreshes_arriving(row).await?;
 			for i in row.inputs.iter().filter(|i| !i.returned) {
 				let asset = AssetId::from_byte_array(i.asset);
 				if !caps.contains_key(&asset) {
@@ -2790,6 +2799,41 @@ impl Rounds {
 	/// [`holding_back`] in this server's store.
 	pub async fn holding_back(&self, leaf_ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], u64)>, StoreError> {
 		holding_back(&self.store, leaf_ids, &self.active).await
+	}
+
+	/// Whether `row` refreshes payments arriving, as the operator's own
+	/// records show: it names some (`arriving`), gives up nothing but coins
+	/// out of round, and each coin it names is one of its inputs that a
+	/// transfer paid to it from another's mailbox ([`Store::paid_by_another`]).
+	/// A wallet that names its own change, or a round's coin, gets nothing
+	/// for it.
+	async fn refreshes_arriving(&self, row: &ParticipationRow) -> Result<bool, RoundError> {
+		if row.arriving.is_empty() {
+			return Ok(false);
+		}
+		for i in row.inputs.iter().filter(|i| !i.returned) {
+			let out_of_round = match self.store.leaf(&i.leaf_id).await? {
+				Some(l) => CoinRecord::from_bytes(&l.record).is_ok_and(|r| matches!(r, CoinRecord::Transfer(_) | CoinRecord::Fill(_))),
+				None => false,
+			};
+			if !out_of_round {
+				log::warn!("participation {} names coins arriving and gives up a coin not out of round: judged as any refresh",
+					crate::signer::hex(&row.id));
+				return Ok(false);
+			}
+		}
+		for named in &row.arriving {
+			let ok = match crate::signer::unhex32(named) {
+				Ok(id) => row.inputs.iter().any(|i| i.leaf_id == id) && self.store.paid_by_another(&id).await?,
+				Err(_) => false,
+			};
+			if !ok {
+				log::warn!("participation {} names {} as arriving, which the operator's records do not show paid to it by another: \
+					judged as any refresh", crate::signer::hex(&row.id), named);
+				return Ok(false);
+			}
+		}
+		Ok(true)
 	}
 
 	/// Records why `row` waits.

@@ -1763,15 +1763,20 @@ A round held for its forfeits counts from when it is built, so a refresh
 judged while an earlier round of its asset is held waits as it would once
 that round is out, and the rounds built in one forfeit window cannot
 together front past the cap.
-A participation that names payments arriving among the coins it gives up
+A participation may name payments arriving among the coins it gives up
 (`arriving`, their leaf ids, when `info.participations.arriving` says the
-operator reads it; not part of the participation's id) and gives up only
-coins received out of round (reassignments' and fills' coins) is never held
-by the cap, and runs ahead of the other participations of its asset: its
-owner has the payment only once a round has refreshed it, and a coin out of
-round is what the bond wants refreshed soonest. A name that is not one of
-the participation's inputs is refused (`malformed`). Only coins out of
-round can be named, so no round's or board's coin passes the cap this way.
+operator reads it; not part of the participation's id): its owner has the
+payment only once a round has refreshed it, and a coin out of round is what
+the bond wants refreshed soonest. A name that is not one of the
+participation's inputs is refused (`malformed`). The operator takes the
+names only as far as its own records bear them out: the participation gives
+up nothing but coins out of round (reassignments' and fills' coins), and the
+transfer that made each coin named paid it to a mailbox other than its
+inputs' (a wallet's change from its own payment goes back to its own
+mailbox). Such a participation runs ahead of the other participations of its
+asset, and runs past the cap as long as what is in flight stays within twice
+it; past that it waits like any other. One whose names the records do not
+bear out is judged as any participation, and the operator logs it.
 A coin whose own forfeit is final on the chain, brought down by a collection
 (through its lineage's reassignments when it was paid on out of round), counts
 for nothing either.

@@ -228,9 +228,9 @@ pub struct ParticipationRequest {
 	pub record_formats: Vec<String>,
 	/// The coins among its inputs the wallet names as payments arriving,
 	/// by leaf id in hex: received out of round, past what it counts as its
-	/// own at once. A refresh giving up only coins received out of round
-	/// that names some runs ahead of the others and is not held by the
-	/// in-flight cap ([`crate::rounds`]). Not covered by the id.
+	/// own at once. A refresh whose names the operator's records bear out
+	/// runs ahead of the others and past the in-flight cap, up to twice it
+	/// ([`crate::rounds`]). Not covered by the id.
 	pub arriving: Vec<String>,
 }
 

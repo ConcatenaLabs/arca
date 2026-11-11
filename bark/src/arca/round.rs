@@ -1377,8 +1377,9 @@ impl Wallet {
 		//
 		// And, to an operator that reads it (`info.participations.arriving`),
 		// which coins it gives up are payments arriving
-		// ([`super::places`]): that refresh runs ahead of the others, and the
-		// operator's in-flight cap does not hold it.
+		// ([`super::places`]): an operator whose records bear the names out
+		// runs that refresh ahead of the others, and past its in-flight cap up
+		// to twice it.
 		let told;
 		let reads = |key: &str| info.as_ref().is_some_and(|i| i["participations"][key].as_bool() == Some(true));
 		let arriving: Vec<String> = if reads("arriving") && call == "submit_participation" && self.own_instant_limit()?.is_some() {
