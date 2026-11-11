@@ -981,7 +981,11 @@ impl Wallet {
 							why
 						};
 						self.store.refused(&format!("exit of {}", leaf_id), &why)?;
-						if self.chain.finality(&by)?.is_final() {
+						if !back.is_empty() || !returning.is_empty() {
+							// Out of the balance while what the wallet gave comes
+							// home ([`Self::undo_made_by`] marked it already).
+							self.store.set_coin_state(leaf_id, "lost", &why)?;
+						} else if self.chain.finality(&by)?.is_final() {
 							self.store.set_coin_state(leaf_id, "lost", &format!("lost: {}; that spend is final", why))?;
 						} else {
 							self.store.set_coin_state(leaf_id, &row.state, &format!("{}; that spend is not final yet", why))?;
@@ -1335,7 +1339,11 @@ impl Wallet {
 					continue;
 				}
 				let claim_index = self.store.take_index(super::keys::RECEIVE)?;
-				let v = json!({"via": via, "claim_index": claim_index});
+				// What the dead trade made for the wallet is no coin of its
+				// own while the given coin comes home: out of the balance, its
+				// note saying why, and back should the trade complete after all.
+				let undone = self.undo_made_by(&id)?;
+				let v = json!({"via": via, "claim_index": claim_index, "undone": undone});
 				let why = format!("the trade it was given into (coin {}'s) can never complete: another coin of it was spent elsewhere on \
 					the chain; it comes home by its checkpoint's own exit, no operator signature needed", via);
 				self.store.atomically(|s| {
@@ -1349,6 +1357,34 @@ impl Wallet {
 			let _ = self.exit(id, None);
 		}
 		Ok(started)
+	}
+
+	/// Marks `lost` every coin the wallet holds whose record rests on the
+	/// coin `given` (a coin it gave into a trade that can never complete):
+	/// the trade made it, and it can never reach the chain while the spend
+	/// that undid the trade stands. Returns them, with the state each had.
+	fn undo_made_by(&self, given: &str) -> Result<Vec<(String, String)>, Error> {
+		let Some(g) = self.store.coin(given)? else { return Ok(vec![]) };
+		let given_record = Self::record_of(&g)?;
+		fn rests_on(r: &CoinRecord, on: &CoinRecord) -> bool {
+			match r {
+				CoinRecord::Transfer(t) => t.inputs.iter().any(|i| i.coin == *on || rests_on(&i.coin, on)),
+				CoinRecord::Fill(f) => f.fill.order == *on || rests_on(&f.fill.order, on)
+					|| f.fill.inputs.iter().any(|i| i.coin == *on || rests_on(&i.coin, on)),
+				_ => false,
+			}
+		}
+		let mut out = vec![];
+		for c in self.store.coins_in_states(Self::HOMEWARD)? {
+			let Ok(r) = Self::record_of(&c) else { continue };
+			if rests_on(&r, &given_record) {
+				self.store.set_coin_state(&c.leaf_id, "lost", &format!("the trade that made it was undone: coin {} the wallet gave into \
+					it comes home by its checkpoint's own exit; this coin comes back only if the spend that undid the trade leaves the chain",
+					given))?;
+				out.push((c.leaf_id, c.state));
+			}
+		}
+		Ok(out)
 	}
 
 	/// The wallet's coins given into a reassignment or a fill in `coin`'s
@@ -1421,11 +1457,28 @@ impl Wallet {
 			if let Some((sp, _)) = self.chain.spender(&OutPoint::new(tx.txid(), vout), h)? {
 				let txid = sp.txid().to_string();
 				if sp.output.contains(&marker) {
+					// The coins the trade made are the wallet's again, as they
+					// were before the return: the next re-check follows them.
+					for u in prior["undone"].as_array().cloned().unwrap_or_default() {
+						let (Some(id), Some(was)) = (u[0].as_str(), u[1].as_str()) else { continue };
+						if self.store.coin(id)?.is_some_and(|c| c.state == "lost") {
+							self.store.set_coin_state(id, was, &format!("the trade that made it completed after all, by {}", txid))?;
+						}
+					}
 					self.store.set_coin_spent(leaf_id, &format!("its trade completed after all, by {}", txid))?;
 					return Ok(json!({"leaf_id": leaf_id, "state": "spent", "spent_by": txid,
 						"note": "the trade it was given into completed after all"}));
 				}
-				if sp.output.iter().any(|o| o.script_pubkey == to) {
+				// The wallet's own claim: paid to its claim address, or, for a
+				// wallet restored since (which drew another address), spent by
+				// the checkpoint's exit leaf, which only the coin's own key
+				// signs.
+				let at = OutPoint::new(tx.txid(), vout);
+				let by_exit = sp.input.iter().find(|x| x.previous_output == at).is_some_and(|x| {
+					let w = &x.witness.script_witness;
+					w.len() >= 2 && i.checkpoint.exit_script().is_some_and(|e| w[w.len() - 2] == e.to_bytes())
+				});
+				if by_exit || sp.output.iter().any(|o| o.script_pubkey == to) {
 					let f = self.chain.finality(&sp.txid())?;
 					if f.is_final() {
 						self.store.set_coin_state(leaf_id, "exited", &format!("returned: its trade never completed; claimed by its \

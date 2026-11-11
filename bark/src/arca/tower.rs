@@ -459,6 +459,35 @@ impl Wallet {
 		Ok(Some((record, bases, opens)))
 	}
 
+	/// Deposits the wallet's coins with its watchtowers now, and says which
+	/// of `ids` (a trade's coins) a watchtower holds: called before a trade
+	/// is reported done, since a trade whose checkpoints carry their owners'
+	/// exit can be undone by an early checkpoint nobody answers within the
+	/// exit delay, and the coin a trade paid, and any coin paid on from it,
+	/// is lost then. Where none holds them, the answer says so: the trade
+	/// then rests on this wallet answering at its next sync or re-check.
+	pub(crate) fn deposit_now(&mut self, ids: &[String]) -> Value {
+		let ran = self.progress_deposits().unwrap_or_else(|e| vec![json!({"error": e.to_string()})]);
+		let (mut held, mut not) = (vec![], vec![]);
+		for id in ids {
+			match self.store.deposit_sent_to(id) {
+				Ok(t) if !t.is_empty() => held.push(json!({"leaf_id": id, "watchtowers": t})),
+				_ => not.push(id.clone()),
+			}
+		}
+		let mut v = json!({"held": held});
+		if !not.is_empty() {
+			v["not_held"] = json!(not);
+			v["note"] = json!("no watchtower holds these coins of the trade yet: until one does, the trade rests on this wallet: \
+				should the other side publish its checkpoint early, the wallet answers it at its next sync or re-check, which must come \
+				within the exit delay; name a watchtower (watchtowers) or keep the wallet syncing");
+		}
+		if ran.iter().any(|r| !r["error"].is_null() || !r["passed_over"].is_null()) {
+			v["deposits"] = json!(ran);
+		}
+		v
+	}
+
 	/// Every live coin resting on a batch deposited with each watchtower the
 	/// wallet names, once; every deposit of a coin no longer the wallet's
 	/// withdrawn. What it did, a line a coin and watchtower; a watchtower

@@ -517,10 +517,18 @@ impl Wallet {
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let key = self.keys.leaf(&r.nonce)?;
 		let digest = publish_digest(&self.genesis, &self.operator, &id, &nonces, &mailbox);
-		self.server.post("order_publish", &json!({
+		let mut body = json!({
 			"record": hex(&row.record), "credit_nonces": r.credit_nonces, "mailbox": hex(&mailbox.serialize()),
 			"signature": hex(sign(&key, &digest).as_ref()),
-		}))
+		});
+		// The record formats this wallet reads: a taker gives a coin of the
+		// newer format, and asks for the checkpoint exit, only to a maker
+		// that names it. An operator that publishes no `checkpoint_exit`
+		// predates the field and would refuse it.
+		if self.server_info()?.get("checkpoint_exit").is_some() {
+			body["record_formats"] = json!(arca_covenant::RECORD_FORMATS);
+		}
+		self.server.post("order_publish", &body)
 	}
 
 	/// How the wallet's resting orders stand, as the operator shows them, and
@@ -643,8 +651,14 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		let mut kept = 0u64;
 		let mut done = None;
+		// An order an older build published names no format it reads: its
+		// maker reads no coin record of the newer format.
+		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
 		for mut c in self.coins_to_give(asset_b)? {
 			if c.row.expiry < order_expiry {
+				continue;
+			}
+			if !maker_reads && c.row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
 				continue;
 			}
 			if chosen.len() == super::round::MAX_GIVEN {
@@ -710,7 +724,12 @@ impl Wallet {
 		// the operator co-signs them: a fill the maker and the operator never
 		// complete then gives them back (`arca_covenant::checkpoint`). The
 		// maker's order coin is spent only if the fill confirms.
-		let checkpoint_exit = Self::checkpoint_exit_offered(&info);
+		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
+		let checkpoint_exit = Self::checkpoint_exit_offered(&info) && maker_reads;
+		if !checkpoint_exit {
+			self.exit_required(if maker_reads { "the operator does not offer it (info.checkpoint_exit)" } else {
+				"the order's maker reads no coin record of the format it makes (an older build)" })?;
+		}
 		let tplan = TransferPlan { checkpoint_exit, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
 		// The fill spends the order's coin at input 0 and the checkpoints
 		// after it: a vtxo-2 checkpoint's pair names them all, its own index
