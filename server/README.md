@@ -1771,10 +1771,12 @@ the bond wants refreshed soonest. A name that is not one of the
 participation's inputs is refused (`malformed`). The operator takes each
 name only as far as its own records bear it out: the coin is out of round (a
 reassignment's or a fill's), and the transfer that made it posted it to a
-mailbox other than its inputs' (a wallet's change from its own payment goes
-back to its own mailbox; an output that named no mailbox is posted to its
-leaf's own key, and never qualifies). A name the records do not bear out is
-logged, and that coin is judged as any coin; the others keep their place.
+mailbox other than its inputs' (an output that named no mailbox is posted to
+its leaf's own key, and never qualifies). This screens out a wallet's change
+sent back to its own mailbox, and no more: it does not identify a payer. A
+wallet can post its own change to another key, or spend coins bound to no
+mailbox, and pass it. A name the records do not bear out is logged, and that
+coin is judged as any coin; the others keep their place.
 A participation with payments arriving runs ahead of the other
 participations of its asset, oldest first. What those payments open may run
 past the cap by the asset's lane (`arriving_lane`, in atoms, or
@@ -1782,7 +1784,8 @@ past the cap by the asset's lane (`arriving_lane`, in atoms, or
 `assets[].arriving_lane`; no lane when absent), while what the
 participation opens beside them stays within the cap. The lane is capital
 the operator chooses to risk: no record tells a payment between two wallets
-of one owner from a real one, so anyone holding two wallets can use it.
+of one owner from a real one, so anyone can use it, and the lane is sized as
+the capital the operator is willing to front for that.
 A coin whose own forfeit is final on the chain, brought down by a collection
 (through its lineage's reassignments when it was paid on out of round), counts
 for nothing either.
