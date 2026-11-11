@@ -35,9 +35,9 @@
 //!   that a leaf is `H`'s. Otherwise a wallet could hold a leaf whose exit
 //!   pays another holder's enclave and spend it under that holder's rules.
 //! - `D` after `K` binds the operator's pair to the enclave the coin exits to,
-//!   as a `landing-1` leaf's `P` binds its landing: a signer told the wrong
+//!   as a landing leaf's `P` binds its landing: a signer told the wrong
 //!   holder signs a message no real leaf checks. `D` is 20 bytes, so the
-//!   message has a `landing-1` message's length, 95 + 32m bytes, and `K` is
+//!   message has a landing message's length, 95 + 32m bytes, and `K` is
 //!   the salt's own, as the equivocation bond reads it.
 //! - The claw leaf is the enclave's own, byte for byte. Its signatures are
 //!   signature hashes over the spending transaction, so they move one coin,

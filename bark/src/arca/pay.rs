@@ -959,7 +959,7 @@ impl Wallet {
 				let program: [u8; 20] = unhex(req["landing"].as_str().unwrap_or(""))?.try_into().map_err(|_| Error::Refused(format!(
 					"asset {} is supervised, and the request names no landing: a coin of it lands only at its receiver's own key, which a \
 					request from an older wallet does not name; ask the receiver for a new request", asset)))?;
-				Some(arca_covenant::Landing { program, allowance: own.allowance }.terms(asset, value)
+				Some(arca_covenant::Landing { program, allowance: own.allowance, own_index: false }.terms(asset, value)
 					.map_err(|e| Error::Refused(e.to_string()))?)
 			},
 			None => None,

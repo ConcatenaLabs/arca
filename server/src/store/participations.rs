@@ -118,7 +118,7 @@ pub(crate) fn landing_of(b: &[u8]) -> Result<arca_covenant::Landing, StoreError>
 	}
 	let mut program = [0u8; 20];
 	program.copy_from_slice(&b[..20]);
-	Ok(arca_covenant::Landing { program, allowance: u64::from_le_bytes(b[20..].try_into().expect("8 bytes")) })
+	Ok(arca_covenant::Landing { program, allowance: u64::from_le_bytes(b[20..].try_into().expect("8 bytes")), own_index: false })
 }
 
 /// What an output wanted is.

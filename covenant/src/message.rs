@@ -7,7 +7,7 @@
 //!   being spent and to the chain,
 //!   `SHA256(K ‖ asset_in ‖ 0x01 ‖ 0x01 ‖ value_in ‖ m ‖ SHA256(record 0) ‖ … ‖ SHA256(record m-1))`
 //!   with `K = SHA256(SHA256("ArcaRbd1" ‖ genesis_hash) ‖ salt)`; a
-//!   `landing-1` leaf's script pushes `K ‖ P`, `P` its landing program, so its
+//!   landing leaf's script pushes `K ‖ P`, `P` its landing program, so its
 //!   message is `SHA256(K ‖ P ‖ asset_in ‖ …)` ([`Chain::landing_prefix`]);
 //! - the unroll authorisation, `SHA256("Arca/unroll" ‖ H ‖ t)`;
 //! - the release each owner under a lowest node signs,
@@ -91,7 +91,7 @@ impl Chain {
 		sha256(&b)
 	}
 
-	/// What a `landing-1` leaf's collaborative script pushes where another
+	/// What a landing leaf's collaborative script pushes where another
 	/// leaf's pushes `K`: `K ‖ P`, the salt's own `K` followed by the leaf's
 	/// landing program `P` (20 bytes), 52 bytes. Its rebindable message is
 	/// `SHA256(K ‖ P ‖ asset_in ‖ …)`, so a pair made for one landing spends
@@ -108,7 +108,7 @@ impl Chain {
 
 	/// What an `enclave-1` leaf's collaborative script pushes where another
 	/// leaf's pushes `K`: `K ‖ D`, `D` the 20-byte digest of the holder's
-	/// enclave ([`crate::enclave::Enclave::digest`]). It has a `landing-1`
+	/// enclave ([`crate::enclave::Enclave::digest`]). It has a landing
 	/// constant's shape, 52 bytes, and its message is
 	/// `SHA256(K ‖ D ‖ asset_in ‖ …)`, so a pair made for one holder's
 	/// enclave spends only a leaf that exits there.
@@ -162,7 +162,7 @@ impl Chain {
 
 /// The rebindable message for a spend of a coin of `asset_in` and `value_in`
 /// that commits to `outputs` at indices `0..m`. `k` is what the script pushes:
-/// `K` ([`Chain::leaf_constant`]), or a `landing-1` leaf's `K ‖ P`
+/// `K` ([`Chain::leaf_constant`]), or a landing leaf's `K ‖ P`
 /// ([`Chain::landing_prefix`]). The format carries `m` in one byte; the scripts
 /// take 1 to 4 outputs ([`crate::leaf::MAX_OUTPUTS`]), `htlc-1` exactly one.
 pub fn rebind_message(k: &[u8], asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {

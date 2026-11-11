@@ -1412,7 +1412,7 @@ mod test {
 		let other = req(vec![output(4, Some(HtlcTerms { payment_hash: [8; 32], ..t })), output(5, None)]);
 		let landed = |program: [u8; 20]| {
 			let mut o = output(4, None);
-			o.leaf.landing = Some(arca_covenant::LandingTerms { program, asset: o.asset, min_value: 900 });
+			o.leaf.landing = Some(arca_covenant::LandingTerms { program, asset: o.asset, min_value: 900, own_index: false });
 			req(vec![o, output(5, None)])
 		};
 		let all = [plain, first, second, other, landed([7; 20]), landed([8; 20])];

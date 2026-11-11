@@ -83,7 +83,8 @@ fn the_builder_rebuilds_every_record_vector() {
 			let landing = l.get("landing").map(|g| {
 				let mut program = [0u8; 20];
 				program.copy_from_slice(&Vec::<u8>::from_hex(g["program"].as_str().unwrap()).unwrap());
-				arca_covenant::Landing { program, allowance: g["allowance"].as_u64().unwrap() }
+				arca_covenant::Landing { program, allowance: g["allowance"].as_u64().unwrap(),
+					own_index: l["template"] == "landing-2" }
 			});
 			let channel = l.get("channel").map(|c| arca_covenant::Channel {
 				capacity: c["capacity"].as_u64().unwrap(),
@@ -97,7 +98,7 @@ fn the_builder_rebuilds_every_record_vector() {
 			});
 			LeafSpec {
 				template: if let Some(o) = &order { o.template() } else if htlc.is_some() { Template::Htlc1 }
-					else if landing.is_some() { Template::Landing1 } else if channel.is_some() { Template::Channel1 }
+					else if let Some(g) = &landing { g.template() } else if channel.is_some() { Template::Channel1 }
 					else if claim.is_some() { Template::Claim1 }
 					else if l.get("template") == Some(&serde_json::json!("vtxo-2")) { Template::Vtxo2 } else { Template::Vtxo1 },
 				owner: key_of(&l["owner"]),

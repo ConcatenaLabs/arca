@@ -126,14 +126,17 @@ def landing_exit(a_x, delay, program, asset_id, min_value):
                     a_x, OP_CHECKSIG])
 
 
-def landing_taptree(a_x, s_x, salt, ctag, delay, program, asset_id, value, allowance):
-    """landing-1: [collab, landing], both at depth 1. collab is the leaf's
-    collaborative path, its script pushing K || P (landing_prefix); landing is
-    the exit forced into the owner's single-owner output, P2WPKH(L), where a
-    freeze of the asset binds."""
+def landing_taptree(a_x, s_x, salt, ctag, delay, program, asset_id, value, allowance, own_index=False):
+    """landing-1, or landing-2 with own_index: [collab, landing], both at
+    depth 1. collab is the leaf's collaborative path, its script pushing
+    K || P (landing_prefix); landing is the exit forced into the owner's
+    single-owner output, P2WPKH(L), where a freeze of the asset binds: at
+    output 0 for landing-1 (landing_exit), at the spending input's own index
+    for landing-2 (landing_exit_own_index), so two landings spent together
+    never share one output."""
     assert 0 <= allowance < value
     collab = collab3_loop(a_x, s_x, salt, ctag, fold=True, const=landing_prefix(ctag, salt, program))
-    land = landing_exit(a_x, delay, program, asset_id, value - allowance)
+    land = (landing_exit_own_index if own_index else landing_exit)(a_x, delay, program, asset_id, value - allowance)
     tap = taproot_construct(NUMS, [("collab", collab), ("landing", land)])
     return tap, {"collab": collab, "landing": land}
 
@@ -771,10 +774,11 @@ def connector_taptree(s_x):
 
 
 def landing_exit_own_index(a_x, delay, program, asset_id, min_value):
-    """A checkpoint's landing exit: landing_exit with the output at the
-    spending input's own index inspected (OP_PUSHCURRENTINPUTINDEX where the
-    leaf pushes 0), so two landings spent together can never share one
-    output. The same 119 bytes with a 512-second delay. Witness: <sig_A>."""
+    """landing-2's exit, and a checkpoint's landing exit for either landing
+    leaf: landing_exit with the output at the spending input's own index
+    inspected (OP_PUSHCURRENTINPUTINDEX where landing-1 pushes 0), so two
+    landings spent together can never share one output. The same 119 bytes
+    with a 512-second delay. Witness: <sig_A>."""
     assert len(program) == 20 and len(asset_id) == 32
     return CScript([delay, OP_CHECKSEQUENCEVERIFY, OP_DROP,
                     OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTSCRIPTPUBKEY, OP_0, OP_EQUALVERIFY, program, OP_EQUALVERIFY,

@@ -66,7 +66,7 @@
 //! ```text
 //! u8    format version, 2
 //! u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing), 7 (channel), 8 (claim) or 9 (vest)
-//! u8    template version, 1 (vtxo, htlc, landing, channel, claim, vest), or 2 or 3 (order)
+//! u8    template version, 1 (vtxo, htlc, landing, channel, claim, vest), 2 (landing), or 2 or 3 (order)
 //! [32]  owner key A                   the vtxo-1 parameters
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
 //! [32]  operator nonce
@@ -84,9 +84,11 @@
 //! u32   the landed order's REFUND time, a median time
 //! [32]  the landed order's refund key
 //! 4 × [32]  the next credit keys, the next first, zero once used
-//!       for landing-1 only (a leaf of a supervised asset, [`crate::landing`]):
+//!       for landing-1 and landing-2 only (a leaf of a supervised asset,
+//!       [`crate::landing`]; landing-1 lands at output 0, landing-2 at the
+//!       spending input's own index):
 //! [20]  P, the landing program: hash160 of the owner's landing key L
-//! u64   the fee allowance: the landing's output 0 holds at least the value
+//! u64   the fee allowance: the landing's output holds at least the value
 //!       less this; below the value
 //!       for channel-1 only (a leaf with a balance for each side, [`crate::channel`]):
 //! u64   the operator's opening balance, below the value
@@ -223,8 +225,13 @@ pub enum Template {
 	Order3,
 	/// `landing-1`, the leaf of a supervised asset: its exit pays only P2WPKH
 	/// of the owner's landing key, where a freeze of the asset binds
-	/// ([`crate::landing`]).
+	/// ([`crate::landing`]), at output 0. Read and spent for the coins built
+	/// under it; new coins are `landing-2`.
 	Landing1,
+	/// `landing-2`: `landing-1` whose landing pays the output at the spending
+	/// input's own index, so two landings spent together never share one
+	/// output ([`crate::landing`]).
+	Landing2,
 	/// `channel-1`, a leaf with a balance for each of owner and operator,
 	/// replaced by a newer state both sign and settled after the exit delay
 	/// ([`crate::channel`]).
@@ -254,8 +261,8 @@ impl Template {
 	/// Every template this crate knows, in the order of their ids and
 	/// versions. The operator publishes those its rounds make
 	/// (`info.templates`), which leaves out `order-2`.
-	pub const ALL: [Template; 11] = [Template::Vtxo1, Template::Vtxo2, Template::Board1, Template::Htlc1, Template::Order2,
-		Template::Order3, Template::Landing1, Template::Enclave1, Template::Channel1, Template::Claim1, Template::Vest1];
+	pub const ALL: [Template; 12] = [Template::Vtxo1, Template::Vtxo2, Template::Board1, Template::Htlc1, Template::Order2,
+		Template::Order3, Template::Landing1, Template::Landing2, Template::Enclave1, Template::Channel1, Template::Claim1, Template::Vest1];
 
 	/// The template id of `vtxo`.
 	pub const VTXO: u8 = 1;
@@ -283,7 +290,7 @@ impl Template {
 			Template::Board1 => Template::BOARD,
 			Template::Htlc1 => Template::HTLC,
 			Template::Order2 | Template::Order3 => Template::ORDER,
-			Template::Landing1 => Template::LANDING,
+			Template::Landing1 | Template::Landing2 => Template::LANDING,
 			Template::Channel1 => Template::CHANNEL,
 			Template::Enclave1 => Template::ENCLAVE,
 			Template::Vtxo2 => Template::VTXO,
@@ -297,7 +304,7 @@ impl Template {
 		match self {
 			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 | Template::Enclave1 | Template::Channel1
 			| Template::Claim1 | Template::Vest1 => 1,
-			Template::Order2 | Template::Vtxo2 => 2,
+			Template::Order2 | Template::Vtxo2 | Template::Landing2 => 2,
 			Template::Order3 => 3,
 		}
 	}
@@ -309,7 +316,7 @@ impl Template {
 			Template::Board1 => "board",
 			Template::Htlc1 => "htlc",
 			Template::Order2 | Template::Order3 => "order",
-			Template::Landing1 => "landing",
+			Template::Landing1 | Template::Landing2 => "landing",
 			Template::Channel1 => "channel",
 			Template::Enclave1 => "enclave",
 			Template::Claim1 => "claim",
@@ -327,6 +334,7 @@ impl Template {
 			(Template::ORDER, 2) => Ok(Template::Order2),
 			(Template::ORDER, 3) => Ok(Template::Order3),
 			(Template::LANDING, 1) => Ok(Template::Landing1),
+			(Template::LANDING, 2) => Ok(Template::Landing2),
 			(Template::CHANNEL, 1) => Ok(Template::Channel1),
 			(Template::ENCLAVE, 1) => Ok(Template::Enclave1),
 			(Template::CLAIM, 1) => Ok(Template::Claim1),
@@ -367,7 +375,7 @@ impl FromStr for Template {
 			"board" => &[Template::Board1],
 			"htlc" => &[Template::Htlc1],
 			"order" => &[Template::Order2, Template::Order3],
-			"landing" => &[Template::Landing1],
+			"landing" => &[Template::Landing1, Template::Landing2],
 			"channel" => &[Template::Channel1],
 			"enclave" => &[Template::Enclave1],
 			"claim" => &[Template::Claim1],
@@ -432,8 +440,9 @@ pub struct LeafRecord {
 	/// An order's terms: present exactly when the template is `order-3` or
 	/// `order-2`, and landing as the version the template names.
 	pub order: Option<OrderLeafTerms>,
-	/// `landing-1`'s landing: present exactly when the template is
-	/// `landing-1`.
+	/// The landing: present exactly when the template is `landing-1` or
+	/// `landing-2`, and landing as the template names
+	/// ([`Landing::own_index`]).
 	pub landing: Option<Landing>,
 	/// `channel-1`'s terms: present exactly when the template is `channel-1`.
 	pub channel: Option<Channel>,
@@ -579,7 +588,7 @@ pub enum RecordError {
 	Order(String),
 	#[error("the htlc-1 terms: {0}")]
 	Htlc(crate::Error),
-	#[error("the landing-1 terms: {0}")]
+	#[error("the landing terms: {0}")]
 	Landing(crate::landing::LandingError),
 	#[error("the channel-1 terms: {0}")]
 	Channel(ChannelError),
@@ -700,12 +709,14 @@ pub(crate) fn check_template(template: Template, htlc: &Option<HtlcTerms>, order
 			.map_err(|e| RecordError::Order(e.to_string()))?,
 		(Template::Order2 | Template::Order3, None, Some(o), None) =>
 			return Err(RecordError::Template(format!("{} with the terms of {}", template, o.template()))),
-		(Template::Landing1, None, None, Some(l)) => {
+		(Template::Landing1 | Template::Landing2, None, None, Some(l)) if l.template() == template => {
 			l.terms(asset, value).map_err(RecordError::Landing)?;
 		},
+		(Template::Landing1 | Template::Landing2, None, None, Some(l)) =>
+			return Err(RecordError::Template(format!("{} with the landing of {}", template, l.template()))),
 		(Template::Htlc1, None, ..) => return Err(RecordError::Template("htlc-1 without its terms".into())),
 		(Template::Order2 | Template::Order3, _, None, _) => return Err(RecordError::Template(format!("{} without its terms", template))),
-		(Template::Landing1, _, _, None) => return Err(RecordError::Template("landing-1 without its terms".into())),
+		(Template::Landing1 | Template::Landing2, _, _, None) => return Err(RecordError::Template(format!("{} without its terms", template))),
 		(Template::Enclave1, ..) => return Err(RecordError::Template(
 			"enclave-1 in a batch: a leaf of a restricted asset rests on its board or comes from a reassignment".into())),
 		(Template::Vtxo1, ..) => return Err(RecordError::Template("vtxo-1 with another template's terms".into())),
@@ -731,7 +742,7 @@ pub(crate) fn leaf_policy(template: Template,
 		// check_template() refuses an allowance not below the value; built
 		// anyway, the script is the one such a record names.
 		landing: landing.map(|l| crate::landing::LandingTerms {
-			program: l.program, asset, min_value: value.saturating_sub(l.allowance),
+			program: l.program, asset, min_value: value.saturating_sub(l.allowance), own_index: l.own_index,
 		}),
 		channel: None,
 		v2: template == Template::Vtxo2,
@@ -1106,10 +1117,10 @@ impl LeafRecord {
 			None => None,
 		};
 		let landing = match template {
-			Template::Landing1 => {
+			Template::Landing1 | Template::Landing2 => {
 				let mut program = [0u8; PROGRAM_BYTES];
 				program.copy_from_slice(r.bytes(PROGRAM_BYTES)?);
-				Some(Landing { program, allowance: r.u64()? })
+				Some(Landing { program, allowance: r.u64()?, own_index: template == Template::Landing2 })
 			},
 			_ => None,
 		};

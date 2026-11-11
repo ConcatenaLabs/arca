@@ -162,7 +162,7 @@ impl Holder {
 	}
 
 	fn landing(&self, allowance: u64) -> Landing {
-		Landing { program: self.program(), allowance }
+		Landing { program: self.program(), allowance, own_index: false }
 	}
 
 	fn script(&self) -> Script {

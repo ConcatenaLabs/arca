@@ -89,7 +89,7 @@ fn the_wallets_digests_are_the_servers() {
 		credits: [1, 2, 3, 4].map(|i| key(&format!("credit {}", i)).x_only_public_key().0.serialize()),
 	};
 	// A supervised asset's leaf (`landing-1`): its id covers its landing.
-	let landing = arca_covenant::Landing { program: [0x2b; 20], allowance: 300 };
+	let landing = arca_covenant::Landing { program: [0x2b; 20], allowance: 300, own_index: false };
 	let mut ids_seen = vec![];
 	for (fees, nb, template, terms, land) in [
 		(vec![], None, Template::Vtxo1, None, None),

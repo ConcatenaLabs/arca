@@ -2308,7 +2308,7 @@ impl Wallet {
 				of it", asset))),
 			(Some(s), true) => {
 				let allowance = amount(&s["landing_allowance"], "landing_allowance")?;
-				Ok(Some(arca_covenant::Landing { program: self.keys.landing_program()?, allowance }))
+				Ok(Some(arca_covenant::Landing { program: self.keys.landing_program()?, allowance, own_index: false }))
 			},
 		}
 	}

@@ -146,8 +146,9 @@ pub struct LeafSpec {
 	pub htlc: Option<HtlcTerms>,
 	/// `order-2`'s terms, present exactly when the template is `order-2`.
 	pub order: Option<OrderLeafTerms>,
-	/// `landing-1`'s landing, present exactly when the template is
-	/// `landing-1`: every leaf of a supervised asset's batch.
+	/// The landing, present exactly when the template is `landing-1` or
+	/// `landing-2` (as [`Landing::own_index`] says): every leaf of a
+	/// supervised asset's batch.
 	pub landing: Option<Landing>,
 	/// `channel-1`'s terms, present exactly when the template is
 	/// `channel-1`: the operator's opening balance, part of the leaf's value,
@@ -347,7 +348,7 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 			(Template::Htlc1, Some(t), None, None) if t.check(spec.exit_delay).is_ok() => None,
 			(Template::Order2 | Template::Order3, None, Some(o), None)
 				if o.template() == spec.template && o.check(params.asset, &spec.owner, &operator).is_ok() => None,
-			(Template::Landing1, None, None, Some(l)) => match l.terms(params.asset, spec.value) {
+			(Template::Landing1 | Template::Landing2, None, None, Some(l)) if l.template() == spec.template => match l.terms(params.asset, spec.value) {
 				Ok(t) => Some(t),
 				Err(_) => return Err(TreeError::Template { leaf: i }),
 			},

@@ -80,7 +80,7 @@
 //! u8    format version, 1
 //! u8    template, u8 template version          as a leaf record's
 //! [32]  owner key, [32] owner nonce, [32] operator nonce, u16 exit delay
-//!       the template's terms (htlc-1, order-2, landing-1) as a leaf record's
+//!       the template's terms (htlc-1, order-2, landing-1, landing-2) as a leaf record's
 //! [32]  asset, u64 value, [32] unlock hash, u64 entry reserve
 //! [32]  genesis hash, [32] operator key S, [32] token T, u16 notice W
 //! u8    flags: bit 0, the sweeps are burn-only
@@ -1741,10 +1741,10 @@ impl AccumulatorRecord {
 			None => None,
 		};
 		let landing = match template {
-			Template::Landing1 => {
+			Template::Landing1 | Template::Landing2 => {
 				let mut program = [0u8; crate::landing::PROGRAM_BYTES];
 				program.copy_from_slice(r.bytes(crate::landing::PROGRAM_BYTES)?);
-				Some(Landing { program, allowance: r.u64()? })
+				Some(Landing { program, allowance: r.u64()?, own_index: template == Template::Landing2 })
 			},
 			_ => None,
 		};
