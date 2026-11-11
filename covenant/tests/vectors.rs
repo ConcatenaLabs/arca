@@ -198,13 +198,44 @@ impl Ctx {
 
 	fn checkpoint(&self) -> CheckpointPolicy {
 		let p = &self.output("checkpoint")["params"];
-		let cp = CheckpointPolicy {
+		let cp = CheckpointPolicy { exit: None,
 			owner: key(&p["owner"]),
 			operator: key(&p["operator"]),
 			salt: h32(&p["salt"]),
 			chain: self.chain,
 			sweep: Some(self.sweep_of(p, false)),
 			v2: false,
+		};
+		assert_eq!(cp.leaf_constant(), h32(&p["K"]));
+		cp
+	}
+
+	/// A checkpoint with its owner's exit: `checkpoint_exit` without a
+	/// sweep, `checkpoint_exit_sweep` with one.
+	fn checkpoint_exit(&self, name: &str) -> CheckpointPolicy {
+		let p = &self.output(name)["params"];
+		let cp = CheckpointPolicy {
+			owner: key(&p["owner"]),
+			operator: key(&p["operator"]),
+			salt: h32(&p["salt"]),
+			chain: self.chain,
+			sweep: (name == "checkpoint_exit_sweep").then(|| self.sweep_of(p, false)),
+			v2: false,
+			exit: Some(CheckpointExit::plain(rel(&p["exit_delay"]))),
+		};
+		assert_eq!(cp.leaf_constant(), h32(&p["K"]));
+		cp
+	}
+
+	/// A `landing-1` coin's checkpoint with its owner's exit, the landing.
+	fn checkpoint_landing(&self) -> CheckpointPolicy {
+		let p = &self.output("checkpoint_landing")["params"];
+		let mut program = [0u8; 20];
+		program.copy_from_slice(&hex(&p["landing_program"]));
+		let landing = LandingTerms { program, asset: asset(&p["asset"]), min_value: p["min_value"].as_u64().unwrap() };
+		let cp = CheckpointPolicy {
+			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, sweep: None, v2: false,
+			exit: Some(CheckpointExit { delay: rel(&p["exit_delay"]), landing: Some(landing) }),
 		};
 		assert_eq!(cp.leaf_constant(), h32(&p["K"]));
 		cp
@@ -322,6 +353,18 @@ impl Ctx {
 				let c = self.checkpoint();
 				(c.taproot(), BTreeMap::from([("collab", c.collab_script()), ("sweep", c.sweep_script().unwrap())]))
 			},
+			"checkpoint_exit" | "checkpoint_exit_sweep" => {
+				let c = self.checkpoint_exit(name);
+				let mut m = BTreeMap::from([("collab", c.collab_script()), ("exit", c.exit_script().unwrap())]);
+				if let Some(sw) = c.sweep_script() {
+					m.insert("sweep", sw);
+				}
+				(c.taproot(), m)
+			},
+			"checkpoint_landing" => {
+				let c = self.checkpoint_landing();
+				(c.taproot(), BTreeMap::from([("collab", c.collab_script()), ("exit", c.exit_script().unwrap())]))
+			},
 			"htlc" | "htlc_receive" => {
 				let h = self.htlc(name);
 				(h.taproot(), BTreeMap::from([
@@ -348,7 +391,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 20);
+	assert_eq!(outputs.len(), 23);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();
@@ -388,7 +431,7 @@ fn every_spend_matches_its_vector_and_verifies() {
 	let ctx = Ctx::load();
 	let verifier = Verifier::consensus(ctx.genesis);
 	let spends = ctx.v["spends"].as_array().unwrap();
-	assert_eq!(spends.len(), 37);
+	assert_eq!(spends.len(), 41);
 	for s in spends {
 		let name = s["name"].as_str().unwrap();
 		let output = s["output"].as_str().unwrap();
@@ -437,6 +480,22 @@ fn every_spend_matches_its_vector_and_verifies() {
 			},
 			("entry", "sweep") => ctx.entry("entry", false).sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32).unwrap(),
 			("checkpoint", "sweep") => ctx.checkpoint().sweep_witness(&checksig("S"), s["k"].as_u64().unwrap() as u32).unwrap(),
+			(n @ ("checkpoint_exit" | "checkpoint_exit_sweep" | "checkpoint_landing"), "exit") => {
+				let c = if n == "checkpoint_landing" { ctx.checkpoint_landing() } else { ctx.checkpoint_exit(n) };
+				let ks = c.exit_tx(tx.input[0].previous_output, asset_in, value_in, &committed(1), &FeeSource::Reserve).unwrap();
+				assert_eq!(ks.tx.txid(), tx.txid(), "{}: the policy's exit transaction", name);
+				c.exit_witness(&checksig(ctx.label_of(&c.owner))).unwrap()
+			},
+			("checkpoint_exit", "collab") => {
+				let c = ctx.checkpoint_exit("checkpoint_exit");
+				let m = s["m"].as_u64().unwrap() as usize;
+				let msg = c.collab_message(asset_in, value_in, &committed(m)).unwrap();
+				// The message names the salt and never the spent script: the
+				// same as a checkpoint without the exit under this salt.
+				assert_eq!(msg, CheckpointPolicy { exit: None, ..c }.collab_message(asset_in, value_in, &committed(m)).unwrap());
+				let owner = ctx.label_of(&c.owner).to_string();
+				c.collab_witness(&csfs(&msg, "S"), &csfs(&msg, &owner), m as u8)
+			},
 			("entry", "unlock") => ctx.entry("entry", false).unlock_witness(&h32(&s["preimage"])),
 			(n, "reclaim") => {
 				let node = ctx.node(n, false);

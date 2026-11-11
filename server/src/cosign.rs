@@ -122,6 +122,9 @@ pub struct OutputRequest {
 pub struct TransferRequest {
 	pub inputs: Vec<InputRequest>,
 	pub outputs: Vec<OutputRequest>,
+	/// Each coin of a plain leaf moves into a checkpoint with its owner's
+	/// exit ([`TransferPlan::checkpoint_exit`]), as the owners signed.
+	pub checkpoint_exit: bool,
 }
 
 /// What the server returns for a co-signed transfer.
@@ -361,6 +364,11 @@ impl TransferRequest {
 				e.input(&[o.leaf.v2 as u8]);
 			}
 		}
+		// Checkpoints with their owners' exit: a request without hashes as
+		// it always did.
+		if self.checkpoint_exit {
+			e.input(&[0xfb, 1]);
+		}
 		sha256::Hash::from_engine(e).to_byte_array()
 	}
 }
@@ -479,6 +487,10 @@ impl Cosigner {
 		let ids: HashSet<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		if ids.len() != n {
 			return Err(CosignError::Malformed("a leaf is given twice".into()));
+		}
+		if req.checkpoint_exit && !self.params.checkpoint_exit {
+			return Err(CosignError::NotServed("this operator co-signs no checkpoint with its owner's exit (info.checkpoint_exit is false): \
+				the owners sign the transfer again without it".into()));
 		}
 		let transfer = req.hash();
 		// A request repeated byte for byte gets the answer it got.
@@ -618,7 +630,7 @@ impl Cosigner {
 		}
 
 		// The owners' signatures.
-		let plan = TransferPlan {
+		let plan = TransferPlan { checkpoint_exit: req.checkpoint_exit,
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
@@ -855,7 +867,7 @@ impl Cosigner {
 		let mut records = Vec::with_capacity(m);
 		for (j, o) in req.outputs.iter().enumerate() {
 			let record = CoinRecord::Transfer(Box::new(Transfer {
-				inputs: checked.iter().zip(&req.inputs).zip(&sigs).map(|((c, i), (cp, re))| TransferInput {
+				inputs: checked.iter().zip(&req.inputs).zip(&sigs).enumerate().map(|(k, ((c, i), (cp, re)))| TransferInput { exit: plan.exit(k),
 					coin: c.record.clone(),
 					checkpoint_value: i.checkpoint_value,
 					checkpoint: Pair { operator: *cp, owner: i.checkpoint_sig },
@@ -942,7 +954,8 @@ impl Cosigner {
 		let mut sized = Vec::with_capacity(checked.len());
 		for (k, (i, c)) in req.inputs.iter().zip(checked).enumerate() {
 			let vi = ValidInput {
-				coin: c.coin.clone(), checkpoint: c.coin.checkpoint(), checkpoint_value: c.coin.value,
+				coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed(), c.coin.value),
+				checkpoint_value: c.coin.value,
 				checkpoint_pair: pair, reassignment_pair: pair,
 			};
 			let vsize = vi.checkpoint_tx(OutPoint::default(), &FeeSource::Reserve).map_err(internal)?.tx.vsize();
@@ -1392,7 +1405,7 @@ mod test {
 			direction: HtlcDirection::Send, payment_hash: [9; 32], timeout: MedianTime::from_consensus(1_800_000_000).unwrap(),
 			operator_delay: RelativeTime::from_units(36).unwrap(),
 		};
-		let req = |o: Vec<OutputRequest>| TransferRequest { inputs: vec![input.clone()], outputs: o }.hash();
+		let req = |o: Vec<OutputRequest>| TransferRequest { inputs: vec![input.clone()], outputs: o, checkpoint_exit: false }.hash();
 		let plain = req(vec![output(4, None), output(5, None)]);
 		let first = req(vec![output(4, Some(t)), output(5, None)]);
 		let second = req(vec![output(4, None), output(5, Some(t))]);

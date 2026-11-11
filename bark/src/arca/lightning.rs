@@ -270,6 +270,18 @@ impl Wallet {
 	pub fn lightning_pay_shown(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>, timeout: Option<u32>,
 		shown: Option<&Value>) -> Result<Value, Error>
 	{
+		self.lightning_pay_spend(invoice, from, max_fee_ppm, timeout, shown, super::places::Spend::Pay)
+	}
+
+	/// [`Self::lightning_pay_shown`] for a spend of `spend`: the leg of a
+	/// cross-chain swap paid to another party takes no trade proceeds while
+	/// the wallet sets an instant limit ([`super::places`]). When proceeds
+	/// would have paid it, they go into the next round at once, and the
+	/// payment is refused, saying so: it goes ahead once that round has made
+	/// them the wallet's own.
+	pub(crate) fn lightning_pay_spend(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>, timeout: Option<u32>,
+		shown: Option<&Value>, spend: super::places::Spend) -> Result<Value, Error>
+	{
 		let p = self.pay_checks(invoice, from, max_fee_ppm)?;
 		let PayChecks { asset, value, fee, ref hash, ref info, operator_delay, owner_delay, timeout_seconds, now, .. } = p;
 		let inv = p.inv.clone();
@@ -291,7 +303,17 @@ impl Wallet {
 		let htlc = Out { asset, value: value + fee, leaf, mailbox, until: None };
 		let min = Self::min_leaf(info, asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
-		let (inputs, margin, change) = self.choose_coins(info, asset, value + fee, &htlc_out, min)?;
+		let (inputs, margin, change) = match self.choose_coins_for(info, asset, value + fee, &htlc_out, min, spend) {
+			Err(Error::Refused(why)) if spend == super::places::Spend::CrossChain => {
+				let settling = self.settle_proceeds(asset)?;
+				if settling > 0 {
+					return Err(Error::Refused(format!("{}; {} of asset {} the wallet got in trades goes into the next round now, and this \
+						goes ahead once that round has made it the wallet's own, in about a minute", why, settling, asset)));
+				}
+				return Err(Error::Refused(why));
+			},
+			r => r?,
+		};
 		if let Some(s) = shown {
 			let quote = Self::pay_quote_of(&p, &inputs, margin, change);
 			for k in ["payment_hash", "asset", "amount", "fee", "spends"] {

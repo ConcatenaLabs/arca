@@ -12,13 +12,13 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 an `enclave-1` leaf, 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf, 16 a `vest-1` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 an `enclave-1` leaf, 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf, 16 a `vest-1` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint, 17 a checkpoint with its owner's exit, 18 a `vtxo-2` coin's checkpoint with its owner's exit, 19 a `landing-1` coin's checkpoint with its landing), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
 //! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `enclave-1` then `H`, `Kp` (32 each), a clawback flag (u8) and `Ki` (32) when it is set, the asset (32) and the value the exit pays (u64); for `claim-1` then the deadline (u32), the return script's pin (32), the asset (32) and the least the lapse pays (u64); for `vest-1` the same, then the vest time (u32) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8: 0 none, 1 RECLAIM, 2 RECLAIM behind a vest time) and, when set, the genesis hash, then for 2 the vest time (u32) |
 //! | [`EntryPolicy`] | unlock hash, asset (32 each), value (u64), leaf program (32), sweep |
 //! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16), the leaf id given up (32), the connector asset (32) |
-//! | [`CheckpointPolicy`] | `A`, `S`, salt, genesis hash (32 each), sweep |
+//! | [`CheckpointPolicy`] | `A`, `S`, salt, genesis hash (32 each), sweep; with its owner's exit (types 17, 18 and 19) then the exit delay units (u16); for type 19 then the landing program (20), the asset (32) and the least the landing pays (u64) |
 //! | [`OffboardPolicy`] | unlock hash (32), destination asset (32), value (u64), script length (compact size, at most 10,000), script, `S` (32), reclaim delay units (u16) |
 //! | [`Sweep`] | `T`, `R` program, `S` (32 each), flags (u8: bit 0 notice, bit 1 burn), and the notice units (u16) when bit 0 is set |
 //! | No sweep, where a policy above holds its sweep | the no-sweep token ([`crate::clock::no_sweep_token`], 32), alone: no sweep names it |
@@ -484,7 +484,7 @@ impl Encoding for CheckpointPolicy {
 			operator: r.key()?,
 			salt: r.array32()?,
 			chain: r.chain()?,
-			sweep: decode_sweep_path(r)?, v2: false,
+			sweep: decode_sweep_path(r)?, v2: false, exit: None,
 		})
 	}
 }
@@ -569,7 +569,21 @@ impl Encoding for Policy {
 			Policy::Node(p) => { w.push(2); p.encode_to(w) },
 			Policy::Entry(p) => { w.push(3); p.encode_to(w) },
 			Policy::Forfeit(p) => { w.push(4); p.encode_to(w) },
-			Policy::Checkpoint(p) => { w.push(if p.v2 { 14 } else { 5 }); p.encode_to(w) },
+			Policy::Checkpoint(p) => {
+				let landing = p.exit.and_then(|e| e.landing);
+				w.push(match (p.v2, p.exit.is_some(), landing.is_some()) {
+					(false, false, _) => 5, (true, false, _) => 14, (false, true, false) => 17, (true, true, false) => 18, (_, true, true) => 19,
+				});
+				p.encode_to(w);
+				if let Some(e) = p.exit {
+					w.extend(e.delay.units().to_le_bytes());
+				}
+				if let Some(l) = landing {
+					w.extend(l.program);
+					w.extend(asset_bytes(l.asset));
+					w.extend(l.min_value.to_le_bytes());
+				}
+			},
 			Policy::Offboard(p) => { w.push(7); p.encode_to(w) },
 		}
 	}
@@ -637,6 +651,23 @@ impl Encoding for Policy {
 			},
 			12 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
 			14 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
+			t @ (17 | 18) => {
+				let p = CheckpointPolicy::decode_from(r)?;
+				Policy::Checkpoint(CheckpointPolicy { v2: t == 18, exit: Some(crate::CheckpointExit::plain(r.relative_time()?)), ..p })
+			},
+			19 => {
+				let p = CheckpointPolicy::decode_from(r)?;
+				let delay = r.relative_time()?;
+				let mut program = [0u8; crate::landing::PROGRAM_BYTES];
+				program.copy_from_slice(r.bytes(crate::landing::PROGRAM_BYTES)?);
+				let asset = r.asset()?;
+				let min_value = r.u64()?;
+				if min_value == 0 {
+					return Err(DecodeError::Count(0));
+				}
+				let landing = Some(crate::landing::LandingTerms { program, asset, min_value });
+				Policy::Checkpoint(CheckpointPolicy { exit: Some(crate::CheckpointExit { delay, landing }), ..p })
+			},
 			15 | 16 => {
 				let mut p = LeafPolicy::decode_from(r)?;
 				let deadline = r.median_time()?;

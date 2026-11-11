@@ -147,6 +147,13 @@ enum Cmd {
 		/// vtxo-1 or vtxo-2.
 		template: Option<String>,
 	},
+	/// Shows, or sets with `on` or `off`, whether the wallet trades only when
+	/// every checkpoint of the trade has its owner's exit: with it on, a swap
+	/// or a fill without it is refused before anything is signed.
+	RequireCheckpointExit {
+		/// on or off.
+		set: Option<String>,
+	},
 	/// The operator's equivocation bond as this wallet checks it on its own
 	/// node, and what the wallet holds out of round against it.
 	Bond,
@@ -159,6 +166,19 @@ enum Cmd {
 		/// A share of the bond such as 0.1, or off.
 		share: String,
 	},
+	/// Sets the wallet's instant limit: in atoms of the reference unit at
+	/// this node's rates, the most it holds of coins received out of round
+	/// and counts as its own at once; past it a payment arrives, and counts
+	/// once its round has refreshed it. The lower of this and what the
+	/// operator suggests is taken. Coins arriving are spent in no payment,
+	/// and trade proceeds in none that leaves the Arca.
+	InstantLimit {
+		/// Atoms of the reference unit, or off.
+		value: String,
+	},
+	/// Every coin in its place (settled, proceeds, counted, arriving), the
+	/// totals of each place by asset, and the instant limit.
+	CoinPlaces,
 	/// Every message the operator key signed that the wallet's coins rest
 	/// on, as evidence lines (`{"lines": […]}`): what the wallet hands a
 	/// watcher.
@@ -1450,9 +1470,17 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Info => w.info(),
 		Cmd::Supply { asset: a } => w.supply(asset(&a)?),
 		Cmd::LeafTemplate { template } => w.leaf_template(template.as_deref()),
+		Cmd::RequireCheckpointExit { set } => w.require_checkpoint_exit(match set.as_deref() {
+			None => None,
+			Some("on") => Some(true),
+			Some("off") => Some(false),
+			Some(o) => return Err(bark::arca::Error::Parse(format!("{:?}: on or off", o)).into()),
+		}),
 		Cmd::Bond => w.bond(),
 		Cmd::BondEvidence => w.bond_evidence().map(|lines| json!({"lines": lines})),
 		Cmd::InstantBudget { share } => w.set_instant_budget_text(&share),
+		Cmd::InstantLimit { value } => w.set_instant_limit_text(&value),
+		Cmd::CoinPlaces => w.coin_places(),
 		Cmd::WatchBond { evidence, fee_asset } => {
 			// A file is what `bond-evidence` printed, or one line a line.
 			let mut lines = vec![];

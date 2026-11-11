@@ -959,9 +959,13 @@ impl Wallet {
 			if let Some(t) = g.get("transfer") {
 				let tid = t["transfer_id"].as_str().unwrap_or("");
 				let cpv = amount(&t["checkpoint_value"], "a checkpoint value").unwrap_or(0);
-				let plan = TransferPlan { inputs: vec![(coin.clone(), cpv)], outputs: vec![] };
-				let signed = plan.checkpoint_message(0).ok().zip(signature(&t["checkpoint_sig"]))
-					.is_some_and(|(m, s)| arca_covenant::sign::verify_digest(&s, &m.digest, &owner));
+				// Into a checkpoint with or without its owner's exit: the pair
+				// names the checkpoint's output, so one of the two verifies.
+				let signed = [false, true].into_iter().any(|checkpoint_exit| {
+					let plan = TransferPlan { checkpoint_exit, inputs: vec![(coin.clone(), cpv)], outputs: vec![] };
+					plan.checkpoint_message(0).ok().zip(signature(&t["checkpoint_sig"]))
+						.is_some_and(|(m, s)| arca_covenant::sign::verify_digest(&s, &m.digest, &owner))
+				});
 				if !signed {
 					let why = format!("the server says coin {} was given up in transfer {}, with a checkpoint signature that is not its owner's: \
 						the wallet holds the coin as its own", id, tid);

@@ -161,7 +161,7 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	let t = &e["given"][0]["transfer"];
 	assert_eq!((t["transfer_id"].as_str(), t["state"].as_str()), (done["transfer_id"].as_str(), Some("signed")));
 	let cp: u64 = t["checkpoint_value"].as_str().unwrap().parse().unwrap();
-	let plan = TransferPlan { inputs: vec![(coin.clone(), cp)], outputs: vec![] };
+	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(coin.clone(), cp)], outputs: vec![] };
 	assert!(verify_digest(&sig(&t["checkpoint_sig"]), &plan.checkpoint_message(0).unwrap().digest, &xonly(&a_board)),
 		"the checkpoint signature served is A's own over its board's move into its checkpoint");
 	// The change, with the transfer and the head its signature was recorded at.

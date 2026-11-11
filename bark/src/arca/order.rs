@@ -202,7 +202,7 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		let (mut total, mut refresh) = (0u64, 0u64);
 		let mut done = None;
-		for c in self.coins_to_give(a)? {
+		for c in self.coins_to_give(a, super::places::Spend::Pay)? {
 			if chosen.len() == super::round::MAX_GIVEN {
 				return Err(Self::too_many_coins(a, total, ask.amount.saturating_add(refresh).saturating_add(offboard)));
 			}
@@ -262,6 +262,7 @@ impl Wallet {
 			if let Ok((_, a)) = self.held(&c) {
 				scripts.push(("leaf", a.valid.output().script_pubkey));
 				scripts.push(("checkpoint", a.valid.checkpoint().script_pubkey()));
+				scripts.push(("checkpoint", a.valid.checkpoint_of(true, a.valid.value).script_pubkey()));
 			}
 			if let Some((what, _)) = scripts.iter().find(|(_, s)| v1_program(s) == Some(*p)) {
 				return Err(Error::Refused(format!("the maker program {} is the {} script of the wallet's coin {}, an Arca script: a pair of \

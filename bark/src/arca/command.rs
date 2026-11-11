@@ -26,10 +26,10 @@ use super::{Config, Error, Wallet};
 
 /// Every command [`run`] takes, with its arguments.
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, brief?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
-	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?}, forget_request {owner}, send {request, amount?, route?, \
+	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?, channels?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?}, deposits, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
-	refresh_received {max_fee_ppm?}, refresh_needed {idle_seconds?}, withdraw_participation {participation}, refusals, \
+	refresh_received {max_fee_ppm?, leaves?}, refresh_needed {idle_seconds?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
 	maker_prog?, max_fee_ppm?, shown?}, orders, order_refund {order, fee_asset?}, order_fill_quote and order_fill (take_quote and take, \
@@ -45,9 +45,9 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?, brief?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
-	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
+	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, instant_limit {value}, coin_places, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
-	fee_asset?}, channel_code {address?}, leaf_template {template?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
+	fee_asset?}, channel_code {address?}, leaf_template {template?}, require_checkpoint_exit {on?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
 	address | script, fee_asset?, max_fee_ppm?, shown?}, offboards";
 
 /// A refusal as the command line prints it.
@@ -234,9 +234,9 @@ pub(crate) const ALONE_NAMED: u64 = 50;
 fn reads_only(command: &str) -> bool {
 	matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit_quote" | "schedule"
 		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
-		| "info" | "supply" | "leaf_template" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
+		| "info" | "supply" | "leaf_template" | "require_checkpoint_exit" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
 		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
-		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed")
+		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed" | "coin_places")
 }
 
 /// What `arca` runs before a command: the witness (unless the command stays
@@ -286,6 +286,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"info" => w.info(),
 		"supply" => w.supply(asset(req_str(&a["asset"], "the asset")?)?),
 		"leaf_template" => w.leaf_template(a["template"].as_str()),
+		"require_checkpoint_exit" => w.require_checkpoint_exit(a["on"].as_bool()),
 		"bond" => w.bond(),
 		"bond_evidence" => w.bond_evidence().map(|l| json!({"lines": l})),
 		"instant_budget" => {
@@ -296,6 +297,16 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			};
 			w.set_instant_budget_text(&share)
 		},
+		// Atoms of the reference unit, as text or a number, or "off".
+		"instant_limit" => {
+			let value = match &a["value"] {
+				Value::String(t) => t.clone(),
+				Value::Number(n) => n.to_string(),
+				_ => return Err(Error::Parse("the value is missing: atoms of the reference unit, or \"off\"".into())),
+			};
+			w.set_instant_limit_text(&value)
+		},
+		"coin_places" => w.coin_places(),
 		"watch_bond" => {
 			let lines = a["evidence"].as_array().cloned().unwrap_or_default();
 			let fee = a["fee_asset"].as_str().map(asset).transpose()?;
@@ -323,7 +334,8 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.board_quote(asset(req_str(&a["asset"], "the asset")?)?, amount, opt_asset(&a["fee_asset"])?)
 		},
 		"boards" => w.boards(),
-		"receive" => w.receive(opt_asset(&a["asset"])?, opt_u64(&a["amount"], "the amount")?),
+		// `"channels": false` names none of the wallet's channels.
+		"receive" => w.receive_with(opt_asset(&a["asset"])?, opt_u64(&a["amount"], "the amount")?, a["channels"].as_bool() != Some(false)),
 		"forget_request" => w.forget_request(req_str(&a["owner"], "the request's key")?),
 		"send" => w.send_routed(req_str(&a["request"], "the receive request")?, opt_u64(&a["amount"], "the amount")?, opt_asset(&a["asset"])?,
 			a["route"].as_str()),
@@ -400,7 +412,11 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 				.map_err(|e| Error::Parse(format!("the transaction: {}", e)))?;
 			w.speed_up(txid, opt_asset(&a["fee_asset"])?, opt_u64(&a["rate"], "the rate")?, opt_u64(&a["max_fee"], "the most it may pay")?)
 		},
-		"refresh_received" => w.refresh_received(opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		// `leaves`: those coins alone (what one rule of refresh_needed names).
+		"refresh_received" => {
+			let only: Option<Vec<String>> = a["leaves"].as_array().map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_string)).collect());
+			w.refresh_received_of(opt_u64(&a["max_fee_ppm"], "the fee bound")?, only.as_deref())
+		},
 		"refresh_needed" => w.refresh_needed(opt_u64(&a["idle_seconds"], "the idle seconds")?),
 		"withdraw_participation" => w.withdraw_participation(req_str(&a["participation"], "the participation")?),
 		"refusals" => w.refusals(),

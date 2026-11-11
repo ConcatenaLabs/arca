@@ -31,6 +31,20 @@
 //! No budget is set unless the wallet's owner sets one: the library imposes
 //! none, and values the bond at its node's rate whatever its asset.
 //!
+//! What counts against the budget is what the operator, with someone other
+//! than the wallet, could take from it by signing a second spend: each coin
+//! of `received` lineage ([`super::places::Lineage`]) at its whole value: a
+//! payment received, and what a trade paid the wallet (change included)
+//! when some checkpoint of the trade has no owner's exit. A coin of the
+//! wallet's own lineage (its round's and boards' coins, its own change from
+//! paying out of them) counts nothing, and neither does a coin of `trade`
+//! lineage, what a trade with its owner's exit on every checkpoint paid it:
+//! if that trade dies, the coin the wallet gave comes home by its exit. A
+//! coin on its way into a swap whose checkpoint has its owner's exit is
+//! judged by its own lineage, since it comes home if the swap never
+//! completes; one whose checkpoint has none counts as a coin received out
+//! of round does.
+//!
 //! The wallet keeps the operator's signature over every message of its
 //! coins' lineage ([`arca_covenant::bond::cosigned_by`]) and writes it as
 //! evidence lines ([`Wallet::bond_evidence`]): `{"salt", "form", "rest",
@@ -265,18 +279,61 @@ impl Wallet {
 		Ok(s)
 	}
 
-	/// What the wallet holds on lineages paid out of round, by asset: its
-	/// coins received by a reassignment or an in-tree fill, not yet refreshed
-	/// in a round.
+	/// What the wallet holds at risk out of round, by asset: each coin the
+	/// operator and someone else could take from it by signing twice
+	/// ([`Self::at_risk`]), not yet refreshed in a round.
 	fn out_of_round(&self) -> Result<BTreeMap<AssetId, u64>, Error> {
 		let mut out: BTreeMap<AssetId, u64> = BTreeMap::new();
 		for c in self.store.coins_in_states(&HELD)? {
-			if (c.kind == "transfer" || c.kind == "fill") && HELD.contains(&c.state.as_str()) {
+			if HELD.contains(&c.state.as_str()) && self.at_risk(&c)? {
 				let a = AssetId::from_str(&c.asset).map_err(|e| Error::Store(e.to_string()))?;
 				*out.entry(a).or_default() = out.get(&a).copied().unwrap_or(0).saturating_add(c.value);
 			}
 		}
 		Ok(out)
+	}
+
+	/// Whether the coin `c` is at risk out of round: whether the operator,
+	/// with someone other than the wallet, could take it from the wallet by
+	/// signing a second spend.
+	///
+	/// - A coin of `received` lineage ([`super::places::Lineage`]): a
+	///   payment received, or what a trade paid the wallet (change included)
+	///   when some checkpoint of the trade has no owner's exit, is at risk at
+	///   its whole value: another input's owner and the operator can spend it
+	///   elsewhere, and every coin the reassignment made is void.
+	/// - A coin of the wallet's own lineage (a round's or a board's, or its
+	///   own change from paying out of one) is not: only the wallet's key
+	///   spends it. Nor is a coin of `trade` lineage: what a trade with its
+	///   owner's exit on every checkpoint paid the wallet. Should that trade
+	///   die, the coin the wallet gave comes home by its exit.
+	/// - A coin on its way into a swap or a fill (`offered`, `sending`,
+	///   `given`) whose checkpoint has its owner's exit is judged by its own
+	///   lineage: if the trade never completes, the coin comes home by that
+	///   exit. One whose checkpoint has none counts as a coin received out of
+	///   round does, as it always has: should the trade die, it would stand
+	///   in a checkpoint only the wallet and the operator can spend.
+	fn at_risk(&self, c: &super::store::CoinRow) -> Result<bool, Error> {
+		let paid_out = c.kind == "transfer" || c.kind == "fill";
+		if matches!(c.state.as_str(), "offered" | "sending" | "given") && !self.given_with_exit(c)? {
+			return Ok(paid_out);
+		}
+		if !paid_out {
+			return Ok(false);
+		}
+		let record = Self::record_of(c)?;
+		Ok(self.lineage(&record) == super::places::Lineage::Received)
+	}
+
+	/// Whether the coin `c`, on its way into a swap, goes into a checkpoint
+	/// with its owner's exit: its swap's acceptance signs so. A swap not yet
+	/// accepted, and a fill, count as one without.
+	fn given_with_exit(&self, c: &super::store::CoinRow) -> Result<bool, Error> {
+		let Some(id) = c.note.strip_prefix("swap ") else { return Ok(false) };
+		Ok(match self.store.swap(id)? {
+			Some((_, _, Some(accept), _)) => serde_json::from_str::<Value>(&accept).is_ok_and(|a| a["checkpoint_exit"] == json!(true)),
+			_ => false,
+		})
 	}
 
 	/// `held` worth more than the bond's `value` of `asset`, and by how much,
@@ -366,6 +423,23 @@ impl Wallet {
 	/// one; a refusal when the bond is required and does not stand, or does
 	/// not cover what the wallet would hold out of round.
 	pub(crate) fn bond_gate(&self, incoming: Option<(AssetId, u64)>) -> Result<Option<String>, Error> {
+		// A wallet with an instant limit ([`super::places`]) never refuses a
+		// payment here: what it counts at once is within its limit, and
+		// anything past it, or that it cannot value, arrives and counts only
+		// after its round, so the bond is the safety of nothing above the
+		// limit. The refusal is said instead.
+		let gate = self.bond_gate_strict(incoming);
+		if self.own_instant_limit()?.is_some() {
+			if let Err(Error::Refused(why)) = &gate {
+				return Ok(Some(format!("{}; with an instant limit the payment is taken, and counts once its round has made it the \
+					wallet's own", why)));
+			}
+		}
+		gate
+	}
+
+	/// [`Self::bond_gate`] without an instant limit.
+	fn bond_gate_strict(&self, incoming: Option<(AssetId, u64)>) -> Result<Option<String>, Error> {
 		let info = self.server_info()?;
 		let s = self.bond_standing(&info)?;
 		let seen = self.store.meta(BOND_SEEN)?.is_some();

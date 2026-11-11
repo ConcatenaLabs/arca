@@ -59,7 +59,12 @@
 //! ([`checkpoint_salt`]): one leaf is spent once, so it has one checkpoint
 //! script, and the tag keeps that salt apart from every leaf's. The checkpoint
 //! sweeps with the notice of the batch the coin descends from (for a coin from
-//! a reassignment of several, the first input's, recursively).
+//! a reassignment of several, the first input's, recursively). In a
+//! reassignment of several owners' coins, each coin of a plain leaf or of a
+//! supervised asset may move
+//! into a checkpoint with its owner's exit ([`TransferPlan::checkpoint_exit`],
+//! [`crate::checkpoint`]), which gives the coin back alone if the reassignment
+//! can never complete.
 //!
 //! # The coin record
 //!
@@ -124,10 +129,15 @@
 //! accepts, and it answers a stale exit at once by publishing the checkpoint
 //! and the reassignment within that delay.
 //!
-//! # The binary form, version 1
+//! # The binary form, versions 1 and 2
+//!
+//! Version 2 is written where any checkpoint in the record has its owner's
+//! exit, and only then; it adds one byte to each input, below. A record of
+//! version 2 with no such checkpoint is refused, so each record has one
+//! encoding.
 //!
 //! ```text
-//! u8    format version, 1
+//! u8    format version, 1 or 2
 //! coin:
 //!   u8  0, a leaf of a batch:
 //!         u16  length L, then L bytes: its LeafRecord, binary form
@@ -146,6 +156,7 @@
 //!                coin (recursively), u64 the checkpoint's value,
 //!                [64] [64] the checkpoint pair (operator, owner),
 //!                [64] [64] the reassignment pair (operator, owner)
+//!                version 2 only: u8 1 where the checkpoint has its owner's exit, else 0
 //!         u8   output count m, 1 to 4, then per output:
 //!                [32] asset, u64 value, compact size and the scriptPubKey (at most 10,000 bytes)
 //!         u8   the coin's index, below m
@@ -197,8 +208,13 @@ use crate::sweep::Sweep;
 use crate::time::{MedianTime, RelativeTime};
 use crate::unroll::UnrollAuth;
 
-/// The coin record format this crate writes and reads.
+/// The coin record format this crate writes when no checkpoint in the
+/// record has its owner's exit; it reads it too.
 pub const COIN_RECORD_VERSION: u8 = 1;
+/// The coin record format this crate writes when a checkpoint in the record
+/// has its owner's exit ([`crate::checkpoint`]); it reads it too. A reader
+/// that knows only version 1 refuses it as a format it does not know.
+pub const COIN_RECORD_VERSION_EXIT: u8 = 2;
 /// The most reassignments a record nests along any path.
 pub const MAX_HOPS: usize = 16;
 /// The most inputs a reassignment in a record has.
@@ -403,6 +419,9 @@ pub struct TransferInput {
 	pub checkpoint_value: u64,
 	pub checkpoint: Pair,
 	pub reassignment: Pair,
+	/// Whether the coin's checkpoint has its owner's exit
+	/// ([`crate::checkpoint`]).
+	pub exit: bool,
 }
 
 /// Why a coin record does not decode or is not accepted.
@@ -484,6 +503,8 @@ pub enum TransferError {
 	NotAnOrder,
 	#[error("the fill: {0}")]
 	Fill(String),
+	#[error("input {0}: a checkpoint with its owner's exit holds a coin of a plain leaf (vtxo-1 or vtxo-2) or a landing-1 leaf only")]
+	CheckpointExit(usize),
 }
 
 impl TransferError {
@@ -528,6 +549,7 @@ impl TransferError {
 			OnChain { .. } | BoardSpent(_) => "on_chain",
 			NotATransfer | NotABoard | Checkpoints { .. } => "use",
 			NotAnOrder | Fill(_) => "fill",
+			CheckpointExit(_) => "template",
 		}
 	}
 }
@@ -755,12 +777,51 @@ impl ValidCoin {
 	}
 
 	/// The checkpoint this coin moves into when transferred: its own salt,
-	/// the sweep of the batch it descends from.
+	/// the sweep of the batch it descends from, and no exit.
 	pub fn checkpoint(&self) -> CheckpointPolicy {
+		self.checkpoint_of(false, self.value)
+	}
+
+	/// [`ValidCoin::checkpoint`], with its owner's exit after the coin's own
+	/// exit delay when `exit` is set ([`crate::checkpoint`]), for a
+	/// checkpoint keeping `value`: a `landing-1` coin's exit is its landing,
+	/// at least `value` less the coin's allowance.
+	pub fn checkpoint_of(&self, exit: bool, value: u64) -> CheckpointPolicy {
+		let exit = exit.then(|| crate::checkpoint::CheckpointExit {
+			delay: self.leaf.exit_delay,
+			landing: self.leaf.landing.map(|l| crate::LandingTerms {
+				min_value: value.saturating_sub(self.value.saturating_sub(l.min_value)), ..l
+			}),
+		});
 		CheckpointPolicy {
 			owner: self.leaf.owner, operator: self.leaf.operator, salt: checkpoint_salt(&self.leaf.salt),
-			chain: self.leaf.chain, sweep: self.sweep, v2: self.leaf.v2,
+			chain: self.leaf.chain, sweep: self.sweep, v2: self.leaf.v2, exit,
 		}
+	}
+
+	/// Whether this coin may move into a checkpoint with its owner's exit:
+	/// a coin of a plain leaf or a `landing-1` leaf
+	/// ([`crate::checkpoint::exit_allowed`]).
+	pub fn exit_allowed(&self) -> bool {
+		crate::checkpoint::exit_allowed(&self.leaf)
+	}
+
+	/// Whether any checkpoint in the coin's record has its owner's exit: the
+	/// record is then written in format version 2
+	/// ([`COIN_RECORD_VERSION_EXIT`]), which a reader of version 1 alone
+	/// does not take.
+	pub fn has_checkpoint_exit(&self) -> bool {
+		let inputs = match &self.origin {
+			ValidOrigin::Transfer { inputs, .. } => inputs,
+			ValidOrigin::Fill { order, inputs, .. } => {
+				if order.has_checkpoint_exit() {
+					return true;
+				}
+				inputs
+			},
+			ValidOrigin::Leaf { .. } | ValidOrigin::Board { .. } | ValidOrigin::Accumulator { .. } => return false,
+		};
+		inputs.iter().any(|i| i.checkpoint.exit.is_some() || i.coin.has_checkpoint_exit())
 	}
 
 	/// The coin's output.
@@ -966,12 +1027,23 @@ pub struct TransferPlan {
 	pub inputs: Vec<(ValidCoin, u64)>,
 	/// The committed outputs.
 	pub outputs: Vec<ExplicitOutput>,
+	/// Whether each coin of a plain or a `landing-1` leaf moves into a checkpoint with its
+	/// owner's exit ([`crate::checkpoint`]); a coin of any other leaf moves
+	/// into one without, as every coin does when this is not set. A
+	/// reassignment of several owners' coins sets it, where every party
+	/// reads the record format it makes ([`COIN_RECORD_VERSION_EXIT`]).
+	pub checkpoint_exit: bool,
 }
 
 impl TransferPlan {
+	/// Whether input `i`'s checkpoint has its owner's exit.
+	pub fn exit(&self, i: usize) -> bool {
+		self.checkpoint_exit && self.inputs[i].0.exit_allowed()
+	}
+
 	/// The checkpoint of input `i`.
 	pub fn checkpoint(&self, i: usize) -> CheckpointPolicy {
-		self.inputs[i].0.checkpoint()
+		self.inputs[i].0.checkpoint_of(self.exit(i), self.inputs[i].1)
 	}
 
 	/// The checkpoint output of input `i`.
@@ -1066,8 +1138,11 @@ fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[Expl
 {
 	let first = before.len();
 	let mut named = before.to_vec();
-	for (input, coin) in inputs.iter().zip(&coins) {
-		named.push(ExplicitOutput::new(coin.asset, input.checkpoint_value, coin.checkpoint().script_pubkey()).txout());
+	for (k, (input, coin)) in inputs.iter().zip(&coins).enumerate() {
+		if input.exit && !coin.exit_allowed() {
+			return Err(TransferError::CheckpointExit(k + first));
+		}
+		named.push(ExplicitOutput::new(coin.asset, input.checkpoint_value, coin.checkpoint_of(input.exit, input.checkpoint_value).script_pubkey()).txout());
 	}
 	let mut out = Vec::with_capacity(inputs.len());
 	for (k, (input, coin)) in inputs.iter().zip(coins).enumerate() {
@@ -1075,7 +1150,7 @@ fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[Expl
 		if input.checkpoint_value == 0 || input.checkpoint_value > coin.value {
 			return Err(TransferError::CheckpointValue { value: input.checkpoint_value, coin: coin.value });
 		}
-		let checkpoint = coin.checkpoint();
+		let checkpoint = coin.checkpoint_of(input.exit, input.checkpoint_value);
 		let cp_out = ExplicitOutput::new(coin.asset, input.checkpoint_value, checkpoint.script_pubkey());
 		coin.leaf.verify(coin.asset, coin.value, &[cp_out], &input.checkpoint)
 			.map_err(|error| TransferError::Pair { input: k, pair: "checkpoint", error })?;
@@ -1355,7 +1430,8 @@ impl CoinRecord {
 				// Every input resolves under the receiver's policy, so its
 				// leaf is the policy's operator's, on the policy's chain.
 				let coins = t.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
-				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().map(|c| (c.id, c.checkpoint().taproot().program())).collect();
+				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().zip(&t.inputs)
+					.map(|(c, i)| (c.id, c.checkpoint_of(i.exit, i.checkpoint_value).taproot().program())).collect();
 				let values: Vec<u64> = t.inputs.iter().map(|i| i.checkpoint_value).collect();
 				let spend = spend_hash(&parts, &values, &t.outputs);
 				for (k, coin) in coins.iter().enumerate() {
@@ -1423,7 +1499,8 @@ impl CoinRecord {
 				op.check_signature(order.value, &txouts, &fill.signature).map_err(|e| TransferError::Fill(e.to_string()))?;
 				op.judge(&txouts, 0, order.value, fill.partial).map_err(|e| TransferError::Fill(e.to_string()))?;
 				let coins = fill.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
-				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().map(|c| (c.id, c.checkpoint().taproot().program())).collect();
+				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().zip(&fill.inputs)
+					.map(|(c, i)| (c.id, c.checkpoint_of(i.exit, i.checkpoint_value).taproot().program())).collect();
 				let mut values = vec![order.value];
 				values.extend(fill.inputs.iter().map(|i| i.checkpoint_value));
 				let hash = fill_hash((order.id, order.leaf.program()), &parts, &fill.outputs);
@@ -1482,12 +1559,24 @@ impl CoinRecord {
 
 	/// The binary form.
 	pub fn to_bytes(&self) -> Result<Vec<u8>, TransferError> {
-		let mut w = vec![COIN_RECORD_VERSION];
-		self.write(&mut w, 0)?;
+		let exit = self.has_checkpoint_exit();
+		let mut w = vec![if exit { COIN_RECORD_VERSION_EXIT } else { COIN_RECORD_VERSION }];
+		self.write(&mut w, 0, exit)?;
 		Ok(w)
 	}
 
-	fn write(&self, w: &mut Vec<u8>, depth: usize) -> Result<(), TransferError> {
+	/// Whether any checkpoint in the record has its owner's exit, so that
+	/// it is written in format version 2 ([`COIN_RECORD_VERSION_EXIT`]).
+	pub fn has_checkpoint_exit(&self) -> bool {
+		match self {
+			CoinRecord::Transfer(t) => t.inputs.iter().any(|i| i.exit || i.coin.has_checkpoint_exit()),
+			CoinRecord::Fill(f) => f.fill.order.has_checkpoint_exit()
+				|| f.fill.inputs.iter().any(|i| i.exit || i.coin.has_checkpoint_exit()),
+			CoinRecord::Leaf { .. } | CoinRecord::Board(_) | CoinRecord::Accumulator { .. } => false,
+		}
+	}
+
+	fn write(&self, w: &mut Vec<u8>, depth: usize, v2: bool) -> Result<(), TransferError> {
 		if depth > MAX_HOPS {
 			return Err(TransferError::TooDeep);
 		}
@@ -1544,7 +1633,7 @@ impl CoinRecord {
 					return Err(TransferError::Template("vtxo-2 with another template's terms".into()));
 				}
 				w.push(if t.leaf.htlc.is_some() { 3 } else if landing.is_some() { 5 } else if t.leaf.enclave.is_some() { 7 } else if t.leaf.v2 { 8 } else { 1 });
-				write_inputs(w, &t.inputs, depth)?;
+				write_inputs(w, &t.inputs, depth, v2)?;
 				write_outputs(w, &t.outputs)?;
 				w.push(t.index);
 				w.extend(t.leaf.owner.serialize());
@@ -1571,10 +1660,10 @@ impl CoinRecord {
 					return Err(TransferError::Outputs(fill.outputs.len()));
 				}
 				w.push(4);
-				fill.order.write(w, depth + 1)?;
+				fill.order.write(w, depth + 1, v2)?;
 				w.extend(fill.signature.as_ref());
 				w.push(fill.partial as u8);
-				write_inputs(w, &fill.inputs, depth)?;
+				write_inputs(w, &fill.inputs, depth, v2)?;
 				write_outputs(w, &fill.outputs)?;
 				w.push(f.index);
 				match &f.leaf {
@@ -1606,17 +1695,23 @@ impl CoinRecord {
 	pub fn from_bytes(data: &[u8]) -> Result<CoinRecord, TransferError> {
 		let mut r = Reader::new(data);
 		let v = r.u8()?;
-		if v != COIN_RECORD_VERSION {
+		if v != COIN_RECORD_VERSION && v != COIN_RECORD_VERSION_EXIT {
 			return Err(TransferError::Version(v));
 		}
-		let c = CoinRecord::read(&mut r, 0)?;
+		let v2 = v == COIN_RECORD_VERSION_EXIT;
+		let c = CoinRecord::read(&mut r, 0, v2)?;
 		if r.remaining() != 0 {
 			return Err(DecodeError::TrailingBytes(r.remaining()).into());
+		}
+		// Version 2 is written only for a record with an exit somewhere:
+		// one without reads back as version 1, its one encoding.
+		if v2 && !c.has_checkpoint_exit() {
+			return Err(DecodeError::Flag(0).into());
 		}
 		Ok(c)
 	}
 
-	fn read(r: &mut Reader, depth: usize) -> Result<CoinRecord, TransferError> {
+	fn read(r: &mut Reader, depth: usize, v2: bool) -> Result<CoinRecord, TransferError> {
 		if depth > MAX_HOPS {
 			return Err(TransferError::TooDeep);
 		}
@@ -1634,7 +1729,7 @@ impl CoinRecord {
 				Ok(CoinRecord::Leaf { record, preimage, auths })
 			},
 			tag @ (1 | 3 | 5 | 7 | 8) => {
-				let inputs = read_inputs(r, depth)?;
+				let inputs = read_inputs(r, depth, v2)?;
 				let outputs = read_outputs(r)?;
 				let m = outputs.len();
 				let index = r.u8()?;
@@ -1675,10 +1770,10 @@ impl CoinRecord {
 				Ok(CoinRecord::Accumulator { record, preimage, auth: (s, r.median_time()?) })
 			},
 			4 => {
-				let order = CoinRecord::read(r, depth + 1)?;
+				let order = CoinRecord::read(r, depth + 1, v2)?;
 				let signature = Signature::from_slice(r.bytes(64)?).map_err(|_| DecodeError::Key)?;
 				let partial = r.flag()?;
-				let inputs = read_inputs(r, depth)?;
+				let inputs = read_inputs(r, depth, v2)?;
 				let outputs = read_outputs(r)?;
 				if !(2..=crate::order::MAX_FILL_OUTPUTS as usize).contains(&outputs.len()) {
 					return Err(TransferError::Outputs(outputs.len()));
@@ -1703,13 +1798,18 @@ impl CoinRecord {
 	}
 }
 
-fn write_inputs(w: &mut Vec<u8>, inputs: &[TransferInput], depth: usize) -> Result<(), TransferError> {
+fn write_inputs(w: &mut Vec<u8>, inputs: &[TransferInput], depth: usize, v2: bool) -> Result<(), TransferError> {
 	w.push(inputs.len() as u8);
 	for i in inputs {
-		i.coin.write(w, depth + 1)?;
+		i.coin.write(w, depth + 1, v2)?;
 		w.extend(i.checkpoint_value.to_le_bytes());
 		for s in [&i.checkpoint.operator, &i.checkpoint.owner, &i.reassignment.operator, &i.reassignment.owner] {
 			w.extend(s.as_ref());
+		}
+		if v2 {
+			w.push(i.exit as u8);
+		} else if i.exit {
+			return Err(DecodeError::Flag(1).into());
 		}
 	}
 	Ok(())
@@ -1730,22 +1830,23 @@ fn write_outputs(w: &mut Vec<u8>, outputs: &[ExplicitOutput]) -> Result<(), Tran
 	Ok(())
 }
 
-fn read_inputs(r: &mut Reader, depth: usize) -> Result<Vec<TransferInput>, TransferError> {
+fn read_inputs(r: &mut Reader, depth: usize, v2: bool) -> Result<Vec<TransferInput>, TransferError> {
 	let n = r.u8()? as usize;
 	if n == 0 || n > MAX_INPUTS {
 		return Err(TransferError::Inputs(n));
 	}
 	let mut inputs = Vec::with_capacity(n);
 	for _ in 0..n {
-		let coin = CoinRecord::read(r, depth + 1)?;
+		let coin = CoinRecord::read(r, depth + 1, v2)?;
 		let checkpoint_value = r.u64()?;
 		let mut sigs = [None; 4];
 		for s in sigs.iter_mut() {
 			*s = Some(Signature::from_slice(r.bytes(64)?).map_err(|_| DecodeError::Key)?);
 		}
 		let [a, b, c, d] = sigs.map(|s| s.expect("read"));
+		let exit = v2 && r.flag()?;
 		inputs.push(TransferInput {
-			coin, checkpoint_value, checkpoint: Pair { operator: a, owner: b }, reassignment: Pair { operator: c, owner: d },
+			coin, checkpoint_value, checkpoint: Pair { operator: a, owner: b }, reassignment: Pair { operator: c, owner: d }, exit,
 		});
 	}
 	Ok(inputs)
@@ -1778,7 +1879,7 @@ mod format_tests {
 	/// version is malformed.
 	#[test]
 	fn an_unknown_version_is_an_unknown_format_and_a_truncated_record_is_not() {
-		let unknown = CoinRecord::from_bytes(&[COIN_RECORD_VERSION + 1]).unwrap_err();
+		let unknown = CoinRecord::from_bytes(&[COIN_RECORD_VERSION_EXIT + 1]).unwrap_err();
 		assert!(unknown.is_unknown_format(), "{}", unknown);
 		let truncated = CoinRecord::from_bytes(&[COIN_RECORD_VERSION]).unwrap_err();
 		assert!(!truncated.is_unknown_format(), "{}", truncated);

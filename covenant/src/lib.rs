@@ -152,7 +152,7 @@ pub use batch::{reads_format, Batch, BatchKind, FORMATS_EVERY_WALLET_READS, RECO
 pub use board::{BoardPolicy, BoardRecord, ValidBoard};
 pub use bond::{BondError, BondPolicy, BondState, Cosigned, Evidence, Form, Signed};
 pub use channel::{Channel, ChannelError, ChannelPolicy, ChannelSpend, ChannelTerms, State};
-pub use checkpoint::CheckpointPolicy;
+pub use checkpoint::{CheckpointExit, CheckpointPolicy};
 pub use checks::{check_reissue, check_round, RoundCheckFailure};
 pub use claim::{claim_key, claim_keypair, script_pin, Claim, ClaimError, Distribution, DistributionLapse, Lapse, LapseError, LapseTerms};
 pub use clock::{no_sweep_token, Clock, ClockSchedule, TokenPlace};
@@ -223,6 +223,8 @@ pub enum Error {
 	HtlcDelays { operator: u16, owner: u16 },
 	#[error("an htlc-1 leaf has no exit: it is spent by its claim, its refund or its collaborative path")]
 	HtlcHasNoExit,
+	#[error("this checkpoint has no exit: only its owner and the operator together spend it")]
+	CheckpointHasNoExit,
 	#[error("a vtxo-1 leaf has no {0} path")]
 	NotAnHtlc(&'static str),
 	#[error("a vtxo-2 pair names {0} inputs; it names 1 to {max}", max = collab::MAX_NAMED)]

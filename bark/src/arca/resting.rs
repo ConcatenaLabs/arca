@@ -229,7 +229,7 @@ impl Wallet {
 		// refresh that waits is taken back first when the live coins fall
 		// short.
 		self.free_when_short(a, ask.amount)?;
-		let coins = self.coins_to_give(a)?;
+		let coins = self.coins_to_give(a, super::places::Spend::Trade)?;
 		// The schedule charges nothing when it has neither a rate nor a base:
 		// then no coin needs reading for its date.
 		let free = schedule["refresh_ppm"].as_u64().unwrap_or(0) == 0
@@ -517,10 +517,18 @@ impl Wallet {
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let key = self.keys.leaf(&r.nonce)?;
 		let digest = publish_digest(&self.genesis, &self.operator, &id, &nonces, &mailbox);
-		self.server.post("order_publish", &json!({
+		let mut body = json!({
 			"record": hex(&row.record), "credit_nonces": r.credit_nonces, "mailbox": hex(&mailbox.serialize()),
 			"signature": hex(sign(&key, &digest).as_ref()),
-		}))
+		});
+		// The record formats this wallet reads: a taker gives a coin of the
+		// newer format, and asks for the checkpoint exit, only to a maker
+		// that names it. An operator that publishes no `checkpoint_exit`
+		// predates the field and would refuse it.
+		if self.server_info()?.get("checkpoint_exit").is_some() {
+			body["record_formats"] = json!(arca_covenant::RECORD_FORMATS);
+		}
+		self.server.post("order_publish", &body)
 	}
 
 	/// How the wallet's resting orders stand, as the operator shows them, and
@@ -580,6 +588,9 @@ impl Wallet {
 		self.witnessed_now()?;
 		let info = self.server_info()?;
 		let o = self.served_order(order)?;
+		// Refused here as the fill would refuse it, so a program leaves the
+		// order out of what it offers rather than show a fill that cannot go.
+		self.resting_exit(&info, &o)?;
 		let leaf = |w: &Wallet| -> Result<NewLeaf, Error> {
 			let n = random32();
 			Ok(NewLeaf { enclave: None, v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
@@ -587,6 +598,21 @@ impl Wallet {
 		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
 		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;
 		self.quoted(Ok(f.quote(order, &o)))
+	}
+
+	/// Whether a fill of the order served as `o` moves the taker's coins
+	/// into checkpoints with their owners' exit: when the operator co-signs
+	/// them and the order's maker reads the record format they make. Refused
+	/// when it cannot and the wallet requires the exit
+	/// ([`Wallet::require_checkpoint_exit`]).
+	fn resting_exit(&self, info: &Value, o: &Value) -> Result<bool, Error> {
+		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
+		let checkpoint_exit = Self::checkpoint_exit_offered(info) && maker_reads;
+		if !checkpoint_exit {
+			self.exit_required(if maker_reads { "the operator does not offer it (info.checkpoint_exit)" } else {
+				"the order's maker reads no coin record of the format it makes (an older build)" })?;
+		}
+		Ok(checkpoint_exit)
 	}
 
 	/// The order `order` as the operator serves it now, resting.
@@ -643,8 +669,16 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		let mut kept = 0u64;
 		let mut done = None;
-		for mut c in self.coins_to_give(asset_b)? {
+		// An order an older build published names no format it reads: its
+		// maker reads no coin record of the newer format.
+		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
+		let mut unread = 0u64;
+		for mut c in self.coins_to_give(asset_b, super::places::Spend::Trade)? {
 			if c.row.expiry < order_expiry {
+				continue;
+			}
+			if !maker_reads && c.row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
+				unread = unread.saturating_add(c.coin.value);
 				continue;
 			}
 			if chosen.len() == super::round::MAX_GIVEN {
@@ -664,6 +698,13 @@ impl Wallet {
 			}
 		}
 		let Some((fee, change)) = done else {
+			// Coins enough, but of a format the order's maker cannot read:
+			// say so, as a payment or a swap with an older build does.
+			if unread > 0 && kept.saturating_add(unread) > price {
+				return Err(Error::Refused(format!("the order's maker runs an older build, which reads no coin whose past holds a checkpoint \
+					with its owner's exit, and the wallet's coins of asset {} that would pay this fill of {} are such coins: they pay it \
+					once a round refreshes them (refresh-received), or once the maker updates; nothing was signed", asset_b, filled)));
+			}
 			return Err(self.short_of(asset_b, price.saturating_sub(kept).max(1), format!("the wallet's live coins of asset {} that expire \
 				no earlier than the order's coin (median time {}) keep {} past their checkpoints; the fill of {} costs {} and its fee, with \
 				change of none or at least {}", asset_b, order_expiry, kept, filled, price, min))?);
@@ -706,7 +747,12 @@ impl Wallet {
 		let RestingFill { oc, policy, plan, filled, price, fee, change, chosen, asset_a, asset_b } = f;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let outputs = fill_outputs(&plan, &policy, (&got, filled), (change > 0).then_some((&change_leaf, asset_b, change)), self);
-		let tplan = TransferPlan { inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
+		// The taker's coins into checkpoints with their owners' exit where
+		// the operator co-signs them: a fill the maker and the operator never
+		// complete then gives them back (`arca_covenant::checkpoint`). The
+		// maker's order coin is spent only if the fill confirms.
+		let checkpoint_exit = self.resting_exit(&info, &o)?;
+		let tplan = TransferPlan { checkpoint_exit, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
 		// The fill spends the order's coin at input 0 and the checkpoints
 		// after it: a vtxo-2 checkpoint's pair names them all, its own index
 		// one past its place among the checkpoints (`fill_tx`).
@@ -742,7 +788,10 @@ impl Wallet {
 		if change > 0 {
 			taker.push(leaf_json(asset_b, change, &change_leaf));
 		}
-		let body = json!({"order": order, "coin": oc.id.to_string(), "filled": filled.to_string(), "inputs": inputs, "outputs": taker});
+		let mut body = json!({"order": order, "coin": oc.id.to_string(), "filled": filled.to_string(), "inputs": inputs, "outputs": taker});
+		if checkpoint_exit {
+			body["checkpoint_exit"] = json!(true);
+		}
 		let given: Vec<String> = chosen.iter().map(|c| c.row.leaf_id.clone()).collect();
 		self.store.atomically(|s| {
 			for l in &given {

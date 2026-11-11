@@ -137,6 +137,25 @@ impl LandingTerms {
 			.into_script()
 	}
 
+	/// The landing script of a checkpoint's exit ([`crate::checkpoint`]) for
+	/// owner `A` and the exit delay: [`Self::script`] with each output it
+	/// inspects the one at the spending input's own index
+	/// (`OP_PUSHCURRENTINPUTINDEX` where the leaf pushes 0), so two landings
+	/// spent together can never share one output and carry the other
+	/// coin's value past the landing key, where the issuer's freeze binds.
+	/// The same 119 bytes with a 512-second delay.
+	pub fn script_at_own_index(&self, owner: &XOnlyPublicKey, delay: RelativeTime) -> Script {
+		Builder::new().push_int(delay.to_sequence() as i64).ops(&[OP_CSV, OP_DROP])
+			.ops(&[OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTSCRIPTPUBKEY]).push_int(0).push_opcode(OP_EQUALVERIFY)
+			.push_slice(&self.program).push_opcode(OP_EQUALVERIFY)
+			.ops(&[OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTASSET]).push_int(1).push_opcode(OP_EQUALVERIFY)
+			.push_slice(&asset_bytes(self.asset)).push_opcode(OP_EQUALVERIFY)
+			.ops(&[OP_PUSHCURRENTINPUTINDEX, OP_INSPECTOUTPUTVALUE]).push_int(1).push_opcode(OP_EQUALVERIFY)
+			.push_slice(&self.min_value.to_le_bytes()).push_opcode(OP_GREATERTHANOREQUAL64).push_opcode(OP_VERIFY)
+			.push_slice(&owner.serialize()).push_opcode(OP_CHECKSIG)
+			.into_script()
+	}
+
 	/// The script the landing pays.
 	pub fn script_pubkey(&self) -> Script {
 		landing_script_pubkey(&self.program)

@@ -422,7 +422,7 @@ impl Rebindable for CheckpointPolicy {
 		if !self.v2 {
 			return self.collab_witness(&pair.operator, &pair.owner, m);
 		}
-		self.collab2().witness_of(self.sweep_script(), pair, n, m)
+		self.collab2().witness_at(&self.taproot(), pair, n, m)
 	}
 }
 
@@ -509,6 +509,26 @@ impl KeySpend {
 	pub fn finish(mut self, below: Vec<Vec<u8>>) -> UnrollTx {
 		self.tx.input[0].witness.script_witness = self.tap.witness(&self.script, below);
 		UnrollTx { tx: self.tx, prevouts: self.prevouts }
+	}
+}
+
+impl CheckpointPolicy {
+	/// The owner's exit of `coin`, this checkpoint on-chain holding `value`
+	/// of `asset`, into `outputs`: input 0's sequence is the exit delay, so
+	/// it confirms only that long after the checkpoint did, and only while
+	/// no reassignment has spent the checkpoint. The owner signs
+	/// [`KeySpend::sighash`] and finishes it with its signature.
+	pub fn exit_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
+		-> Result<KeySpend, SpendError>
+	{
+		let (e, script) = self.exit.zip(self.exit_script()).ok_or(Error::CheckpointHasNoExit)?;
+		// A supervised coin's checkpoint lands as its leaf does.
+		if let Some(l) = &e.landing {
+			let first = outputs.first().ok_or(SpendError::Landing(crate::LandingError::Output { min: l.min_value }))?;
+			l.check_output(first).map_err(SpendError::Landing)?;
+		}
+		let spent = explicit_txout(asset, value, self.script_pubkey());
+		KeySpend::build(self.taproot(), script, vec![(coin, spent, Sequence(e.delay.to_sequence()))], outputs, fee)
 	}
 }
 

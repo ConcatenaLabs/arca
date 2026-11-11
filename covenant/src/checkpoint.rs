@@ -7,13 +7,63 @@
 //! ```text
 //! collab:  <A> and <S>, rebindable, with the checkpoint's own salt
 //! sweep:   the sweep with notice of the input's batch
+//! exit:    the coin's own exit, where the checkpoint has one:
+//!          <delay> CSV DROP <A> CHECKSIG, or a landing-1 coin's landing
 //! ```
 //!
-//! The checkpoint of a coin of a batch without a sweep has the
-//! collaborative path alone (`sweep` is `None`).
+//! The checkpoint of a coin of a batch without a sweep has no sweep path
+//! (`sweep` is `None`).
 //!
 //! A `vtxo-2` coin's checkpoint has `arca/collab-2` and its data leaf in place
 //! of the tapscript collaborative path ([`crate::collab`]).
+//!
+//! # The owner's exit
+//!
+//! A reassignment that spends coins of several owners (a swap, or a fill of
+//! a resting order) completes only if every input reaches it. When one
+//! input's owner and the operator sign a second spend of that owner's
+//! checkpoint, the reassignment can never confirm, and every other owner's
+//! coin stands in a checkpoint that only that owner and the operator
+//! together can spend. A checkpoint with an exit (`exit` is `Some`) gives the
+//! owner its coin back alone, after the delay:
+//!
+//! ```text
+//! [collab, exit]                      without a sweep
+//! [collab, [sweep, exit]]             with one
+//! [[arca/collab-2, data], exit]       a vtxo-2 coin's, without a sweep
+//! [[arca/collab-2, data], [sweep, exit]]   and with one
+//! ```
+//!
+//! The delay is the coin's own exit delay, and the exit is the very script of
+//! the coin's leaf's exit. Every receiver checked that delay against its
+//! bounds when it took the coin, and every party already answers a leaf's
+//! exit within it: a good reassignment completes inside it, as the answer to
+//! a stale exit does, by publishing the other checkpoints and the
+//! reassignment. A dead one gives the coin home one exit delay after its
+//! checkpoint confirms, as soon as its owner's own exit would. Once the
+//! reassignment confirms, the checkpoint is spent and the exit is gone.
+//!
+//! The exit's signature commits to its own transaction alone (a taproot
+//! signature hash over every spent output), so it spends nothing else: not
+//! the leaf, whose exit has the same script under another output, and not
+//! another checkpoint. The collaborative path and its message are those of
+//! a checkpoint without an exit: the message names the checkpoint's salt and
+//! never the spent script. A `vtxo-2` checkpoint's message names each
+//! checkpoint output, so its pairs are made for one form or the other.
+//!
+//! A coin of a supervised asset (`landing-1`) exits only by its landing, so
+//! its checkpoint's exit is the landing: the output at the spending input's
+//! own index pays P2WPKH of the holder's landing key, in the asset,
+//! explicitly, at least the checkpoint's value less the coin's allowance
+//! ([`CheckpointExit::landing`], [`LandingTerms::script_at_own_index`]), so
+//! two landings spent together each need an output of their own. The
+//! checkpoint is a script path, which no freeze reaches, exactly as the
+//! leaf; the landed coin is a single-owner output, where the issuer's freeze
+//! and pause bind, as they bind on a coin landed from its leaf. Only a coin
+//! of a plain leaf or a `landing-1` leaf has a checkpoint with an exit
+//! ([`exit_allowed`]). A coin of a restricted asset (`enclave-1`) is never
+//! in a reassignment of several owners: a transfer of one moves that asset
+//! alone, from one holder.
 //!
 //! The checkpoint's salt differs from the leaf's, so a reassignment's
 //! signatures do not fit the leaf and a checkpoint's do not fit the checkpoint:
@@ -24,11 +74,13 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, Script};
 
 use crate::collab::Collab2;
-use crate::leaf::{rebindable_two_party, two_party_items, two_party_message};
+use crate::landing::LandingTerms;
+use crate::leaf::{exit_script, rebindable_two_party, two_party_items, two_party_message, LeafPolicy};
 use crate::message::{Chain, CsfsMessage};
 use crate::script::ExplicitOutput;
 use crate::sweep::Sweep;
 use crate::taptree::TapOutput;
+use crate::time::RelativeTime;
 use crate::Error;
 
 /// A checkpoint output's policy.
@@ -45,6 +97,33 @@ pub struct CheckpointPolicy {
 	/// The checkpoint of a `vtxo-2` coin: its collaborative path is
 	/// `arca/collab-2` ([`crate::collab`]), `[[program, data], sweep]`.
 	pub v2: bool,
+	/// The owner's exit; `None` for a checkpoint that only owner and
+	/// operator together spend. See the [module documentation](self).
+	pub exit: Option<CheckpointExit>,
+}
+
+/// A checkpoint's exit: the coin's own exit delay, and for a coin of a
+/// supervised asset its landing over the checkpoint's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CheckpointExit {
+	pub delay: RelativeTime,
+	/// `landing-1`'s terms over the checkpoint: the holder's landing program,
+	/// the asset, and the checkpoint's value less the coin's allowance.
+	pub landing: Option<LandingTerms>,
+}
+
+impl CheckpointExit {
+	/// The plain exit after `delay`.
+	pub fn plain(delay: RelativeTime) -> CheckpointExit {
+		CheckpointExit { delay, landing: None }
+	}
+}
+
+/// Whether a coin of `leaf` may move into a checkpoint with an exit: a plain
+/// leaf (`vtxo-1`, `vtxo-2`), whose exit pays wherever its owner signs, or a
+/// `landing-1` leaf, whose checkpoint lands as the leaf does.
+pub fn exit_allowed(leaf: &LeafPolicy) -> bool {
+	leaf.htlc.is_none() && leaf.order.is_none() && leaf.enclave.is_none() && leaf.channel.is_none() && leaf.claim.is_none()
 }
 
 impl CheckpointPolicy {
@@ -66,16 +145,30 @@ impl CheckpointPolicy {
 		Collab2 { owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain }
 	}
 
+	/// The owner's exit leaf, when the checkpoint has one: the coin's own
+	/// exit script, `<delay> CSV DROP <A> CHECKSIG`, or its landing, which
+	/// inspects the output at the spending input's own index
+	/// ([`LandingTerms::script_at_own_index`]).
+	pub fn exit_script(&self) -> Option<Script> {
+		self.exit.map(|e| match e.landing {
+			Some(l) => l.script_at_own_index(&self.owner, e.delay),
+			None => exit_script(&self.owner, e.delay),
+		})
+	}
+
 	/// `[collab, sweep]`, both at depth 1; a `vtxo-2` coin's checkpoint
 	/// `[[arca/collab-2, data], sweep]`. Without a sweep: `[collab]`, or
-	/// `[arca/collab-2, data]`.
+	/// `[arca/collab-2, data]`. With the owner's exit, the shapes the
+	/// [module documentation](self) gives.
 	pub fn taproot(&self) -> TapOutput {
-		if self.v2 {
-			return self.collab2().taproot_of(self.sweep_script());
-		}
-		match self.sweep_script() {
-			Some(sweep) => TapOutput::new(vec![(1, self.collab_script()), (1, sweep)]),
-			None => TapOutput::new(vec![(0, self.collab_script())]),
+		match (self.v2, self.sweep_script(), self.exit_script()) {
+			(true, sweep, None) => self.collab2().taproot_of(sweep),
+			(true, None, Some(exit)) => self.collab2().taproot_of(Some(exit)),
+			(true, Some(sweep), Some(exit)) => self.collab2().taproot_beside(sweep, exit),
+			(false, Some(sweep), None) => TapOutput::new(vec![(1, self.collab_script()), (1, sweep)]),
+			(false, None, None) => TapOutput::new(vec![(0, self.collab_script())]),
+			(false, None, Some(exit)) => TapOutput::new(vec![(1, self.collab_script()), (1, exit)]),
+			(false, Some(sweep), Some(exit)) => TapOutput::new(vec![(1, self.collab_script()), (2, sweep), (2, exit)]),
 		}
 	}
 
@@ -99,7 +192,7 @@ impl CheckpointPolicy {
 	/// coin's checkpoint, spent alone at input 0.
 	pub fn collab_witness(&self, operator_sig: &Signature, owner_sig: &Signature, m: u8) -> Vec<Vec<u8>> {
 		if self.v2 {
-			return self.collab2().witness_of(self.sweep_script(), &crate::Pair { operator: *operator_sig, owner: *owner_sig }, 1, m);
+			return self.collab2().witness_at(&self.taproot(), &crate::Pair { operator: *operator_sig, owner: *owner_sig }, 1, m);
 		}
 		self.taproot().witness(&self.collab_script(), two_party_items(operator_sig, owner_sig, m))
 	}
@@ -107,5 +200,10 @@ impl CheckpointPolicy {
 	/// The full sweep witness, when the checkpoint has a sweep.
 	pub fn sweep_witness(&self, sig: &Signature, k: u32) -> Option<Vec<Vec<u8>>> {
 		Some(self.taproot().witness(&self.sweep_script()?, Sweep::witness_items(sig, k)))
+	}
+
+	/// The owner's exit witness, when the checkpoint has an exit.
+	pub fn exit_witness(&self, owner_sig: &Signature) -> Option<Vec<Vec<u8>>> {
+		Some(self.taproot().witness(&self.exit_script()?, vec![owner_sig.as_ref().to_vec()]))
 	}
 }

@@ -70,7 +70,7 @@ async fn post(r: &mut Running, policy: &BondPolicy, w: &elements::secp256k1_zkp:
 	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
 	let op = OutPoint::new(tx.txid(), vout);
 	r.config.bond = Some(BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice_units(),
-		outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None });
+		outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None, instant_limit_value: None });
 	r.restart_server().await;
 	r.synced().await;
 	op
@@ -446,4 +446,57 @@ async fn an_instant_budget_follows_the_bonds_market_value() {
 	let e = server::server::bond_withdraw(&r.config, &key_file, &to, Some((&old, noticed["notice"].as_str().unwrap()))).await.unwrap_err();
 	println!("the retired coin's withdrawal before its delay: {}", e);
 	assert!(e.to_string().contains("non-BIP68-final"), "{}", e);
+}
+
+/// What counts against an instant budget is what someone other than the
+/// wallet could take with the operator: a coin whose lineage holds an input
+/// the wallet does not own, at its whole value. A wallet's own change from
+/// a plain payment out of its board is its key's alone, and counts nothing;
+/// the coin its receiver holds counts whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn own_change_counts_nothing_and_a_received_coin_counts_whole() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("own change A");
+	let b = Arca::new("own change B");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1",
+		"--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, r.x, 10_000_000);
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit A's board", || a.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	a.ok(&["sync"]);
+	let w = keypair("own change W");
+	let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
+	let policy = BondPolicy::new(chain, keypair("operator").x_only_public_key().0, w.x_only_public_key().0,
+		RelativeTime::from_units(notice_units()).unwrap()).unwrap();
+	post(&mut r, &policy, &w).await;
+	for k in [&a, &b] {
+		k.ok(&["instant-budget", "0.1"]);
+	}
+	// A pays B 300,000 out of its board: B holds 300,000 received, A about
+	// 1,700,000 of its own change, both out of round.
+	let req = b.ok(&["receive", "--asset", &x, "--amount", "300000"]);
+	a.ok(&["send", req["request"].as_str().unwrap(), "--amount", "300000", "--asset", &x]);
+	b.ok(&["mailbox"]);
+	let change: u64 = a.ok(&["coins"]).as_array().unwrap().iter()
+		.filter(|c| c["state"] == "live" && c["kind"] == "transfer").map(|c| c["value"].as_str().unwrap().parse::<u64>().unwrap()).sum();
+	println!("OC: A's own change out of round: {}", change);
+	assert!(change > 1_600_000, "A holds its change out of round");
+	let (ab, bb) = (a.ok(&["bond"]), b.ok(&["bond"]));
+	println!("OC: A's budget: {} | B's budget: {}", ab["instant_budget"], bb["instant_budget"]);
+	assert_eq!(budget_of(&ab).3, BOND / 10, "A's own change counts nothing: its whole budget is room");
+	assert_eq!(budget_of(&bb).3, BOND / 10 - 300_000, "B's received coin counts whole");
+	a.ok(&["receive", "--asset", &x, "--amount", "400000"]);
+	b.refused(&["receive", "--asset", &x, "--amount", "400000"], "past its instant budget of 500000");
+	for k in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&k.dir);
+	}
 }
