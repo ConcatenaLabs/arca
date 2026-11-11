@@ -580,7 +580,7 @@ async fn given_nothing(r: &Running, key: &Keypair, value: u64) -> [u8; 32] {
 	let preimage = common::client::random32();
 	let p = NewParticipation {
 		id, unlock_hash: arca_covenant::script::sha256(&preimage), preimage, not_before: None, refund_delay_units: 1,
-		inputs: vec![], fees: vec![], fill: None, distribution: None, record_formats: vec![],
+		inputs: vec![], fees: vec![], fill: None, distribution: None, record_formats: vec![], arriving: vec![],
 		outputs: vec![ParticipationOutput {
 			asset: r.x.into_inner().to_byte_array(), value,
 			kind: WantedKind::Leaf {

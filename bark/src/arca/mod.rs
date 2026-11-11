@@ -122,6 +122,7 @@ pub mod offboard;
 pub mod order;
 pub mod owed;
 mod pay;
+pub mod places;
 pub mod plan;
 mod restore;
 pub mod resting;

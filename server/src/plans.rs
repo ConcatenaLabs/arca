@@ -778,6 +778,7 @@ pub async fn apply(store: &Store, params: &Params, now: MedianTime) -> Result<us
 			// The holder's wallet named no format here: it is taken to read
 			// those every wallet reads.
 			record_formats: vec![],
+			arriving: vec![],
 			id: pid,
 			unlock_hash: s.unlock_hash,
 			preimage: s.preimage,

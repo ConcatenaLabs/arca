@@ -286,13 +286,52 @@ and a board whose registration never reached the server, are not recovered.
   out of round, and the `room` left, each in atoms of the reference unit, and
   that room in atoms of each asset the node prices, `room_atoms`).
   What counts as held out of round is what the operator, with someone other
-  than the wallet, could take by signing twice: each coin whose lineage
-  holds an input the wallet does not own (a payment received, what a swap
-  or a fill paid it, change from one included), at its whole value. The
-  wallet's own change from paying out of its round's or board's coins
-  counts nothing, and so does a coin it gives into a swap whose checkpoint
-  has its owner's exit, which comes home should the swap never complete.
-  A wallet sets no budget unless its owner sets one.
+  than the wallet, could take from it by signing twice: each coin received
+  from someone else (a payment received, or what a trade paid it, change
+  included, when some checkpoint of the trade has no owner's exit), at its
+  whole value. The wallet's own change from paying out of its round's or
+  board's coins counts nothing; so does what a trade paid it when every
+  checkpoint of the trade has its owner's exit, since the coin it gave comes
+  home should the trade die; and so does a coin it gives into a swap whose
+  checkpoint has its owner's exit. A wallet sets no budget unless its owner
+  sets one.
+- **Where each coin stands, and an instant limit.** `coin-places` places each
+  coin the wallet holds: `settled` (of its own lineage: a round's or a
+  board's coin, its own change from paying out of one), `proceeds` (what a
+  trade paid it, every checkpoint of the trade with its owner's exit, and
+  coins made from it by its own payments), `counted` (received from someone
+  else, not yet in a round, inside its instant limit) or `arriving`
+  (received past the limit, or not valued by its node; and any coin not
+  final yet, or on its way home on the chain), with the totals of each place
+  by asset, what is spendable now (`spendable`), and the limit. `instant-limit
+  ATOMS` sets the limit, in atoms of the reference unit at the wallet's
+  node's rates (`instant-limit off` sets none); the lowest of it, the
+  operator's suggestion (`info.bond.instant_limit_value`) and the bond's
+  suggested share is taken, and zero while the operator's bond does not
+  stand. Received coins count oldest first, by the operator's record of the
+  transfers that made them, until the next would pass the limit; a counted
+  coin stays counted, and a coin made from counted coins keeps their place:
+  the change of the wallet's own payment out of one, and what a trade with
+  its owner's exit on every checkpoint paid for one, which counts (with any
+  change of that trade) at most what the coins given were worth; what the
+  trade brought beyond that counts nothing against the limit, and the
+  wallet's own payments out of such a coin carry that bound on. A channel coin counts the wallet's side of it
+  alone, and with a limit set is arriving: it is the wallet's to spend once
+  its close has made it a coin. With a limit set, the wallet spends no
+  arriving coin but in a refresh, which it names to the operator so the
+  refresh runs first (`refresh-needed` asks for it, rule `arriving`, and
+  `refresh_received {leaves}` gives up those coins alone); spends trade
+  proceeds in no leg of a cross-chain swap paid to another party, and when
+  only proceeds would pay one, puts them into the next round at once and
+  goes ahead after it (they pay inside the Arca, over Lightning and on the
+  chain at once); gives into a swap a coin of exactly its amount, paying itself one first
+  when it holds none, so no change of its own rides in it; and never refuses
+  a payment for its bond (one it cannot value, or past what the bond covers,
+  arrives instead). A wallet sets no limit unless its owner sets one;
+  without one every received coin counts at once and nothing above applies.
+  A wallet that should trade only with its owner's exit on every checkpoint
+  says so apart (`require-checkpoint-exit on`), as a wallet with an instant
+  limit for people would.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
@@ -1930,6 +1969,8 @@ registry for both commands.
 | `require-checkpoint-exit [on\|off]` | Whether the wallet trades only when every checkpoint of the trade has its owner's exit, after setting it when `on` or `off` is named; off by default. With it on, a swap or a fill is refused before anything is signed when the operator does not offer the exit (`info.checkpoint_exit`), when the other side's offer or acceptance does not ask for it, when a resting order's maker reads no `coin-2` record, or when a coin of the trade cannot have it (its leaf is neither plain nor `landing-1`) |
 | `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, whether the bond covers it (`covers`), and the instant budget when one is set (`instant_budget`) |
 | `instant-budget SHARE` | Sets the share of the bond's value the wallet holds out of round at most (`0.1`, or `off`): a counterparty's instant budget |
+| `instant-limit ATOMS` | Sets the wallet's instant limit, in atoms of the reference unit (or `off`): of coins received out of round, the most it counts as its own at once |
+| `coin-places` | Each coin's place (`settled`, `proceeds`, `counted`, `arriving`), the totals of each place by asset, what is spendable now, and the instant limit |
 | `bond-evidence` | Every message the operator key signed that the wallet's coins rest on, as evidence lines (`lines`): what the wallet hands a watcher |
 | `watch-bond [--evidence FILE]… [--fee-asset ASSET]` | Compares the wallet's evidence and every file's under each salt, reads the chain and the mempool for spends of the coins they name, and burns the operator's bond on two different messages under one salt: what it counted (`evidence`), what it read (`scanned`), the `conflicts`, the slash it sent (`slashed`), and each slash sent before again until final (`resent`) |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |

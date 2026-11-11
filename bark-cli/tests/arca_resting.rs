@@ -375,3 +375,27 @@ async fn a_resting_quote_reads_the_orders_round_without_a_scan() {
 	let f = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q.to_string()]);
 	assert_eq!(f["filled"], "200000", "{}", f);
 }
+
+/// With the checkpoint exit required, a resting fill the fill itself would
+/// refuse is refused already at its quote (here the operator offers no exit),
+/// so a program leaves the order out of its prices; without the requirement
+/// the same quote answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resting_quote_is_refused_as_the_fill_would_be_when_the_exit_is_required() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+		c.checkpoint_exit = false;
+	}).await;
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let maker = holder(&mut r, "SQ M", x, 1_500_000, 0).await;
+	let (order, _) = rest(&mut r, &maker, 1_000_000, 100_000).await;
+	let t = holder(&mut r, "SQ T", y, 1_000_000, 0).await;
+	t.ok(&["require-checkpoint-exit", "on"]);
+	let why = t.refused(&["order", "fill-resting", &order, "--amount", "200000", "--quote"], "require-checkpoint-exit");
+	println!("the quote with the exit required: {}", why);
+	assert!(why.contains("the operator does not offer it"), "{}", why);
+	t.ok(&["require-checkpoint-exit", "off"]);
+	let q = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	assert_eq!(q["gets"]["amount"], "200000", "{}", q);
+}

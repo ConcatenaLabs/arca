@@ -91,6 +91,10 @@ payment out of round
   (`0.1`: a tenth of the bond's value) is published in `info.bond`; a
   counterparty's wallet takes it where it is lower than its own
   ([Limits an operator publishes](../server/README.md#limits-an-operator-publishes)).
+- **Optionally, suggest an instant limit:** `[bond] instant_limit_value`
+  (atoms of the reference unit) is published in `info.bond`: of coins paid
+  to a wallet out of round, the most it counts as its own at once. A wallet
+  that sets a limit takes the lower of the two.
 - **Never co-sign anything outside the signer.** The signer signs one message
   under a coin's salt, ever. A second signature made any other way, with a
   copy of the key or by a signer started on another record, burns the bond in

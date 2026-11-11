@@ -90,6 +90,10 @@ pub struct AssetParams {
 	/// The most the operator puts on its own side of a `channel-1` leaf in
 	/// the asset ([`crate::channels`]); zero, the default, makes none.
 	pub channel_capacity: Amount,
+	/// The most the operator holds on its own side of all its `channel-1`
+	/// leaves of the asset together, open or being opened: a participation
+	/// that would open past it is refused. No total when `None`.
+	pub channel_total: Option<Amount>,
 	/// Set when the operator serves the asset as a restricted asset in its
 	/// issuer's tree: its leaves are `enclave-1`, and its policy server
 	/// co-signs beside the operator ([`crate::restricted`]).
@@ -99,6 +103,9 @@ pub struct AssetParams {
 	/// a refresh that would take it past the cap waits for a later round.
 	/// No cap when `None`.
 	pub in_flight_cap: Option<Amount>,
+	/// How far past the in-flight cap refreshes of payments arriving may
+	/// run ([`crate::rounds`]); none when `None`.
+	pub arriving_lane: Option<Amount>,
 }
 
 /// What the operator serves of a supervised asset beside the rest.
@@ -520,6 +527,21 @@ impl Params {
 		let a = self.assets.get(asset).ok_or_else(|| format!("asset {} is not served by this operator", asset))?;
 		a.channel_capacity.atoms(self.rates.last(asset)).ok_or_else(|| format!("asset {}'s channel capacity is a value in the \
 			reference unit, and the operator has no rate for it yet", asset))
+	}
+
+	/// The asset's total channel capacity in its atoms
+	/// ([`AssetParams::channel_total`]): `None` for no total; a total set as a
+	/// value with no rate yet counts as 0, so no channel opens on a guess.
+	pub fn channel_capacity_total(&self, asset: &AssetId) -> Option<u64> {
+		let a = self.assets.get(asset)?;
+		a.channel_total.map(|c| c.atoms(self.rates.last(asset)).unwrap_or(0))
+	}
+
+	/// The asset's lane for payments arriving in its atoms
+	/// ([`AssetParams::arriving_lane`]): 0 for none, and for a value with no
+	/// rate yet.
+	pub fn arriving_lane(&self, asset: &AssetId) -> u64 {
+		self.assets.get(asset).and_then(|a| a.arriving_lane).and_then(|l| l.atoms(self.rates.last(asset))).unwrap_or(0)
 	}
 
 	/// The asset's in-flight cap in its atoms ([`AssetParams::in_flight_cap`]):

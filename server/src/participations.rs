@@ -226,6 +226,12 @@ pub struct ParticipationRequest {
 	/// whose record it reads ([`arca_covenant::reads_format`]). Not covered
 	/// by the id.
 	pub record_formats: Vec<String>,
+	/// The coins among its inputs the wallet names as payments arriving,
+	/// by leaf id in hex: received out of round, past what it counts as its
+	/// own at once. A refresh whose names the operator's records bear out
+	/// runs ahead of the others and past the in-flight cap, up to twice it
+	/// ([`crate::rounds`]). Not covered by the id.
+	pub arriving: Vec<String>,
 }
 
 impl ParticipationRequest {
@@ -776,6 +782,24 @@ impl Participations {
 			}
 		}
 
+		// The channel leaves wanted, within what the operator holds on its own
+		// side of all its channel leaves of each asset together.
+		let mut opening: BTreeMap<AssetId, u64> = BTreeMap::new();
+		for o in &req.outputs {
+			if let OutputRequest::Leaf { asset, channel: Some(c), .. } = o {
+				*opening.entry(*asset).or_default() = opening.get(asset).copied().unwrap_or(0).saturating_add(c.capacity);
+			}
+		}
+		for (asset, adds) in opening {
+			if let Some(total) = p.channel_capacity_total(&asset) {
+				let held = self.store.channel_capacity_outstanding(&asset.into_inner().to_byte_array()).await?;
+				if held.saturating_add(adds) > total {
+					return Err(ParticipationError::OutOfBounds(format!("the operator holds {} of asset {} on its side of its channel leaves, \
+						of a total of {}: a channel of {} more opens once others close", held, asset, total, adds)));
+				}
+			}
+		}
+
 		// The outputs, within the published bounds, each leaf under a key the
 		// participation proves it holds.
 		if req.key_proofs.len() != m {
@@ -1022,6 +1046,7 @@ impl Participations {
 			fill: None,
 			distribution: None,
 			record_formats: req.record_formats.clone(),
+			arriving: req.arriving.clone(),
 		};
 		match self.store.insert_participation_seen(&new, &seen).await {
 			Ok(()) => {},
@@ -1204,6 +1229,7 @@ impl Participations {
 			// The holder's wallet named no format here: it is taken to read
 			// those every wallet reads.
 			record_formats: vec![],
+			arriving: vec![],
 			id,
 			unlock_hash: sha256_bytes(&preimage),
 			preimage,
