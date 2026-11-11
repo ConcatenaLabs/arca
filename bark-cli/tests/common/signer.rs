@@ -108,24 +108,6 @@ impl SignerProcess {
 		self.dir.join("signer.record")
 	}
 
-	/// What [`Self::set_extra`] takes to start the signer, on its key, on a
-	/// record of another chain: every message it builds then differs from
-	/// the server's, no owner's signature verifies under it, and it declines
-	/// each one, a refusal it repeats however often it is asked.
-	pub fn on_another_chain(&self) -> Vec<String> {
-		use elements::hashes::Hash;
-		let genesis = BlockHash::from_byte_array([0x5a; 32]);
-		let record = self.dir.join("another-chain.record");
-		if !record.exists() {
-			let made = Command::new(signer_exe())
-				.args(["--key-file", self.dir.join("operator.key").to_str().unwrap(), "--genesis", &genesis.to_string(),
-					"--record", record.to_str().unwrap(), "--create-record", "--no-keepers"])
-				.output().unwrap();
-			assert!(made.status.success(), "the record on another chain: {}", String::from_utf8_lossy(&made.stderr));
-		}
-		vec!["--genesis".into(), genesis.to_string(), "--record".into(), record.to_str().unwrap().into()]
-	}
-
 	/// Stops the signer; its record stays.
 	pub fn halt(&mut self) {
 		let _ = self.child.kill();
@@ -152,5 +134,102 @@ impl Drop for SignerProcess {
 		let _ = self.child.kill();
 		let _ = self.child.wait();
 		let _ = std::fs::remove_dir_all(&self.dir);
+	}
+}
+
+/// A tap on a signer's socket that changes one character of every owner's
+/// signature the server's requests carry, checks included: the signer then
+/// declines each such request (`declined`), on its own key, chain and record,
+/// as it declines any request whose owner did not sign it, and answers
+/// everything else as it is. Dropping the tap puts the signer's own socket
+/// back. The signer is not restarted while a tap is on it.
+pub struct GarblingTap {
+	at: PathBuf,
+	real: PathBuf,
+	stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+	thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl GarblingTap {
+	pub fn on(signer: &SignerProcess) -> GarblingTap {
+		use std::io::{BufRead, BufReader, Write};
+		use std::os::unix::net::{UnixListener, UnixStream};
+		let at = signer.socket.clone();
+		let real = signer.dir.join("signer.real.sock");
+		std::fs::rename(&at, &real).unwrap();
+		let listener = UnixListener::bind(&at).unwrap();
+		listener.set_nonblocking(true).unwrap();
+		let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let (s, r) = (stop.clone(), real.clone());
+		let thread = std::thread::spawn(move || {
+			while !s.load(Ordering::SeqCst) {
+				let (client, _) = match listener.accept() {
+					Ok(x) => x,
+					Err(_) => {
+						std::thread::sleep(Duration::from_millis(10));
+						continue;
+					},
+				};
+				let r = r.clone();
+				std::thread::spawn(move || {
+					client.set_nonblocking(false).unwrap();
+					let mut reader = BufReader::new(client.try_clone().unwrap());
+					let mut line = String::new();
+					if reader.read_line(&mut line).unwrap_or(0) == 0 {
+						return;
+					}
+					if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&line) {
+						if garble_owner_sigs(&mut v) {
+							println!("signer tap: request {} carries an owner's signature changed", v["op"]);
+							line = format!("{}\n", v);
+						}
+					}
+					let Ok(mut up) = UnixStream::connect(&r) else { return };
+					if up.write_all(line.as_bytes()).is_err() {
+						return;
+					}
+					let mut answer = String::new();
+					let _ = BufReader::new(up).read_line(&mut answer);
+					let mut client = client;
+					let _ = client.write_all(answer.as_bytes());
+				});
+			}
+		});
+		GarblingTap { at, real, stop, thread: Some(thread) }
+	}
+}
+
+impl Drop for GarblingTap {
+	fn drop(&mut self) {
+		self.stop.store(true, Ordering::SeqCst);
+		if let Some(t) = self.thread.take() {
+			let _ = t.join();
+		}
+		let _ = std::fs::remove_file(&self.at);
+		let _ = std::fs::rename(&self.real, &self.at);
+	}
+}
+
+/// Changes the first hex digit of every `owner_sig` in a request, wherever it
+/// sits; true when there was one.
+fn garble_owner_sigs(v: &mut serde_json::Value) -> bool {
+	match v {
+		serde_json::Value::Object(m) => {
+			let mut any = false;
+			for (k, x) in m.iter_mut() {
+				if k == "owner_sig" {
+					if let Some(sig) = x.as_str().filter(|s| !s.is_empty()) {
+						let first = if sig.starts_with('0') { '1' } else { '0' };
+						*x = serde_json::Value::String(format!("{}{}", first, &sig[1..]));
+						any = true;
+					}
+				} else {
+					any |= garble_owner_sigs(x);
+				}
+			}
+			any
+		},
+		serde_json::Value::Array(a) => a.iter_mut().fold(false, |any, x| garble_owner_sigs(x) | any),
+		_ => false,
 	}
 }
