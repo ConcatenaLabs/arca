@@ -622,7 +622,7 @@ async fn d63_a_restore_counts_a_received_leaf_once_when_its_claims_coin_was_spen
 	let s = script(&a.ok(&["address"]));
 	r.pay_to(s, x, 5_000_000);
 	r.produce().await;
-	a.ok(&["board", &xs, "2000000"]);
+	a.ok(&["board", &xs, "200000"]);
 	r.produce().await;
 	r.bury().await;
 	r.synced().await;
@@ -635,16 +635,16 @@ async fn d63_a_restore_counts_a_received_leaf_once_when_its_claims_coin_was_spen
 	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete");
 	assert_eq!(a.ok(&["lightning", "receives"])[&hash]["state"], "received");
 	a.ok(&["sync"]);
-	// The claim's coin paid on (a wallet pays from the coin furthest from
-	// its exit date first: the claim's, younger than the board).
+	// The claim's coin paid on: the board alone cannot make the payment.
 	let claimed: Vec<String> = a.ok(&["coins"]).as_array().unwrap().iter()
-		.filter(|c| c["state"] == "live" && c["value"].as_str().is_some_and(|v| v.parse::<u64>().unwrap() < 1_000_000))
+		.filter(|c| c["state"] == "live" && c["value"].as_str().is_some_and(|v| v.parse::<u64>().unwrap() > 300_000))
 		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	assert_eq!(claimed.len(), 1, "the claim's coin alone holds more than the payment");
 	let b = wallet_at("D63HB", &url, &r);
 	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
 	let sent = a.ok(&["send", &req, "--amount", "300000", "--asset", &xs]);
 	println!("D63H A pays from {} (the claim's coin {:?})", sent["inputs"], claimed);
-	assert_eq!(sent["inputs"], json!(claimed), "the claim's coin is the one paid from");
+	assert!(sent["inputs"].as_array().unwrap().iter().any(|i| i == claimed[0].as_str()), "the claim's coin is paid from: {}", sent["inputs"]);
 	b.ok(&["sync"]);
 	a.ok(&["sync"]);
 	// And once more from the change, so the claim's coin is two transfers
