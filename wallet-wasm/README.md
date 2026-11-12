@@ -143,7 +143,8 @@ value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?, leaves?}` (`leaves`: those coins alone), `refresh_needed {idle_seconds?}` (whether what the wallet received out
-of round should be refreshed now, and by which rule: `arriving`, `depth`, `exposure`, `expiry`, `idle`, `shape`),
+of round should be refreshed now, and by which rule: `arriving`, `depth`, `exposure`, `expiry`, `idle`, `shape`; `give_up`, the
+received coins to give up now, and `kept_back`, one coin of each asset kept out of the round so the asset is never all in it),
 `settle_first {coins? | asset?, max_fee_ppm?, spread?}` (puts through the next round the coins a `settle_first` refusal names, or
 the `shape` rule's coins, with `spread` cut into a few coins of the asset, at most four with the others the wallet holds; giving up
 nothing twice: `settling`, `waiting`, `done`, `left`, `ready` once the coins their round made can be spent, and while not,

@@ -433,7 +433,14 @@ and a board whose registration never reached the server, are not recovered.
   left under the rule `shape` at once (with `spread`, and `max_fee_ppm` 0)
   while the wallet holds another coin of its asset with room and the
   operator refreshes it for nothing; one it charges for, or the last coin
-  of an asset, only once the wallet has been left alone two minutes.
+  of an asset, only once the wallet has been left alone two minutes. Its
+  answer also says which received coins go now (`give_up`, what
+  `refresh_received {leaves}` is given) and which it keeps back
+  (`kept_back`): when the coins going would be every coin of an asset the
+  wallet can spend and it can spend more than one, one of them stays (one
+  with room to trade from first, the largest), so a payment or a trade
+  asked meanwhile goes at once; a coin inside its refresh window always
+  goes.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.

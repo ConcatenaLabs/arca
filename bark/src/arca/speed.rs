@@ -611,8 +611,8 @@ impl Wallet {
 		// alone when it is the only rule; every received coin with any other
 		// but `shape`) and the `shape` rule's coins; and, so no asset is all
 		// in a round at once, one coin of each asset kept back when they
-		// would be every coin of it the wallet can spend now (one with room
-		// to shape first, the largest of those).
+		// would be every coin of it the wallet can spend now and it can
+		// spend more than one (one with room to shape first, the largest).
 		let others: Vec<&Value> = reasons.iter().filter(|r| r["rule"] != "shape").collect();
 		let mut give: Vec<String> = if others.is_empty() {
 			vec![]
@@ -648,10 +648,12 @@ impl Wallet {
 	/// when they are every coin of it the wallet can spend now, one of them,
 	/// so a payment or a trade asked meanwhile is paid at once from it. The
 	/// one kept is the largest with room to shape a trade's coin, else the
-	/// largest; never one of `due` (inside its refresh window, it goes). A
-	/// wallet holding one coin of an asset so keeps it: it goes into a round
-	/// when a payment or a trade needs it to (`settle_first`, the wait said),
-	/// or with others once another coin of its asset is spendable.
+	/// largest; never one of `due` (inside its refresh window, it goes). It
+	/// goes in a later round, with others once another coin of its asset is
+	/// spendable again. A wallet holding a single coin of an asset cannot
+	/// keep one back: that coin goes as the rules say (the `shape` rule
+	/// names it only once the person has left the wallet alone), and a spend
+	/// asked meanwhile waits for its round, the wait said.
 	fn kept_back(&self, info: &Value, give: &[String], shaped: &[String], due: &[String]) -> Result<Vec<String>, Error> {
 		let going: std::collections::BTreeSet<&String> = give.iter().chain(shaped).collect();
 		let mut assets: std::collections::BTreeSet<String> = Default::default();
@@ -665,7 +667,9 @@ impl Wallet {
 		for a in assets {
 			let asset = AssetId::from_str(&a).map_err(|e| Error::Store(e.to_string()))?;
 			let spendable = self.coins_to_give(asset, super::places::Spend::Pay)?;
-			if spendable.is_empty() || spendable.iter().any(|c| !going.contains(&c.row.leaf_id)) {
+			// A single coin cannot be kept back from itself: it goes as the
+			// rules say, and a spend asked meanwhile waits for it, the wait said.
+			if spendable.len() < 2 || spendable.iter().any(|c| !going.contains(&c.row.leaf_id)) {
 				continue;
 			}
 			let roomy = |h: usize| limit.is_none_or(|l| h + 3 <= l);
