@@ -82,12 +82,40 @@ use super::wallet::{owner_of, record_hops};
 use super::chain::Finality;
 use super::{Error, Wallet};
 
-/// The operator's round interval and block time when it publishes neither
-/// (`fills`), and a Bitcoin block's time: what [`Wallet::final_within`]
-/// counts a round's wait in.
+/// What [`Wallet::final_within`] counts a round's wait in. The operator's
+/// round interval and block time are read from its `info`
+/// (`fills.round_interval_seconds`, `fills.block_seconds`), and its anchor
+/// depth from `finality.anchor_depth`; these two values stand only for an
+/// operator that publishes neither. A Bitcoin block is Bitcoin's target
+/// interval, ten minutes, for each anchor block still to bury a round.
 const ROUND_SECONDS: u64 = 60;
 const BLOCK_SECONDS: u64 = 60;
 const BITCOIN_BLOCK_SECONDS: u64 = 600;
+
+/// The step a settling round waits for, earliest first: the operator's
+/// next round, its transaction's block, that block's certificate, its
+/// anchor buried at the operator's depth, and the operator's release of
+/// the new coins once it holds the round final.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Wait {
+	Round,
+	Block,
+	Certificate,
+	Anchor,
+	Release,
+}
+
+impl Wait {
+	fn name(self) -> &'static str {
+		match self {
+			Wait::Round => "round",
+			Wait::Block => "block",
+			Wait::Certificate => "certificate",
+			Wait::Anchor => "anchor",
+			Wait::Release => "release",
+		}
+	}
+}
 
 /// The store's note of the wallet's instant limit, in atoms of the
 /// reference unit, or absent.
@@ -546,7 +574,14 @@ impl Wallet {
 	/// asked again, and pays. While not ready, `final_in_seconds` is the
 	/// most it should take from now, read from where each round stands on
 	/// the chain, the operator's round interval and block time, and the
-	/// anchor depth it counts finality at ([`Self::final_within`]). Costs
+	/// anchor depth it counts finality at ([`Self::final_within`]), and
+	/// `waiting_for` the step the furthest of them waits for ([`Wait`]):
+	/// `round`, `block`, `certificate`, `anchor` or `release`. Each answer
+	/// counts again from where things stand, so a wait past its time (an
+	/// operator slow to release, a parent chain slow to bury) keeps
+	/// answering the same step and its usual time: a program that told a
+	/// person a time keeps it, and moves it on only when `waiting_for` goes
+	/// back to an earlier step (a new round, an anchor rollback). Costs
 	/// the refresh's fee per coin given up, within `max_fee_ppm` (by
 	/// default the wallet's bound).
 	pub fn settle_first(&mut self, coins: &[String], asset: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
@@ -621,11 +656,15 @@ impl Wallet {
 		let ready = settling.is_empty() && waiting.is_empty();
 		let mut v = json!({"settling": settling, "waiting": waiting, "done": done, "left": left, "ready": ready});
 		if !ready {
-			let mut most = 0u64;
+			// The round furthest from done names the step waited for, and the most it takes.
+			let (mut most, mut step) = (0u64, Wait::Release);
 			for r in &rounds {
-				most = most.max(self.final_within(&info, r.as_deref())?);
+				let (s, w) = self.final_within(&info, r.as_deref())?;
+				most = most.max(s);
+				step = step.min(w);
 			}
 			v["final_in_seconds"] = json!(most);
+			v["waiting_for"] = json!(step.name());
 		}
 		Ok(v)
 	}
@@ -654,7 +693,7 @@ impl Wallet {
 
 	/// The most seconds until `round` (a txid; empty or `None` for a round
 	/// not built yet) is final at the operator's anchor depth and its coins
-	/// are the wallet's: the operator's next round when it is not built
+	/// are the wallet's, and the step it waits for now: the operator's next round when it is not built
 	/// (`fills.round_interval_seconds`), a block for its transaction to be
 	/// mined and one more for the certificate a block above may carry
 	/// (`fills.block_seconds`), and a Bitcoin block for each anchor block
@@ -662,20 +701,20 @@ impl Wallet {
 	/// waits one round interval more: the operator releases its
 	/// participations in its pass over the rounds, which runs at that
 	/// interval and can take many seconds.
-	pub(crate) fn final_within(&self, info: &Value, round: Option<&str>) -> Result<u64, Error> {
+	pub(crate) fn final_within(&self, info: &Value, round: Option<&str>) -> Result<(u64, Wait), Error> {
 		let round_s = info["fills"]["round_interval_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(ROUND_SECONDS);
 		let block_s = info["fills"]["block_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(BLOCK_SECONDS);
 		let depth = self.chain.anchor_depth();
 		let bury = |have: u64| depth.saturating_sub(have).saturating_mul(BITCOIN_BLOCK_SECONDS);
 		let txid = round.and_then(|t| elements::Txid::from_str(t).ok());
 		let Some(txid) = txid else {
-			return Ok(round_s + 2 * block_s + bury(0));
+			return Ok((round_s + 2 * block_s + bury(0), Wait::Round));
 		};
 		Ok(match self.chain.finality(&txid)? {
-			Finality::NotInChain { .. } => 2 * block_s + bury(0),
-			Finality::Unsettled { .. } => block_s + bury(0),
-			Finality::Settled { depth: d, .. } => bury(d).max(block_s),
-			Finality::Final { .. } => round_s.max(block_s),
+			Finality::NotInChain { .. } => (2 * block_s + bury(0), Wait::Block),
+			Finality::Unsettled { .. } => (block_s + bury(0), Wait::Certificate),
+			Finality::Settled { depth: d, .. } => (bury(d).max(block_s), Wait::Anchor),
+			Finality::Final { .. } => (round_s.max(block_s), Wait::Release),
 		})
 	}
 
