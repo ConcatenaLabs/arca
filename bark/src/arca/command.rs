@@ -47,8 +47,8 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
 	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, instant_limit {value}, coin_places, settle_first {coins? | asset?, max_fee_ppm?}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
-	fee_asset?}, channel_code {address?}, leaf_template {template?}, require_checkpoint_exit {on?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
-	address | script, fee_asset?, max_fee_ppm?, shown?}, offboards";
+	fee_asset?}, channel_code {address?}, leaf_template {template?}, require_checkpoint_exit {on?}, offboard_quote {asset, amount | coins | value + expiry, address | script, max_fee_ppm?}, \
+	offboard {asset, amount | coins, address | script, fee_asset?, max_fee_ppm?, shown?}, offboards";
 
 /// A refusal as the command line prints it.
 pub fn refusal(e: &Error) -> Value {
@@ -461,17 +461,35 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		},
 		"orders" => w.orders(),
 		"offboard_quote" | "offboard" => {
-			let amount = opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?;
 			let asset = asset(req_str(&a["asset"], "the asset")?)?;
 			let script = w.offboard_script(a["address"].as_str(), a["script"].as_str())?;
 			let max_fee_ppm = opt_u64(&a["max_fee_ppm"], "the fee bound")?;
+			// `value` and `expiry` (a quote only): moving the whole of a coin
+			// the wallet is about to receive, before it holds it.
+			if command == "offboard_quote" && !a["value"].is_null() {
+				if !a["amount"].is_null() || !a["coins"].is_null() {
+					return Err(Error::Parse("an offboard quote of a coin's value names no amount and no coins".into()));
+				}
+				let value = opt_u64(&a["value"], "the value")?.ok_or_else(|| Error::Parse("the value is missing".into()))?;
+				let expiry = opt_u64(&a["expiry"], "the expiry")?.ok_or_else(|| Error::Parse("the expiry is missing".into()))?;
+				let expiry = u32::try_from(expiry).map_err(|_| Error::Parse("the expiry is out of range".into()))?;
+				return w.offboard_whole_quote(asset, value, expiry, &script, max_fee_ppm);
+			}
+			// `coins`: the whole of those coins, less the fee, with no change.
+			let named = if a["coins"].is_null() { None } else { Some(strings(&a["coins"], "the coins")?) };
+			let of = match &named {
+				Some(ids) if a["amount"].is_null() => super::offboard::OffboardOf::Coins(ids),
+				Some(_) => return Err(Error::Parse("an offboard of named coins pays what they hold less the fee: name no amount".into())),
+				None => super::offboard::OffboardOf::Amount(opt_u64(&a["amount"], "the amount")?
+					.ok_or_else(|| Error::Parse("the amount is missing".into()))?),
+			};
 			if command == "offboard_quote" {
-				return w.offboard_quote(asset, amount, &script, max_fee_ppm);
+				return w.offboard_quote_of(asset, of, &script, max_fee_ppm);
 			}
 			// With `shown`, the offboard goes ahead only on the fee and the
 			// coins the program showed (an `offboard_quote`'s).
 			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
-			w.offboard(asset, amount, &script, opt_asset(&a["fee_asset"])?, max_fee_ppm, shown)
+			w.offboard_of(asset, of, &script, opt_asset(&a["fee_asset"])?, max_fee_ppm, shown)
 		},
 		"offboards" => w.offboards(),
 		// An order resting in the tree (`super::resting`): its terms as an
@@ -687,6 +705,14 @@ fn texts(v: &Value, what: &str) -> Result<Vec<String>, Error> {
 		Value::Null => Ok(vec![]),
 		Value::Array(v) => v.iter().map(|l| l.as_str().map(String::from).ok_or_else(|| Error::Parse(format!("{}: an entry is not text", what))))
 			.collect(),
+		other => Err(Error::Parse(format!("{}: {}", what, other))),
+	}
+}
+
+/// A list of coin ids, `what` naming it in a refusal.
+fn strings(v: &Value, what: &str) -> Result<Vec<String>, Error> {
+	match v {
+		Value::Array(v) => v.iter().map(|l| l.as_str().map(String::from).ok_or_else(|| Error::Parse(format!("{}: a coin is not text", what)))).collect(),
 		other => Err(Error::Parse(format!("{}: {}", what, other))),
 	}
 }
