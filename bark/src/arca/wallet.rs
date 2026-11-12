@@ -3657,11 +3657,15 @@ impl Wallet {
 		// The coins the wallet holds, read once: those it spent or lost,
 		// which no figure here counts, are not read.
 		let held_coins = self.store.coins_not_in(&GONE)?;
+		// A coin held out as spent elsewhere: the wallet's still, counted in
+		// what it holds, and shown apart from what it can spend now.
+		let elsewhere = self.spent_elsewhere()?;
 		for c in &held_coins {
 			if matches!(c.state.as_str(), "spent" | "exited" | "lost") {
 				continue;
 			}
-			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" } else { Self::standing(c) };
+			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" }
+				else if elsewhere.contains(&c.leaf_id) { "spent_elsewhere" } else { Self::standing(c) };
 			// A channel coin counts the wallet's side of it alone.
 			let worth = self.channel_worth(c)?.unwrap_or(c.value);
 			*per.entry(c.asset.clone()).or_default().entry(standing.to_string()).or_default() += worth;

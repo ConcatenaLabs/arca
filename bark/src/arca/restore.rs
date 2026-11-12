@@ -176,7 +176,113 @@ pub(crate) const CAUGHT_UP: &str = "caught_up";
 /// How often `sync` catches up, at most (median-time seconds).
 pub(crate) const CATCH_UP_EVERY: u32 = 600;
 
+/// Where the wallet keeps the coins held out as spent elsewhere, each with
+/// the median time its hold ends ([`Wallet::spent_elsewhere`]).
+const SPENT_ELSEWHERE: &str = "spent_elsewhere";
+
 impl Wallet {
+	/// After the operator refused a spend of this store's because coin
+	/// `leaf` of the wallet's own is spent already (`double_spend`), by
+	/// nothing this store did: another store of the mnemonic (a second
+	/// device) gave it to a round or paid with it. The wallet reads what the
+	/// other stores did at once, so it stops counting the coin and holds
+	/// what replaced it (arca #839). While that other store's round is not
+	/// final its participation is not released and the catch-up finds
+	/// nothing yet: the coin is then held out of every spend
+	/// ([`Self::spent_elsewhere`]), so no quote or spend offers it again
+	/// meanwhile.
+	///
+	/// The hold is the operator's word with an age, never a state of the
+	/// coin: it lasts at most as long as a round of the operator's takes to
+	/// be final from now (the wait the wallet states for it), and ends
+	/// sooner when a catch-up settles the coin or the operator serves it
+	/// live again (the other device's participation withdrawn or voided, its
+	/// round dropped). Only a new refusal sets it again. So an operator that
+	/// answers `double_spend` falsely costs the wallet at most that one wait
+	/// per coin per refusal; and no hold touches the coin's exit.
+	pub(crate) fn caught_up_after_spent(&mut self, leaf: &str) -> Result<(), Error> {
+		let info = self.server_info()?;
+		let now = self.now()?.to_consensus_u32();
+		let wait = self.final_within(&info, None)?.most;
+		let mut holds = self.spent_elsewhere_holds()?;
+		holds.insert(leaf.to_string(), now.saturating_add(u32::try_from(wait).unwrap_or(u32::MAX)));
+		self.store.set_meta(SPENT_ELSEWHERE, &json!(holds).to_string())?;
+		if let Err(c) = self.settle_spent_elsewhere() {
+			self.store.refused("the catch-up after a coin spent elsewhere", &c.to_string())?;
+		}
+		Ok(())
+	}
+
+	/// The coins of the wallet's own that the operator refused to spend as
+	/// spent already, held out until their hold ends: still live or pending
+	/// here, their hold's time not passed, and no catch-up having settled
+	/// them or found them live again. No spend takes them, and nothing counts
+	/// them as spendable now; a spend short without them waits for them
+	/// ([`Error::SettleFirst`]) for at most what is left of the hold, and
+	/// `sync` and `settle_first` catch up while any is held.
+	pub(crate) fn spent_elsewhere(&self) -> Result<BTreeSet<String>, Error> {
+		Ok(self.spent_elsewhere_until()?.into_keys().collect())
+	}
+
+	/// [`Self::spent_elsewhere`], each with the median time its hold ends.
+	pub(crate) fn spent_elsewhere_until(&self) -> Result<BTreeMap<String, u32>, Error> {
+		let holds = self.spent_elsewhere_holds()?;
+		if holds.is_empty() {
+			return Ok(holds);
+		}
+		let now = self.now()?.to_consensus_u32();
+		let mut out = BTreeMap::new();
+		for (l, until) in holds {
+			if until > now && self.store.coin(&l)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				out.insert(l, until);
+			}
+		}
+		Ok(out)
+	}
+
+	/// Every hold kept, ended or not. A list of a build that kept no end
+	/// time reads as ended.
+	fn spent_elsewhere_holds(&self) -> Result<BTreeMap<String, u32>, Error> {
+		let Some(v) = self.store.meta(SPENT_ELSEWHERE)? else { return Ok(BTreeMap::new()) };
+		if let Ok(m) = serde_json::from_str::<BTreeMap<String, u32>>(&v) {
+			return Ok(m);
+		}
+		Ok(BTreeMap::new())
+	}
+
+	/// A catch-up while a coin is held out as spent elsewhere
+	/// ([`Self::spent_elsewhere`]), whenever it is asked, not once every ten
+	/// minutes; what it found, or `None` when no coin is held out. A held
+	/// coin the operator serves live again is no longer held: the round that
+	/// spent it elsewhere is not going ahead.
+	pub(crate) fn settle_spent_elsewhere(&mut self) -> Result<Option<Value>, Error> {
+		let held = self.spent_elsewhere_until()?;
+		if held.is_empty() {
+			self.store.set_meta(SPENT_ELSEWHERE, "{}")?;
+			return Ok(None);
+		}
+		let (v, served) = self.catch_up_served()?;
+		let live: BTreeSet<&str> = served.iter().filter(|e| e["state"] == "live").filter_map(|e| e["leaf_id"].as_str()).collect();
+		let mut lifted = vec![];
+		let mut keep = BTreeMap::new();
+		for (l, until) in held {
+			if live.contains(l.as_str()) {
+				lifted.push(l);
+			} else {
+				keep.insert(l, until);
+			}
+		}
+		self.store.set_meta(SPENT_ELSEWHERE, &json!(keep).to_string())?;
+		// What is still held is what the catch-up left live or pending.
+		let still = self.spent_elsewhere_until()?;
+		self.store.set_meta(SPENT_ELSEWHERE, &json!(still).to_string())?;
+		let mut v = v;
+		if !lifted.is_empty() {
+			v["live_again"] = json!(lifted);
+		}
+		Ok(Some(v))
+	}
+
 	/// Restores the wallet from what its mnemonic names: every leaf the server
 	/// serves to its mailbox key, each checked as the module documentation
 	/// says, then the mailbox, then a `sync`. Run on a wallet created from a
@@ -822,8 +928,15 @@ impl Wallet {
 	/// same coins. `sync` runs it at most once every ten minutes; the coins
 	/// held stay as they are while it runs.
 	pub fn catch_up(&mut self) -> Result<Value, Error> {
+		Ok(self.catch_up_served()?.0)
+	}
+
+	/// [`Self::catch_up`], with every coin the operator served, as it served
+	/// them.
+	pub(crate) fn catch_up_served(&mut self) -> Result<(Value, Vec<Value>), Error> {
 		let info = self.server_info()?;
 		let (entries, served_receives, read_note) = self.read_served()?;
+		let served = entries.clone();
 		// The coins a restore left to its history steps are theirs: a catch-up
 		// would otherwise check them all at once.
 		let listed = self.history_ids()?;
@@ -842,7 +955,7 @@ impl Wallet {
 		if let Some(n) = read_note {
 			out["note"] = json!(n);
 		}
-		Ok(out)
+		Ok((out, served))
 	}
 
 	/// Whether the server serves coin `e` as given up for good: in a

@@ -68,6 +68,10 @@ pub fn refusal(e: &Error) -> Value {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["release"] = json!(release);
 	}
+	if let Error::Shaped { asset, fee, .. } = e {
+		out["error"]["asset"] = json!(asset);
+		out["error"]["fee"] = json!(fee.to_string());
+	}
 	if let Error::SettleFirst { asset, coins, wait, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["coins"] = json!(coins);
@@ -539,6 +543,12 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"swap_read" => w.swap_read(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
 		"swap_accept" => {
 			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			// Only a build for the test of the shaped refusal reads this, and
+			// only when the call names it.
+			#[cfg(feature = "shape-probe")]
+			if let Some(off) = a["shape_off_by"].as_i64() {
+				return w.swap_accept_shaped_off(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false), shown, off);
+			}
 			w.swap_accept_shown(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false), shown)
 		},
 		"swap_complete" => w.swap_complete(req_str(&a["accept"], "the acceptance")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
@@ -791,6 +801,9 @@ mod test {
 		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], side: 7, most: Some(9), fee: Some(3), message: "short".into() };
 		assert_eq!(refusal(&c), json!({"error": {"kind": "in_channel", "message": "refused: short", "asset": "aa", "close": ["ch1"], "side": "7",
 			"most": "9", "fee": "3"}}));
+		// A trade refused after the wallet paid itself its coin: what that payment cost, to count as paid.
+		let sh = Error::Shaped { asset: "aa".into(), fee: 480, message: "shaped".into() };
+		assert_eq!(refusal(&sh), json!({"error": {"kind": "shaped", "message": "refused: shaped", "asset": "aa", "fee": "480"}}));
 		// A completion the operator refused: the swap, its code, and whose coin it named.
 		let s = Error::SwapRefused { swap: "ab".into(), status: 409, code: "double_spend".into(), coin: Some("cd".into()), whose: Some("taker"),
 			message: "leaf cd is already spent".into() };
