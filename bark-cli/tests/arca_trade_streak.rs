@@ -317,6 +317,10 @@ impl Clock {
 	async fn tick(&mut self, r: &Running, a: &Arca) {
 		if self.block.elapsed().as_secs() >= 60 {
 			r.produce().await;
+			// At the harness's defaults a round is final only once its anchor is buried.
+			if defaults() {
+				r.bury().await;
+			}
 			self.block = std::time::Instant::now();
 		}
 		if self.sync.elapsed().as_secs() >= 5 {
@@ -481,6 +485,7 @@ async fn twenty_trades_from_one_coin_wait_once_with_the_wait_said() {
 	let w = waits(&t);
 	let multi = t.iter().filter(|x| x.spent > 1).count();
 	println!("{}: {} trades, waits {:?}, paid {}, trades paid from more than one coin {}", tag, t.len(), w, paid, multi);
+	assert_eq!(t.len(), 20, "every trade went, waiting or not: {:?}", t);
 	// A trade of more than half of what is left pays from the reserve coin alone.
 	let (x, y) = (r.x, r.y);
 	let total: u64 = coins_of(&a, x).iter().map(|c| c.1).sum();
