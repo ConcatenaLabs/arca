@@ -113,6 +113,9 @@ pub struct App {
 	/// database, each kept so that `info` answers from memory and never
 	/// waits on the read ([`crate::fresh`]).
 	pub info_parts: InfoParts,
+	/// The watcher, when it acts on its own (`[watcher] enabled`): `info`
+	/// publishes the bound its unlock lane keeps.
+	pub watcher: Option<Arc<crate::watcher::Watcher>>,
 	/// The operator's equivocation bond, when the configuration names one.
 	pub bond: Option<crate::bond::Bond>,
 	/// The keepers the signer's record names, as `info` publishes them: the
@@ -930,6 +933,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		mailbox_reads: MAX_MAILBOX_READS as u32,
 		checkpoint_exit: app.params.checkpoint_exit,
 		landing_2_only: app.params.landing_2_only,
+		offboards: api::OffboardsInfo { unlock_within_seconds: app.watcher.as_ref().map_or(0, |w| w.unlock_within_seconds()) },
 	})
 }
 

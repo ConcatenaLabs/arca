@@ -219,6 +219,14 @@ impl Wallet {
 		}
 		let Some((fee, change)) = done else {
 			let need = ask.amount.saturating_add(refresh).saturating_add(offboard);
+			// Coins the wallet holds as its own that a round must refresh or
+			// make final first (arriving, not final yet, given up in its own
+			// round): said so, naming them, as an offboard does, since an
+			// order gives its coins up in a round the same way.
+			let held = self.round_first(info, a, super::places::Spend::Pay, None, super::pay::Reads::ALL)?;
+			if let Some(e) = self.settle_first_of(a, total, need, held) {
+				return Err(e);
+			}
 			return Err(self.short_of(a, need.saturating_sub(total).max(1), format!("the wallet's live coins of asset {} hold {} and the order \
 				of {} and its fee need {} (refresh {}, offboard {}), with any change at least the operator's smallest leaf of {}: board or \
 				receive more, or place less", a, total, ask.amount, need, refresh, offboard, min))?);

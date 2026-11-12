@@ -263,13 +263,15 @@ pub struct Forfeits {
 	params: Arc<Params>,
 	signer: SignerClient,
 	cosigner: Arc<Cosigner>,
+	/// Each participation released, for the watcher's unlock lane.
+	releases: Arc<crate::watcher::Releases>,
 }
 
 impl Forfeits {
-	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, signer: SignerClient, cosigner: Arc<Cosigner>)
-		-> Arc<Forfeits>
+	pub fn new(store: Store, finality: Arc<FinalityService>, params: Arc<Params>, signer: SignerClient, cosigner: Arc<Cosigner>,
+		releases: Arc<crate::watcher::Releases>) -> Arc<Forfeits>
 	{
-		Arc::new(Forfeits { store, finality, params, signer, cosigner })
+		Arc::new(Forfeits { store, finality, params, signer, cosigner, releases })
 	}
 
 	/// Whether the node holds the round `round_id` now: in a block of the
@@ -462,6 +464,7 @@ impl Forfeits {
 			Err(StoreError::NotInRound(state)) => return Err(ForfeitError::NotInRound(state)),
 			Err(e) => return Err(e.into()),
 		}
+		self.releases.push(id);
 		log::info!("participation {} released: {} forfeit(s) in, preimage handed over", hex(&id), forfeits.len());
 		Ok(Forfeited { participation_id: id, state: ParticipationState::Released, preimage: Some(p.preimage) })
 	}

@@ -420,6 +420,63 @@ impl Store {
 		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
 	}
 
+	/// The offboard outputs of the participations `ids` that may be unlocked
+	/// now: the participation released, at the attempt and in the round the
+	/// output is of, that round final, and no final transaction of the
+	/// watcher's spending the output; with each participation's offboard
+	/// outputs that may be unlocked later (its round not final yet, or its
+	/// participation not released yet) counted, by participation. The
+	/// unlock lane reads only these, so it costs what was released, never
+	/// the history.
+	pub async fn offboards_to_unlock(&self, ids: &[[u8; 32]])
+		-> Result<(Vec<super::rounds::OffboardRow>, std::collections::HashMap<[u8; 32], u64>), StoreError>
+	{
+		let conn = self.conn().await?;
+		let ids: Vec<Vec<u8>> = ids.iter().map(|i| i.to_vec()).collect();
+		let rows = conn.query(
+			&format!("SELECT o.round_id, o.vout, o.participation_id, o.output_idx, o.attempt, o.value,
+			   r.state = 'final' AND p.state = 'released' AND p.attempt = o.attempt AND p.round_id = o.round_id
+			 FROM participation p JOIN round_offboard o ON o.participation_id = p.participation_id
+			 JOIN round r ON r.round_id = o.round_id
+			 WHERE p.participation_id = ANY($1) AND r.state <> 'lost' AND p.state IN ('issued', 'released') AND NOT {}
+			 ORDER BY o.round_id, o.vout", spent_final("r.txid", "o.vout")),
+			&[&ids],
+		).await?;
+		let mut now = vec![];
+		let mut later: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+		for r in &rows {
+			let o = super::rounds::OffboardRow {
+				round_id: r.get(0),
+				vout: r.get::<_, i32>(1) as u32,
+				participation_id: array32(r.get(2), "participation id")?,
+				output_idx: r.get::<_, i16>(3) as u16,
+				attempt: r.get::<_, i32>(4) as u32,
+				value: r.get::<_, i64>(5) as u64,
+			};
+			if r.get::<_, bool>(6) {
+				now.push(o);
+			} else {
+				*later.entry(o.participation_id).or_default() += 1;
+			}
+		}
+		Ok((now, later))
+	}
+
+	/// The participations released whose offboard outputs in a final round
+	/// no final transaction of the watcher's spends: what the unlock lane
+	/// takes over when it starts.
+	pub async fn released_with_offboards_open(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			&format!("SELECT DISTINCT o.participation_id FROM round_offboard o JOIN round r ON r.round_id = o.round_id
+			 JOIN participation p ON p.participation_id = o.participation_id
+			 WHERE r.state = 'final' AND p.state = 'released' AND p.attempt = o.attempt AND p.round_id = o.round_id AND NOT {}",
+				spent_final("r.txid", "o.vout")),
+			&[],
+		).await?;
+		rows.iter().map(|r| array32(r.get(0), "participation id")).collect()
+	}
+
 	/// The offboard outputs of final rounds whose participation is released,
 	/// expired or void and that no final transaction of the watcher's
 	/// spends: those that may still be unlocked or reclaimed.

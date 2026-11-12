@@ -53,6 +53,11 @@
 //! `SEQUENTIA_REGTEST_COMMITTEE_STAKE` to each committee staker's weight in
 //! atoms, well above the stakes the wallet bonds (one atom when unset).
 //!
+//! With `ARCA_OPERATOR_FINALITY_POLL_MS` set, the operator follows the
+//! chain at that interval (200 ms otherwise), so a wallet can see a round
+//! final before the operator does and waits for its release, as on an
+//! operator whose pass over the rounds is slow.
+//!
 //! With `ARCA_OPERATOR_SUPERVISED` set, the chain issues an asset Z under
 //! the supervision descriptor (pause allowed, listed for fees at 1:1), and
 //! the operator serves it under the supervised profile, its signer reading
@@ -746,6 +751,13 @@ fn bitcoin_handle(side: &Option<BitcoinSide>, path: &str, b: &Value) -> Option<R
 	}
 }
 
+/// `ARCA_OPERATOR_FINALITY_POLL_MS`, when set.
+fn finality_knobs(c: &mut server::server::Config) {
+	if let Ok(ms) = std::env::var("ARCA_OPERATOR_FINALITY_POLL_MS") {
+		c.finality.poll_interval_ms = ms.trim().parse().expect("ARCA_OPERATOR_FINALITY_POLL_MS is milliseconds");
+	}
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a server kept running for a wallet outside this process; run by hand"]
 async fn operator_for_browsers() {
@@ -758,12 +770,13 @@ async fn operator_for_browsers() {
 			Ok(h) => {
 				let h: u32 = h.trim().parse().expect("ARCA_OPERATOR_NO_SWEEP is a service horizon in seconds");
 				(Running::start_with(|c, _, _| {
+					finality_knobs(c);
 					c.batches.no_sweep = true;
 					c.batches.holder_batches = Some(0);
 					c.batches.collect_after_seconds = Some(h);
 				}).await, vec![])
 			},
-			Err(_) => (Running::start().await, vec![]),
+			Err(_) => (Running::start_with(|c, _, _| finality_knobs(c)).await, vec![]),
 		},
 	};
 	let mut profiles = Profiles::default();
