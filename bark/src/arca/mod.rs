@@ -178,6 +178,14 @@ pub enum Error {
 	/// The server refused, with its stable code.
 	#[error("the server refused {call} ({status} {code}): {message}")]
 	Server { call: String, status: i32, code: String, message: String },
+	/// The operator refused the completion of swap `swap` that this wallet
+	/// offered: nothing was co-signed, the offer is withdrawn (`swaps` lists
+	/// it cancelled) and its coins are spendable again, so the acceptance can
+	/// never complete here. `coin` is the coin the operator named, when it
+	/// named one, and `whose` whether it is the maker's or the taker's; the
+	/// server's own `code` and `status` come with it.
+	#[error("refused: the operator refused the swap's completion ({status} {code}): {message}; the offer is withdrawn")]
+	SwapRefused { swap: String, status: i32, code: String, coin: Option<String>, whose: Option<&'static str>, message: String },
 	#[error("cannot reach the server: {0}")]
 	Unreachable(String),
 	/// What a coin rests on is not on the chain the node holds now, as during
@@ -210,6 +218,7 @@ impl Error {
 			Error::InChannel { .. } => "in_channel",
 			Error::SettleFirst { .. } => "settle_first",
 			Error::Server { .. } => "server_refused",
+			Error::SwapRefused { .. } => "swap_refused",
 			Error::Unreachable(_) => "unreachable",
 			Error::Missing(_) => "missing",
 			Error::Unread(_) => "unread",
