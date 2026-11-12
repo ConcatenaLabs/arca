@@ -79,7 +79,144 @@ use arca_covenant::CoinRecord;
 
 use super::store::CoinRow;
 use super::wallet::{owner_of, record_hops};
+use super::chain::Finality;
 use super::{Error, Wallet};
+
+/// What [`Wallet::final_within`] counts a round's wait in. The operator's
+/// round interval, block time, window for a held round's forfeits and the
+/// time its passes over the rounds take are read from its `info`
+/// (`fills.round_interval_seconds`, `fills.block_seconds`,
+/// `fills.forfeit_window_seconds`, `fills.round_pass_seconds`), and its
+/// anchor depth from `finality.anchor_depth`; these three values stand only
+/// for an operator that publishes none (one that publishes no pass time is
+/// counted as in [`Wallet::final_within`]). A Bitcoin block is Bitcoin's target
+/// interval, ten minutes, for each anchor block still to bury a round.
+const ROUND_SECONDS: u64 = 60;
+const BLOCK_SECONDS: u64 = 60;
+const FORFEIT_WINDOW_SECONDS: u64 = 600;
+const BITCOIN_BLOCK_SECONDS: u64 = 600;
+
+/// [`Wallet::final_within`]'s count, for a round where `finality` says
+/// (`None` for a round not built yet) on an operator that publishes `info`
+/// and counts finality at anchor depth `depth`.
+pub(crate) fn wait_counts(info: &Value, depth: u64, finality: Option<&Finality>) -> Within {
+	let round_s = info["fills"]["round_interval_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(ROUND_SECONDS);
+	let block_s = info["fills"]["block_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(BLOCK_SECONDS);
+	let forfeits_s = info["fills"]["forfeit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(FORFEIT_WINDOW_SECONDS);
+	// The operator builds a round and releases its participations in its
+	// passes over the rounds, which run at its round interval and on each
+	// block. An operator that publishes how long its passes take
+	// (`fills.round_pass_seconds`, its finality poll included) is counted one
+	// pass to build the round and three to release it (a build and a pass
+	// that may be under way when the round turns final, and the pass after
+	// them); one that does not, a round interval and a block to release it.
+	let pass_s = info["fills"]["round_pass_seconds"].as_u64().filter(|s| *s > 0);
+	let build = pass_s.unwrap_or(0);
+	let release = pass_s.map_or(round_s + block_s, |p| 3 * p);
+	let bury = |have: u64| depth.saturating_sub(have).saturating_mul(BITCOIN_BLOCK_SECONDS);
+	let held = info["batches"]["no_sweep"].as_bool() == Some(true);
+	let after_block = 2 * block_s + bury(0) + release;
+	let w = |most: u64, usual: u64, step: Wait| Within { most, usual, step };
+	match finality {
+		None if held => w(round_s + build + forfeits_s + after_block, 2 * round_s + build + after_block, Wait::Round),
+		None => w(round_s + build + after_block, round_s + build + after_block, Wait::Round),
+		Some(Finality::NotInChain { in_mempool: false }) => w(forfeits_s + after_block, round_s + after_block, Wait::Forfeits),
+		Some(Finality::NotInChain { in_mempool: true }) => w(after_block, after_block, Wait::Block),
+		Some(Finality::Unsettled { .. }) => w(block_s + bury(0) + release, block_s + bury(0) + release, Wait::Certificate),
+		Some(Finality::Settled { depth: d, .. }) => w(bury(*d).max(block_s) + release, bury(*d).max(block_s) + release, Wait::Anchor),
+		Some(Finality::Final { .. }) => w(release, release, Wait::Release),
+	}
+}
+
+#[cfg(test)]
+mod wait_tests {
+	use super::*;
+
+	fn info(extra: Value) -> Value {
+		let mut v = json!({"fills": {"round_interval_seconds": 60, "block_seconds": 60, "forfeit_window_seconds": 600},
+			"batches": {"no_sweep": true}});
+		if let (Some(o), Some(e)) = (v["fills"].as_object_mut(), extra.as_object()) {
+			for (k, x) in e {
+				o.insert(k.clone(), x.clone());
+			}
+		}
+		v
+	}
+
+	#[test]
+	fn the_testnets_wait_term_by_term() {
+		// Round 60, held for forfeits 600 (usual: one round more), block 60,
+		// certificate 60, depth 0, release a round and a block 120.
+		let w = wait_counts(&info(json!({})), 0, None);
+		assert_eq!((w.most, w.usual, w.step), (60 + 600 + 120 + 120, 60 + 60 + 120 + 120, Wait::Round));
+		let w = wait_counts(&info(json!({})), 0, Some(&Finality::NotInChain { in_mempool: false }));
+		assert_eq!((w.most, w.usual, w.step), (600 + 120 + 120, 60 + 120 + 120, Wait::Forfeits));
+		let w = wait_counts(&info(json!({})), 0, Some(&Finality::NotInChain { in_mempool: true }));
+		assert_eq!((w.most, w.step), (120 + 120, Wait::Block));
+		let w = wait_counts(&info(json!({})), 0, Some(&Finality::Unsettled { height: 1 }));
+		assert_eq!((w.most, w.step), (60 + 120, Wait::Certificate));
+		let w = wait_counts(&info(json!({})), 0, Some(&Finality::Final { height: 1, depth: 0 }));
+		assert_eq!((w.most, w.usual, w.step), (120, 120, Wait::Release));
+		// Depth 2: two Bitcoin blocks more until buried.
+		let w = wait_counts(&info(json!({})), 2, Some(&Finality::Settled { height: 1, depth: 1 }));
+		assert_eq!((w.most, w.step), (600 + 120, Wait::Anchor));
+	}
+
+	#[test]
+	fn a_published_pass_time_replaces_the_release_guess() {
+		let fast = info(json!({"round_pass_seconds": 3}));
+		let w = wait_counts(&fast, 0, Some(&Finality::Final { height: 1, depth: 0 }));
+		assert_eq!(w.most, 9, "a build and a pass under way, and the next pass, 3 s each");
+		let w = wait_counts(&fast, 0, None);
+		assert_eq!(w.usual, 60 + 3 + 60 + 120 + 9, "a pass to build, the forfeits, block and certificate, three passes to release");
+		let unheld = json!({"fills": {"round_interval_seconds": 30, "block_seconds": 60}});
+		assert_eq!(wait_counts(&unheld, 0, None).most, 30 + 120 + 30 + 60, "a sweeping operator holds no round for forfeits");
+	}
+}
+
+/// `settle_first`'s sorting of the coins it is asked for ([`Wallet::sorted`]).
+struct Sorted {
+	give: Vec<String>,
+	waiting: Vec<String>,
+	done: Vec<String>,
+	rounds: Vec<Option<String>>,
+}
+
+/// What [`Wallet::final_within`] answers: the most seconds a round still
+/// takes, what it usually takes, and the step it waits for.
+pub(crate) struct Within {
+	pub most: u64,
+	pub usual: u64,
+	pub step: Wait,
+}
+
+/// The step a settling round waits for, earliest first: the operator's
+/// next round; a round held unbroadcast until every participation in it
+/// has handed its forfeits over; its transaction's block; that block's
+/// certificate; its anchor buried at the operator's depth; and the
+/// operator's release of the new coins once it holds the round final.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Wait {
+	Round,
+	Forfeits,
+	Block,
+	Certificate,
+	Anchor,
+	Release,
+}
+
+impl Wait {
+	fn name(self) -> &'static str {
+		match self {
+			Wait::Round => "round",
+			Wait::Forfeits => "forfeits",
+			Wait::Block => "block",
+			Wait::Certificate => "certificate",
+			Wait::Anchor => "anchor",
+			Wait::Release => "release",
+		}
+	}
+}
 
 /// The store's note of the wallet's instant limit, in atoms of the
 /// reference unit, or absent.
@@ -524,20 +661,39 @@ impl Wallet {
 	/// spend waits for ([`Error::SettleFirst`] names them, as `coins`), or,
 	/// with `asset` alone, every coin of it that pays out of round only
 	/// after a round ([`Wallet::round_first`] for a payment) and every coin
-	/// of it a round of the wallet's holds now (given up, not final yet). Each coin
-	/// still live is given up in a refresh for a coin of the wallet's own
-	/// (`settling`); one already given up, or not final yet, waits for its
-	/// round as it is (`waiting`); one the wallet no longer holds is through
-	/// (`done`); one the operator would not take now stays live, with why
-	/// (`left`). Asked again it gives up nothing twice, so a program asks it
-	/// again while it waits. `ready` once nothing named is settling or
-	/// waiting: the spend can be asked again. Costs the refresh's fee per
-	/// coin given up, within `max_fee_ppm` (by default the wallet's bound).
+	/// of it a round of the wallet's holds now (given up, not final yet, or
+	/// final with its new coins not taken yet). Each coin still live is
+	/// given up in a refresh for a coin of the wallet's own (`settling`).
+	/// One already given up waits for its round as it is (`waiting`), and so
+	/// does one whose round is through while the coins it made cannot be
+	/// spent yet: their round not final, or final with the operator's
+	/// preimage for them still to come. One the wallet no longer holds and
+	/// whose round left it coins it can spend is through (`done`); one the
+	/// operator would not take now stays live, with why (`left`). Asked again
+	/// it gives up nothing twice, so a program asks it again while it waits.
+	/// `ready` once nothing named is settling or waiting: the spend can be
+	/// asked again, and pays. While not ready, `final_in_seconds` is the
+	/// most it should take from now, read from where each round stands on
+	/// the chain, the operator's round interval and block time, and the
+	/// anchor depth it counts finality at ([`Self::final_within`]), and
+	/// `usual_in_seconds` what it usually takes (less than the most only
+	/// while a round may be held for other participations' forfeits, which
+	/// usually come within a round interval and may take the operator's
+	/// whole window), and `waiting_for` the step the furthest of them waits
+	/// for ([`Wait`]):
+	/// `round`, `forfeits`, `block`, `certificate`, `anchor` or `release`. Each answer
+	/// counts again from where things stand, so a wait past its time (an
+	/// operator slow to release, a parent chain slow to bury) keeps
+	/// answering the same step and its usual time: a program that told a
+	/// person a time keeps it, and moves it on only when `waiting_for` goes
+	/// back to an earlier step (a new round, an anchor rollback). Costs
+	/// the refresh's fee per coin given up, within `max_fee_ppm` (by
+	/// default the wallet's bound).
 	pub fn settle_first(&mut self, coins: &[String], asset: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let info = self.server_info()?;
 		let ids: Vec<String> = if !coins.is_empty() {
 			coins.to_vec()
 		} else if let Some(a) = asset {
-			let info = self.server_info()?;
 			let mut ids: Vec<String> = self.round_first(&info, a, Spend::Pay, super::pay::depth_limit(&info), super::pay::Reads::ALL)?.into_iter().map(|(l, ..)| l).collect();
 			// And every coin of it the wallet's own rounds hold now (given up in a
 			// refresh, or not final yet), which a spend waits for as it is.
@@ -550,14 +706,7 @@ impl Wallet {
 		} else {
 			return Err(Error::Parse("name the coins to settle, or the asset".into()));
 		};
-		let (mut give, mut waiting, mut done) = (vec![], vec![], vec![]);
-		for id in ids {
-			match self.store.coin(&id)?.map(|c| c.state) {
-				Some(st) if st == "live" => give.push(id),
-				Some(st) if st == "given" || st == "pending" => waiting.push(id),
-				_ => done.push(id),
-			}
-		}
+		let Sorted { give, waiting, done, mut rounds } = self.sorted(ids)?;
 		let mut left = vec![];
 		let mut settling = vec![];
 		if !give.is_empty() {
@@ -579,8 +728,177 @@ impl Wallet {
 				},
 			}
 		}
+		if !settling.is_empty() {
+			rounds.push(None);
+			self.keep_settling(&settling)?;
+		}
 		let ready = settling.is_empty() && waiting.is_empty();
-		Ok(json!({"settling": settling, "waiting": waiting, "done": done, "left": left, "ready": ready}))
+		let mut v = json!({"settling": settling, "waiting": waiting, "done": done, "left": left, "ready": ready});
+		if !ready {
+			let w = self.wait_of(&info, &rounds)?;
+			v["final_in_seconds"] = json!(w.most);
+			v["usual_in_seconds"] = json!(w.usual);
+			v["waiting_for"] = json!(w.step.name());
+		}
+		Ok(v)
+	}
+
+	/// `ids` as `settle_first` sorts them: the live ones it gives up, the
+	/// ones that wait for a round as they are, the ones that are through,
+	/// and the round each waiting one waits for (`None` or empty for one not
+	/// built yet; a live one, once given up, waits for one not built yet).
+	fn sorted(&self, ids: Vec<String>) -> Result<Sorted, Error> {
+		let (mut give, mut waiting, mut done) = (vec![], vec![], vec![]);
+		let mut rounds: Vec<Option<String>> = vec![];
+		for id in ids {
+			let Some(c) = self.store.coin(&id)? else {
+				done.push(id);
+				continue;
+			};
+			match c.state.as_str() {
+				"live" => give.push(id),
+				"given" => {
+					// The round the operator built for it, once the wallet has
+					// read it (a held round, before its forfeits); else none yet.
+					rounds.push(Self::participation_of(&c).and_then(|p| self.store.participation(&p).ok().flatten()).and_then(|p| p.6));
+					waiting.push(id);
+				},
+				"pending" => {
+					rounds.push(c.bases.last().cloned());
+					waiting.push(id);
+				},
+				"forfeited" | "spent" => match self.made_by_round_waits(&c)? {
+					Some(round) => {
+						rounds.push(Some(round));
+						waiting.push(id);
+					},
+					None => done.push(id),
+				},
+				_ => done.push(id),
+			}
+		}
+		Ok(Sorted { give, waiting, done, rounds })
+	}
+
+	/// The wait of `rounds` together: the round furthest from done names the
+	/// step waited for, the most it takes and what it usually takes.
+	fn wait_of(&self, info: &Value, rounds: &[Option<String>]) -> Result<Within, Error> {
+		let mut out = Within { most: 0, usual: 0, step: Wait::Release };
+		for r in rounds {
+			let w = self.final_within(info, r.as_deref())?;
+			out.most = out.most.max(w.most);
+			out.usual = out.usual.max(w.usual);
+			out.step = out.step.min(w.step);
+		}
+		Ok(out)
+	}
+
+	/// How long the coins a [`Error::SettleFirst`] names wait, as
+	/// `settle_first` would answer once asked for them: `(final_in_seconds,
+	/// usual_in_seconds, waiting_for)`, the refusal's own reading of when the
+	/// spend can be asked again. `None` when it cannot be read now.
+	pub(crate) fn settle_wait(&self, coins: &[String]) -> Option<(u64, u64, &'static str)> {
+		let info = self.server_info().ok()?;
+		let Sorted { give, rounds, .. } = self.sorted(coins.to_vec()).ok()?;
+		let mut rounds = rounds;
+		if !give.is_empty() {
+			rounds.push(None);
+		}
+		if rounds.is_empty() {
+			return None;
+		}
+		let w = self.wait_of(&info, &rounds).ok()?;
+		Some((w.most, w.usual, w.step.name()))
+	}
+
+	/// For a coin given up (`forfeited`) or spent (`spent`) by a
+	/// participation of the wallet's own, while the coins that participation
+	/// makes, or the coin itself, cannot be spent yet: the round they wait
+	/// for, empty for a round not built yet.
+	/// - The participation waits for a round (`submitting`, `pending`), as
+	///   after a held round it was in was dropped: a round not built yet.
+	/// - Its forfeits are signed and the operator's preimage is still to
+	///   come (`issued`, `forfeiting`): its round, unless that round was held
+	///   and is neither in a block nor in the mempool, and the operator says
+	///   the participation waits for a round again (the held round dropped):
+	///   a round not built yet.
+	/// - It is released and a coin it made is `pending` (its round not
+	///   final): its round.
+	/// - It is void or expired, and the operator gave the coin back while a
+	///   forfeit it signed for a round that is not gone stands (D75, marked
+	///   by `given_back_key`): the coin is the wallet's again once that round
+	///   can no longer confirm, and then goes into a round anew, so a round
+	///   not built yet. A coin the operator keeps under its forfeit is not
+	///   waiting for a round: it goes home by the claim, the refund or its
+	///   exit.
+	/// `None` once they can be spent, or for a coin spent otherwise.
+	fn made_by_round_waits(&self, c: &CoinRow) -> Result<Option<String>, Error> {
+		// The participation its note or `spent_by` names, else, for a coin
+		// held under a forfeit, the one its latest forfeit was signed for.
+		let pid = match Self::participation_of(c) {
+			Some(p) => p,
+			None if c.state == "forfeited" => match self.store.forfeits_of(&c.leaf_id)?.into_iter().last() {
+				Some(f) => f.participation,
+				None => return Ok(None),
+			},
+			None => return Ok(None),
+		};
+		let Some((_, _, _, _, state, _, round)) = self.store.participation(&pid)? else { return Ok(None) };
+		let round = round.or_else(|| self.store.participation_news(&pid).ok().flatten()
+			.and_then(|n| serde_json::from_str::<Value>(&n).ok()).and_then(|n| n["round"].as_str().map(str::to_string)));
+		match state.as_str() {
+			"submitting" | "pending" => Ok(Some(String::new())),
+			"issued" | "forfeiting" => {
+				let round = round.unwrap_or_default();
+				// A held round neither in a block nor in the node's mempool may
+				// have been dropped, the participation waiting for a round again:
+				// the operator says which.
+				if let Ok(txid) = elements::Txid::from_str(&round) {
+					if matches!(self.chain.finality(&txid)?, Finality::NotInChain { in_mempool: false }) {
+						if let Ok(st) = self.server.post("participation_status", &json!({"participation_id": pid})) {
+							if st["state"] == "pending" {
+								return Ok(Some(String::new()));
+							}
+						}
+					}
+				}
+				Ok(Some(round))
+			},
+			"released" => {
+				let Some(round) = round else { return Ok(None) };
+				let made_pending = self.store.coins_in("pending")?.into_iter().any(|n| n.bases.contains(&round));
+				Ok(made_pending.then_some(round))
+			},
+			"void" | "expired" if c.state == "forfeited" && self.store.meta(&super::round::given_back_key(&c.leaf_id))?.is_some() => {
+				Ok(Some(String::new()))
+			},
+			_ => Ok(None),
+		}
+	}
+
+	/// The most seconds until `round` (a txid; empty or `None` for a round
+	/// not built yet) is final at the operator's anchor depth and its coins
+	/// are the wallet's, and the step it waits for now. Each step counts
+	/// every step after it: the operator's next round when it is not built
+	/// (`fills.round_interval_seconds`); for a round built and held
+	/// unbroadcast (neither in a block nor in the node's mempool), the
+	/// operator's window for the other participations' forfeits
+	/// (`fills.forfeit_window_seconds`); a block for its transaction to be
+	/// mined and one more for the certificate a block above may carry
+	/// (`fills.block_seconds`); a Bitcoin block for each anchor block still
+	/// to bury it; and one round interval for the operator's release of the
+	/// new coins, which it makes in its pass over the rounds once it holds
+	/// the round final. An operator whose batches have no sweep
+	/// (`batches.no_sweep`) holds every round so, so a round not built yet
+	/// counts that window too. What it usually takes counts a round interval
+	/// for the forfeits in place of the window.
+	pub(crate) fn final_within(&self, info: &Value, round: Option<&str>) -> Result<Within, Error> {
+		let txid = round.and_then(|t| elements::Txid::from_str(t).ok());
+		let finality = match txid {
+			Some(t) => Some(self.chain.finality(&t)?),
+			None => None,
+		};
+		Ok(wait_counts(info, self.chain.anchor_depth(), finality.as_ref()))
 	}
 
 	/// `coin_places`: every coin the wallet holds in a place (with its kind:
