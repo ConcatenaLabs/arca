@@ -308,6 +308,15 @@ fn forfeit_held(e: &Error) -> Option<[u8; 32]> {
 	unhex32(salt).ok()
 }
 
+/// The leaf a refusal of the server's names, as its coin refusals name it
+/// ("leaf … is already spent", "coin … is not live"): the first 64 hex
+/// digits after "leaf " or "coin ". An asset id it names is no leaf.
+fn leaf_named(message: &str) -> Option<String> {
+	let words: Vec<&str> = message.split(|c: char| c.is_whitespace() || c == ':' || c == ',' || c == '(' || c == ')').collect();
+	words.windows(2).find(|w| matches!(w[0], "leaf" | "coin") && w[1].len() == 64 && w[1].chars().all(|c| c.is_ascii_hexdigit()))
+		.map(|w| w[1].to_ascii_lowercase())
+}
+
 fn dummy_sig() -> Signature {
 	Signature::from_slice(&[1u8; 64]).expect("64 bytes")
 }
@@ -1376,6 +1385,19 @@ impl Wallet {
 					s.set_transfer(id, "refused", &e.to_string())?;
 					s.refused(&format!("transfer request {}", id), &e.to_string())
 				})?;
+				// A coin of the wallet's own that the operator holds spent, by
+				// nothing this store did: another store of the mnemonic (a second
+				// device) gave it to a round or paid with it. The wallet reads what
+				// the other stores did now, rather than at its next catch-up, so
+				// it stops counting and offering the coin and holds what replaced
+				// it.
+				if let Error::Server { code, message, .. } = &e {
+					if code == "double_spend" && forfeited.is_none() && leaf_named(message).is_some_and(|l| mine.contains(&l)) {
+						if let Err(c) = self.catch_up() {
+							self.store.refused("the catch-up after a coin spent elsewhere", &c.to_string())?;
+						}
+					}
+				}
 				Err(e)
 			},
 			Err(e) => Err(e),
@@ -3027,7 +3049,22 @@ impl Wallet {
 		}
 		// Coins of the taker's are not the wallet's to mark: only the maker's
 		// are put to `sending`.
-		let answer = self.transfer_with(&inputs, &outs, &theirs, None, checkpoint_exit)?;
+		let answer = match self.transfer_with(&inputs, &outs, &theirs, None, checkpoint_exit) {
+			Ok(a) => a,
+			// The operator refused it: nothing was co-signed, and the maker's
+			// coins are spendable again (`take_transfer_answer`). The offer is
+			// withdrawn with them, so the swap never stands open on coins it no
+			// longer holds: an acceptance handed over again is answered at once
+			// that it is cancelled, and the taker asks for a new offer.
+			Err(Error::Server { status, code, message, .. }) => {
+				self.store.set_swap(&id, "cancelled", None)?;
+				let coin = leaf_named(&message);
+				let whose = coin.as_ref().and_then(|c| inputs.iter().position(|i| i.coin.id.to_string() == *c))
+					.map(|k| if k < n { "maker" } else { "taker" });
+				return Err(Error::SwapRefused { swap: id, status, code, coin, whose, message });
+			},
+			Err(e) => return Err(e),
+		};
 		// The trade's coins go to the wallet's watchtowers before the swap is
 		// reported done.
 		let made: Vec<String> = answer["kept"].as_array().map(|k| k.iter().filter_map(|c| c["leaf_id"].as_str().map(String::from))
@@ -3059,11 +3096,7 @@ impl Wallet {
 					Ok(json!({"swap": id, "cancelled": true, "respent": ids, "transfer": answer,
 						"note": "the coins signed into the acceptance moved to a fresh leaf of the wallet's own: the acceptance can never complete"}))
 				},
-				Err(Error::Server { code, message, .. }) if code == "double_spend" => {
-					Ok(json!({"swap": id, "cancelled": false, "error": message,
-						"note": "the coins signed into the acceptance are already spent, most likely by the maker completing the swap: \
-						read the mailbox for what the swap pays the wallet"}))
-				},
+				Err(Error::Server { code, message, .. }) if code == "double_spend" => self.swap_cancel_spent(id, &ids, &message),
 				Err(e) => {
 					for l in &ids {
 						if self.store.coin(l)?.is_some_and(|c| c.state == "live") {
@@ -3083,6 +3116,109 @@ impl Wallet {
 		}
 		self.store.set_swap(id, "cancelled", None)?;
 		Ok(json!({"swap": id, "cancelled": true, "freed": freed}))
+	}
+
+	/// The cancel of acceptance `id` found a coin signed into it (`ids`)
+	/// already spent: the operator co-signs one spend of a leaf, so either
+	/// the maker completed the swap with it, or something else spent it and
+	/// the acceptance, which spends every one of them, can never complete. The
+	/// mailbox says the first (the swap's coins arrive, and the swap is done);
+	/// the wallet's other stores of the mnemonic say the second, read at once
+	/// when the respend was refused (a catch-up: a second device gave the coin
+	/// to a round or paid with it).
+	/// Then the swap is cancelled and the coins still the wallet's are free:
+	/// no respend is needed for an acceptance that can never complete. When
+	/// neither says it yet, the coins stay held for the swap and the answer
+	/// says so; a later cancel asks again.
+	fn swap_cancel_spent(&mut self, id: &str, ids: &[String], message: &str) -> Result<Value, Error> {
+		let mailbox = self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()}));
+		if self.swap_paid(id)? {
+			return Ok(json!({"swap": id, "cancelled": false, "done": true, "error": message,
+				"note": "the maker completed the swap: what it pays the wallet has arrived"}));
+		}
+		// The refused respend had the wallet catch up with its other stores
+		// (`take_transfer_answer`). Read again after it: a completion the
+		// operator signed between the first read and the catch-up (which then
+		// shows the coin spent by a signed transfer) has posted what the swap
+		// pays by now.
+		let mailbox = match mailbox.get("error") {
+			None => self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})),
+			Some(_) => mailbox,
+		};
+		let named = leaf_named(message);
+		let gone: Vec<String> = ids.iter().filter(|l| {
+			self.store.coin(l).ok().flatten().is_some_and(|c| !matches!(c.state.as_str(), "live" | "offered" | "sending"))
+		}).cloned().collect();
+		if self.swap_paid(id)? {
+			return Ok(json!({"swap": id, "cancelled": false, "done": true, "error": message,
+				"note": "the maker completed the swap: what it pays the wallet has arrived"}));
+		}
+		// Only on a mailbox read in full: the maker's completion posts what the
+		// swap pays the wallet there as the operator co-signs it, so a read
+		// that brought nothing of the swap's says it did not complete.
+		if mailbox.get("error").is_none() && !gone.is_empty() && named.as_ref().map_or(true, |n| gone.contains(n)) {
+			let mut freed = vec![];
+			for l in ids {
+				if self.store.coin(l)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "offered")) {
+					self.store.set_coin_state(l, "live", "")?;
+					freed.push(l.clone());
+				}
+			}
+			self.store.set_swap(id, "cancelled", None)?;
+			return Ok(json!({"swap": id, "cancelled": true, "spent_elsewhere": gone, "freed": freed,
+				"note": "a coin signed into the acceptance was spent elsewhere (by another device of this wallet's): the acceptance can \
+				never complete, and the wallet's other coins in it are free"}));
+		}
+		for l in ids {
+			if self.store.coin(l)?.is_some_and(|c| c.state == "live") {
+				self.store.set_coin_state(l, "offered", &format!("swap {}", id))?;
+			}
+		}
+		Ok(json!({"swap": id, "cancelled": false, "error": message, "mailbox": mailbox,
+			"note": "a coin signed into the acceptance is already spent, and neither the mailbox nor the wallet's other stores say by \
+			what yet: the coins stay held for the swap; cancel again shortly"}))
+	}
+
+	/// Whether swap `id`, which the wallet accepted, completed: it is done,
+	/// or the wallet holds a coin under the owner nonce of one of its own
+	/// outputs in the acceptance (those past the offer's: what the swap pays
+	/// it, and its change, whose nonces it drew; the maker chooses its own
+	/// outputs' nonces) whose record spends one of the wallet's own inputs of
+	/// the acceptance, which only the swap's own transfer does. It is then
+	/// recorded done, whatever order the mailbox read and a catch-up ran in (a
+	/// catch-up that saw the coins spent first leaves no coin held for the
+	/// swap for the mailbox to mark it done by).
+	fn swap_paid(&mut self, id: &str) -> Result<bool, Error> {
+		let Some((_, offer, accept, state)) = self.store.swap(id)? else { return Ok(false) };
+		if state == "done" {
+			return Ok(true);
+		}
+		let (Ok(offer), Some(Ok(accept))) = (serde_json::from_str::<Value>(&offer), accept.as_deref().map(serde_json::from_str::<Value>)) else {
+			return Ok(false);
+		};
+		let n_out = offer["outputs"].as_array().map_or(0, |a| a.len());
+		let n_in = offer["inputs"].as_array().map_or(0, |a| a.len());
+		// The owner nonces of the wallet's own coins the acceptance spends.
+		let mut mine: Vec<[u8; 32]> = vec![];
+		for i in accept["inputs"].as_array().into_iter().flatten().skip(n_in) {
+			if let Some(c) = self.store.coin(i["leaf_id"].as_str().unwrap_or(""))? {
+				mine.push(c.owner_nonce);
+			}
+		}
+		for o in accept["outputs"].as_array().into_iter().flatten().skip(n_out) {
+			let Ok(n) = unhex32(o["owner_nonce"].as_str().unwrap_or("")) else { continue };
+			let Some(leaf) = self.store.nonce(&n)?.and_then(|r| r.leaf_id) else { continue };
+			let Some(c) = self.store.coin(&leaf)? else { continue };
+			let spends_mine = match Self::record_of(&c) {
+				Ok(CoinRecord::Transfer(t)) => t.inputs.iter().any(|i| mine.contains(&owner_of(&i.coin).1)),
+				_ => false,
+			};
+			if spends_mine {
+				self.store.set_swap(id, "done", None)?;
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 
 	/// Spends `rows`, coins of one asset, to one fresh leaf of the wallet's
@@ -3249,6 +3385,17 @@ pub(crate) fn fit_order(coins: &[(u64, u32, usize, bool)], paid: u64, depth_limi
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The coin a refusal of the server's names: its first leaf id.
+	#[test]
+	fn a_refusal_names_its_leaf() {
+		let id = "5aff741aaac4b9360e93b4e1d36d00fe93c63d5710068321f538b49c2342e230";
+		assert_eq!(leaf_named(&format!("leaf {} is already spent: the server co-signs one spend of a leaf", id)).as_deref(), Some(id));
+		assert_eq!(leaf_named(&format!("coin {} is not live (forfeited)", id.to_uppercase())).as_deref(), Some(id));
+		assert_eq!(leaf_named(&format!("a margin is outside the bounds: at least 4308 of asset {}, or 756 of asset {}", id, id)), None,
+			"an asset id is no leaf");
+		assert_eq!(leaf_named(&format!("asset {}x", &id[..63])), None, "63 digits name no leaf");
+	}
 
 	/// A swap tries alone, in order, the coins with at least seven days of
 	/// life worth at least what it pays: those already out of round with room

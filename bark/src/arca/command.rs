@@ -57,6 +57,13 @@ pub fn refusal(e: &Error) -> Value {
 		out["error"]["code"] = json!(code);
 		out["error"]["status"] = json!(status);
 	}
+	if let Error::SwapRefused { swap, status, code, coin, whose, .. } = e {
+		out["error"]["code"] = json!(code);
+		out["error"]["status"] = json!(status);
+		out["error"]["swap"] = json!(swap);
+		out["error"]["coin"] = json!(coin);
+		out["error"]["whose"] = json!(whose);
+	}
 	if let Error::Planned { asset, release, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["release"] = json!(release);
@@ -773,6 +780,12 @@ mod test {
 		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], side: 7, most: Some(9), fee: Some(3), message: "short".into() };
 		assert_eq!(refusal(&c), json!({"error": {"kind": "in_channel", "message": "refused: short", "asset": "aa", "close": ["ch1"], "side": "7",
 			"most": "9", "fee": "3"}}));
+		// A completion the operator refused: the swap, its code, and whose coin it named.
+		let s = Error::SwapRefused { swap: "ab".into(), status: 409, code: "double_spend".into(), coin: Some("cd".into()), whose: Some("taker"),
+			message: "leaf cd is already spent".into() };
+		assert_eq!(refusal(&s), json!({"error": {"kind": "swap_refused", "code": "double_spend", "status": 409, "swap": "ab", "coin": "cd",
+			"whose": "taker", "message": "refused: the operator refused the swap's completion (409 double_spend): leaf cd is already spent; the \
+			offer is withdrawn"}}));
 	}
 
 	#[test]
