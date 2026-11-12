@@ -187,13 +187,20 @@ async fn a_late_release_and_a_reorganisation_are_read_again() {
 	let read = r.server.watcher.last_read();
 	assert!(read.contains(&batch), "the disconnection touched the batch, and the pass read it: {:?}", read);
 	println!("the reclaim's block disconnected: the next pass read the batch again");
-	for _ in 0..20 {
+	// The nursery puts the reclaim back, trying again every 30 s
+	// (`rebroadcast_interval`) when the node refuses it (its parent, out of
+	// the chain with it, not back yet): three intervals is enough.
+	let until = std::time::Instant::now() + Duration::from_secs(90);
+	while std::time::Instant::now() < until {
 		pass(&r).await;
 		if reclaims(&r).await.iter().all(|w| w.state == server::store::NurseryState::Final) {
 			break;
 		}
+		tokio::time::sleep(Duration::from_millis(500)).await;
 	}
 	let rc = reclaims(&r).await;
+	assert!(rc.iter().all(|w| w.state == server::store::NurseryState::Final), "the reclaim put back and final again: {:?}",
+		rc.iter().map(|w| w.state).collect::<Vec<_>>());
 	assert_eq!(rc.len(), 1, "no second reclaim was built");
 	assert_eq!(Txid::from_byte_array(rc[0].txid), rtx, "the same reclaim, put back");
 	let n = store.nursery_get(&t).await.unwrap().unwrap();

@@ -42,7 +42,7 @@ fn env(name: &str, default: u64) -> u64 {
 /// The tables never cloned: the chain, the operator's own keys, wallet and
 /// signer state, and the migrations' record.
 const KEEP: &[&str] = &["refinery_schema_history", "arca_schema", "block", "chain_event", "wallet_key", "wallet_coin", "challenge_key",
-	"signer_head", "signer_message", "keeper", "keeper_ack", "watch_touch", "watch_cursor", "tx_unblocked"];
+	"signer_head", "signer_message", "keeper", "keeper_ack", "watch_touch", "watch_cursor", "tx_unblocked", "pass_open"];
 
 async fn db(r: &Running) -> tokio_postgres::Client {
 	let (client, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
@@ -190,6 +190,9 @@ async fn passes_with_a_history_behind_them() {
 		ORDER BY n_live_tup DESC LIMIT 14", &[]).await.unwrap().iter().map(|r| r.get(0)).collect();
 	let finals: i64 = c.query_one("SELECT count(*) FROM round WHERE state = 'final'", &[]).await.unwrap().get(0);
 	println!("history ×{}: {} final rounds; {}", scale, finals, sizes.join(", "));
+	// The logs of open items start again, as after the schema step: the
+	// restarted server's first passes fill them from the whole history.
+	c.batch_execute("DELETE FROM pass_open; DELETE FROM watch_cursor WHERE name LIKE 'open:%'").await.unwrap();
 	r.restart_server().await;
 	r.synced().await;
 

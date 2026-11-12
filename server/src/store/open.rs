@@ -157,23 +157,30 @@ impl Store {
 	}
 
 	/// Prunes the logs of `passes`, and checks each against its whole
-	/// statement when [`RECOUNT_EVERY`] has passed since it was last: a row
-	/// of the whole statement not logged is an alarm (logged at error and
-	/// counted), and is logged so the passes act on it.
+	/// statement, in a task of its own, when [`RECOUNT_EVERY`] has passed
+	/// since it was last: a row of the whole statement not logged is an alarm
+	/// (logged at error and counted), and is logged so the passes act on it.
 	pub async fn keep_open(&self, passes: &[Pass]) -> Result<(), StoreError> {
 		for &pass in passes {
 			self.open_ready(pass).await?;
 			let due = self.open.lock().unwrap_or_else(|e| e.into_inner()).counted.get(&pass)
 				.map_or(true, |at| at.elapsed() >= RECOUNT_EVERY);
 			if due {
-				let (whole, added) = self.recount_open(pass).await?;
-				let mut o = self.open.lock().unwrap_or_else(|e| e.into_inner());
-				o.counted.insert(pass, Instant::now());
-				if added > 0 {
-					*o.missing.entry(pass).or_default() += added;
-					log::error!("{} pass: the recount found {} of {} open item(s) no trigger logged; logged now, so the passes act on \
-						them. A write path the schema's triggers miss: report it.", pass.name(), added, whole);
-				}
+				// Off the pass: at ten times the testnet's history the whole
+				// statement takes seconds, and the pass holds its lock.
+				self.open.lock().unwrap_or_else(|e| e.into_inner()).counted.insert(pass, Instant::now());
+				let store = self.clone();
+				tokio::spawn(async move {
+					match store.recount_open(pass).await {
+						Ok((whole, added)) if added > 0 => {
+							*store.open.lock().unwrap_or_else(|e| e.into_inner()).missing.entry(pass).or_default() += added;
+							log::error!("{} pass: the recount found {} of {} open item(s) no trigger logged; logged now, so the \
+								passes act on them. A write path the schema's triggers miss: report it.", pass.name(), added, whole);
+						},
+						Ok(_) => {},
+						Err(e) => log::warn!("{} pass: the recount of its open items failed: {}", pass.name(), e),
+					}
+				});
 			}
 			self.prune_open(pass).await?;
 		}
