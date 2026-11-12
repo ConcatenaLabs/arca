@@ -146,6 +146,17 @@ pub enum Error {
 	/// The wallet refused: the reason is for the user.
 	#[error("refused: {0}")]
 	Refused(String),
+	/// A payment of `asset` the wallet's own coins cannot make as asked, with
+	/// nothing more of it on its way that would: what it holds in live coins,
+	/// less the margins the payment's transactions leave for their fees, falls
+	/// short of the amount, or would leave change below the operator's
+	/// smallest leaf. `most` is the most of `asset` it can pay now, in atoms
+	/// (0 when nothing), and `live` what it holds of it in live coins when the
+	/// margins are what it falls short by, so a program offers that figure
+	/// without reading either out of `message`. Refused like
+	/// [`Error::Refused`] otherwise (its kind is `refused`).
+	#[error("refused: {message}")]
+	Short { asset: String, most: u64, live: Option<u64>, message: String },
 	/// A payment of `asset` that the coins it may spend cannot cover, and
 	/// that the coins an offline-refresh plan names could: `release` names
 	/// the fewest of those, largest first, whose release through the next
@@ -218,7 +229,7 @@ impl Error {
 	/// A short machine-readable kind, for the command line's JSON.
 	pub fn kind(&self) -> &'static str {
 		match self {
-			Error::Refused(_) => "refused",
+			Error::Refused(_) | Error::Short { .. } => "refused",
 			Error::Planned { .. } => "planned",
 			Error::InChannel { .. } => "in_channel",
 			Error::SettleFirst { .. } => "settle_first",
