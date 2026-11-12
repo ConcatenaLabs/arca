@@ -62,6 +62,7 @@ mod distributions;
 mod lightning;
 mod mailbox;
 mod nursery;
+pub mod open;
 mod orders;
 mod owed;
 mod participations;
@@ -299,6 +300,9 @@ pub struct Store {
 	/// The latest head of the signer's record this process gave the
 	/// database or read from it ([`Store::signer_head_latest`]).
 	head_seen: std::sync::Arc<std::sync::Mutex<Option<HeadSeen>>>,
+	/// Where the logs of the passes over the whole history stand in this
+	/// process ([`open`]).
+	open: std::sync::Arc<std::sync::Mutex<open::OpenState>>,
 }
 
 /// A head of the signer's record: its entry, running hash, and the signer's
@@ -323,7 +327,7 @@ impl Store {
 			.connection_timeout(Duration::from_secs(10))
 			.build(manager)
 			.await?;
-		let store = Store { pool, head_seen: Default::default() };
+		let store = Store { pool, head_seen: Default::default(), open: Default::default() };
 		store.migrate().await?;
 		Ok(store)
 	}

@@ -507,6 +507,12 @@ impl Watcher {
 		self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
+	/// The metrics of the passes' logs of open items
+	/// ([`crate::store::open`]).
+	pub fn open_metrics(&self) -> String {
+		self.store.open_metrics()
+	}
+
 	pub fn config(&self) -> &WatcherConfig {
 		&self.config
 	}
@@ -524,6 +530,8 @@ impl Watcher {
 		laps.lap("channels");
 		let _one = self.running.lock().await;
 		laps.lap("wait");
+		self.store.keep_open(&crate::store::open::WATCHER_PASSES).await?;
+		laps.lap("open items");
 		let now = self.now().await?;
 		self.answer_stale_exits().await?;
 		laps.lap("stale exits");

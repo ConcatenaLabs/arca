@@ -2149,7 +2149,7 @@ impl Server {
 			let w = watcher.clone();
 			let routes = axum::Router::new().route("/metrics", axum::routing::get(move || {
 				let w = w.clone();
-				async move { w.fee_status().metrics() }
+				async move { format!("{}{}", w.fee_status().metrics(), w.open_metrics()) }
 			}));
 			let listener = tokio::net::TcpListener::bind(at).await.map_err(err("metrics_listen"))?;
 			metrics_addr = Some(listener.local_addr().map_err(err("metrics_listen"))?);

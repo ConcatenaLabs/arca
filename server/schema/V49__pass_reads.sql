@@ -212,3 +212,161 @@ WHERE NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = f.txid);
 -- schema step, as every pass read it before.
 INSERT INTO watch_touch (round_id, vout)
 SELECT b.round_id, b.vout FROM batch b JOIN round r ON r.round_id = b.round_id WHERE r.state <> 'lost';
+
+-- What the passes over the whole history act on, logged as it may open: a
+-- sighting of a coin given up that may need an answer (`sighting`, by
+-- outpoint), a forfeited coin of a transfer whose forfeit may be unclaimed
+-- (`transfer_forfeit`, by leaf id), a forfeit the watcher published that
+-- may still be claimed (`forfeit`, by txid), a credited board the operator
+-- may still have to recover (`board`, by leaf id), and a coin given up whose
+-- value may be in flight (`flight`, by leaf id). The triggers below log an
+-- item in the transaction of every write that can make it open, whichever
+-- code path writes it; each pass reads the items logged, tests each by the
+-- whole statement's own condition, and removes those the test closes. An
+-- item closed matters again only through a new write, which logs it again
+-- in its own transaction. A recount runs the whole statements now and then,
+-- in one snapshot with the logged reads, and raises an alarm when they
+-- disagree (`store::open`).
+CREATE TABLE IF NOT EXISTS pass_open (
+	pass TEXT NOT NULL,
+	k    BYTEA NOT NULL,
+	v    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS pass_open_by_key ON pass_open (pass, k, v);
+CREATE INDEX IF NOT EXISTS arca_script_by_leaf ON arca_script (leaf_id);
+CREATE INDEX IF NOT EXISTS batch_by_token ON batch (token);
+CREATE INDEX IF NOT EXISTS board_by_outpoint ON board (txid, vout);
+
+-- The coins given up that rest on the coins `ids`: each of them, and every
+-- coin a transfer or a fill made of one of them, eight deep (the depth the
+-- in-flight statement reads up a coin's lineage).
+CREATE OR REPLACE FUNCTION pass_open_flight(ids BYTEA[]) RETURNS void LANGUAGE sql AS $$
+	INSERT INTO pass_open (pass, k)
+	WITH RECURSIVE down (leaf_id, depth) AS (
+		SELECT DISTINCT i, 0 FROM unnest(ids) i WHERE i IS NOT NULL
+		UNION
+		SELECT o.leaf_id, d.depth + 1 FROM down d
+		JOIN LATERAL (SELECT ti.transfer_id FROM transfer_input ti WHERE ti.leaf_id = d.leaf_id
+		              UNION ALL SELECT f.transfer_id FROM order_fill f WHERE f.order_leaf = d.leaf_id) t ON true
+		JOIN transfer_output o ON o.transfer_id = t.transfer_id
+		WHERE d.depth < 8)
+	SELECT DISTINCT 'flight', d.leaf_id FROM down d
+	WHERE EXISTS (SELECT 1 FROM participation_input pi WHERE pi.leaf_id = d.leaf_id AND pi.active)
+$$;
+
+-- What a change to the coins `ids` (spent, or a forfeit stored) may open: the
+-- sightings of their leaves and checkpoints, their forfeits, their boards.
+CREATE OR REPLACE FUNCTION pass_open_leaves(ids BYTEA[]) RETURNS void LANGUAGE sql AS $$
+	INSERT INTO pass_open (pass, k, v)
+	SELECT 'sighting', s.txid, s.vout FROM arca_script a JOIN script_sighting s ON s.script_pubkey = a.script_pubkey
+	WHERE a.leaf_id = ANY (ids) AND a.kind IN ('leaf', 'checkpoint')
+	UNION ALL
+	SELECT 'transfer_forfeit', l.leaf_id, 0 FROM leaf l WHERE l.leaf_id = ANY (ids) AND l.kind = 'transfer'
+	UNION ALL
+	SELECT 'board', b.leaf_id, 0 FROM board b WHERE b.leaf_id = ANY (ids)
+$$;
+
+-- What a transaction of the watcher's going in or out of the final state
+-- (or out of the lost one) may open: what it spends (a sighting, a board's
+-- output, a forfeit's output and the coin of that forfeit), the forfeit it
+-- is, and the coins whose value it brought back (its own coin for a
+-- forfeit, a sweep's batch, a reclaim's leaves).
+CREATE OR REPLACE FUNCTION pass_open_txs(txids BYTEA[]) RETURNS void LANGUAGE sql AS $$
+	INSERT INTO pass_open (pass, k, v)
+	SELECT 'sighting', wi.prev_txid, wi.prev_vout FROM watcher_input wi WHERE wi.txid = ANY (txids)
+	UNION ALL
+	SELECT 'board', b.leaf_id, 0 FROM watcher_input wi JOIN board b ON b.txid = wi.prev_txid AND b.vout = wi.prev_vout
+	WHERE wi.txid = ANY (txids)
+	UNION ALL
+	SELECT 'forfeit', wi.prev_txid, 0 FROM watcher_input wi WHERE wi.txid = ANY (txids) AND wi.prev_vout = 0
+	UNION ALL
+	SELECT 'transfer_forfeit', fw.subject, 0 FROM watcher_input wi JOIN watcher_tx fw ON fw.txid = wi.prev_txid AND fw.kind = 'forfeit'
+	WHERE wi.txid = ANY (txids) AND wi.prev_vout = 0
+	UNION ALL
+	SELECT 'forfeit', w.txid, 0 FROM watcher_tx w WHERE w.txid = ANY (txids) AND w.kind = 'forfeit';
+	SELECT pass_open_flight(ARRAY(
+		SELECT w.subject FROM watcher_tx w WHERE w.txid = ANY (txids) AND w.kind = 'forfeit'
+		UNION ALL
+		SELECT bl.leaf_id FROM watcher_tx w JOIN batch b ON b.token = w.subject
+		JOIN batch_leaf bl ON bl.round_id = b.round_id AND bl.vout = b.vout
+		WHERE w.txid = ANY (txids) AND w.kind = 'sweep'
+		UNION ALL
+		SELECT rl.leaf_id FROM reclaimed_leaf rl WHERE rl.txid = ANY (txids)
+		UNION ALL
+		SELECT nr.leaf_id FROM watcher_tx w JOIN node_release nr ON nr.node_hash = w.subject
+		WHERE w.txid = ANY (txids) AND w.kind = 'reclaim'));
+$$;
+
+CREATE OR REPLACE FUNCTION pass_open_rows() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	IF TG_OP = 'UPDATE' THEN
+		CASE TG_TABLE_NAME
+		WHEN 'nursery_tx' THEN
+			PERFORM pass_open_txs(ARRAY(SELECT n.txid FROM touched n JOIN untouched o USING (txid) WHERE n.state IS DISTINCT FROM o.state));
+		WHEN 'leaf' THEN
+			PERFORM pass_open_leaves(ARRAY(SELECT n.leaf_id FROM touched n JOIN untouched o USING (leaf_id)
+				WHERE n.state = 'spent' AND o.state IS DISTINCT FROM 'spent'));
+		WHEN 'board' THEN
+			INSERT INTO pass_open (pass, k) SELECT 'board', n.leaf_id FROM touched n JOIN untouched o USING (leaf_id)
+			WHERE n.state = 'credited' AND (o.state IS DISTINCT FROM 'credited' OR n.txid IS DISTINCT FROM o.txid OR n.vout IS DISTINCT FROM o.vout);
+		WHEN 'participation_input' THEN
+			PERFORM pass_open_flight(ARRAY(SELECT n.leaf_id FROM touched n JOIN untouched o USING (participation_id, idx)
+				WHERE n.active IS DISTINCT FROM o.active OR n.leaf_id IS DISTINCT FROM o.leaf_id));
+		WHEN 'participation' THEN
+			PERFORM pass_open_flight(ARRAY(SELECT i.leaf_id FROM touched n JOIN untouched o USING (participation_id)
+				JOIN participation_input i ON i.participation_id = n.participation_id
+				WHERE n.state IS DISTINCT FROM o.state OR n.round_id IS DISTINCT FROM o.round_id));
+		WHEN 'round' THEN
+			PERFORM pass_open_flight(ARRAY(
+				SELECT i.leaf_id FROM touched n JOIN untouched o USING (round_id) JOIN participation p ON p.round_id = n.round_id
+				JOIN participation_input i ON i.participation_id = p.participation_id WHERE n.state IS DISTINCT FROM o.state
+				UNION ALL
+				SELECT bl.leaf_id FROM touched n JOIN untouched o USING (round_id) JOIN batch_leaf bl ON bl.round_id = n.round_id
+				WHERE n.state IS DISTINCT FROM o.state));
+		WHEN 'batch' THEN
+			PERFORM pass_open_flight(ARRAY(SELECT bl.leaf_id FROM touched n JOIN untouched o USING (round_id, vout)
+				JOIN batch_leaf bl ON bl.round_id = n.round_id AND bl.vout = n.vout
+				WHERE n.collect_mtp IS DISTINCT FROM o.collect_mtp OR n.token IS DISTINCT FROM o.token OR n.asset IS DISTINCT FROM o.asset));
+		END CASE;
+	ELSE
+		CASE TG_TABLE_NAME
+		WHEN 'nursery_tx', 'watcher_tx' THEN
+			PERFORM pass_open_txs(ARRAY(SELECT txid FROM touched));
+		WHEN 'script_sighting' THEN
+			INSERT INTO pass_open (pass, k, v) SELECT 'sighting', txid, vout FROM touched;
+		WHEN 'arca_script' THEN
+			INSERT INTO pass_open (pass, k, v)
+			SELECT 'sighting', s.txid, s.vout FROM touched n JOIN script_sighting s ON s.script_pubkey = n.script_pubkey;
+		WHEN 'leaf' THEN
+			PERFORM pass_open_leaves(ARRAY(SELECT leaf_id FROM touched WHERE state = 'spent'));
+		WHEN 'forfeit' THEN
+			PERFORM pass_open_leaves(ARRAY(SELECT leaf_id FROM touched));
+		WHEN 'board' THEN
+			INSERT INTO pass_open (pass, k) SELECT 'board', leaf_id FROM touched WHERE state = 'credited';
+		WHEN 'participation_input', 'batch_leaf' THEN
+			PERFORM pass_open_flight(ARRAY(SELECT leaf_id FROM touched));
+		WHEN 'round' THEN
+			PERFORM pass_open_flight(ARRAY(SELECT bl.leaf_id FROM touched n JOIN batch_leaf bl ON bl.round_id = n.round_id));
+		WHEN 'transfer_input', 'transfer_output', 'order_fill' THEN
+			PERFORM pass_open_flight(ARRAY(SELECT o.leaf_id FROM touched n JOIN transfer_output o ON o.transfer_id = n.transfer_id));
+		END CASE;
+	END IF;
+	RETURN NULL;
+END $$;
+
+DO $$
+DECLARE
+	t TEXT;
+BEGIN
+	FOREACH t IN ARRAY ARRAY['nursery_tx', 'watcher_tx', 'script_sighting', 'arca_script', 'leaf', 'forfeit', 'board', 'participation_input',
+		'batch_leaf', 'round', 'transfer_input', 'transfer_output', 'order_fill']
+	LOOP
+		EXECUTE format('CREATE TRIGGER pass_open_ins AFTER INSERT ON %I REFERENCING NEW TABLE AS touched
+			FOR EACH STATEMENT EXECUTE FUNCTION pass_open_rows()', t);
+	END LOOP;
+	FOREACH t IN ARRAY ARRAY['nursery_tx', 'leaf', 'board', 'participation_input', 'participation', 'round', 'batch']
+	LOOP
+		EXECUTE format('CREATE TRIGGER pass_open_upd AFTER UPDATE ON %I REFERENCING OLD TABLE AS untouched NEW TABLE AS touched
+			FOR EACH STATEMENT EXECUTE FUNCTION pass_open_rows()', t);
+	END LOOP;
+END $$;

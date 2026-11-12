@@ -50,12 +50,17 @@ pub struct PoolFlow {
 /// each coin given up in a round built, broadcast or final (a round held for
 /// its forfeits counts from when it is built, so the rounds built in one
 /// forfeit window are judged together by the cap), its lineage up through
-/// reassignments, and what has come back.
-const IN_FLIGHT_WITH: &str = "
+/// reassignments, and what has come back. `given` limits the coins given up
+/// (`pi`, a condition beginning with `AND`): the passes read those logged as
+/// they may have opened ([`super::open::Pass::Flight`]). What has come back
+/// is read for the batch leaves of those coins' lineages only, which is all
+/// `held` asks of it.
+pub(super) fn in_flight_with(given: &str) -> String {
+	format!("
 	WITH RECURSIVE given AS MATERIALIZED (
 	   SELECT pi.leaf_id, pi.asset, pi.value FROM participation_input pi
 	   JOIN participation p USING (participation_id) JOIN round r ON r.round_id = p.round_id
-	   WHERE pi.active AND p.state IN ('issued', 'released') AND r.state IN ('built', 'broadcast', 'final')),
+	   WHERE pi.active AND p.state IN ('issued', 'released') AND r.state IN ('built', 'broadcast', 'final'){}),
 	 up (root, asset, leaf_id, depth) AS (
 	   SELECT leaf_id, asset, leaf_id, 0 FROM given
 	   UNION
@@ -64,20 +69,23 @@ const IN_FLIGHT_WITH: &str = "
 	   JOIN LATERAL (SELECT ti.leaf_id AS parent FROM transfer_input ti WHERE ti.transfer_id = o.transfer_id
 	                 UNION ALL SELECT f.order_leaf FROM order_fill f WHERE f.transfer_id = o.transfer_id) p ON true
 	   WHERE u.depth < 8),
+	 lineage AS MATERIALIZED (SELECT DISTINCT leaf_id FROM up),
 	 swept AS MATERIALIZED (
 	   SELECT DISTINCT b.round_id, b.vout FROM batch b JOIN watcher_tx w ON w.subject = b.token JOIN nursery_tx n USING (txid)
-	   WHERE w.kind = 'sweep' AND n.state = 'final'),
+	   WHERE w.kind = 'sweep' AND n.state = 'final'
+	     AND (b.round_id, b.vout) IN (SELECT bl.round_id, bl.vout FROM lineage x JOIN batch_leaf bl ON bl.leaf_id = x.leaf_id)),
 	 back AS MATERIALIZED (
 	   SELECT rl.leaf_id FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid) WHERE n.state <> 'lost'
+	     AND rl.leaf_id IN (SELECT leaf_id FROM lineage)
 	   UNION
 	   SELECT nr.leaf_id FROM node_release nr JOIN watcher_tx w ON w.kind = 'reclaim' AND w.subject = nr.node_hash
-	   JOIN nursery_tx n ON n.txid = w.txid WHERE n.state <> 'lost'
+	   JOIN nursery_tx n ON n.txid = w.txid WHERE n.state <> 'lost' AND nr.leaf_id IN (SELECT leaf_id FROM lineage)
 	   UNION
 	   -- A leaf of a batch without a sweep, collected: brought down to its
 	   -- leaf and forfeited on the chain, the forfeit final.
 	   SELECT bl.leaf_id FROM batch_leaf bl JOIN batch b ON b.round_id = bl.round_id AND b.vout = bl.vout
 	   JOIN watcher_tx w ON w.kind = 'forfeit' AND w.subject = bl.leaf_id JOIN nursery_tx n ON n.txid = w.txid
-	   WHERE b.collect_mtp IS NOT NULL AND n.state = 'final'),
+	   WHERE b.collect_mtp IS NOT NULL AND n.state = 'final' AND bl.leaf_id IN (SELECT leaf_id FROM lineage)),
 	 -- A coin given up whose own forfeit is final on the chain: the
 	 -- collection brought it down to its leaf, through its lineage's
 	 -- reassignments when it was paid on out of round, and forfeited it.
@@ -91,7 +99,8 @@ const IN_FLIGHT_WITH: &str = "
 	   WHERE b.asset = u.asset AND r.state IN ('broadcast', 'final')
 	     AND NOT EXISTS (SELECT 1 FROM swept s WHERE s.round_id = bl.round_id AND s.vout = bl.vout)
 	     AND NOT EXISTS (SELECT 1 FROM back k WHERE k.leaf_id = bl.leaf_id)
-	     AND NOT EXISTS (SELECT 1 FROM forfeited f WHERE f.leaf_id = u.root))";
+	     AND NOT EXISTS (SELECT 1 FROM forfeited f WHERE f.leaf_id = u.root))", given)
+}
 
 /// The value in flight, by asset: each coin given up counted once, however
 /// many of its batch leaves still hold value.
@@ -222,10 +231,12 @@ impl Store {
 	}
 
 	/// What is in flight of each asset ([`PoolFlow::in_flight`]), by asset.
-	/// One read-only statement.
+	/// One read-only statement over the coins logged as they may be in flight
+	/// ([`super::open::Pass::Flight`]).
 	pub async fn in_flight(&self) -> Result<BTreeMap<[u8; 32], u64>, StoreError> {
+		self.open_ready(super::open::Pass::Flight).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(&format!("{} {}", IN_FLIGHT_WITH, IN_FLIGHT), &[]).await?;
+		let rows = conn.query(&format!("{} {}", super::open::Pass::Flight.body(true).0, IN_FLIGHT), &[]).await?;
 		rows.iter().map(|r| Ok((array32(r.get(0), "asset")?, r.get::<_, i64>(1).max(0) as u64))).collect()
 	}
 
@@ -236,8 +247,9 @@ impl Store {
 	/// back once every one of them has. A tree's lowest nodes above them are
 	/// the ones that hold fronted value.
 	pub async fn in_flight_slots(&self) -> Result<Vec<InFlightSlot>, StoreError> {
+		self.open_ready(super::open::Pass::Flight).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(&format!("{} {}", IN_FLIGHT_WITH, IN_FLIGHT_SLOTS), &[]).await?;
+		let rows = conn.query(&format!("{} {}", super::open::Pass::Flight.body(true).0, IN_FLIGHT_SLOTS), &[]).await?;
 		rows.iter().map(|r| Ok(InFlightSlot {
 			given: array32(r.get(0), "coin id")?,
 			asset: array32(r.get(1), "asset")?,

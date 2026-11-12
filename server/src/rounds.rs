@@ -1804,6 +1804,8 @@ impl Rounds {
 		let mut built = vec![];
 		let mut failed = vec![];
 		let mut laps = Laps::start("run_rounds");
+		self.store.keep_open(&[crate::store::open::Pass::Flight]).await?;
+		laps.lap("open items");
 		self.plans_due().await?;
 		laps.lap("plans");
 		let assets = self.assets_waiting().await?;

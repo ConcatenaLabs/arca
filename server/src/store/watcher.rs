@@ -58,7 +58,7 @@ pub struct TreeOutput {
 
 /// The outpoint `t.v` is spent by a transaction of the watcher's the nursery
 /// calls final: nothing more to do for it until a rollback takes that out.
-fn spent_final(t: &str, v: &str) -> String {
+pub(super) fn spent_final(t: &str, v: &str) -> String {
 	format!("EXISTS (SELECT 1 FROM watcher_input wi JOIN nursery_tx wn ON wn.txid = wi.txid
 		WHERE wi.prev_txid = {} AND wi.prev_vout = {} AND wn.state = 'final')", t, v)
 }
@@ -254,15 +254,10 @@ impl Store {
 	/// may still need answering. `(kind, the coin's leaf id, txid, vout)`,
 	/// oldest first.
 	pub async fn spent_coin_sightings(&self) -> Result<Vec<(ScriptKind, [u8; 32], [u8; 32], u32)>, StoreError> {
+		self.open_ready(super::open::Pass::Sighting).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			&format!("SELECT a.kind, a.leaf_id, s.txid, s.vout FROM script_sighting s
-			 JOIN arca_script a ON a.script_pubkey = s.script_pubkey
-			 JOIN leaf l ON l.leaf_id = a.leaf_id
-			 WHERE a.kind IN ('leaf', 'checkpoint') AND l.state = 'spent' AND NOT {}
-			 ORDER BY s.seen_at, s.txid, s.vout", spent_final("s.txid", "s.vout")),
-			&[],
-		).await?;
+		let (_, from) = super::open::Pass::Sighting.body(true);
+		let rows = conn.query(&format!("SELECT a.kind, a.leaf_id, s.txid, s.vout {} ORDER BY s.seen_at, s.txid, s.vout", from), &[]).await?;
 		rows.iter().map(|r| {
 			let kind = match r.get::<_, &str>(0) {
 				"leaf" => ScriptKind::Leaf,
@@ -348,18 +343,10 @@ impl Store {
 	/// subject is its round's connector asset, so the claim is found as the
 	/// spender of the forfeit's output.
 	pub async fn forfeited_transfer_coins(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, StoreError> {
+		self.open_ready(super::open::Pass::TransferForfeit).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			"SELECT DISTINCT l.leaf_id, l.record FROM leaf l JOIN forfeit f ON f.leaf_id = l.leaf_id
-			 WHERE l.kind = 'transfer' AND l.state = 'spent'
-			   AND NOT EXISTS (SELECT 1 FROM watcher_tx fw
-			                   JOIN watcher_input wi ON wi.prev_txid = fw.txid AND wi.prev_vout = 0
-			                   JOIN watcher_tx cw ON cw.txid = wi.txid AND cw.kind = 'claim'
-			                   JOIN nursery_tx n ON n.txid = cw.txid
-			                   WHERE fw.kind = 'forfeit' AND fw.subject = l.leaf_id AND n.state = 'final')
-			 ORDER BY l.leaf_id",
-			&[],
-		).await?;
+		let (_, from) = super::open::Pass::TransferForfeit.body(true);
+		let rows = conn.query(&format!("SELECT DISTINCT l.leaf_id, l.record {} ORDER BY l.leaf_id", from), &[]).await?;
 		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, r.get(1)))).collect()
 	}
 
@@ -367,13 +354,10 @@ impl Store {
 	/// transaction of the watcher's spends: what may still be claimed.
 	/// `(txid, the coin's leaf id)`, oldest first.
 	pub async fn unclaimed_forfeits(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, StoreError> {
+		self.open_ready(super::open::Pass::Forfeit).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			&format!("SELECT w.txid, w.subject FROM watcher_tx w JOIN nursery_tx n ON n.txid = w.txid
-			 WHERE w.kind = 'forfeit' AND n.state <> 'lost' AND NOT {}
-			 ORDER BY w.created_at, w.txid", spent_final("w.txid", "0")),
-			&[],
-		).await?;
+		let (_, from) = super::open::Pass::Forfeit.body(true);
+		let rows = conn.query(&format!("SELECT w.txid, w.subject {} ORDER BY w.created_at, w.txid", from), &[]).await?;
 		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, r.get(1)))).collect()
 	}
 
@@ -381,14 +365,10 @@ impl Store {
 	/// whose board output no final transaction of the watcher's spends: the
 	/// boards the operator may still have to recover. Their leaf ids.
 	pub async fn boards_to_recover(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+		self.open_ready(super::open::Pass::Board).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			&format!("SELECT b.leaf_id FROM board b JOIN leaf l ON l.leaf_id = b.leaf_id
-			 WHERE b.state = 'credited' AND l.state = 'spent'
-			   AND EXISTS (SELECT 1 FROM forfeit f WHERE f.leaf_id = b.leaf_id) AND NOT {}
-			 ORDER BY b.created_at, b.leaf_id", spent_final("b.txid", "b.vout")),
-			&[],
-		).await?;
+		let (_, from) = super::open::Pass::Board.body(true);
+		let rows = conn.query(&format!("SELECT b.leaf_id {} ORDER BY b.created_at, b.leaf_id", from), &[]).await?;
 		rows.iter().map(|r| array32(r.get(0), "leaf id")).collect()
 	}
 
