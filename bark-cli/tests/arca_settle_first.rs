@@ -1091,3 +1091,78 @@ async fn a_resting_order_in_the_gap_is_not_money_to_spend() {
 		"{}: in the gap the payment was told to settle first and wait, counting the order's own leaf; once released and ready it is refused: {}",
 		tag, kind(&after));
 }
+
+// ---------------------------------------------------------------------------
+// 8. A board the operator has not credited yet (arca #846).
+// ---------------------------------------------------------------------------
+
+/// A coin moved in from the chain (a board) whose block the wallet reads
+/// final while the operator, following the chain on its own clock, has not
+/// credited it yet: the wallet holds it as waiting, `settle-first` says when,
+/// and a payment from it answers `settle_first`, never the operator's
+/// `422 not_live`. Once the operator credits it, it is live and the payment
+/// goes. At anchor depth 0 (the testnet's) and 2.
+async fn board_case(depth: u32) {
+	let tag = format!("SF8 board d{}", depth);
+	let mut r = Running::start_with(move |cfg, _, _| {
+		cfg.finality.anchor_depth = depth;
+		cfg.watcher.enabled = false;
+		cfg.finality.poll_interval_ms = 15_000;
+	}).await;
+	let x = r.x;
+	let (a, c) = (Arca::new(&format!("{} A", tag)), Arca::new(&format!("{} C", tag)));
+	create(&r, &a);
+	create(&r, &c);
+	let info = library(&a, "info", json!({})).unwrap();
+	println!("{}: the operator's finality: {}", tag, info["server_info"]["finality"]);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 3_000_000);
+	r.produce().await;
+	r.synced().await;
+	let board = a.ok(&["board", &x.to_string(), "2000000", "--fee-asset", &x.to_string()]);
+	println!("{}: board: {}", tag, board);
+	r.produce().await;
+	if depth > 0 {
+		r.bury().await;
+	}
+	a.ok(&["sync"]);
+	let server_state = |a: &Arca| a.ok(&["boards"]).as_array().unwrap().iter().map(|b| b["server"]["state"].clone()).collect::<Vec<_>>();
+	let before = server_state(&a);
+	let coins: Vec<Value> = a.ok(&["coins"]).as_array().unwrap().iter().filter(|k| k["asset"] == x.to_string())
+		.map(|k| json!([k["kind"], k["state"], k["value"], k["note"]])).collect();
+	let settled = library(&a, "settle_first", json!({"asset": x.to_string()})).unwrap();
+	let req = request(&c);
+	let (paid, v) = a.run(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+	let after = server_state(&a);
+	println!("{}: the operator reads the board {:?} then {:?}; the wallet's coins of X: {:?}", tag, before, after, coins);
+	println!("{}: settle-first: {}", tag, settled);
+	println!("{}: the payment: {}", tag, v);
+	assert_eq!(after, vec![json!("pending")], "{}: the case needs the operator behind the wallet throughout", tag);
+	assert!(!paid, "{}: paid from a board the operator has not credited: {}", tag, v);
+	assert!(!v.to_string().contains("not_live"), "{}: refused by the operator, not waited for: {}", tag, v);
+	assert_eq!(v["error"]["kind"], "settle_first", "{}: it waits for the board, as for any coin not final yet: {}", tag, v);
+	assert_eq!(settled["ready"], false, "{}: {}", tag, settled);
+	assert!(settled["final_in_seconds"].as_u64().is_some(), "{}: it says when: {}", tag, settled);
+	assert!(coins.iter().any(|k| k[0] == "board" && k[1] == "pending"), "{}: the board waits: {:?}", tag, coins);
+	// The operator credits it: live, ready, and the payment goes.
+	r.synced().await;
+	r.wait("the board to be credited", || server_state(&a) == vec![json!("credited")]).await;
+	a.ok(&["sync"]);
+	let done = library(&a, "settle_first", json!({"asset": x.to_string()})).unwrap();
+	assert_eq!(done["ready"], true, "{}: {}", tag, done);
+	let sent = a.ok(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+	println!("{}: once credited: {}", tag, sent);
+	for w in [&a, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_board_the_operator_has_not_credited_waits_at_the_testnets_depth() {
+	board_case(0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_board_the_operator_has_not_credited_waits_at_depth_two() {
+	board_case(2).await;
+}

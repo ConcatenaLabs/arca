@@ -557,8 +557,17 @@ impl Wallet {
 		}
 		self.take_served_bases(e);
 		let a = self.checked_as_held(&record, &owner, &nonce, now)?;
-		let (state, note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
-		let row = self.row(&record, &a, state, &note).map_err(|e| e.to_string())?;
+		let (mut state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		let mut row = self.row(&record, &a, state, &note).map_err(|e| e.to_string())?;
+		// A board is live once the operator credits it, whatever the chain
+		// reads ([`Wallet::board_waits`]): a restore or another device's
+		// catch-up right after a board holds it pending until then.
+		if let (true, CoinRecord::Board(b)) = (state == "live", &record) {
+			if let Some(waits) = self.board_waits(b, row.bases.first().map(String::as_str), false, "").map_err(|e| e.to_string())? {
+				(state, note) = ("pending", waits);
+				row = self.row(&record, &a, state, &note).map_err(|e| e.to_string())?;
+			}
+		}
 		let coin = a.valid.clone();
 		let entry_head = e["made_by"]["signer_record"].clone();
 		self.store.atomically(|s| {
