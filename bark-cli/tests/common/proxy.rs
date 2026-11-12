@@ -36,6 +36,10 @@ pub struct Proxy {
 	/// Paths whose requests are held unanswered past the wallet's timeout and
 	/// never forwarded.
 	hold: Arc<Mutex<Vec<String>>>,
+	/// Paths whose requests are never forwarded and answered at once as a
+	/// gateway with the server gone answers (a 502): the call lost on its
+	/// way, the server never seeing it.
+	lose: Arc<Mutex<Vec<String>>>,
 }
 
 fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
@@ -76,6 +80,13 @@ fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
 		p.log.lock().unwrap().push((path.clone(), req, 0, Value::Null));
 		std::thread::sleep(Duration::from_secs(75));
 		return Ok(());
+	}
+	if p.lose.lock().unwrap().contains(&path) {
+		let v = json!({"error": {"code": "proxy", "message": "the server did not answer"}});
+		p.log.lock().unwrap().push((path.clone(), req, 502, v.clone()));
+		let text = v.to_string();
+		write!(s, "HTTP/1.1 502 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", text.len(), text)?;
+		return s.flush();
 	}
 	let url = format!("{}{}", target, path);
 	let resp = if method == "GET" { minreq::get(url).send() } else {
@@ -139,6 +150,7 @@ impl Proxy {
 			rewrite_request: Arc::new(Mutex::new(None)),
 			log: Arc::new(Mutex::new(vec![])),
 			hold: Arc::new(Mutex::new(vec![])),
+			lose: Arc::new(Mutex::new(vec![])),
 		};
 		let (q, target) = (p.clone(), target.to_string());
 		std::thread::spawn(move || {
@@ -182,6 +194,16 @@ impl Proxy {
 	/// Holds calls to `path` no more: the next is forwarded.
 	pub fn release(&self, path: &str) {
 		self.hold.lock().unwrap().retain(|p| p != path);
+	}
+
+	/// Answers every call to `path` with a 502 from now on, never forwarding
+	/// it, or (`false`) forwards them again.
+	pub fn lose(&self, path: &str, on: bool) {
+		let mut d = self.lose.lock().unwrap();
+		d.retain(|p| p != path);
+		if on {
+			d.push(path.to_string());
+		}
 	}
 
 	/// Every call so far.
