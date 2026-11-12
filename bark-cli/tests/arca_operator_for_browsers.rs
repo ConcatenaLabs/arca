@@ -14,7 +14,10 @@
 //! ```
 //!
 //! with `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` as for the
-//! scenarios (`tests/common/mod.rs`). It writes nothing a browser must read:
+//! scenarios (`tests/common/mod.rs`). `ARCA_TEST_ANCHOR_DEPTH` sets the anchor
+//! depth the operator calls a block final at (the server's default otherwise),
+//! so a wallet is proven at the depth a real operator publishes too. It writes
+//! nothing a browser must read:
 //! `GET /state` on the control address answers with the server's URL, the
 //! node's RPC URL and credentials, the two assets, the chain's genesis hash,
 //! and the file of the test operator key (for `arca-signer
