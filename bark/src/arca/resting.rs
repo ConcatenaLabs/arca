@@ -844,6 +844,19 @@ impl Wallet {
 					s.refused(&format!("a fill of resting order {}", body["order"].as_str().unwrap_or("")), &e.to_string())
 				})?;
 				forget(self)?;
+				// A coin of the wallet's own that the operator holds spent, by
+				// nothing this store did: another store of the mnemonic (a
+				// second device) gave it to a round or paid with it. As for a
+				// refused transfer, the wallet reads what the other stores did
+				// now rather than at its next catch-up, so it stops counting the
+				// coin and holds what replaced it (arca #839).
+				if let Error::Server { code, message, .. } = &e {
+					if code == "double_spend" && super::pay::leaf_named(message).is_some_and(|l| given.contains(&l)) {
+						if let Err(c) = self.catch_up() {
+							self.store.refused("the catch-up after a coin spent elsewhere", &c.to_string())?;
+						}
+					}
+				}
 				Err(e)
 			},
 			Err(e) => Ok(json!({"state": "sent", "error": e.to_string(),
