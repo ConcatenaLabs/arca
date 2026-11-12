@@ -1889,8 +1889,14 @@ one coin's worth leaves past a freeze. The wallet asks for every leaf of such
 an asset as `landing-2` where the operator makes it (its `info.templates.list`
 names `landing-2`), and as `landing-1` from one that does not: in a board, a
 refresh, a payment it receives (its receive request carries the landing and
-names `landing-2` among the formats it reads) and the change of a payment it
-sends. It pays a receiver `landing-2` when the request names it, and
+names `landing-2` among the formats it reads), the change of a payment it
+sends, and the change an offboard or an order on the chain leaves in the
+tree, so a holder can take part of such a balance out. The operator serves
+no take of an order on the chain, no resting order and no Lightning payment
+in such an asset, since each would make a coin out of the freeze's reach:
+the wallet refuses each before anything moves, and the refusal says what
+the holder can do instead (pay it to another wallet, swap it by a swap
+offer, withdraw it to an address, or sell it by an order on the chain). It pays a receiver `landing-2` when the request names it, and
 `landing-1` to an older wallet's request, whose wallet reads no `landing-2`
 coin, so it gives such a request no coin whose past holds a `landing-2` leaf
 either (refused, naming the reason, when it has no other). In a swap, its

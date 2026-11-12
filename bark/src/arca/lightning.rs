@@ -391,6 +391,9 @@ impl Wallet {
 		let leg = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
 			.map(|a| a["lightning"].clone())
 			.ok_or_else(|| Error::Refused(format!("the operator does not serve asset {}; nothing is signed", asset)))?;
+		if self.landing_rule(&info, asset)?.is_some() {
+			return Err(Self::supervised_refusal(asset, "no Lightning payment carries it"));
+		}
 		if leg.is_null() {
 			return Err(Error::Refused(format!("the operator runs no Lightning node in asset {}; nothing is signed", asset)));
 		}
@@ -789,6 +792,9 @@ impl Wallet {
 		let leg = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
 			.map(|a| a["lightning"].clone())
 			.ok_or_else(|| Error::Refused(format!("the operator does not serve asset {}", asset)))?;
+		if self.landing_rule(&info, asset)?.is_some() {
+			return Err(Self::supervised_refusal(asset, "no Lightning payment carries it"));
+		}
 		if leg.is_null() {
 			return Err(Error::Refused(format!("the operator runs no Lightning node in asset {}", asset)));
 		}

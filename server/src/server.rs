@@ -1660,7 +1660,7 @@ pub const LANDING_VSIZE: u64 = 250;
 /// supervised profile ([`crate::supervision`]), with its fee allowance; and
 /// refuses a configuration that names the profile for an asset the chain does
 /// not supervise, or serves a supervised asset issuer-operated or over
-/// Lightning, neither of which keeps it in `landing-1` leaves.
+/// Lightning, neither of which keeps it in landing leaves.
 async fn supervise(list: &mut [(AssetId, AssetParams)], config: &Config, finality: &FinalityService) -> Result<(), StartError> {
 	let listed = finality.call(|c| c.supervised_assets()).await.map_err(err("the node's supervised assets"))?;
 	for (id, p) in list.iter_mut() {
