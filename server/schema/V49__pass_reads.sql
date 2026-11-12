@@ -380,3 +380,9 @@ BEGIN
 			FOR EACH STATEMENT EXECUTE FUNCTION pass_open_rows()', t);
 	END LOOP;
 END $$;
+
+-- The planner's statistics of what this step made (the change log seeded
+-- above with every live batch, the log of transactions in no block), so the
+-- first passes after the step are planned on what the tables hold, not
+-- blind until autovacuum comes round.
+ANALYZE watch_touch, tx_unblocked, watch_cursor, pass_open;

@@ -76,6 +76,32 @@ async fn schema_from_nothing() {
 	assert_eq!(again.schema_version().await.unwrap(), SCHEMA);
 }
 
+/// The planner's statistics of what schema step 49 makes are there when the
+/// step is done, and the log of open items is analyzed again once a pass
+/// first fills it: no pass after a move is planned on a table never
+/// analyzed (`reltuples` -1) or on the empty log the step left.
+#[tokio::test]
+async fn the_pass_logs_are_analyzed_by_the_step_and_after_their_fill() {
+	let db = TestDb::new().await;
+	let (c, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	let tuples = |t: &'static str| {
+		let c = &c;
+		async move { c.query_one("SELECT reltuples::float8 FROM pg_class WHERE relname = $1", &[&t]).await.unwrap().get::<_, f64>(0) }
+	};
+	for t in ["watch_touch", "tx_unblocked", "watch_cursor", "pass_open"] {
+		assert!(tuples(t).await >= 0.0, "{} analyzed by the step ({})", t, tuples(t).await);
+	}
+	// An item logged before the first fill (of another pass than the one
+	// filled): the analysis after the fill counts it.
+	c.batch_execute("INSERT INTO pass_open (pass, k) VALUES ('flight', '\\x01')").await.unwrap();
+	assert_eq!(tuples("pass_open").await, 0.0, "as the step left it");
+	db.store.keep_open(&[server::store::open::Pass::Sighting]).await.unwrap();
+	assert_eq!(tuples("pass_open").await, 1.0, "analyzed after the fill");
+}
+
 /// A database of schema 16 moves to 17 in place: every leaf it holds is
 /// numbered for `leaf_data`'s cursor, in the order the leaves lie, and no
 /// leaf is bound to a mailbox key.

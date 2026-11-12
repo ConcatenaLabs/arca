@@ -25,8 +25,16 @@
 //!
 //! `HISTORY_V49=1` also times schema step V49 on the cloned history, run
 //! again whole after what it made is taken away: what the operator's move
-//! across it spends with the service down. `HISTORY_EXPLAIN=1` prints the
-//! plans of the whole-history statements.
+//! across it spends with the service down, each statement of it over 100 ms
+//! named. The step logs every live batch for the first pass to read once, so
+//! that pass reads every clone. A clone's keys are its base's mapped like
+//! any id, which are not points on the curve: the watcher cannot rebuild a
+//! clone's tree ("the published tree: malformed public key"), and a batch
+//! whose step fails is read again at every pass. So after `HISTORY_V49=1`
+//! the passes after the first read every clone again and measure that, not
+//! the operator's; the steady passes are the ones measured without it.
+//! `HISTORY_EXPLAIN=1` prints the plans of the whole-history statements;
+//! `HISTORY_PASSES` sets how many watcher passes are timed (5).
 //!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
@@ -122,6 +130,41 @@ async fn clone_history(c: &tokio_postgres::Client, n: i64) {
 	println!("history: cloned {} times in {:.0} s: {}", n, t.elapsed().as_secs_f64(), cloned.join(", "));
 }
 
+/// The statements of a schema step, split at the semicolons outside quotes,
+/// dollar quotes and comments.
+fn statements(sql: &str) -> Vec<String> {
+	let (mut out, mut cur) = (vec![], String::new());
+	let (mut dollar, mut quote, mut comment) = (false, false, false);
+	let b: Vec<char> = sql.chars().collect();
+	let mut i = 0;
+	while i < b.len() {
+		let ch = b[i];
+		if comment {
+			if ch == '\n' { comment = false; }
+		} else if quote {
+			if ch == '\'' { quote = false; }
+		} else if ch == '$' && b.get(i + 1) == Some(&'$') {
+			dollar = !dollar;
+			cur.push_str("$$");
+			i += 2;
+			continue;
+		} else if !dollar && ch == '-' && b.get(i + 1) == Some(&'-') {
+			comment = true;
+		} else if !dollar && ch == '\'' {
+			quote = true;
+		} else if !dollar && ch == ';' {
+			if !cur.trim().is_empty() { out.push(cur.clone()); }
+			cur.clear();
+			i += 1;
+			continue;
+		}
+		if !comment { cur.push(ch); }
+		i += 1;
+	}
+	if !cur.trim().is_empty() { out.push(cur); }
+	out
+}
+
 fn median(v: &mut [f64]) -> f64 {
 	v.sort_by(|a, b| a.partial_cmp(b).unwrap());
 	if v.is_empty() { 0.0 } else { v[v.len() / 2] }
@@ -214,16 +257,17 @@ async fn passes_with_a_history_behind_them() {
 				batch_leaf_by_participation, participation_by_round, nursery_tx_not_final, round_by_created_mtp, batch_by_collect_mtp,
 				arca_script_by_leaf, batch_by_token, board_by_outpoint").await.unwrap();
 		let t = Instant::now();
-		c.batch_execute(&format!("BEGIN; {} COMMIT;", include_str!("../schema/V49__pass_reads.sql"))).await.unwrap();
-		println!("V49 ×{}: the schema step on {} final rounds took {:.0} ms", scale, finals, t.elapsed().as_secs_f64() * 1000.0);
-		// The planner's statistics of what the step made, as autovacuum would
-		// gather them in time (`HISTORY_ANALYZE=1`): without them the first
-		// passes plan blind.
-		if env("HISTORY_ANALYZE", 0) == 1 {
-			let t = Instant::now();
-			c.batch_execute("ANALYZE").await.unwrap();
-			println!("ANALYZE after V49: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+		c.batch_execute("BEGIN").await.unwrap();
+		for stmt in statements(include_str!("../schema/V49__pass_reads.sql")) {
+			let s = Instant::now();
+			c.batch_execute(&stmt).await.unwrap();
+			let ms = s.elapsed().as_secs_f64() * 1000.0;
+			if ms >= 100.0 {
+				println!("V49 part: {:.0} ms: {}", ms, stmt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim());
+			}
 		}
+		c.batch_execute("COMMIT").await.unwrap();
+		println!("V49 ×{}: the schema step on {} final rounds took {:.0} ms", scale, finals, t.elapsed().as_secs_f64() * 1000.0);
 	}
 	// The logs of open items start again, as after the schema step: the
 	// restarted server's first passes fill them from the whole history.
@@ -233,10 +277,15 @@ async fn passes_with_a_history_behind_them() {
 
 	// The passes, each run by hand.
 	let mut watcher = vec![];
-	for _ in 0..5 {
+	let passes = env("HISTORY_PASSES", 5);
+	let c = db(&r).await;
+	for i in 0..passes {
+		let touches: i64 = c.query_one("SELECT count(*) FROM watch_touch", &[]).await.unwrap().get(0);
 		let t = Instant::now();
 		r.server.watcher.pass().await.unwrap();
 		watcher.push(t.elapsed().as_secs_f64() * 1000.0);
+		println!("watcher pass {}: {:.0} ms, {} batch(es) read, {} touch(es) logged before it", i + 1, watcher[i as usize],
+			r.server.watcher.last_read().len(), touches);
 	}
 	let mut rounds = vec![];
 	for _ in 0..5 {

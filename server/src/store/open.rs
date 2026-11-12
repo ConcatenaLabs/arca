@@ -154,6 +154,10 @@ impl Store {
 		if self.watch_cursor(&marker).await?.is_none() {
 			let t = Instant::now();
 			let (whole, added) = self.recount_open(pass).await?;
+			// The log was empty when last analyzed (the schema step made it):
+			// the planner learns what it holds now, so the passes that read
+			// it next are planned on that, not on an empty table.
+			self.conn().await?.batch_execute("ANALYZE pass_open").await?;
 			self.set_watch_cursor(&marker, 1).await?;
 			log::info!("{} pass: its log of open items filled from the whole history: {} item(s), {} logged, in {} ms",
 				pass.name(), whole, added, t.elapsed().as_millis());
