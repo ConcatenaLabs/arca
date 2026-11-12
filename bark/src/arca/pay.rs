@@ -789,6 +789,48 @@ impl Wallet {
 		Ok(())
 	}
 
+	/// The refusal [`Error::Short`] of a payment that `chosen` (the coins
+	/// [`Self::choose_live`] takes, in the order it takes them, at most a
+	/// transfer's inputs) cannot make as asked, with what it can pay now.
+	/// For each first `k` of them whose margins are within the wallet's
+	/// bound: `all` is what they hold less the margins of a payment taking
+	/// them all (that exact amount pays, with no change), and `most` that
+	/// less the operator's smallest leaf, below which every amount pays (the
+	/// selection takes coins until the change is none or at least the
+	/// smallest leaf, and these `k` leave at least that). The largest of
+	/// each. When no first `k` is within the bound, the bound's own refusal:
+	/// nothing pays, and no figure is given.
+	#[allow(clippy::too_many_arguments)]
+	fn short(&self, asset: AssetId, chosen: &[In], others: &[ExplicitOutput], pays_margin: bool, other_inputs: usize, margins: &Margins,
+		min_leaf: u64, live: Option<u64>, message: String, margin_all: u64) -> Result<Error, Error>
+	{
+		let mut best: Option<(u64, u64)> = None;
+		for k in 1..=chosen.len() {
+			let set = &chosen[..k];
+			let kept: u64 = set.iter().map(|i| i.checkpoint_value).sum();
+			let mut outs = others.to_vec();
+			outs.push(ExplicitOutput::new(asset, 1, leaf_probe()));
+			let mut all: Vec<&ValidCoin> = set.iter().map(|i| &i.coin).collect();
+			for _ in 0..other_inputs {
+				all.push(&set[0].coin);
+			}
+			let margin = if pays_margin { self.reassignment_margin(&all, &outs, margins)? } else { 0 };
+			if self.margins_within_bound(set, margin, asset).is_err() {
+				continue;
+			}
+			let whole = kept.saturating_sub(margin);
+			let upto = whole.saturating_sub(min_leaf);
+			best = Some(match best { Some((u, a)) => (u.max(upto), a.max(whole)), None => (upto, whole) });
+		}
+		Ok(match best {
+			Some((most, all)) => Error::Short { asset: asset.to_string(), most, all: Some(all), live, message },
+			None => match self.margins_within_bound(chosen, margin_all, asset) {
+				Err(e) => e,
+				Ok(()) => Error::Refused(message),
+			},
+		})
+	}
+
 	/// `c` alone paying `paid` into `others` (with `other_inputs` inputs of
 	/// another owner beside it): the input, the reassignment's margin and the
 	/// change when its change is none or at least `min_leaf` and its margins
@@ -861,7 +903,7 @@ impl Wallet {
 		// back no refresh: the coins it names may be in one now, on their
 		// way to paying it.
 		let r = match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, reads, spend) {
-			Err(e @ Error::Refused(_)) => {
+			Err(e @ (Error::Refused(_) | Error::Short { .. })) => {
 				if self.free_refreshes(asset)? {
 					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, reads, spend)
 				} else {
@@ -874,7 +916,7 @@ impl Wallet {
 		// say so, and say when coins it reads are held back only while they
 		// arrive (the wallet's instant limit), which is the cause then.
 		match r {
-			Err(Error::Refused(_)) if reads != Reads::ALL
+			Err(Error::Refused(_) | Error::Short { .. }) if reads != Reads::ALL
 				&& self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, Reads::ALL, spend).is_ok() =>
 			{
 				let unread = match (reads.exit, reads.landing_2) {
@@ -937,10 +979,19 @@ impl Wallet {
 			}
 		}
 		let total_live: u64 = candidates.iter().map(|c| c.coin.value).sum();
+		// A transfer takes at most MAX_INPUTS inputs, another owner's among
+		// them: when more coins are held, the largest are the ones it can give.
+		let cap = arca_covenant::transfer::MAX_INPUTS.saturating_sub(other_inputs).max(1);
+		if candidates.len() > cap {
+			candidates.sort_by(|a, b| b.coin.value.cmp(&a.coin.value));
+		}
 		let mut chosen: Vec<In> = vec![];
 		// The reassignment's margin with every coin chosen so far.
 		let mut margin = 0;
 		for c in candidates {
+			if chosen.len() >= cap {
+				break;
+			}
 			let m = self.checkpoint_margin(&c.coin, &margins)?;
 			chosen.push(In { checkpoint_value: c.coin.value - m.min(c.coin.value - 1), ..c });
 			let kept: u64 = chosen.iter().map(|i| i.checkpoint_value).sum();
@@ -958,7 +1009,7 @@ impl Wallet {
 			if kept >= paid + margin {
 				let change = kept - paid - margin;
 				if change > 0 && change < min_leaf {
-					if chosen.len() < arca_covenant::transfer::MAX_INPUTS {
+					if chosen.len() < cap {
 						continue;
 					}
 				} else {
@@ -969,8 +1020,9 @@ impl Wallet {
 		}
 		let kept: u64 = chosen.iter().map(|i| i.checkpoint_value).sum();
 		if kept >= paid + margin {
-			return Err(Error::Refused(format!("the change would be below the operator's smallest leaf in asset {} ({} atoms): \
-				pay a little less, or that much more", asset, min_leaf)));
+			let message = format!("the change would be below the operator's smallest leaf in asset {} ({} atoms): pay a little less, or \
+				that much more", asset, min_leaf);
+			return Err(self.short(asset, &chosen, others, pays_margin, other_inputs, &margins, min_leaf, None, message, margin)?);
 		}
 		// Coins the wallet holds as its own that pay this only after a round
 		// (at the depth limit, arriving, proceeds for a cross-chain leg, of
@@ -983,8 +1035,18 @@ impl Wallet {
 		// Coins an offline-refresh plan names are paid out of round by no
 		// wallet: say so, naming those whose release would cover it.
 		let need = paid + total_live.saturating_sub(kept) + margin;
-		let refused = self.short_of(asset, need.saturating_sub(total_live), format!("the wallet holds {} of asset {} in live coins, and paying {} \
-			takes {} with the margins its transactions leave for their fees", total_live, asset, paid, need))?;
+		let mut words = format!("the wallet holds {} of asset {} in live coins, and paying {} takes {} with the margins its transactions \
+			leave for their fees", total_live, asset, paid, need);
+		if total_live > kept && chosen.len() >= cap {
+			words = format!("{}; a payment gives at most {} of its coins, the largest, which hold {}: a round merges them", words, cap, kept);
+		}
+		let refused = self.short_of(asset, need.saturating_sub(total_live), words)?;
+		// Nothing more on its way covers it: the most it pays now goes with
+		// the refusal ([`Self::short`]).
+		let refused = match refused {
+			Error::Refused(message) => self.short(asset, &chosen, others, pays_margin, other_inputs, &margins, min_leaf, Some(total_live), message, margin)?,
+			other => other,
+		};
 		Err(self.after_close(refused, &chosen, others, other_inputs, pays_margin, &margins, total_live)?)
 	}
 
@@ -2589,8 +2651,14 @@ impl Wallet {
 	fn trade_coins(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize, reads: Reads) -> Result<TradeCoins, Error>
 	{
-		let (mine, margin, change) = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, reads, Spend::Trade)?;
-		if self.own_instant_limit()?.is_none() || change == 0 {
+		let shapes = self.own_instant_limit()?.is_some();
+		let (mine, margin, change) = match self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, reads, Spend::Trade) {
+			// What a trade can give while it shapes its coin first is what
+			// that payment to itself can make, less the traded coin's margins.
+			Err(e @ Error::Short { .. }) if shapes => return Err(self.trade_short(info, asset, paid, others, pays_margin, other_inputs, reads, e)?),
+			r => r?,
+		};
+		if !shapes || change == 0 {
 			return Ok(TradeCoins { mine, margin, change, shaping: None });
 		}
 		let margins = Margins::of(info, asset)?;
@@ -2609,7 +2677,15 @@ impl Wallet {
 		for _ in 0..4 {
 			let leaf = self.leaf_traded_probe(info, asset, need, reads.landing_2)?;
 			let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
-			let (inputs, left) = self.shape_inputs(info, asset, need, &probe, reads)?;
+			let (inputs, left) = match self.shape_inputs(info, asset, need, &probe, reads) {
+				// The shape's figures are those of the coin it makes: the
+				// trade gives that coin less its own margins.
+				Err(Error::Short { asset: a, most, live, message, .. }) => {
+					let take = need.saturating_sub(paid);
+					return Err(Self::less_short(a, most, live, message, take));
+				},
+				r => r?,
+			};
 			let coin = Self::shaped_coin(&inputs, &leaf, asset, need)?;
 			let (next, m, r) = need_of(&coin)?;
 			if next != need {
@@ -2623,6 +2699,45 @@ impl Wallet {
 		}
 		Err(Error::Refused(format!("the wallet could not price a coin of asset {} holding exactly what this trade gives; it trades from \
 			coins a round has shaped, after the next round; nothing moved", asset)))
+	}
+
+	/// A trade's [`Error::Short`] while the wallet shapes its coin first: the
+	/// payment to itself of a coin of `paid` and the traded coin's margins
+	/// (priced on the wallet's largest coin of `asset`, as the shape is), and
+	/// that payment's figures less those margins. `e` as it is when the
+	/// shape's payment would go.
+	#[allow(clippy::too_many_arguments)]
+	fn trade_short(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, other_inputs: usize,
+		reads: Reads, e: Error) -> Result<Error, Error>
+	{
+		let margins = Margins::of(info, asset)?;
+		let Some(first) = self.spendable(asset, Spend::Trade)?.into_iter().max_by_key(|c| c.coin.value) else { return Ok(e) };
+		let m = self.checkpoint_margin(&first.coin, &margins)?;
+		let all: Vec<&ValidCoin> = std::iter::repeat(&first.coin).take(1 + other_inputs).collect();
+		let r = if pays_margin { self.reassignment_margin(&all, others, &margins)? } else { 0 };
+		let need = paid.saturating_add(m).saturating_add(r);
+		let leaf = self.leaf_traded_probe(info, asset, need, reads.landing_2)?;
+		let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
+		// An amount the trade gives with no change goes with no shaping (the
+		// direct `all`); any other is shaped first, so it goes only within
+		// both: the direct selection's ceiling and the shape's, less the
+		// traded coin's margins.
+		Ok(match (self.shape_inputs(info, asset, need, &probe, reads), e) {
+			(Err(Error::Short { most: shape_most, .. }), Error::Short { asset: a, most, all, live, message }) =>
+				Error::Short { asset: a, most: most.min(shape_most.saturating_sub(m + r)), all, live, message },
+			(_, e) => e,
+		})
+	}
+
+	/// An [`Error::Short`] of a payment that makes a coin, as the figure of
+	/// what that coin then gives: `most` less `take`, its own margins (no
+	/// `all`: an amount the shape empties its coins for leaves the trade's
+	/// own change); none when nothing is left.
+	fn less_short(asset: String, most: u64, live: Option<u64>, message: String, take: u64) -> Error {
+		match most.checked_sub(take).filter(|m| *m > 0) {
+			Some(m) => Error::Short { asset, most: m, all: None, live, message },
+			None => Error::Refused(message),
+		}
 	}
 
 	/// The coin a payment of the wallet to itself from `inputs` makes at
@@ -2828,7 +2943,7 @@ impl Wallet {
 		if back.is_empty() {
 			return e;
 		}
-		let why = match e { Error::Refused(m) => m, other => other.to_string() };
+		let why = match e { Error::Refused(m) | Error::Short { message: m, .. } => m, other => other.to_string() };
 		Error::Refused(format!("{}: the trade that made it can never complete, and the wallet's coin(s) {} given into it come home by \
 			their checkpoint's own exit", why, back.join(", ")))
 	}

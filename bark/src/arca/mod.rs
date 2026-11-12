@@ -146,6 +146,21 @@ pub enum Error {
 	/// The wallet refused: the reason is for the user.
 	#[error("refused: {0}")]
 	Refused(String),
+	/// A payment of `asset` the wallet's own coins cannot make as asked, with
+	/// nothing more of it on its way that would: what it holds in live coins,
+	/// less the margins the payment's transactions leave for their fees, falls
+	/// short of the amount, or would leave change below the operator's
+	/// smallest leaf. `most` is the most of `asset` below which every amount
+	/// pays now, in atoms (what its coins hold less the margins and the
+	/// operator's smallest leaf, so the change is never too small); `all`
+	/// the exact amount that pays with no change at all (more than `most`;
+	/// an amount between the two leaves change below the smallest leaf and
+	/// is refused); `live` what it holds of it in live coins when the margins
+	/// are what it falls short by. A program offers `most` ("up to") without
+	/// reading it out of `message`. Refused like [`Error::Refused`] otherwise
+	/// (its kind is `refused`).
+	#[error("refused: {message}")]
+	Short { asset: String, most: u64, all: Option<u64>, live: Option<u64>, message: String },
 	/// A payment of `asset` that the coins it may spend cannot cover, and
 	/// that the coins an offline-refresh plan names could: `release` names
 	/// the fewest of those, largest first, whose release through the next
@@ -224,10 +239,22 @@ pub enum Error {
 }
 
 impl Error {
+	/// This refusal without the figures of [`Error::Short`], for a payment
+	/// whose amount is not what its caller asks for (a take's price and its
+	/// fee, a distribution's claims and its fee): its figures would name an
+	/// amount of the payment that no ask of the caller's makes. Any other
+	/// error as it is.
+	pub(crate) fn without_figures(self) -> Error {
+		match self {
+			Error::Short { message, .. } => Error::Refused(message),
+			e => e,
+		}
+	}
+
 	/// A short machine-readable kind, for the command line's JSON.
 	pub fn kind(&self) -> &'static str {
 		match self {
-			Error::Refused(_) => "refused",
+			Error::Refused(_) | Error::Short { .. } => "refused",
 			Error::Planned { .. } => "planned",
 			Error::InChannel { .. } => "in_channel",
 			Error::SettleFirst { .. } => "settle_first",
