@@ -598,7 +598,7 @@ async fn window_case(depth: u32) {
 	let w2 = window_answers(&a, &[arriving.clone()], x, &req, &address, &offer);
 	println!("{}: final in the wallet's view, not yet the operator's: {}", tag, w2);
 	assert_eq!(w2["settle"]["waiting_for"], "release", "{}: final, the operator's release still to come: {}", tag, w2["settle"]);
-	assert_eq!(w2["settle"]["final_in_seconds"], 60, "{}: one round interval of the operator's: {}", tag, w2["settle"]);
+	assert_eq!(w2["settle"]["final_in_seconds"], 120, "{}: the operator's release: a pass under way and one more (a round interval and a block): {}", tag, w2["settle"]);
 	for w in [&w1, &w2] {
 		assert_eq!(w["settle"]["ready"], false, "{}: not ready while the coin it makes cannot be spent: {}", tag, w["settle"]);
 		assert!(w["settle"]["final_in_seconds"].as_u64().is_some(), "{}: it says when: {}", tag, w["settle"]);
