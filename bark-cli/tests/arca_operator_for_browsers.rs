@@ -16,7 +16,10 @@
 //! with `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` as for the
 //! scenarios (`tests/common/mod.rs`). `ARCA_TEST_ANCHOR_DEPTH` sets the anchor
 //! depth the operator calls a block final at (the server's default otherwise),
-//! so a wallet is proven at the depth a real operator publishes too. It writes
+//! and `ARCA_TEST_CHECKPOINT_EXIT=0` runs it without checkpoints that carry
+//! their owners' exit (it offers them otherwise), so a wallet is proven at the
+//! settings a real operator publishes too: the testnet's are anchor depth 0,
+//! no checkpoint exit, and batches without a sweep (`ARCA_OPERATOR_NO_SWEEP`). It writes
 //! nothing a browser must read:
 //! `GET /state` on the control address answers with the server's URL, the
 //! node's RPC URL and credentials, the two assets, the chain's genesis hash,
