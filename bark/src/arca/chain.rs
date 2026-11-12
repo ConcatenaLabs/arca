@@ -370,9 +370,10 @@ pub(crate) struct BlockSeen {
 }
 
 /// The most blocks the wallet keeps a [`BlockSeen`] of, in memory and in its
-/// store: 100,000, about 69 days of one-minute blocks. Each costs about
-/// 150 bytes and 8 bytes per output and input, so the index holds some
-/// 15 MB and more only where blocks are larger. Past it, the blocks of the
+/// store: 100,000, about 69 days of one-minute blocks. A block of ten
+/// outputs and ten inputs costs about 315 bytes in the store and 200 to 330
+/// bytes in memory, so the index holds some 30 MB at the bound, and more
+/// where blocks are larger. Past it, the blocks of the
 /// lowest heights are dropped first ([`ChainSource::seen_to_keep`]); a search
 /// below them reads them again.
 pub const SEEN_MOST: usize = 100_000;
@@ -1841,6 +1842,27 @@ impl ChainSource {
 	/// search reads from `from_height`. With the answer, the block at the top
 	/// of the stretch read: every block read is it or one of its ancestors,
 	/// so it is what a later search may start above.
+	/// The payment of forfeit `f`'s output `output` in the active chain, as
+	/// `watch_forfeit` follows it across sessions: searched from above the
+	/// block the store says the last empty search reached
+	/// (`forfeit.searched`), on the terms of [`Self::find_payment_after`],
+	/// and, when none is found, the top of the stretch read kept as the next
+	/// search's start. `between` runs after the mark is read and before the
+	/// search (a test's node moving meanwhile; `watch_forfeit` passes
+	/// nothing).
+	pub(crate) fn find_forfeit_payment(&self, store: &super::store::Store, f: &super::store::ForfeitRow, output: &TxOut,
+		between: impl FnOnce()) -> Result<Option<(Transaction, u64)>, Error>
+	{
+		let after = store.forfeit_searched(&f.leaf_id, &f.round)?
+			.and_then(|(h, hash)| BlockHash::from_str(&hash).ok().map(|b| (h, b)));
+		between();
+		let (found, top) = self.find_payment_after(output, f.from_height, after)?;
+		if let (None, Some((h, hash))) = (&found, top) {
+			store.set_forfeit_searched(&f.leaf_id, &f.round, h, &hash.to_string())?;
+		}
+		Ok(found)
+	}
+
 	pub fn find_payment_after(&self, output: &TxOut, from_height: u64, after: Option<(u64, BlockHash)>)
 		-> Result<(Option<(Transaction, u64)>, Option<(u64, BlockHash)>), Error>
 	{
@@ -3991,22 +4013,15 @@ mod test {
 
 	// ---- From review RV50 of arca #854. ----
 
-	/// `watch_forfeit`'s resumed search (bark/src/arca/round.rs), line for
-	/// line, over the store's `forfeit.searched`: the search resumes above the
-	/// block the last empty search reached only when the stretch it reads
-	/// hangs from that block, and keeps the top of the stretch it read.
-	/// `between` runs before the search: the node moving while a command
-	/// runs.
+	/// `watch_forfeit`'s resumed search (bark/src/arca/round.rs), the very
+	/// helper it calls ([`ChainSource::find_forfeit_payment`]), over the
+	/// store's `forfeit.searched`: the search resumes above the block the
+	/// last empty search reached only when the stretch it reads hangs from
+	/// that block, and keeps the top of the stretch it read. `between` runs
+	/// before the search: the node moving while a command runs.
 	fn rv50_watch_forfeit_resume(c: &ChainSource, store: &super::super::store::Store, f: &super::super::store::ForfeitRow, out: &TxOut,
 		between: impl FnOnce()) -> Option<(Txid, u64)> {
-		let after = store.forfeit_searched(&f.leaf_id, &f.round).unwrap()
-			.and_then(|(h, hash)| BlockHash::from_str(&hash).ok().map(|b| (h, b)));
-		between();
-		let (found, top) = c.find_payment_after(out, f.from_height, after).unwrap();
-		if let (None, Some((h, hash))) = (&found, top) {
-			store.set_forfeit_searched(&f.leaf_id, &f.round, h, &hash.to_string()).unwrap();
-		}
-		found.map(|(t, h)| (t.txid(), h))
+		c.find_forfeit_payment(store, f, out, between).unwrap().map(|(t, h)| (t.txid(), h))
 	}
 
 	fn rv50_forfeit_row(from_height: u64) -> super::super::store::ForfeitRow {

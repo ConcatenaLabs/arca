@@ -51,7 +51,7 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   read once: a summary of what it pays and spends is kept in the wallet's
   store, by its hash, checked against the active chain at every use, so a
   page reloaded reads only the blocks it has not seen (at most 100,000 kept,
-  some 15 MB, the oldest dropped first).
+  some 30 MB, the oldest dropped first).
 - **The pause** between two tries (a node or proxy that answers busy or "too
   many calls", an operator that does not answer) is the host's to give. A worker
   blocked in the library has nothing else to do, but a pause that watches the

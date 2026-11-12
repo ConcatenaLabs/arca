@@ -2612,16 +2612,11 @@ impl Wallet {
 		// the stretch read now hangs from that very block (a hash names its
 		// ancestors, so the blocks below are the ones read); after a
 		// reorganisation below it, of any depth, from the forfeit's own
-		// height ([`super::chain::ChainSource::find_payment_after`]). So a
+		// height ([`super::chain::ChainSource::find_forfeit_payment`]). So a
 		// forfeit followed for days is read in the blocks since the last
 		// sync, not from its round at every session. What is kept is the top
 		// of the stretch the search itself read.
-		let after = self.store.forfeit_searched(&f.leaf_id, &f.round)?
-			.and_then(|(h, hash)| elements::BlockHash::from_str(&hash).ok().map(|b| (h, b)));
-		let (found, top) = self.chain.find_payment_after(&out, f.from_height, after)?;
-		if let (None, Some((h, hash))) = (&found, top) {
-			self.store.set_forfeit_searched(&f.leaf_id, &f.round, h, &hash.to_string())?;
-		}
+		let found = self.chain.find_forfeit_payment(&self.store, f, &out, || ())?;
 		if let Some((ftx, h)) = found {
 			let vout = ftx.output.iter().position(|o| *o == out).expect("pays it") as u32;
 			let at = OutPoint::new(ftx.txid(), vout);

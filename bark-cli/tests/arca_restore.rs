@@ -1741,6 +1741,9 @@ async fn a_history_in_slices_keeps_no_ask_waiting() {
 
 	// The sync's slice: about a second, then the coin it was checking.
 	const SLICE_BOUND_MS: u64 = 2_000;
+	// What a slice spends besides its coins: settling the coins held another
+	// way first, and the records' and the birthday's pass after.
+	let fixed_part = |h: &Value| h["parts"]["settle"].as_u64().unwrap() + h["parts"]["after"].as_u64().unwrap();
 	let s = a2.ok(&["sync"]);
 	let step = &s["cost_by_step"]["history"];
 	println!("HS A2's sync over the far link: {} ms in all; its history slice {} ms, checked {}, left {}, parts {}", s["cost_by_step"].as_object()
@@ -1749,6 +1752,8 @@ async fn a_history_in_slices_keeps_no_ask_waiting() {
 	assert!(s["history"]["checked"].as_u64().unwrap() >= 1, "{}", s["history"]);
 	assert!(std::env::var_os("HS_MEASURE").is_some() || step["ms"].as_u64().unwrap() <= SLICE_BOUND_MS || s["history"]["checked"] == 1,
 		"the sync's history slice held the wallet {} ms over {} coins", step["ms"], s["history"]["checked"]);
+	assert!(std::env::var_os("HS_MEASURE").is_some() || fixed_part(&s["history"]) <= SLICE_BOUND_MS,
+		"the fixed part of the sync's history slice held the wallet {} ms: {}", fixed_part(&s["history"]), s["history"]["parts"]);
 	left = s["history"]["left"].as_u64().unwrap();
 
 	// Slices of half a second, as a page runs them while nobody asks.
@@ -1766,6 +1771,10 @@ async fn a_history_in_slices_keeps_no_ask_waiting() {
 		// makes a coin cost.
 		if std::env::var_os("HS_MEASURE").is_none() {
 			assert!(ms <= SLICE_BOUND_MS || slice["checked"] == 1, "a slice of 500 ms held the wallet {} ms over {} coins", ms, slice["checked"]);
+			// And the slice's own part, before and after its coins, stays
+			// within the bound whatever a coin costs: a pass over every coin
+			// held in each slice would show here.
+			assert!(fixed_part(&slice) <= SLICE_BOUND_MS, "the fixed part of a slice held the wallet {} ms: {}", fixed_part(&slice), slice["parts"]);
 		}
 		longest = longest.max(ms);
 		checked_all += slice["checked"].as_u64().unwrap();
