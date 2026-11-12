@@ -357,7 +357,7 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 		if spec.value < min || spec.value > MAX_VALUE {
 			return Err(TreeError::LeafValue { leaf: i, value: spec.value, min });
 		}
-		let leaf = LeafPolicy { enclave: None, claim,
+		let leaf = LeafPolicy { claim,
 			owner: spec.owner, operator, salt: spec.salt(), chain: params.chain, exit_delay: spec.exit_delay,
 			htlc: spec.htlc,
 			order: spec.order,

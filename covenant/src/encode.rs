@@ -12,9 +12,9 @@
 //!
 //! | Type | Encoding |
 //! |---|---|
-//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 an `enclave-1` leaf, 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf, 16 a `vest-1` leaf, 20 a `landing-2` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint, 17 a checkpoint with its owner's exit, 18 a `vtxo-2` coin's checkpoint with its owner's exit, 19 a landing coin's checkpoint with its landing, at the spending input's own index), then the policy |
+//! | [`Policy`] | version `0x01`, a type byte (1 a `vtxo-1` leaf, 6 an `htlc-1` leaf, 8 an `order-2` leaf, 9 a `landing-1` leaf, 10 a `channel-1` leaf, 11 reserved (it reads as `ENCLAVE_RETIRED`), 12 a `vtxo-2` leaf, 13 an `order-3` leaf, 15 a `claim-1` leaf, 16 a `vest-1` leaf, 20 a `landing-2` leaf; 5 a checkpoint, 14 a `vtxo-2` coin's checkpoint, 17 a checkpoint with its owner's exit, 18 a `vtxo-2` coin's checkpoint with its owner's exit, 19 a landing coin's checkpoint with its landing, at the spending input's own index), then the policy |
 //! | [`ClockSchedule`] | version `0x01`, `T` (32), `S` (32), `W` units (u16), step count (u8, 1 to 64), each `E` (u32) |
-//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` and `landing-2` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `enclave-1` then `H`, `Kp` (32 each), a clawback flag (u8) and `Ki` (32) when it is set, the asset (32) and the value the exit pays (u64); for `claim-1` then the deadline (u32), the return script's pin (32), the asset (32) and the least the lapse pays (u64); for `vest-1` the same, then the vest time (u32) |
+//! | [`LeafPolicy`] | `A`, `S`, salt, genesis hash (32 each), exit delay units (u16); for `htlc-1` then direction (u8: 0 send, 1 receive), payment hash (32), timeout (u32), operator delay units (u16); for `landing-1` and `landing-2` then the landing program (20), the asset (32) and the least the landing pays (u64); for `channel-1` then the value (u64), the operator's opening balance (u64) and the credit window units (u16); for `claim-1` then the deadline (u32), the return script's pin (32), the asset (32) and the least the lapse pays (u64); for `vest-1` the same, then the vest time (u32) |
 //! | [`NodePolicy`] | child count (u8, 1 to 6), each child (asset 32, value u64, program 32), `S`, owner count (compact size), owners, sweep, reclaim flag (u8: 0 none, 1 RECLAIM, 2 RECLAIM behind a vest time) and, when set, the genesis hash, then for 2 the vest time (u32) |
 //! | [`EntryPolicy`] | unlock hash, asset (32 each), value (u64), leaf program (32), sweep |
 //! | [`ForfeitPolicy`] | unlock hash, `A`, `S` (32 each), refund delay units (u16), the leaf id given up (32), the connector asset (32) |
@@ -56,6 +56,10 @@ pub enum DecodeError {
 	Version(u8),
 	#[error("unknown policy type {0}")]
 	PolicyType(u8),
+	/// A reserved number of a retired form, with the sentence that names it
+	/// ([`crate::ENCLAVE_RETIRED`]).
+	#[error("{0}")]
+	Retired(&'static str),
 	#[error("not a valid x-only public key")]
 	Key,
 	#[error("a sweep names the no-sweep token, which only marks an output without a sweep")]
@@ -166,14 +170,6 @@ impl<'a> Reader<'a> {
 		Ok(Chain::new(BlockHash::from_byte_array(self.array32()?)))
 	}
 
-	/// An `enclave-1` leaf's enclave: `H`, `Kp`, a clawback flag, and `Ki`
-	/// when it is set ([`crate::enclave::Enclave::write`]).
-	pub fn enclave(&mut self) -> Result<crate::enclave::Enclave, DecodeError> {
-		let holder = self.key()?;
-		let policy = self.key()?;
-		let clawback = if self.flag()? { Some(self.key()?) } else { None };
-		Ok(crate::enclave::Enclave { holder, policy, clawback })
-	}
 }
 
 pub(crate) fn write_compact_size(w: &mut Vec<u8>, n: u64) {
@@ -318,11 +314,6 @@ impl Encoding for LeafPolicy {
 			w.extend(c.capacity.to_le_bytes());
 			w.extend(c.window.units().to_le_bytes());
 		}
-		if let Some(e) = &self.enclave {
-			e.enclave.write(w);
-			w.extend(asset_bytes(e.asset));
-			w.extend(e.value.to_le_bytes());
-		}
 		if let Some(c) = &self.claim {
 			w.extend(c.deadline.to_consensus_u32().to_le_bytes());
 			w.extend(c.pin);
@@ -335,7 +326,7 @@ impl Encoding for LeafPolicy {
 	}
 
 	fn decode_from(r: &mut Reader) -> Result<LeafPolicy, DecodeError> {
-		Ok(LeafPolicy { enclave: None, claim: None,
+		Ok(LeafPolicy { claim: None,
 			owner: r.key()?,
 			operator: r.key()?,
 			salt: r.array32()?,
@@ -523,7 +514,7 @@ impl Encoding for OffboardPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
 	/// A leaf, `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3`, `order-2`,
-	/// `landing-1`, `landing-2`, `enclave-1`, `channel-1` or `claim-1`.
+	/// `landing-1`, `landing-2`, `channel-1` or `claim-1`.
 	Leaf(LeafPolicy),
 	Node(NodePolicy),
 	Entry(EntryPolicy),
@@ -558,7 +549,6 @@ impl Encoding for Policy {
 					crate::Template::Order3 => 13,
 					crate::Template::Landing1 => 9,
 					crate::Template::Landing2 => 20,
-					crate::Template::Enclave1 => 11,
 					crate::Template::Htlc1 => 6,
 					crate::Template::Vtxo2 => 12,
 					crate::Template::Claim1 => 15,
@@ -639,17 +629,8 @@ impl Encoding for Policy {
 				p.channel = Some(t);
 				Policy::Leaf(p)
 			},
-			11 => {
-				let mut p = LeafPolicy::decode_from(r)?;
-				let enclave = r.enclave()?;
-				let asset = r.asset()?;
-				let value = r.u64()?;
-				if value == 0 {
-					return Err(DecodeError::Count(0));
-				}
-				p.enclave = Some(enclave.terms(asset, value));
-				Policy::Leaf(p)
-			},
+			// `enclave-1`'s type, reserved.
+			11 => return Err(DecodeError::Retired(crate::ENCLAVE_RETIRED)),
 			12 => Policy::Leaf(LeafPolicy { v2: true, ..LeafPolicy::decode_from(r)? }),
 			14 => Policy::Checkpoint(CheckpointPolicy { v2: true, ..CheckpointPolicy::decode_from(r)? }),
 			t @ (17 | 18) => {

@@ -846,9 +846,6 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			channels: p.channel_capacity(a).ok().filter(|c| *c > 0).map(|c| api::ChannelsInfo {
 				capacity: c.to_string(), window_units: p.channel_window.units(), total: p.channel_capacity_total(a).map(|t| t.to_string()),
 			}),
-			restricted: ap.restricted.as_ref().map(|r| api::RestrictedInfo {
-				policy: hex(&r.policy.serialize()), clawback: r.clawback.map(|k| hex(&k.serialize())), policy_server: r.server.clone(),
-			}),
 			// What the pool can promise leaves out what is owed for swept
 			// coins, which their holders' claims will draw on.
 			fundable: fundable.as_ref().map(|f| f.get(a).copied().unwrap_or(0).saturating_sub(owed_of(a).map_or(0, |o| o.0)).to_string()),
@@ -1023,6 +1020,9 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 	}
 	let mut outputs = Vec::with_capacity(outs.len());
 	for o in outs {
+		if o.enclave.is_some() {
+			return Err(Refusal::malformed(format!("enclave: {}", arca_covenant::ENCLAVE_RETIRED)));
+		}
 		let htlc = match &o.htlc {
 			None => None,
 			Some(h) => Some(arca_covenant::HtlcTerms {
@@ -1037,19 +1037,16 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 		// A landing leaf is named by its terms, landing-2 by its template too.
 		let (v2, own_index) = match o.template.as_deref() {
 			None | Some("vtxo-1") => (false, false),
-			Some("vtxo-2") if o.htlc.is_none() && o.landing.is_none() && o.enclave.is_none() => (true, false),
+			Some("vtxo-2") if o.htlc.is_none() && o.landing.is_none() => (true, false),
 			Some("landing-1") if o.landing.is_some() => (false, false),
 			Some("landing-2") if o.landing.is_some() => (false, true),
-			Some(t) => return Err(Refusal::malformed(format!("template {:?}: a transfer creates vtxo-1 or vtxo-2 leaves, htlc-1, \
-				landing-1 and enclave-1 by their terms, and landing-2 by its terms and its template", t))),
+			Some(t) => return Err(Refusal::malformed(format!("template {:?}: a transfer creates vtxo-1 or vtxo-2 leaves, htlc-1 and \
+				landing-1 by their terms, and landing-2 by its terms and its template", t))),
 		};
 		outputs.push(OutputRequest {
 			asset: asset(&o.asset)?,
 			value: amount(&o.value)?,
 			leaf: NewLeaf {
-				enclave: o.enclave.as_ref().map(|v| arca_covenant::record_json::enclave_from_json(v)
-					.map_err(|e| Refusal::malformed(format!("enclave: {}", e)))).transpose()?
-					.map(|e| Ok::<_, Refusal>(e.terms(asset(&o.asset)?, amount(&o.value)?))).transpose()?,
 				owner: key(&o.owner)?,
 				owner_nonce: unhex32(&o.owner_nonce).map_err(Refusal::malformed)?,
 				creator_nonce: unhex32(&o.creator_nonce).map_err(Refusal::malformed)?,
@@ -2257,6 +2254,25 @@ pub fn router(app: Arc<App>) -> Router {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A transfer output naming `enclave`, the reserved key of the retired
+	/// `enclave-1`, is refused as malformed with the retirement's sentence;
+	/// the same output without it reads.
+	#[test]
+	fn an_output_naming_an_enclave_is_refused() {
+		let out: api::TransferOutput = serde_json::from_value(serde_json::json!({
+			"asset": "25b251070e29ca19043cf33ccd7324e2ddab03ecc4ae0b5e77c4fc0e5cf6c95a", "value": "1000",
+			"owner": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+			"owner_nonce": "11".repeat(32), "creator_nonce": "22".repeat(32), "exit_delay_units": 254,
+		})).unwrap();
+		assert!(transfer_request(&[], std::slice::from_ref(&out)).is_ok(), "the output reads without the key");
+		for enclave in [serde_json::json!({"holder": "00"}), serde_json::Value::Bool(false)] {
+			let named = api::TransferOutput { enclave: Some(enclave), ..out.clone() };
+			let e = transfer_request(&[], &[named]).err().expect("refused");
+			assert_eq!((e.status, e.code.as_str()), (StatusCode::BAD_REQUEST, "malformed"));
+			assert!(e.message.contains(arca_covenant::ENCLAVE_RETIRED), "{}", e.message);
+		}
+	}
 
 	fn ip(s: &str) -> IpAddr {
 		s.parse().unwrap()

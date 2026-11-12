@@ -398,7 +398,7 @@ mod test {
 	}
 
 	fn taker(label: &str) -> NewLeaf {
-		NewLeaf { enclave: None, v2: false, owner: x(label), owner_nonce: sha256(label.as_bytes()), creator_nonce: [5; 32],
+		NewLeaf { v2: false, owner: x(label), owner_nonce: sha256(label.as_bytes()), creator_nonce: [5; 32],
 			exit_delay: RelativeTime::from_units(254).unwrap(), htlc: None, landing: None }
 	}
 

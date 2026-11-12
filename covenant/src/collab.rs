@@ -235,7 +235,7 @@ mod test {
 		LeafPolicy {
 			claim: None,
 			owner: key("A"), operator: key("S"), salt: [3; 32], chain: Chain::new(BlockHash::from_byte_array([7; 32])),
-			exit_delay: RelativeTime::from_units(254).unwrap(), htlc: None, order: None, landing: None, channel: None, enclave: None, v2,
+			exit_delay: RelativeTime::from_units(254).unwrap(), htlc: None, order: None, landing: None, channel: None, v2,
 		}
 	}
 

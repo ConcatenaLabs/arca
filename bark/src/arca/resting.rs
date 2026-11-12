@@ -484,7 +484,7 @@ impl Wallet {
 		let mut takers = vec![];
 		for l in t["takers"].as_array().into_iter().flatten() {
 			takers.push(NewLeaf {
-				enclave: None, v2: false, htlc: None, landing: None,
+				v2: false, htlc: None, landing: None,
 				owner: parse_key(&l["owner"], "a taker's leaf")?,
 				owner_nonce: unhex32(l["owner_nonce"].as_str().unwrap_or(""))?,
 				creator_nonce: unhex32(l["creator_nonce"].as_str().unwrap_or(""))?,
@@ -598,7 +598,7 @@ impl Wallet {
 		self.resting_exit(&info, &o)?;
 		let leaf = |w: &Wallet| -> Result<NewLeaf, Error> {
 			let n = random32();
-			Ok(NewLeaf { enclave: None, v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
+			Ok(NewLeaf { v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
 		};
 		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
 		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;

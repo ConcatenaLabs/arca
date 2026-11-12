@@ -815,22 +815,11 @@ pub struct AssetSection {
 	pub arriving_lane: Option<String>,
 	#[serde(default)]
 	pub arriving_lane_value: Option<String>,
-	/// The restricted profile ([`crate::restricted`]): the asset is a
-	/// restricted asset its issuer serves in this tree, and its policy server
-	/// co-signs beside the operator.
+	/// Reserved: a `restricted` section is refused at start with
+	/// [`arca_covenant::ENCLAVE_RETIRED`]. Restricted assets stay on the chain,
+	/// and an operator never serves one as an open asset.
 	#[serde(default)]
-	pub restricted: Option<RestrictedSection>,
-}
-
-/// A restricted asset's policy server.
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
-#[serde(deny_unknown_fields)]
-pub struct RestrictedSection {
-	/// The policy server's base URL, as `http://host:port`.
-	pub policy_server: String,
-	/// The file holding the issuer's token for the policy server's issuer
-	/// calls, readable by the operator alone.
-	pub token_file: String,
+	pub restricted: Option<serde::de::IgnoredAny>,
 }
 
 /// A supervised asset's settings.
@@ -1407,8 +1396,10 @@ fn housekeeping(store: Store, nonce_ttl: Duration, every: Duration) -> JoinHandl
 /// a transaction paying the operator's connector script that is no round of
 /// the database's, and a board output spent by its collaborative path, which
 /// needs `S`, by a transaction the server neither built nor co-signed (the
-/// checkpoint of the board's transfer). Each is named.
-async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>, operator: elements::secp256k1_zkp::XOnlyPublicKey)
+/// checkpoint of the board's transfer). Each is named. A board of the
+/// retired `enclave-1` is skipped, with a log line. Public for its tests;
+/// [`Server::start`] runs it after its first pass over the chain.
+pub async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>, operator: elements::secp256k1_zkp::XOnlyPublicKey)
 	-> Result<Vec<String>, StartError>
 {
 	use elements::hashes::Hash;
@@ -1419,6 +1410,15 @@ async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>,
 			elements::Txid::from_byte_array(t)));
 	}
 	for (record, txid, vout, by, checkpoint) in store.board_spends_unbuilt().await.map_err(err("the database"))? {
+		// A board of the retired enclave-1 (record version 4): the start
+		// refuses such a database before this point, and were it reached, the
+		// spend is its holder's own conversion as far as this build can tell,
+		// so it is skipped rather than stopping the start.
+		if record.first() == Some(&arca_covenant::board::BOARD_ENCLAVE_RECORD_VERSION) {
+			log::warn!("board output {}:{}, spent by {}: an enclave-1 board ({}), skipped",
+				elements::Txid::from_byte_array(txid), vout, elements::Txid::from_byte_array(by), arca_covenant::ENCLAVE_RETIRED);
+			continue;
+		}
 		let record = BoardRecord::from_bytes(&record).map_err(err("a board's record"))?;
 		let by = elements::Txid::from_byte_array(by);
 		let spender = match finality.call(move |c| c.transaction(&by)).await.map_err(err("the node"))? {
@@ -1439,6 +1439,26 @@ async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>,
 			by, record.leaf_id()));
 	}
 	Ok(found)
+}
+
+/// Refuses to start while the database holds a coin of the retired
+/// `enclave-1` ([`Store::retired_enclave_coins`]), naming each. This build
+/// reads none of their records, so its watcher could not answer a sender who
+/// converts a board it paid away, and a holder's own conversion would stop a
+/// later start; the previous release still reads them, defends them, and
+/// builds each holder's way home. Checked before anything else, so a refused
+/// start changes nothing.
+async fn retired_enclave_coins(store: &Store) -> Result<(), StartError> {
+	let found = store.retired_enclave_coins().await.map_err(err("the database"))?;
+	if found.is_empty() {
+		return Ok(());
+	}
+	Err(StartError(format!(
+		"the database holds {} coin(s) of the retired enclave-1, which this build can neither read nor defend: {}. This database \
+		 stays with the previous release: run a build from before the retirement on it, under which each holder brings its coin \
+		 home by its exit to its enclave and the watcher defends every one (the server's README, \"Restricted assets\"). \
+		 Report it at https://github.com/ConcatenaLabs/arca/issues: this build has no way to take such a database over",
+		found.len(), found.iter().map(|(id, what)| format!("{} ({})", crate::signer::hex(id), what)).collect::<Vec<_>>().join(", "))))
 }
 
 /// Refuses to start when the signer's record is not the one the database
@@ -1592,6 +1612,10 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 	let mut list: Vec<(AssetId, AssetParams)> = vec![];
 	for a in &config.assets {
 		let id = AssetId::from_str(&a.asset).map_err(err("assets.asset"))?;
+		if a.restricted.is_some() {
+			return Err(StartError(format!("asset {}: restricted: {}. The operator does not serve a restricted asset: remove its entry",
+				id, arca_covenant::ENCLAVE_RETIRED)));
+		}
 		if list.iter().any(|(b, _)| *b == id) {
 			return Err(StartError(format!("assets: asset {} is listed twice", id)));
 		}
@@ -1647,7 +1671,7 @@ fn assets_of(config: &Config) -> Result<(Vec<(AssetId, AssetParams)>, Option<Vec
 			_ => Some(amount("in_flight_cap", &a.in_flight_cap, &a.in_flight_cap_value)?),
 		};
 		list.push((id, AssetParams { min_leaf, min_leaf_value, rate, fees, issuer, supervised: None, channel_capacity, channel_total,
-			restricted: None, in_flight_cap, arriving_lane }));
+			in_flight_cap, arriving_lane }));
 	}
 	if list.is_empty() {
 		return Err(StartError("assets: the server serves at least one asset".into()));
@@ -1706,40 +1730,6 @@ async fn supervise(list: &mut [(AssetId, AssetParams)], config: &Config, finalit
 	Ok(())
 }
 
-/// Serves every asset whose section names a policy server under the
-/// restricted profile ([`crate::restricted`]): the asset's tree terms read
-/// from its policy server, which must name `operator` as the tree's operator.
-/// Refuses a restricted asset that is also supervised, issuer-operated or
-/// served over Lightning, none of which keeps it in `enclave-1` leaves.
-async fn restrict(list: &mut [(AssetId, AssetParams)], config: &Config, operator: elements::secp256k1_zkp::XOnlyPublicKey) -> Result<(), StartError> {
-	for (id, p) in list.iter_mut() {
-		let section = config.assets.iter().find(|s| AssetId::from_str(&s.asset).ok() == Some(*id));
-		let Some(r) = section.and_then(|s| s.restricted.clone()) else {
-			p.restricted = None;
-			continue;
-		};
-		if p.supervised.is_some() || p.issuer.is_some() || section.is_some_and(|s| s.lightning.is_some())
-			|| p.channel_capacity != crate::params::Amount::Atoms(0) {
-			return Err(StartError(format!("asset {}: restricted: a restricted asset is held in enclave-1 leaves alone, so it is not also \
-				supervised, issuer-operated, served over Lightning or in channel-1 leaves here", id)));
-		}
-		let token = std::fs::read_to_string(&r.token_file)
-			.map_err(|e| StartError(format!("asset {}: restricted.token_file {}: {}", id, r.token_file, e)))?.trim().to_string();
-		let terms = crate::restricted::tree_terms(&r.policy_server, *id).await
-			.map_err(|e| StartError(format!("asset {}: restricted: {}", id, e)))?;
-		if terms.operator != operator {
-			return Err(StartError(format!("asset {}: restricted: the policy server names {} as the operator of the asset's tree, and this \
-				operator's key is {}: it serves the asset only in a tree its issuer names it the operator of", id,
-				crate::signer::hex(&terms.operator.serialize()), crate::signer::hex(&operator.serialize()))));
-		}
-		log::info!("asset {} is restricted: served in its issuer's tree, every leaf enclave-1, policy key {}, clawback {}, policy server {}",
-			id, crate::signer::hex(&terms.policy.serialize()),
-			terms.clawback.map_or("none".to_string(), |k| crate::signer::hex(&k.serialize())), r.policy_server);
-		p.restricted = Some(crate::restricted::Restricted { policy: terms.policy, clawback: terms.clawback, server: r.policy_server, token });
-	}
-	Ok(())
-}
-
 /// Refuses an issuer-operated asset whose mint limiter is an instance on
 /// another chain than `genesis`, and issuer-operated assets that leave no
 /// fee asset: a round that mints an asset, and a sweep that burns it, pay
@@ -1789,6 +1779,7 @@ impl Server {
 	/// HTTP listener.
 	pub async fn start(config: &Config) -> Result<Server, StartError> {
 		let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+		retired_enclave_coins(&store).await?;
 		let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(node_client(config)?));
 		let certification = match config.finality.certification.as_str() {
 			"required" => Certification::Required,
@@ -1846,7 +1837,6 @@ impl Server {
 		let (mut list, fee_assets) = assets_of(config)?;
 		issuers_on(&list, &fee_assets, genesis)?;
 		supervise(&mut list, config, &finality).await?;
-		restrict(&mut list, config, operator).await?;
 		let mut params = Params::new(Chain::new(genesis), operator, BTreeMap::new());
 		params.assets.set_default_fees(default_fees(config));
 		params.serve(list, fee_assets);
@@ -2188,7 +2178,6 @@ impl Server {
 		let (mut list, fee_assets) = assets_of(config)?;
 		issuers_on(&list, &fee_assets, self.params.chain.genesis_hash())?;
 		supervise(&mut list, config, &self.finality).await?;
-		restrict(&mut list, config, self.params.operator).await?;
 		let legs = legs_of(config)?;
 		let before = self.params.assets.all();
 		let removed: Vec<String> = before.iter().filter(|(a, _)| !list.iter().any(|(b, _)| b == a)).map(|(a, _)| a.to_string()).collect();
@@ -2272,5 +2261,22 @@ mod tests {
 		let d = super::LimitsSection::default();
 		assert_eq!((c.limits.witness_per_second, c.limits.witness_burst, c.limits.witness_source_per_second, c.limits.witness_source_burst),
 			(d.witness_per_second, d.witness_burst, d.witness_source_per_second, d.witness_source_burst), "the example names the defaults");
+	}
+
+	/// An asset entry with a `restricted` section, whatever it holds, stops
+	/// the server: it names the asset and the retirement, and never serves
+	/// the asset as an open one.
+	#[test]
+	fn a_restricted_section_refuses_to_start() {
+		let asset = "25b251070e29ca19043cf33ccd7324e2ddab03ecc4ae0b5e77c4fc0e5cf6c95a";
+		let example = include_str!("../arcad.example.toml").replace("<asset id>", asset);
+		let c: Config = toml::from_str(&example).expect("the example parses");
+		assert!(super::assets_of(&c).is_ok(), "the asset without the section is served");
+		for section in ["[assets.restricted]\npolicy_server = \"http://127.0.0.1:1\"\ntoken_file = \"/nonexistent\"\n", "[assets.restricted]\n"] {
+			let text = example.replacen("min_leaf = \"1000\"\n", &format!("min_leaf = \"1000\"\n{}", section), 1);
+			let c: Config = toml::from_str(&text).expect("a restricted section still parses");
+			let e = super::assets_of(&c).err().expect("a restricted section is refused").0;
+			assert!(e.contains(asset) && e.contains(arca_covenant::ENCLAVE_RETIRED), "{}", e);
+		}
 	}
 }

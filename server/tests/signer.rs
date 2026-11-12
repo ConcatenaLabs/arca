@@ -44,7 +44,7 @@ async fn the_signer_process() {
 
 	// A rebindable message for a leaf on this chain: the signature verifies
 	// against the message arca-covenant builds.
-	let leaf = LeafPolicy { enclave: None, claim: None,
+	let leaf = LeafPolicy { claim: None,
 		owner: xonly(&keypair("owner")), operator: xonly(&s), salt: [5; 32], chain: Chain::new(genesis),
 		exit_delay: arca_covenant::RelativeTime::from_units(254).unwrap(),
 		htlc: None,
@@ -1575,7 +1575,7 @@ async fn the_signer_builds_a_vtxo_2_message_from_its_named_inputs() {
 	let leaf = LeafPolicy {
 		claim: None,
 		owner: xonly(&owner), operator: xonly(&s), salt: [6; 32], chain: Chain::new(genesis),
-		exit_delay: arca_covenant::RelativeTime::from_units(254).unwrap(), htlc: None, order: None, landing: None, channel: None, enclave: None, v2: true,
+		exit_delay: arca_covenant::RelativeTime::from_units(254).unwrap(), htlc: None, order: None, landing: None, channel: None, v2: true,
 	};
 	let asset = AssetId::from_slice(&[3; 32]).unwrap();
 	let coin = ExplicitOutput::new(asset, 10_000, leaf.script_pubkey());
@@ -1618,4 +1618,38 @@ async fn the_signer_builds_a_vtxo_2_message_from_its_named_inputs() {
 		.await.unwrap_err();
 	assert!(matches!(e, SignerError::AlreadySigned(_)), "{}", e);
 	println!("REFUSED, a second message under the salt, in either form: {}", e);
+}
+
+/// The reserved fields of the retired `enclave-1`: a rebind request naming
+/// `enclave` or `policy_sig` is declined with the retirement's sentence and
+/// records nothing, and `--restricted` is accepted and ignored, said once in
+/// the log, so a unit that still passes it starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebind_naming_an_enclave_is_refused_and_the_restricted_flag_is_ignored() {
+	use server::signer::hex;
+	let s = keypair("retired operator");
+	let genesis = BlockHash::from_raw_hash(sha256d::Hash::hash(b"a chain without enclaves"));
+	let mut p = SignerProcess::start(&s, genesis);
+	let asset = AssetId::from_slice(&[5; 32]).unwrap();
+	let flags = vec!["--restricted".to_string(), format!("{}={}", asset, hex(&xonly(&keypair("P")).serialize())),
+		"--restricted".to_string(), "anything".to_string()];
+	tokio::task::block_in_place(|| p.restart_with(genesis, &flags));
+	let log = p.log();
+	println!("the signer's log, started with --restricted twice: {}", log.trim());
+	assert_eq!(log.matches(arca_covenant::ENCLAVE_RETIRED).count(), 1, "one line says the flag is ignored: {}", log);
+	let owner = keypair("retired owner");
+	let line = || rebind_line(&owner, genesis, [9; 32], asset, 1, None);
+	for (field, value) in [("enclave", hex(&xonly(&keypair("H")).serialize())), ("policy_sig", hex(&[7; 64]))] {
+		let mut v: serde_json::Value = serde_json::from_str(&line()).unwrap();
+		v[field] = serde_json::json!(value);
+		let (code, e) = ask(&p.socket, &v.to_string()).await.unwrap_err();
+		println!("REFUSED, a rebind naming {}: {}: {}", field, code, e);
+		assert_eq!(code, "declined");
+		assert!(e.contains(arca_covenant::ENCLAVE_RETIRED), "{}", e);
+	}
+	// The same request without them is signed, as the record's first entry:
+	// the refusals were for the fields alone, and recorded nothing.
+	let (entry, _) = ask(&p.socket, &line()).await.unwrap();
+	println!("the same rebind without them: signed, entry {}", entry);
+	assert_eq!(entry, 1);
 }

@@ -28,7 +28,7 @@ fn policies() -> Vec<Policy> {
 	let s = xonly(&keypair("S"));
 	let a = xonly(&keypair("A"));
 	let sch = schedule();
-	let leaf = LeafPolicy { enclave: None, claim: None, owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None, order: None, landing: None, channel: None , v2: false};
+	let leaf = LeafPolicy { claim: None, owner: a, operator: s, salt: label32("salt"), chain: chain(), exit_delay: sch.notice, htlc: None, order: None, landing: None, channel: None , v2: false};
 	let owners: Vec<XOnlyPublicKey> = (0..5).map(|i| xonly(&keypair(&format!("o{}", i)))).collect();
 	let children = (0..4).map(|i| Child::new(asset("X"), 1_000 + i, label32(&format!("c{}", i)))).collect::<Vec<_>>();
 	vec![
@@ -256,7 +256,7 @@ fn witness_readers() {
 		direction: HtlcDirection::Send, payment_hash: sha256(&pre),
 		timeout: MedianTime::from_consensus(1_800_000_000).unwrap(), operator_delay: RelativeTime::from_units(1).unwrap(),
 	};
-	let h = LeafPolicy { enclave: None, claim: None,
+	let h = LeafPolicy { claim: None,
 		owner: xonly(&a), operator: xonly(&s), salt: label32("htlc"), chain: chain(), exit_delay: sch.notice, htlc: Some(terms),
 		order: None,
 		landing: None,
@@ -265,4 +265,43 @@ fn witness_readers() {
 	let w = h.claim_witness(&sig(&s, &label32("x")), &pre).unwrap();
 	assert_eq!(find_preimage(&w, &terms.payment_hash), Some(pre));
 	assert!(LeafPolicy { htlc: None, ..h }.claim_script().is_err());
+}
+
+/// Every wire number `enclave-1` used is reserved and reads as one named
+/// refusal, never as another form: the policy type 11, the template id 6 in
+/// either record format and by name in the JSON form, the coin record's tag 7
+/// in either format, and the board record's version 4 in either form.
+#[test]
+fn the_retired_enclave_numbers_read_as_its_refusal() {
+	let retired = |e: &dyn std::fmt::Display| assert_eq!(e.to_string(), ENCLAVE_RETIRED, "the refusal names the retirement");
+	// The policy type, after a leaf's version byte.
+	let mut b = policies()[0].encode();
+	b[1] = 11;
+	assert_eq!(Policy::decode(&b), Err(DecodeError::Retired(ENCLAVE_RETIRED)));
+	retired(&Policy::decode(&b).unwrap_err());
+	// The template id, whatever its version, in both record formats.
+	for format in [2u8, 3] {
+		for version in [0u8, 1, 2] {
+			let e = LeafRecord::from_bytes(&[format, 6, version]).unwrap_err();
+			assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED), "format {} version {}", format, version);
+			assert_eq!(e.kind(), "template");
+			retired(&e);
+		}
+	}
+	for name in ["enclave-1", "enclave-2"] {
+		let e = name.parse::<Template>().unwrap_err();
+		assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED), "{}", name);
+	}
+	// The coin record's tag, in both formats.
+	for format in [1u8, 2] {
+		let e = CoinRecord::from_bytes(&[format, 7]).unwrap_err();
+		retired(&e);
+	}
+	// The board record's version, binary and JSON.
+	let e = BoardRecord::from_bytes(&[4]).unwrap_err();
+	assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED));
+	let e = BoardRecord::from_json(&serde_json::json!({"version": 4, "template": "board-1"})).unwrap_err();
+	assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED));
+	assert!(ENCLAVE_RETIRED.starts_with("enclave-1 was retired: restricted assets stay on the chain; "));
+	assert!(ENCLAVE_RETIRED.contains("goes home by its exit to its holder's enclave"), "the refusal names the way home");
 }

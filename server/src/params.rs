@@ -94,10 +94,6 @@ pub struct AssetParams {
 	/// leaves of the asset together, open or being opened: a participation
 	/// that would open past it is refused. No total when `None`.
 	pub channel_total: Option<Amount>,
-	/// Set when the operator serves the asset as a restricted asset in its
-	/// issuer's tree: its leaves are `enclave-1`, and its policy server
-	/// co-signs beside the operator ([`crate::restricted`]).
-	pub restricted: Option<crate::restricted::Restricted>,
 	/// The most of the asset the operator fronts for refreshes whose old
 	/// coins have not come back yet (`in_flight`, [`crate::store::PoolFlow`]):
 	/// a refresh that would take it past the cap waits for a later round.
@@ -489,34 +485,6 @@ impl Params {
 	/// The supervised profile of `asset`, when the operator serves it so.
 	pub fn supervised(&self, asset: &AssetId) -> Option<Supervised> {
 		self.assets.get(asset).and_then(|p| p.supervised)
-	}
-
-	/// The restricted profile of `asset`, when the operator serves it so.
-	pub fn restricted(&self, asset: &AssetId) -> Option<crate::restricted::Restricted> {
-		self.assets.get(asset).and_then(|p| p.restricted)
-	}
-
-	/// Why a new leaf of `asset`, owned by `owner` under `owner_nonce`, with
-	/// `enclave` breaks the restricted profile, if it does: a leaf of a
-	/// restricted asset is `enclave-1` for the asset's policy key and
-	/// clawback key, its owner key the holder's enclave key for its nonce, and
-	/// no other asset's leaf is ([`crate::restricted`]).
-	pub fn check_enclave(&self, asset: AssetId, owner: &XOnlyPublicKey, owner_nonce: &[u8; 32], enclave: Option<&arca_covenant::Enclave>)
-		-> Result<(), String>
-	{
-		match (self.restricted(&asset), enclave) {
-			(None, None) => Ok(()),
-			(None, Some(_)) => Err(format!("asset {} is not served restricted: its leaves are not enclave-1", asset)),
-			(Some(_), None) => Err(format!("asset {} is restricted: every leaf of it is enclave-1, whose exit pays only its holder's \
-				enclave", asset)),
-			(Some(r), Some(e)) => {
-				if e.policy != r.policy || e.clawback != r.clawback {
-					return Err(format!("an enclave-1 leaf of asset {} carries the asset's policy key {} and clawback {}", asset,
-						crate::signer::hex(&r.policy.serialize()), r.clawback.map_or("none".into(), |k| crate::signer::hex(&k.serialize()))));
-				}
-				e.check_owner(owner, owner_nonce).map_err(|e| e.to_string())
-			},
-		}
 	}
 
 	/// Why a new leaf of `asset` and `value` with `landing` breaks the

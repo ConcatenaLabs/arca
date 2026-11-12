@@ -2369,83 +2369,46 @@ coin, so an operator serving a supervised asset runs its signer with one.
 
 ## Restricted assets
 
-A restricted asset is an OpenAMP asset: on the chain it lives only in its
-holders' enclaves, each `P2TR(NUMS, [<H> CHECKSIGVERIFY <Kp> CHECKSIG,
-<Ki> CHECKSIGVERIFY <Kp> CHECKSIG])` for the holder's registered key `H`,
-the asset's policy key `Kp`, and the issuer's key `Ki` where the asset
-elected clawback, so every move needs the policy key and its policy server
-(`openampd`, in the openamp repository) applies the asset's rules to each:
-freeze, categories, lock-in, velocity, holder caps, vesting. Its issuer runs
-an operator and serves the asset in its own tree, where a transfer between
-registered holders settles at once without a transaction, under the same
-rules:
+A restricted asset, of either kind, is not served in the tree: an OpenAMP
+asset, whose every move its policy server (`openampd`, in the openamp
+repository) co-signs under the issuer's rules, and an OpenDAMP asset, whose
+rules covenants enforce on the chain. Both stay on the chain, between the
+addresses their rules allow. The operator serves the assets its
+configuration lists; what keeps a restricted asset out of the tree is the
+asset's own rules (the policy server's co-signature, the covenants), which a
+board or a round cannot meet, not the operator.
 
-**The issuer names the operator.** A section names the asset's policy
-server and the file holding the issuer's token for it:
+An asset entry with a `restricted` section stops the server at start and at
+a reload, with an error naming the asset and the sentence of
+`ENCLAVE_RETIRED` ("enclave-1 was retired: restricted assets stay on the
+chain; …"). A transfer output that carries `enclave` is refused as
+malformed with the same sentence. The wire numbers reserved for `enclave-1`
+read as that refusal (see `covenant/README.md`). The signer refuses a
+request carrying `enclave` or `policy_sig` (`declined`, with the sentence),
+and `arca-signer --restricted <value>` is accepted and ignored, with one log
+line saying so, so a unit that still passes it starts.
 
-    [[assets]]
-    asset = "<asset id>"
-    min_leaf = "1"
-    [assets.restricted]
-    policy_server = "http://127.0.0.1:8722"
-    token_file = "/etc/arca/openampd.token"
+### A database that holds an `enclave-1` coin
 
-At start and at every reload the server reads the asset's tree terms from
-the policy server (`GET /v1/assets/<id>`: `tree.operator`, `tree.policy`,
-`tree.clawback`), and serves the asset only when the tree's operator is its
-own `S`, which the issuer sets at the policy server (`POST /v1/issuer/tree`).
-A restricted asset is not also supervised, issuer-operated or served over
-Lightning. `info` publishes the profile (`assets[].restricted`: `policy`,
-`clawback`, `policy_server`).
+This build reads no `enclave-1` record, so it could neither defend such a
+coin (answer a sender who converts a board it has paid away) nor tell a
+holder's conversion of one from a spend it never co-signed. So before
+anything else, `arcad` counts the coins the template left in its database:
+every board of record version 4, whatever its state, and every coin not
+spent or expired whose record is coin record tag 7 or such a board. If there
+is one, it refuses to start, naming each by its leaf id, and changes
+nothing. A database without them starts as before.
 
-**Every leaf is `enclave-1`.** A leaf of the asset, on a board or from a
-reassignment, is `enclave-1` (`arca-covenant`'s `enclave`): its owner key is
-the holder's enclave key for the leaf's owner nonce (only the holder of `H`
-signs for it), its exit pays only the holder's enclave, in full, and where
-the asset elected clawback it carries the enclave's own claw leaf. A board's
-record, and a transfer's output, carry `enclave` (`{"holder", "policy",
-"clawback"}`, the leaf record's JSON form) with the keys `info` publishes;
-any other template, other keys, or an owner key that is not the holder's is
-refused (`out_of_bounds`), and `enclave` on a leaf of any other asset too.
-A holder boards from its enclave: the policy server co-signs the board
-transaction once it reads the board output as an `enclave-1` board of the
-asset's tree for that holder.
-
-**The policy server co-signs beside the operator.** Margins are zero: each
-checkpoint keeps the whole coin and the reassignment commits every atom,
-since a remainder of the asset could go anywhere, a fee output included;
-whoever brings a coin on the chain pays its fees with a coin of another
-asset, and the watcher does from the operator's own. A transfer of the asset
-moves that asset alone and gives up one holder's coins. Before its signer
-signs anything of it, the server asks the policy server to co-sign it
-(`POST /v1/issuer/tree/transfer`, with each input's coin record and
-checkpoint value and each new leaf's holder, value, nonces and exit delay):
-it applies the asset's rules, records the move in its register of leaves,
-and answers the policy key's signature over each message `S` is to sign. A
-refusal is the policy server's own words (`policy`, 403); a policy server
-that does not answer is `policy_unavailable` (503). A transfer the server
-then fails to record is dropped at the policy server
-(`POST /v1/issuer/tree/transfer/<id>/drop`).
-
-**The signer checks on its own.** `arca-signer --restricted
-<asset>=<policy key>[:<clawback key>]` signs a rebindable message of the
-asset only beside the policy key's signature over that very message, tagged
-(`arca_covenant::enclave::policy_cosign_digest`); the signer request carries
-it (`policy_sig`), and for an `enclave-1` coin names its holder
-(`enclave`), from which the signer builds the message with the digest of the
-holder's enclave after `K`, as the coin's script does. Without the flag it
-signs no `enclave-1` message; it signs no forfeit of the asset at all.
-
-**What the issuer can do, and what it cannot.** It can refuse to co-sign
-(a freeze, or any rule), and, where the asset elected clawback, take back a
-leaf once it is on the chain, by its claw leaf, with the policy server
-signing the policy half. It cannot move a holder's leaf without the holder's
-signature, nor stop the holder's exit to its own enclave. Not served in the
-asset: rounds (a refresh, an offboard, a round paying the asset), swaps,
-takes and resting orders, distributions, offline-refresh plans and
-Lightning, each refused before anything else (`restricted`, 422). A coin
-rests on its board, whose service dates bind it as any board coin's: its
-holder takes it home before its exit deadline.
+Such a database stays with a build that still serves `enclave-1`: commit
+7a6d2befa, or any commit of this repository before the template was
+retired. Under it, each holder brings its coin home by its exit to its own
+enclave on the chain (`enclave_exit_tx` in that build's `arca-covenant`;
+for a coin received out of round, its checkpoint and reassignment first),
+and the watcher keeps defending every coin. The server records no holder's
+exit, so the rows stay after the coins are home, and the database stays
+with that build; the refusal asks the operator to report it in this
+repository's issues. A wallet built from this repository cannot build that exit
+either: it reads the record as the same refusal, which names the way home.
 
 ## Channel leaves
 
@@ -2986,7 +2949,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, `enclave-1`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), and how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep) |
+| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), and how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -3169,11 +3132,7 @@ channel (`channel_state`) and a credit note (`channel_note`), each message
 built by itself from the channel's terms, a state with its owner's signature
 over it and a note within the cap of a state its owner signed or of the
 opening, neither recorded and both refused once its record holds anything
-under the coin's salt (see Channel leaves). For a restricted asset it was
-started with (`--restricted <asset>=<policy key>[:<clawback key>]`) it signs a
-rebindable message only beside the asset's policy key's approval of that very
-message, no forfeit of the asset, and no `vtxo-2` message for it, since its
-coins are `enclave-1` (see Restricted assets). It signs no digest it is handed and no release, and
+under the coin's salt (see Channel leaves). It signs no digest it is handed and no release, and
 nothing else by a path that checks `S` with `OP_CHECKSIGFROMSTACK`. A rebindable
 message for a landing coin, the leaf of a supervised asset, names the
 coin's landing program: the signer builds the message over the constant
@@ -3225,12 +3184,11 @@ forfeit as a forfeit, not a lost spend. The wallet then shows that coin as
 given up, and takes it home on the chain.
 
 The signer tells a refusal of what a request asks from a failure of its own.
-A message it does not sign as the request builds it (a restricted asset's
-message without its policy key's approval, a forfeit whose parts do not make
-the output committed to, an owner's signature that does not verify, a
-malformed request) is answered with the code `declined`, or a restricted
-asset's `restricted` or `policy`: it refuses the same request again however
-often it is asked. A failure of its own carries no code (its record not read
+A message it does not sign as the request builds it (a forfeit whose parts
+do not make the output committed to, an owner's signature that does not
+verify, a malformed request, a request carrying the reserved `enclave` or
+`policy_sig`) is answered with the code `declined`: it refuses the same
+request again however often it is asked. A failure of its own carries no code (its record not read
 or written) or `keepers_unavailable`, `record_behind`, `record_differs` or
 `stopped`, and the same request may be signed later. Before it asks for any
 signature of a transfer or of a fill of a resting order, the server asks the
@@ -3911,35 +3869,6 @@ says so and lists no `landing-1`; a board, a refresh and a transfer into
 `landing-1` are refused, while a `landing-1` coin moves into a `landing-2`
 leaf and a `landing-2` coin pays on. With it off again, `landing-1` is
 co-signed again.
-
-`tests/restricted.rs` serves a restricted asset in its issuer's tree beside a
-stand-in for its policy server, which publishes the asset's tree terms and
-co-signs a transfer as openampd does (each message computed by
-`arca-covenant`'s own code and signed by the policy key, unless the policy
-refuses the receiver). A policy server naming another operator is refused at
-reload; a board of the asset that is not `enclave-1`, or for another policy
-key, is refused; a transfer leaving a margin, paying a `vtxo-1` leaf, or a
-leaf without the asset's clawback is refused, and one to a receiver the
-policy server refuses is refused with its words (`policy`); a refresh is
-refused (`restricted`); the signer, asked directly, signs no message of the
-asset without the policy key's approval of that very message. A holder pays
-another out of round from its board and then converts the board: the watcher
-answers with the checkpoint and the reassignment, paying every fee from its
-own coins of another asset, the sender's exit is refused, and the receiver's
-exit pays its enclave the whole value.
-
-`tests/restricted_openampd.rs` runs the same with the real policy server, and
-does nothing unless `OPENAMPD_EXEC` (openampd), `ARCA_ENCLAVE_EXEC`
-(`arca-enclave`) and `TOKEN_COVENANTS_EXEC` (sequentia-contracts'
-`token-covenants`) are set: openampd issues the asset with clawback to a
-holder's enclave and names this operator the operator of its tree; the holder
-boards from its enclave, openampd co-signing the board once it reads the
-board output, the holder's wallet checking the signature hash itself; a
-transfer is refused for each of the asset's rules (category, lock-in,
-velocity, holder cap, vesting), each in openampd's words, and one settles at
-once; the receiver takes its coin home to its enclave, which openampd counts;
-and the sender's change, on the chain with it, is clawed back into the
-issuer's enclave, openampd signing the policy half.
 
 `tests/issuer.rs` also needs the mint limiter's tool, named by
 `MINT_LIMITER` (sequentia-contracts `tools/mint-limiter`, with its `sign`
