@@ -221,7 +221,9 @@ impl Wallet {
 	/// `channels`): reads every channel, folds the credit it was paid into
 	/// its balance, and, for each asset the operator makes channels of and
 	/// the wallet holds leaves of but no channel, opens one in the next
-	/// round from those leaves, half of what they hold (after the refresh
+	/// round from those leaves (at most [`super::round::MAX_GIVEN`] of them,
+	/// the nearest the depth limit first: one participation gives up no
+	/// more; the rest stay live for the refresh), half of what they hold (after the refresh
 	/// fee, under `max_fee_ppm`) in the channel with the operator's whole
 	/// capacity on its side, the other half in a plain leaf beside it. Coins
 	/// a plan names, resting orders, coins awaiting a preimage and coins of a
@@ -284,9 +286,14 @@ impl Wallet {
 					Ok(_) => {},
 				}
 				if self.held(&c).is_ok_and(|(_, h)| h.all_final()) {
-					coins.push(c.leaf_id.clone());
+					let hops = Self::record_of(&c).map(|r| super::wallet::record_hops(&r)).unwrap_or(0);
+					coins.push((c.leaf_id.clone(), hops, c.expiry));
 				}
 			}
+			// A channel is one leaf, made by one participation, which gives up
+			// at most MAX_GIVEN coins: those nearest the depth limit first.
+			// The rest stay live, and the refresh settles them in turns.
+			let coins = channel_coins(coins);
 			if coins.is_empty() {
 				continue;
 			}
@@ -762,5 +769,42 @@ mod tests {
 		assert_eq!(unfolded(&kept(1_500_000), &st), 1_000_000, "at the cap: the operator's whole balance");
 		assert_eq!(unfolded(&kept(9_000_000), &st), 1_000_000, "above the cap, as the claim pays it: the operator's balance, no more");
 		assert_eq!(st.owner + unfolded(&kept(9_000_000), &st), st.owner + st.operator, "never beyond the leaf's value");
+	}
+}
+
+/// The coins a channel opens from, of `(leaf id, hops from a round, first
+/// expiry)`: at most [`super::round::MAX_GIVEN`], the most hops first (the
+/// nearest the operator's depth limit), then the earliest expiry.
+pub(crate) fn channel_coins(mut coins: Vec<(String, usize, u32)>) -> Vec<String> {
+	coins.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+	coins.into_iter().take(super::round::MAX_GIVEN).map(|(l, ..)| l).collect()
+}
+
+#[cfg(test)]
+mod channel_coins_tests {
+	use super::channel_coins;
+	use super::super::round::MAX_GIVEN;
+
+	fn coins(n: usize) -> Vec<(String, usize, u32)> {
+		(0..n).map(|i| (format!("c{:02}", i), i % 5, 1_000_000 + (i as u32 * 7) % 13)).collect()
+	}
+
+	#[test]
+	fn a_channel_from_25_or_40_coins_gives_up_16_nearest_the_limit() {
+		for n in [25, 40] {
+			let all = coins(n);
+			let picked = channel_coins(all.clone());
+			assert_eq!(picked.len(), MAX_GIVEN, "{} coins", n);
+			let hops = |l: &String| all.iter().find(|c| &c.0 == l).unwrap().1;
+			let least_picked = picked.iter().map(hops).min().unwrap();
+			let most_left = all.iter().filter(|c| !picked.contains(&c.0)).map(|c| c.1).max().unwrap();
+			assert!(least_picked >= most_left, "{} coins: a coin left has more hops ({}) than one picked ({})", n, most_left, least_picked);
+		}
+	}
+
+	#[test]
+	fn sixteen_coins_or_fewer_all_go() {
+		assert_eq!(channel_coins(coins(16)).len(), 16);
+		assert_eq!(channel_coins(coins(3)).len(), 3);
 	}
 }
