@@ -2081,17 +2081,22 @@ impl Server {
 		});
 		tasks.push(housekeeping(store.clone(), Duration::from_secs(config.limits.nonce_ttl_seconds),
 			Duration::from_secs(config.limits.cleanup_interval_seconds.max(1))));
-		// Once a minute: the forfeits without the operator's half, the fills
-		// of resting orders left unsigned, and the keepers the signer names,
+		// Once a minute, and at once when a round held for its forfeits goes
+		// to the node: the forfeits without the operator's half, the fills of
+		// resting orders left unsigned, and the keepers the signer names,
 		// against the pinned set.
 		let replaced: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
 		let pinned_keepers = Arc::new(std::sync::Mutex::new(keepers.clone()));
 		tasks.push({
 			let (forfeits, orders) = (forfeits.clone(), orders.clone());
 			let (signer, pinned, replaced) = (cosigner.signer().clone(), pinned_keepers.clone(), replaced.clone());
+			let fill_due = rounds.fill_due();
 			tokio::spawn(async move {
 				loop {
-					tokio::time::sleep(Duration::from_secs(60)).await;
+					tokio::select! {
+						_ = tokio::time::sleep(Duration::from_secs(60)) => {},
+						_ = fill_due.notified() => {},
+					}
 					if crate::http::keepers_replaced(&signer, &pinned, &replaced).await {
 						continue;
 					}

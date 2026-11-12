@@ -123,11 +123,13 @@ async fn a_refused_unlock_neither_stalls_the_lane_nor_is_retried_every_poll() {
 	assert_eq!(hand_over_held(&r, &round).await, 3, "three participations hand their forfeits over");
 	let start = Instant::now();
 	let mut mined = false;
+	let mut at_node: Option<Instant> = None;
 	let released = loop {
 		if status(&r, &good_id)["state"] == "released" && status(&r, &bad_id)["state"] == "released" {
 			break Instant::now();
 		}
 		if !mined && r.rt.client().raw_transaction(&round).is_ok() {
+			at_node = Some(Instant::now());
 			let vout = bad_vout_of(&r).expect("the refused offboard's vout") as u32;
 			let subject = [round.to_byte_array().to_vec(), vout.to_le_bytes().to_vec()].concat();
 			*counter().needle.lock().unwrap() = Some(hex(&subject));
@@ -135,7 +137,11 @@ async fn a_refused_unlock_neither_stalls_the_lane_nor_is_retried_every_poll() {
 			r.bury().await;
 			mined = true;
 		}
-		assert!(start.elapsed() < Duration::from_secs(60), "not released: {} / {}", status(&r, &good_id), status(&r, &bad_id));
+		// The round's block made and certified, the operator's half of each
+		// forfeit filled in as the round goes out (arca #853), and both
+		// released: seconds, not the minute of the server's own timer.
+		assert!(start.elapsed() < Duration::from_secs(30), "not released within 30 s of the forfeits: {} / {}",
+			status(&r, &good_id), status(&r, &bad_id));
 		tokio::time::sleep(Duration::from_millis(100)).await;
 	};
 	let gst = status(&r, &good_id);
@@ -150,6 +156,8 @@ async fn a_refused_unlock_neither_stalls_the_lane_nor_is_retried_every_poll() {
 		assert!(released.elapsed() < Duration::from_secs(15), "the good offboard was not unlocked within 15 s beside a refused one");
 		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
+	println!("both released {} ms after the forfeits were handed over, {} ms after the node held the round", (released - start).as_millis(),
+		at_node.map(|t| (released - t).as_millis()).unwrap_or(0));
 	println!("good offboard unlocked {} ms after the release, beside a refused one", released.elapsed().as_millis());
 
 	// 2. No block for 10 s: how often does the lane rebuild and re-test the

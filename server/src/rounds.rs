@@ -1134,6 +1134,11 @@ pub struct Rounds {
 	wake: tokio::sync::Notify,
 	/// Each participation released, for the watcher's unlock lane.
 	releases: Arc<crate::watcher::Releases>,
+	/// Rung when a round held for its forfeits is handed to the node: the
+	/// operator's half of those forfeits is signed only once the node holds
+	/// the round ([`crate::forfeits::Forfeits::fill_unsigned`]), and every
+	/// release of the round waits for it.
+	fill_due: Arc<tokio::sync::Notify>,
 }
 
 /// A batch a round builds: its asset, its leaves (each a participation's
@@ -1294,7 +1299,15 @@ impl Rounds {
 	{
 		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
 			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), in_flight_seen: Mutex::new(None), holders: Mutex::new(Default::default()),
-			active, wake: tokio::sync::Notify::new(), releases: crate::watcher::Releases::new() })
+			active, wake: tokio::sync::Notify::new(), releases: crate::watcher::Releases::new(),
+			fill_due: Arc::new(tokio::sync::Notify::new()) })
+	}
+
+	/// Rung each time a round held for its forfeits goes to the node, so
+	/// the forfeits' operator halves are filled in then
+	/// ([`crate::forfeits::Forfeits::fill_unsigned`]), not at the next minute.
+	pub fn fill_due(&self) -> Arc<tokio::sync::Notify> {
+		self.fill_due.clone()
 	}
 
 	/// Where the participations released are told, for the watcher's unlock
@@ -3437,6 +3450,9 @@ impl Rounds {
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
 			let fee = AssetAmount::new(AssetId::from_byte_array(r.fee_asset), r.fee);
 			let answer = self.submit(r.round_id, &tx, fee).await?;
+			if held {
+				self.fill_due.notify_one();
+			}
 			// An order taken between that check and the node's answer: the
 			// node refused the round, and it is resolved from the node's view
 			// of its orders at once.
