@@ -1313,9 +1313,10 @@ pub enum ReserveFloor {
 	/// floor is a reading of a moving input, taken later than the operator's
 	/// and often at another node: a wallet that asks the operator's full
 	/// multiple of its own floor refuses an honest batch whenever the floor
-	/// rose by an atom since the build. A wallet asks a multiple of 1, that
-	/// each spend on the path pays its way at its floor now, and checks the
-	/// multiple the batch was built at from the batch's published rule.
+	/// rose by an atom since the build. A wallet asks a multiple of 1 here,
+	/// that each spend on the path pays its way at its floor now, and binds
+	/// the rest through the batch's published rule: its multiple, and its
+	/// floor against the wallet's own now within a stated drift.
 	FeeRate { floor_per_kvb: u64, multiple: u64 },
 }
 

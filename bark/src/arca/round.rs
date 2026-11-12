@@ -2009,6 +2009,17 @@ impl Wallet {
 		// every new leaf it holds: a refresh of many coins has all its new
 		// leaves in one batch, and the tree is the whole batch's.
 		let mut batches: std::collections::HashMap<String, Batch> = std::collections::HashMap::new();
+		// Whether the wallet itself holds a forfeit it signed, for this
+		// round, of every coin it gives up (as after a forfeit step that
+		// completed before, or a restore that found its own signed
+		// forfeits): taking the new leaves then gives up nothing more, and it
+		// signs no forfeit but those again (checked below). What the operator
+		// says of the participation counts for nothing here.
+		let rtx = round_txid.to_string();
+		let mut forfeited = !given.is_empty();
+		for l in given {
+			forfeited &= self.store.forfeits_of(l)?.iter().any(|f| f.participation == pid && f.round == rtx);
+		}
 		for (j, (o, w)) in outputs.iter().zip(&wanted).enumerate() {
 			if let Some(ow) = w.get("offboard") {
 				let policy = self.offboard_shown(j, o, ow, &unlock_hash, &round)?;
@@ -2047,12 +2058,12 @@ impl Wallet {
 			};
 			// The reserves: built at the published rule's floor and multiple
 			// (the batch rebuilt from it above, by the builder's own sizes),
-			// a multiple of at least four, and paying each spend at the node's
-			// floor in the leaf's asset now when it accepts that asset for fees;
-			// one atom when it does not, or when the operator already holds
-			// the forfeits whole.
-			let released = st["state"] == "released";
-			let (accept, fee_coin, floor) = self.batch_leaf_policy(batch, record.asset(), as_of, released).map_err(|e| {
+			// a multiple of at least four and a floor that keeps three times
+			// the node's floor in the leaf's asset now, each spend paying its
+			// way at that floor, when the node accepts that asset for fees; one
+			// atom when it does not, or when the wallet holds its own forfeit
+			// of every coin given up for this round already.
+			let (accept, fee_coin, floor) = self.batch_leaf_policy(batch, record.asset(), as_of, forfeited).map_err(|e| {
 				let why = match e { Error::Refused(m) => m, e => e.to_string() };
 				Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", round_txid, why))
 			})?;
@@ -2182,6 +2193,13 @@ impl Wallet {
 				(None, Some(p)) => Forfeit::for_offboard(old.leaf, (old.asset, old.value), old.id, p, &round, c, refund, margin),
 				(None, None) => unreachable!("refused above"),
 			}.map_err(|e| Error::Refused(format!("the forfeit of {}: {}", l, e)))?;
+			// Leaves taken with one-atom reserves on the strength of forfeits
+			// the wallet already signed: it signs only those forfeits again.
+			if forfeited && !self.store.forfeits_of(l)?.iter().any(|h| h.participation == pid && h.round == rtx && h.connector_vout == c
+				&& h.unlock_hash == hex(&unlock_hash) && h.refund_units == refund.units() && h.margin == margin) {
+				return Err(Error::Refused(format!("the forfeit of {} for round {} is not the one the wallet signed before, and the wallet took \
+					the new leaves on the strength of that one: it signs no other", l, rtx)));
+			}
 			let key = self.coin_key(&row.owner_nonce)?;
 			forfeits.push(json!({"leaf_id": l, "signature": hex(sign(&key, &f.message().digest).as_ref())}));
 			signed.push((l.clone(), margin));
@@ -3145,10 +3163,10 @@ mod tests {
 		(batch, record, policy)
 	}
 
-	/// The wallet's rule now: the published rule checked, then each reserve
-	/// paying its spend at the wallet's floor `f`.
-	fn accepts(batch: &Batch, record: &arca_covenant::LeafRecord, policy: &WalletPolicy, f: u64) -> Result<(), String> {
-		let min_reserve = super::super::wallet::round_leaf_floor(batch.reserve(), Some(f), false)?;
+	/// The wallet's rule now: the published rule checked against the wallet's
+	/// floor `f`, then each reserve paying its spend at `f`.
+	fn accepts(batch: &Batch, record: &arca_covenant::LeafRecord, policy: &WalletPolicy, f: u64, forfeited: bool) -> Result<(), String> {
+		let min_reserve = super::super::wallet::round_leaf_floor(batch.reserve(), Some(f), forfeited)?;
 		WalletPolicy { min_reserve, ..policy.clone() }.check(record).map_err(|e| e.to_string())
 	}
 
@@ -3159,43 +3177,61 @@ mod tests {
 	/// its own floor asked 596. Round db07379a…: built on 2026-10-31 at 4 times
 	/// 267, so 280; a restored wallet checked it on 2026-11-12 at that day's
 	/// floor of 568 to 571 (the asset's rate had halved) and asked 592. Under
-	/// the old rule both refuse exactly as on the testnet; under the rule now
-	/// both pass, and a floor past what the reserves pay is still refused.
+	/// the old rule both refuse exactly as on the testnet. Under the rule now
+	/// the first passes while the wallet's floor is at most a third above 571,
+	/// and is refused beyond; so is the same tree published at a floor of 143,
+	/// which keeps 152 on level 0. The second, twelve days and a halving
+	/// later, is refused, unless the wallet holds its own forfeits of the coins
+	/// given up for that round, when the leaf is taken whatever its reserves.
 	#[test]
-	fn the_two_refused_testnet_trees_pass_at_the_wallets_floor_now() {
+	fn the_two_refused_testnet_trees_against_the_wallets_floor_now() {
 		use arca_covenant::{RecordError, ReserveFloor, ReserveRule};
 		use super::super::wallet::RESERVE_MULTIPLE;
 		let old = |policy: &WalletPolicy, f: u64| WalletPolicy { min_reserve: ReserveFloor::FeeRate { floor_per_kvb: f, multiple: RESERVE_MULTIPLE },
 			..policy.clone() };
 
-		let (batch, record, policy) = published_leaf(include_str!("testdata/round_58140a07_batch0.json"));
+		let case1 = include_str!("testdata/round_58140a07_batch0.json");
+		let (batch, record, policy) = published_leaf(case1);
 		assert_eq!(batch.reserve(), ReserveRule::FeeRate { floor_per_kvb: 571, multiple: 4 });
 		assert_eq!(record.upper.iter().map(|u| u.reserve).chain([record.lowest.reserve]).collect::<Vec<_>>(), vec![592]);
 		assert!(old(&policy, 571).check(&record).is_ok(), "the operator's own floor");
 		assert_eq!(old(&policy, 575).check(&record).unwrap_err(), RecordError::NodeReserve { level: 0, reserve: 592, min: 596 },
 			"the refusal seen at 13:06Z");
-		for f in [571, 572, 575, 600, 1_000, 2_284] {
-			accepts(&batch, &record, &policy, f).unwrap_or_else(|e| panic!("floor {}: {}", f, e));
+		for f in [571, 572, 575, 600, 761] {
+			accepts(&batch, &record, &policy, f, false).unwrap_or_else(|e| panic!("floor {}: {}", f, e));
 		}
-		// The first floor the reserves no longer pay: just past four times
-		// the build's, never below it.
-		let first = (571..10_000).find(|f| accepts(&batch, &record, &policy, *f).is_err()).unwrap();
-		assert!((2_285..=2_300).contains(&first), "first refused at {}", first);
-		let e = accepts(&batch, &record, &policy, first).unwrap_err();
-		assert!(e.contains("holds a reserve of"), "{}", e);
+		let first = (571..10_000).find(|f| accepts(&batch, &record, &policy, *f, false).is_err()).unwrap();
+		assert_eq!(first, 762, "a third above 571: 4 × 571 < 3 × 762");
+		let e = accepts(&batch, &record, &policy, first, false).unwrap_err();
+		assert!(e.contains("keeps less than 3 times"), "{}", e);
+		assert!(super::super::wallet::is_reserve_refusal(&e), "declined as a reserve refusal: {}", e);
+
+		// The same round published at a floor of 143: rebuilt, it keeps 152
+		// on level 0, and a wallet whose floor is 571 refuses it.
+		let mut low: Value = serde_json::from_str(case1).unwrap();
+		low["reserve"]["fee_rate"]["floor_per_kvb"] = json!("143");
+		low.as_object_mut().unwrap().remove("nodes");
+		for l in low["leaves"].as_array_mut().unwrap() {
+			l.as_object_mut().unwrap().remove("leaf_id");
+		}
+		let (batch, record, policy) = published_leaf(&low.to_string());
+		assert_eq!(record.upper.iter().map(|u| u.reserve).chain([record.lowest.reserve]).collect::<Vec<_>>(), vec![152]);
+		let e = accepts(&batch, &record, &policy, 571, false).unwrap_err();
+		assert!(e.contains("built at 4 times a floor of 143") && e.contains("keeps less than 3 times"), "{}", e);
+		assert!(accepts(&batch, &record, &policy, 190, false).is_ok(), "143 × 4 keeps 3 × 190");
 
 		let (batch, record, policy) = published_leaf(include_str!("testdata/round_db07379a_batch0.json"));
 		assert_eq!(batch.reserve(), ReserveRule::FeeRate { floor_per_kvb: 267, multiple: 4 });
 		assert_eq!(old(&policy, 571).check(&record).unwrap_err(), RecordError::NodeReserve { level: 0, reserve: 280, min: 592 },
 			"the refusal seen at 19:08Z");
-		for f in [267, 568, 571, 1_000] {
-			accepts(&batch, &record, &policy, f).unwrap_or_else(|e| panic!("floor {}: {}", f, e));
+		for f in [267, 300, 356] {
+			accepts(&batch, &record, &policy, f, false).unwrap_or_else(|e| panic!("floor {}: {}", f, e));
 		}
-		// Released already: the leaf is the wallet's whatever the floor.
-		let released = WalletPolicy { min_reserve: super::super::wallet::round_leaf_floor(batch.reserve(), Some(100_000), true).unwrap(),
-			..policy.clone() };
-		assert!(released.check(&record).is_ok());
-		assert!(accepts(&batch, &record, &policy, 100_000).is_err());
+		assert!(accepts(&batch, &record, &policy, 571, false).is_err(), "a halving later, without the wallet's own forfeits");
+		// The wallet holds its own forfeits of the coins given up for this
+		// round: the leaf is the wallet's whatever its reserves.
+		accepts(&batch, &record, &policy, 571, true).unwrap();
+		accepts(&batch, &record, &policy, 100_000, true).unwrap();
 	}
 
 	/// A record of a leaf the wallet takes, of each kind, read back by its

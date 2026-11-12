@@ -1754,6 +1754,36 @@ async fn a_refused_tree_waits_where_the_operator_takes_no_decline() {
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
+/// F11 against an operator that calls the participation `released` while it
+/// holds no forfeit of it: the wallet holds no forfeit of its own for that
+/// round, so the word counts for nothing. It refuses the one-atom reserves,
+/// signs no forfeit, and declines the round; its coin is live again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_saying_released_gets_no_forfeit_for_a_refused_tree() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/participation_status" && status == 200 && v["state"] == "issued" {
+			v["state"] = json!("released");
+		}
+		None
+	})));
+	let url = proxy.url.clone();
+	let y = r.y;
+	let c = Arca::new("F11C");
+	let board = reserve_case_board(&mut r, &c, &url).await;
+	final_round(&r).await;
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let s = c.ok(&["sync"]);
+	let p = &s["participations"][0];
+	let why = p["refused"].as_str().unwrap_or_else(|| panic!("not refused: {}", s)).to_string();
+	println!("F11C the operator says released, the wallet holds no forfeit: REFUSED: {}", why);
+	assert!(why.contains("reserve of 1"), "{}", why);
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "no forfeit was signed");
+	assert_eq!(coin_of(&c, &board)["state"], "live", "declined: the coin is the wallet's again");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
 /// A wallet of F11 boarded in Y with its fee in X, its refresh asked while
 /// the node does not take Y: the round builds Y's tree with one-atom reserves.
 async fn reserve_case_board(r: &mut Running, c: &Arca, url: &str) -> String {
