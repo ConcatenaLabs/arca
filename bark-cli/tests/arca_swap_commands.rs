@@ -646,3 +646,78 @@ async fn a_cancel_whose_respend_was_not_answered_says_what_it_knows() {
 	assert_eq!(total(&b, "live", &x), x_before + 200_000, "what the swap pays the taker is held");
 	assert_eq!(total(&b, "offered", &y) + total(&b, "sending", &y), 0, "nothing stays held");
 }
+
+/// The answer to a cancel's respend is lost; a sync posts it again and the
+/// operator refuses it for a reason other than a spent coin (a signature the
+/// proxy spoils, standing for a margin or fee the operator no longer takes).
+/// The coin is held for the swap again, not live: the wallet's refresh cannot
+/// give it to a round, where a cancel could miss it and a withdrawal of the
+/// refresh would hand it back to a maker still holding the acceptance. The
+/// next cancel respends it, and the maker's completion is then refused.
+/// (RV41's probe P10.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_respend_keeps_the_coin_held_for_the_swap() {
+	use std::sync::Arc;
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let proxy = common::proxy::Proxy::start(&url);
+	let a = Arca::new("HA");
+	let b = Arca::new("HB");
+	a.ok(&["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	b.ok(&["create", "--server", &proxy.url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &y, "900000", "--fee-asset", &x]);
+	r.fund_server(r.x, 50_000_000).await;
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let state = |w: &Arca, id: &str| library(w, "swaps", json!({})).unwrap().as_array().unwrap().iter().find(|s| s["swap"] == id).unwrap()["state"].clone();
+	let st = |w: &Arca, l: &str| w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == l).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "400000"})).unwrap();
+	let id = offer["swap"].as_str().unwrap().to_string();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	let coin = coins(&b, "offered", &y)[0]["leaf_id"].as_str().unwrap().to_string();
+	proxy.lose("/v1/cosign_transfer", true);
+	let c1 = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	proxy.lose("/v1/cosign_transfer", false);
+	assert_eq!(c1["cancelled"], false, "{}", c1);
+	proxy.rewrite_request(Some(Arc::new(|path: &str, body: &mut Value| {
+		if path == "/v1/cosign_transfer" {
+			body["inputs"][0]["checkpoint_sig"] = json!("11".repeat(64));
+		}
+	})));
+	let s = b.ok(&["sync"]);
+	proxy.rewrite_request(None);
+	println!("SYNC POSTS THE RESPEND AGAIN, REFUSED: {}", s["transfers"]);
+	println!("THE COIN AFTER THE REFUSAL: {}", st(&b, &coin));
+	assert_eq!(st(&b, &coin), "offered", "the coin is held for the swap again");
+	let (ok, p) = b.run(&["participate", "--leaf", &coin]);
+	println!("A REFRESH OF THE COIN: ok {} {}", ok, p);
+	// Whatever the refresh did, take it back, as a person or the wallet may.
+	if let Some(pid) = b.ok(&["participations"]).as_array().and_then(|a| a.iter().find(|p| p["state"] == "pending")).and_then(|p| p["participation"].as_str()).map(String::from) {
+		b.run(&["withdraw-participation", &pid]);
+	}
+	let c2 = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	println!("CANCEL AFTER THE REFUSED RESPEND: {}", c2);
+	let done = library(&a, "swap_complete", json!({"accept": acc["accept"]}));
+	println!("THE MAKER'S COMPLETION AFTER IT: {:?}", done.as_ref().map(|d| d["swap"].clone()));
+	assert!(!(c2["cancelled"] == true && done.is_ok()), "the cancel said cancelled, and the maker completed the acceptance after it: {}", c2);
+	assert_eq!(c2["cancelled"], true, "{}", c2);
+	assert!(c2["respent"].as_array().is_some_and(|v| !v.is_empty()), "{}", c2);
+	assert!(done.unwrap_err().contains("double_spend"));
+	assert_eq!(state(&b, &id), "cancelled");
+}

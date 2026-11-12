@@ -1366,10 +1366,27 @@ impl Wallet {
 					self.store.coin(l).ok().flatten().is_some_and(|c| c.salt == salt)
 				}).cloned());
 				let held_note = self.spelling.say(FORFEIT_HELD_NOTE);
+				// A coin signed into an acceptance the wallet has not seen
+				// cancelled or done (a cancel's respend, refused) is held for
+				// that swap again, never live: the maker can complete the
+				// acceptance while it is unspent, so nothing else (a refresh, a
+				// payment) may take it, and the next cancel respends it.
+				let mut for_swap: BTreeMap<String, String> = BTreeMap::new();
+				for (sid, role, _, state) in self.store.swaps()? {
+					if role == "taker" && state == "accepted" {
+						for l in self.acceptance_coins(&sid)? {
+							if mine.contains(&l) {
+								for_swap.insert(l, sid.clone());
+							}
+						}
+					}
+				}
 				self.store.atomically(|s| {
 					for l in mine {
 						if Some(l) == forfeited.as_ref() {
 							s.set_coin_state(l, "forfeited", &held_note)?;
+						} else if let Some(sid) = for_swap.get(l) {
+							s.set_coin_state(l, "offered", &format!("swap {}", sid))?;
 						} else {
 							// An htlc-1 coin goes back to where it stood: the
 							// leaf of a payment out of the tree to `paying`,
@@ -3129,10 +3146,23 @@ impl Wallet {
 			};
 		}
 		if accepted {
-			// Nothing signed into the acceptance is held or unspent: each coin
-			// in it is spent, by the wallet's own respend or by the swap. What
-			// the swap pays the wallet says which; without a read of the
-			// mailbox, the wallet does not know.
+			// Nothing signed into the acceptance is held, live or sending. Only
+			// a coin spent (by the wallet's own respend, or by the swap) or
+			// whose forfeit the operator holds can no longer be co-signed into
+			// it; one in any other state (given to a refresh not done yet, on
+			// its way home) can still be taken back, and the maker can then
+			// complete the acceptance. So the swap is not called cancelled.
+			let open: Vec<Value> = self.acceptance_coins(id)?.into_iter().filter_map(|l| self.store.coin(&l).ok().flatten())
+				.filter(|c| !matches!(c.state.as_str(), "spent" | "forfeited"))
+				.map(|c| json!({"leaf_id": c.leaf_id, "state": c.state})).collect();
+			if !open.is_empty() {
+				return Ok(json!({"swap": id, "cancelled": false, "acceptance_stands": true, "coins": open,
+					"note": "a coin signed into the acceptance is not spent (it is given to a refresh not done yet, or on its way home): \
+					until it is spent the maker can complete the acceptance; run swap cancel again once it is"}));
+			}
+			// Each coin in it is spent, by the wallet's own respend or by the
+			// swap. What the swap pays the wallet says which; without a read
+			// of the mailbox, the wallet does not know.
 			if let Err(e) = self.mailbox() {
 				return Ok(json!({"swap": id, "cancelled": false, "unknown": true, "error": e.to_string(),
 					"note": "the coins signed into the acceptance are spent, and the mailbox, which says whether by the swap, could not be \
