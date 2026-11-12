@@ -1162,9 +1162,20 @@ is signed, and `--shown` pays only on that very fee and those coins. The answer
 says how soon the round is due (`round_within_seconds`, the operator's interval
 between rounds while participations wait) when the operator publishes one.
 
+`--coins ID,…` in place of `--amount` moves the whole of those coins and no
+other: the amount paid is what they hold less the fee, and there is no change.
+Each must be a live coin of `A` the wallet can give up now; one a round must
+refresh first is answered `settle_first`, naming it, and any other is refused,
+named. Where the schedule's rounding meets no amount exactly, the fee is one
+atom above it (the operator refuses a fee short of its schedule, never one
+above). Before the wallet holds a coin, `--value N --expiry T --quote` says
+what moving a coin of `N` with exit date `T` whole would pay and cost, from
+the operator's published fees, so a program can price a coin a trade is about
+to bring.
+
 `sync` hands over the forfeits once the round is final, and the operator then
 unlocks the round's offboard output into the address: its output 0 pays exactly
-the amount there. The wallet unlocks it itself when the operator has not within
+the amount there (`arca offboards` names the output, `vout`, once paid). The wallet unlocks it itself when the operator has not within
 ten minutes of median time. `arca offboards` reads where each stands from the
 chain: `waiting` for its round, `in_round`, `unlocking`, `paid` (the unlock's
 `txid`, and whether it is `final`), `reclaimed` (the operator took the output
@@ -1180,6 +1191,7 @@ given up to it again, and `sync` completes it. Only one the operator does not
 hold is made anew, as a participation of its own.
 
     arca offboard --asset X --amount 300000 --address ADDR --quote   # fee, coins, change
+    arca offboard --asset X --coins ID --address ADDR --quote        # that coin, whole
     arca offboard … --shown '<the quote>'                            # paid in the next round
     arca offboards                                                   # where each stands
 

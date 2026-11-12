@@ -405,3 +405,119 @@ async fn an_offboard_asked_again_goes_on_with_the_first() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// An offboard of named coins (`--coins`) gives up those coins alone, whole:
+/// it pays what they hold less the fee, with no change, and leaves every other
+/// coin of the wallet's as it was, though the wallet's own choice for that
+/// amount would have taken the other first and made change. Before the wallet
+/// holds a coin, `--value` and `--expiry` quote the same move of a coin of
+/// that value and date, so a program can price it beforehand. The unlock
+/// pays the address exactly the quoted amount, at the output `offboards`
+/// names (`vout`). Refused beside it, nothing signed: a coin the wallet does
+/// not hold, and a quote that is no longer the offboard's.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offboard_of_named_coins_moves_them_whole_and_touches_no_other() {
+	// Fees on both parts, so the whole move's arithmetic is tested.
+	let mut r = Running::start_with(|c, x, _| c.assets[0] = AssetSection { refresh_ppm: Some(3_000), refresh_base: Some("200".into()),
+		offboard_ppm: Some(3_333), offboard_base: Some("7".into()), ..AssetSection::new(x, 1_000) }).await;
+	let x = r.x;
+	let a = leaves_only(&mut r, "OBN", x, 600_000).await;
+	// A second coin.
+	r.pay_to(script(&a.ok(&["address"])), x, 250_000);
+	r.produce().await;
+	let q = a.ok(&["board", &x.to_string(), "240000", "--quote"]);
+	let fee: u64 = q["fee"]["amount"].as_str().unwrap().parse().unwrap();
+	a.ok(&["board", &x.to_string(), &(250_000 - fee).to_string()]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the boards credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let coins = live_of(&a, x);
+	assert_eq!(coins.len(), 2, "{:?}", coins);
+	let b = Arca::new("OBM");
+	b.ok(&create_args(&r.url(), &r.node_url()));
+	let to = b.ok(&["address"]);
+	let (address, spk) = (to["address"].as_str().unwrap().to_string(), script(&to));
+	let xs = x.to_string();
+	// The coin named is one the wallet's own choice for the same amount
+	// passes over: the wallet orders its coins by exit date, then by size,
+	// so for one of the two it takes the other first.
+	let mut pick = None;
+	for c in &coins {
+		let (value, expiry) = (c["value"].as_str().unwrap().to_string(), c["expiry"].as_u64().unwrap().to_string());
+		let whole = a.ok(&["offboard", "--asset", &xs, "--value", &value, "--expiry", &expiry, "--address", &address, "--quote"]);
+		println!("the move of a coin of {} by its value: {}", value, whole);
+		let amount = whole["amount"].as_str().unwrap().to_string();
+		let fee: u64 = whole["fee"]["amount"].as_str().unwrap().parse().unwrap();
+		assert_eq!(amount.parse::<u64>().unwrap() + fee, value.parse::<u64>().unwrap(), "the amount and the fee are the whole coin");
+		assert_eq!(whole["change"], "0");
+		let free = a.ok(&["offboard", "--asset", &xs, "--amount", &amount, "--address", &address, "--quote"]);
+		println!("the wallet's own choice for {}: {}", amount, free["gives"]);
+		if free["gives"] != json!([c["leaf_id"]]) {
+			pick = Some((c.clone(), whole, amount));
+			break;
+		}
+	}
+	let (named, whole, amount) = pick.expect("for one of the coins the wallet's own choice is another: else the test proves nothing");
+	let other = coins.iter().find(|c| c["leaf_id"] != named["leaf_id"]).unwrap().clone();
+	let id = named["leaf_id"].as_str().unwrap().to_string();
+
+	// Refused, nothing signed.
+	let (ok, v) = a.run(&["offboard", "--asset", &xs, "--coins", &"00".repeat(36), "--address", &address, "--quote"]);
+	println!("a coin the wallet does not hold: ok={} {}", ok, v["error"]["message"]);
+	assert!(!ok && v["error"]["message"].as_str().unwrap().contains("is not a live coin"), "{}", v);
+	let q = a.ok(&["offboard", "--asset", &xs, "--coins", &id, "--address", &address, "--quote"]);
+	println!("the move of the named coin: {}", q);
+	assert_eq!((&q["gives"], &q["change"], &q["amount"], &q["fee"]), (&json!([id]), &json!("0"), &whole["amount"], &whole["fee"]),
+		"the named coin alone, whole, at the fee its value and date quoted");
+	let mut stale = q.clone();
+	stale["fee"]["amount"] = json!("1");
+	let (ok, v) = a.run(&["offboard", "--asset", &xs, "--coins", &id, "--address", &address, "--shown", &stale.to_string()]);
+	println!("a quote that is not the offboard's: ok={} {}", ok, v["error"]["message"]);
+	assert!(!ok && v["error"]["message"].as_str().unwrap().contains("changed since it was shown"), "{}", v);
+
+	// Paid: the round, the forfeit, the unlock into the address.
+	let asked = a.ok(&["offboard", "--asset", &xs, "--coins", &id, "--address", &address, "--shown", &q.to_string()]);
+	println!("asked: {}", asked);
+	assert_eq!((&asked["gives"], &asked["change"], &asked["amount"]), (&json!([id]), &json!("0"), &json!(amount)));
+	let again = a.ok(&["offboard", "--asset", &xs, "--coins", &id, "--address", &address]);
+	assert_eq!((&again["offboard"], &again["already"]), (&asked["offboard"], &json!(true)), "asked again, it is the same: {}", again);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built[0].offboards, 1);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	a.ok(&["sync"]);
+	let mut paid = Value::Null;
+	for _ in 0..30 {
+		r.produce().await;
+		r.synced().await;
+		let o = a.ok(&["offboards"])[0].clone();
+		if o["state"] == "paid" {
+			paid = o;
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	}
+	println!("the offboard: {}", paid);
+	assert_eq!(paid["state"], "paid", "{}", a.ok(&["offboards"]));
+	let txid: Txid = paid["txid"].as_str().unwrap().parse().unwrap();
+	let tx = r.rt.client().raw_transaction(&txid).unwrap();
+	let out = &tx.output[paid["vout"].as_u64().unwrap() as usize];
+	assert_eq!((&out.script_pubkey, out.asset.explicit(), out.value.explicit()), (&spk, Some(x), Some(amount.parse::<u64>().unwrap())));
+	// No change, and the other coin as it was.
+	for _ in 0..3 {
+		a.ok(&["sync"]);
+		r.produce().await;
+		r.synced().await;
+	}
+	let left = live_of(&a, x);
+	println!("left: {:?}", left);
+	assert_eq!(left.len(), 1, "{}", a.ok(&["coins"]));
+	assert_eq!((&left[0]["leaf_id"], &left[0]["value"]), (&other["leaf_id"], &other["value"]), "the other coin untouched");
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
