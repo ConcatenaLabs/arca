@@ -161,8 +161,12 @@ fn trade(m: &Arca, a: &Arca, x: AssetId, y: AssetId, give: u64, get: u64) -> Res
 /// With `ARCA_TEST_HARNESS_DEFAULTS` set, the harness's own defaults instead
 /// (anchor depth 2, batches swept, the checkpoint exit offered), the round
 /// loop and the block clock as ever.
+fn defaults() -> bool {
+	std::env::var_os("ARCA_TEST_HARNESS_DEFAULTS").is_some()
+}
+
 fn testnet(cfg: &mut server::server::Config) {
-	if std::env::var_os("ARCA_TEST_HARNESS_DEFAULTS").is_some() {
+	if defaults() {
 		cfg.watcher.enabled = false;
 		cfg.fills.block_seconds = 60;
 		return;
@@ -615,6 +619,10 @@ async fn an_anchor_rollback_during_a_background_refresh_loses_nothing() {
 	let p_round = r.rt.parent.client().block_count().unwrap();
 	let built = rounds_held(&r, &[&a]).await;
 	r.produce().await;
+	// At the harness's defaults the round is final only once its anchor is buried.
+	if defaults() {
+		r.bury().await;
+	}
 	r.synced().await;
 	for b in &built {
 		r.round_state(&b.tx.txid(), RoundState::Final).await;
@@ -633,6 +641,9 @@ async fn an_anchor_rollback_during_a_background_refresh_loses_nothing() {
 	let mut ready = false;
 	for _ in 0..20 {
 		r.produce().await;
+		if defaults() {
+			r.bury().await;
+		}
 		r.synced().await;
 		a.ok(&["sync"]);
 		if library(&a, "settle_first", json!({"coins": [settling.clone()]})).unwrap()["ready"] == true {
@@ -710,6 +721,71 @@ async fn the_upkeep_keeps_a_coin_of_each_asset_out_of_its_rounds() {
 	println!("{}: the quote: {:?}", tag, quoted);
 	assert!(quoted.is_ok(), "priced without waiting for a round: {:?}", quoted);
 	for w in [&a, &m, &s] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// The same wallet on a second device: a copy of its store.
+fn second_device(from: &Arca, name: &str) -> Arca {
+	fn copy(a: &std::path::Path, b: &std::path::Path) {
+		std::fs::create_dir_all(b).unwrap();
+		for e in std::fs::read_dir(a).unwrap() {
+			let e = e.unwrap();
+			if e.file_type().unwrap().is_dir() { copy(&e.path(), &b.join(e.file_name())) } else { std::fs::copy(e.path(), b.join(e.file_name())).unwrap(); }
+		}
+	}
+	let d = Arca::new(name);
+	copy(&from.dir, &d.dir);
+	d
+}
+
+/// A coin another device of the wallet gave to a round, held out of every
+/// spend here until a catch-up settles it (arca #852), is never the
+/// upkeep's: the rule `shape` does not name it though it has no room left
+/// and another coin of its asset has, `give_up` does not list it, and a
+/// spread does not count it in the holding it cuts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_held_as_spent_elsewhere_is_never_the_upkeeps_to_give() {
+	let tag = "SF7 held out";
+	let (r, a, m) = streak_setup(tag, &[1_000_000, 1_000_000]).await;
+	let (x, y) = (r.x, r.y);
+	for _ in 0..3 {
+		trade(&m, &a, x, y, 100_000, 100_000).expect("a trade");
+	}
+	let coins = coins_of(&a, x);
+	println!("{}: X {}", tag, depths(&a, x));
+	let deep = coins.iter().find(|c| c.2 + 3 > 5).expect("a coin with no room left").0.clone();
+	let fresh = coins.iter().find(|c| c.2 == 0).expect("a coin with room").0.clone();
+	// Before anything else, the rule names it at once (another coin has room).
+	let before = library(&a, "refresh_needed", json!({"idle_seconds": 0})).unwrap();
+	assert!(before["reasons"].as_array().unwrap().iter().any(|r| r["rule"] == "shape" && names(&r["coins"]).contains(&deep)), "{}", before);
+	// The wallet's second device gives the deep coin to a round; this one, not caught up, pays from it.
+	let a2 = second_device(&a, &format!("{} A2", tag));
+	a2.ok(&["participate", "--leaf", &deep]);
+	let req = m.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let (ok, e) = a.run(&["send", &req, "--amount", "1500000", "--asset", &x.to_string()]);
+	println!("{}: the payment: ok {} {}", tag, ok, e);
+	assert!(!ok && e.to_string().contains("double_spend"), "{}", e);
+	let line = library(&a, "coin_places", json!({})).unwrap()["coins"].as_array().unwrap().iter().find(|c| c["leaf_id"] == deep).cloned().unwrap();
+	println!("{}: the coin here: {}", tag, line);
+	assert!(line["spent_elsewhere_until"].as_u64().is_some(), "held out as spent elsewhere: {}", line);
+	for idle in [0, 130] {
+		let v = library(&a, "refresh_needed", json!({"idle_seconds": idle})).unwrap();
+		println!("{}: idle {}: {}", tag, idle, v);
+		assert!(!v["reasons"].as_array().unwrap().iter().any(|r| r["rule"] == "shape" && names(&r["coins"]).contains(&deep)), "the rule names no held coin: {}", v);
+		assert!(!names(&v["give_up"]).contains(&deep) && !names(&v["kept_back"]).contains(&deep), "{}", v);
+	}
+	// A spread of the coin with room counts only what the wallet may move: pieces of a sixth of it,
+	// not of it and the held coin together.
+	let s = library(&a, "settle_first", json!({"coins": [fresh.clone()], "spread": true})).unwrap();
+	assert_eq!(names(&s["settling"]), vec![fresh.clone()], "{}", s);
+	let parts = library(&a, "participations", json!({})).unwrap();
+	let p = parts.as_array().unwrap().iter().rev().find(|p| p["gives"].as_array().unwrap().iter().any(|g| g["leaf_id"] == fresh)).cloned().unwrap();
+	let values: Vec<u64> = p["new_leaves"].as_array().unwrap().iter().map(|n| n["value"].as_str().unwrap().parse().unwrap()).collect();
+	println!("{}: the spread made {:?}", tag, values);
+	assert_eq!(values.len(), 4, "three pieces and the reserve: {:?}", values);
+	assert!(values[..3].iter().all(|v| *v == 1_000_000 / 6), "pieces of a sixth of the coin with room alone: {:?}", values);
+	for w in [&a, &a2, &m] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
