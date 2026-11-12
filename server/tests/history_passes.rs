@@ -216,6 +216,14 @@ async fn passes_with_a_history_behind_them() {
 		let t = Instant::now();
 		c.batch_execute(&format!("BEGIN; {} COMMIT;", include_str!("../schema/V49__pass_reads.sql"))).await.unwrap();
 		println!("V49 ×{}: the schema step on {} final rounds took {:.0} ms", scale, finals, t.elapsed().as_secs_f64() * 1000.0);
+		// The planner's statistics of what the step made, as autovacuum would
+		// gather them in time (`HISTORY_ANALYZE=1`): without them the first
+		// passes plan blind.
+		if env("HISTORY_ANALYZE", 0) == 1 {
+			let t = Instant::now();
+			c.batch_execute("ANALYZE").await.unwrap();
+			println!("ANALYZE after V49: {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+		}
 	}
 	// The logs of open items start again, as after the schema step: the
 	// restarted server's first passes fill them from the whole history.
