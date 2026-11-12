@@ -2269,6 +2269,7 @@ mod test {
 pub(crate) struct Steps {
 	at: web_time::Instant,
 	node: u64,
+	blocks: u64,
 	operator: u64,
 	by: BTreeMap<String, u64>,
 	op: BTreeMap<String, (u64, u64)>,
@@ -2277,7 +2278,7 @@ pub(crate) struct Steps {
 
 impl Steps {
 	pub(crate) fn start(w: &Wallet) -> Steps {
-		Steps { at: web_time::Instant::now(), node: w.chain.calls().0, operator: super::chain::gaps(), by: w.chain.asked_by_method(),
+		Steps { at: web_time::Instant::now(), node: w.chain.calls().0, blocks: w.chain.blocks_decoded(), operator: super::chain::gaps(), by: w.chain.asked_by_method(),
 			op: super::chain::operator_calls(), out: serde_json::Map::new() }
 	}
 
@@ -2286,6 +2287,12 @@ impl Steps {
 	pub(crate) fn lap(&mut self, w: &Wallet, name: &str) {
 		let (node, operator, by) = (w.chain.calls().0, super::chain::gaps(), w.chain.asked_by_method());
 		let mut step = json!({"ms": self.at.elapsed().as_millis() as u64, "node": node - self.node, "operator": operator - self.operator});
+		// The blocks the step decoded, where it read any: a search of the
+		// chain costs the processor more than its requests.
+		let blocks = w.chain.blocks_decoded();
+		if blocks > self.blocks {
+			step["blocks"] = json!(blocks - self.blocks);
+		}
 		let alone = super::command::cost_by_method(&self.by, &by);
 		if alone.as_object().is_some_and(|o| !o.is_empty()) {
 			step["alone"] = alone;
@@ -2299,7 +2306,7 @@ impl Steps {
 			step["operator_calls"] = calls;
 		}
 		self.out.insert(name.to_string(), step);
-		*self = Steps { at: web_time::Instant::now(), node, operator, by, op, out: std::mem::take(&mut self.out) };
+		*self = Steps { at: web_time::Instant::now(), node, blocks, operator, by, op, out: std::mem::take(&mut self.out) };
 	}
 
 	pub(crate) fn done(self) -> Value {

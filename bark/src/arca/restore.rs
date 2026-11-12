@@ -661,14 +661,29 @@ impl Wallet {
 			}
 		}
 		let standing = self.chain.unspent_of(&roots.into_iter().collect::<Vec<_>>())?;
+		// The others' own outputs are looked for together, in one pass over
+		// the blocks from the lowest height any of them can be at: a wallet
+		// with a long history has hundreds of coins resting on a batch
+		// output reclaimed or a board converted since, and a pass each read
+		// and decoded the same blocks once for every coin.
+		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
+		let mut wanted: Vec<(&String, &ValidCoin, u64)> = vec![];
 		for (id, t) in &taken {
 			if t.coin.roots().iter().all(|r| standing.contains(r)) {
 				continue;
 			}
 			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
-				if let Some(n) = self.restore_on_chain(id, &t.coin)? {
-					notes.push(n);
+				if let Some(lowest) = self.chain.descendants_from(&t.coin.roots(), from)? {
+					wanted.push((id, &t.coin, from.max(lowest)));
 				}
+			}
+		}
+		let outputs: Vec<(elements::TxOut, u64)> = wanted.iter().map(|(_, c, h)| (c.output().txout(), *h)).collect();
+		let found = self.chain.find_payments(&outputs)?;
+		for ((id, coin, _), paid) in wanted.into_iter().zip(found) {
+			let Some((tx, h)) = paid else { continue };
+			if self.store.coin(id)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				notes.push(self.restore_on_chain(id, coin, tx, h)?);
 			}
 		}
 
@@ -1229,14 +1244,13 @@ impl Wallet {
 	/// of the mnemonic's receive addresses): `exited` once that claim is
 	/// final, `exiting` while it is not or the leaf waits for its claim, and
 	/// as a forfeit or a co-signed checkpoint that took it says otherwise.
-	/// `None` for a coin whose output is not on the chain.
-	fn restore_on_chain(&mut self, id: &str, coin: &ValidCoin) -> Result<Option<Value>, Error> {
-		let from = self.store.meta("birthday")?.and_then(|b| b.parse::<u64>().ok()).unwrap_or(0).saturating_sub(1000);
-		// The coin's output is made only by spends that start at the batch
-		// outputs and boards it rests on: while each stands, no block is read.
-		let Some(lowest) = self.chain.descendants_from(&coin.roots(), from)? else { return Ok(None) };
+	/// `tx`, at height `h`, is the first transaction that pays the coin's
+	/// output, found by the restore's pass over the blocks: the coin's output
+	/// is made only by spends that start at the batch outputs and boards it
+	/// rests on, so only coins with one of those spent are looked for, and
+	/// from the lowest block holding one.
+	fn restore_on_chain(&mut self, id: &str, coin: &ValidCoin, tx: elements::Transaction, h: u64) -> Result<Value, Error> {
 		let out = coin.output().txout();
-		let Some((tx, h)) = self.chain.find_payment(&out, from.max(lowest))? else { return Ok(None) };
 		let vout = tx.output.iter().position(|o| *o == out).expect("pays it") as u32;
 		let leaf = elements::OutPoint::new(tx.txid(), vout);
 		let mut prior = json!({"txs": [], "leaf": leaf.to_string()});
@@ -1260,8 +1274,8 @@ impl Wallet {
 			chain has it")?;
 		let followed = self.exit(id, None).unwrap_or_else(|e| json!({"leaf_id": id, "error": e.to_string()}));
 		let state = self.store.coin(id)?.map(|c| c.state).unwrap_or_default();
-		Ok(Some(json!({"leaf_id": id, "state": state, "note": format!("its leaf {} is on the chain: the lost wallet took it home; {}", leaf,
-			followed)})))
+		Ok(json!({"leaf_id": id, "state": state, "note": format!("its leaf {} is on the chain: the lost wallet took it home; {}", leaf,
+			followed)}))
 	}
 
 	/// D63: the `htlc-1` coin `id` (`coin`, of terms `h`), restored live, as its

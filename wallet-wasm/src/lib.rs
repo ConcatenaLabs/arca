@@ -9,7 +9,13 @@
 //!   `XMLHttpRequest`, which a dedicated worker may block on, so the
 //!   library's blocking calls run as they do natively
 //!   ([`sequentia_ext::platform`]);
-//! - **a pause**, for the library's back-off while it tries an operator again;
+//! - **a pause**, for the library's back-off while it tries a node or an
+//!   operator again. A worker blocked in the library has nothing else to do,
+//!   but it must not spend a processor core on waiting: the host hands the
+//!   library a wait of its own with [`set_pause`] (a request its server
+//!   holds, `Atomics.wait` where the page is cross-origin isolated or under
+//!   Node), and the library watches the clock only for what that wait leaves
+//!   over, or for the whole pause when the host gives none;
 //! - **the store**: SQLite's OPFS storage (`opfs-sahpool`), installed with
 //!   [`install_store`] before a wallet is opened. Every write SQLite commits
 //!   is on disk before the next statement runs, as with the native file, so
@@ -34,9 +40,28 @@ use wasm_bindgen::prelude::*;
 // The platform
 // ---------------------------------------------------------------------------
 
-/// A synchronous `XMLHttpRequest` per request, and a pause that waits on the
-/// clock.
+/// A synchronous `XMLHttpRequest` per request, and a pause through the host's
+/// wait ([`set_pause`]).
 struct Worker;
+
+thread_local! {
+	/// The host's wait: a function of milliseconds that blocks this thread
+	/// for up to that long without using the processor. None: the clock.
+	static PAUSE: std::cell::RefCell<Option<js_sys::Function>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Waits `ms` milliseconds: through the host's wait, then on the clock for
+/// whatever it left over. The host's wait may end early, fail or be absent,
+/// and the pause is still whole: it never ends before `ms`.
+fn pause_ms(ms: f64) {
+	let until = js_sys::Date::now() + ms;
+	let host = PAUSE.with(|p| p.borrow().clone());
+	if let Some(f) = host {
+		// A thrown error is the host's wait failing; the clock finishes the pause.
+		let _ = f.call1(&JsValue::NULL, &JsValue::from_f64(ms));
+	}
+	while js_sys::Date::now() < until {}
+}
 
 fn js_text(v: JsValue) -> String {
 	v.as_string()
@@ -65,12 +90,30 @@ impl Platform for Worker {
 		Ok(Response { status: i32::from(status), body: x.response_text().map_err(js_text)?.unwrap_or_default() })
 	}
 
-	/// Waits on the clock. A worker blocked in the library has nothing else
-	/// to do, and `Atomics.wait` needs a cross-origin-isolated page.
+	/// Waits through the host's wait, and on the clock for what it leaves.
 	fn sleep(&self, d: Duration) {
-		let until = js_sys::Date::now() + d.as_millis() as f64;
-		while js_sys::Date::now() < until {}
+		pause_ms(d.as_millis() as f64);
 	}
+}
+
+/// Gives the library the host's wait, `wait(ms)`: a function that blocks the
+/// calling thread for up to `ms` milliseconds without using the processor,
+/// and returns. It may return early or throw; the library then waits out the
+/// rest on the clock, which keeps a core busy, so a host that can wait
+/// without one should give it. `null` takes it back. How the host waits is
+/// its own: a synchronous request its server holds, `Atomics.wait` on a
+/// shared buffer where the page is cross-origin isolated or under Node.
+#[wasm_bindgen(js_name = setPause)]
+pub fn set_pause(wait: Option<js_sys::Function>) {
+	PAUSE.with(|p| *p.borrow_mut() = wait);
+}
+
+/// Waits `ms` milliseconds as the library does between two tries: through
+/// the host's wait ([`set_pause`]), never less than `ms`. For a host to check
+/// its wait.
+#[wasm_bindgen]
+pub fn pause(ms: f64) {
+	pause_ms(ms.max(0.0));
 }
 
 /// Installs SQLite's OPFS storage in `directory` as the default, and

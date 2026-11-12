@@ -48,8 +48,24 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   time for all its clients: a scan it refuses as busy with another's waits on
   the pause and is asked again, for two minutes at most, and the refusal is
   never kept as the chain's answer.
-- **The pause** waits on the clock: a worker blocked in the library has nothing
-  else to do, and `Atomics.wait` needs a cross-origin-isolated page.
+- **The pause** between two tries (a node or proxy that answers busy or "too
+  many calls", an operator that does not answer) is the host's to give. A worker
+  blocked in the library has nothing else to do, but a pause that watches the
+  clock keeps a processor core busy for the whole of it, and a long restore
+  behind a rate-limited proxy pauses for minutes. So the host hands the library
+  a wait of its own with `setPause(wait)`: `wait(ms)` blocks the thread for up to
+  `ms` milliseconds without using the processor, and returns. The library calls
+  it for each pause and watches the clock only for what it left over, so a wait
+  that returns early, throws or is never given still makes a whole pause, at the
+  cost of a busy core. How the host waits is its own choice, and the library
+  names no address for it:
+  - under Node, or in a page that is cross-origin isolated, `Atomics.wait` on a
+    `SharedArrayBuffer`;
+  - in any other page, a synchronous request to a server of its own origin that
+    holds the request open for the pause and then answers (the web wallet asks
+    its node proxy's `/hold`).
+
+  `pause(ms)` makes one pause as the library does, for a host to check its wait.
 - **The store** is the same SQLite schema, on SQLite's OPFS storage
   (`opfs-sahpool`, from `sqlite-wasm-vfs`), which `installStore` installs as the
   default before a wallet is opened. SQLite commits every write to disk before the
@@ -88,10 +104,11 @@ directory.
 ## The API
 
 ```js
-import init, { installStore, ArcaWallet, arcaWalletExists } from './pkg/leaf_wallet.js'
+import init, { installStore, setPause, ArcaWallet, arcaWalletExists } from './pkg/leaf_wallet.js'
 
 await init()
 await installStore('.leaf-wallet')               // in a dedicated worker, once
+setPause((ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms))  // where the host may
 if (!arcaWalletExists(mnemonic)) {
   const w = ArcaWallet.create(mnemonic, JSON.stringify({
     server: 'https://host/operator', node_url: 'https://host/node',
@@ -222,7 +239,10 @@ stands. A spend the operator refuses because a coin of the wallet's is spent
 already, by another store of the same mnemonic (a second device), has the
 wallet read what its other stores did at once, so it stops counting that coin
 and holds what replaced it; a `swap_cancel` that meets such a coin cancels the
-acceptance without a respend.
+acceptance without a respend. A `swap_cancel` whose respend went unanswered
+never calls the acceptance cancelled until the operator has answered it: the
+next one posts the respend again and answers `cancelled`, `done`, or, while
+the operator cannot be reached, `cancelled: false` with `unknown: true`.
 
 `quote` is the refresh fee, coin by coin, that `participate` would pay; the page
 shows it, and `participate` goes ahead only when `shown` equals the fees it

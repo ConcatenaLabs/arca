@@ -3087,8 +3087,27 @@ impl Wallet {
 		if state == "done" {
 			return Err(Error::Refused(format!("swap {} is done", id)));
 		}
-		let held: Vec<CoinRow> = self.store.coins_in("offered")?.into_iter().filter(|c| c.note == format!("swap {}", id)).collect();
-		if role == "taker" && state == "accepted" && !held.is_empty() {
+		let accepted = role == "taker" && state == "accepted";
+		if accepted {
+			if let Some(answer) = self.swap_cancel_sending(id)? {
+				return Ok(answer);
+			}
+		}
+		let mut held: Vec<CoinRow> = self.store.coins_in("offered")?.into_iter().filter(|c| c.note == format!("swap {}", id)).collect();
+		if accepted {
+			// A coin signed into the acceptance that the store holds live (its
+			// respend refused and put back, by a sync that posted it again) is
+			// unspent as far as the wallet knows: the maker can complete with
+			// it, so it is respent like a held one.
+			for l in self.acceptance_coins(id)? {
+				if !held.iter().any(|c| c.leaf_id == l) {
+					if let Some(c) = self.store.coin(&l)?.filter(|c| c.state == "live") {
+						held.push(c);
+					}
+				}
+			}
+		}
+		if accepted && !held.is_empty() {
 			let ids: Vec<String> = held.iter().map(|c| c.leaf_id.clone()).collect();
 			return match self.respend_to_self(held) {
 				Ok(answer) => {
@@ -3109,6 +3128,21 @@ impl Wallet {
 				},
 			};
 		}
+		if accepted {
+			// Nothing signed into the acceptance is held or unspent: each coin
+			// in it is spent, by the wallet's own respend or by the swap. What
+			// the swap pays the wallet says which; without a read of the
+			// mailbox, the wallet does not know.
+			if let Err(e) = self.mailbox() {
+				return Ok(json!({"swap": id, "cancelled": false, "unknown": true, "error": e.to_string(),
+					"note": "the coins signed into the acceptance are spent, and the mailbox, which says whether by the swap, could not be \
+					read: run swap cancel again shortly"}));
+			}
+			if self.swap_paid(id)? {
+				return Ok(json!({"swap": id, "cancelled": false, "done": true,
+					"note": "the maker completed the swap: what it pays the wallet has arrived"}));
+			}
+		}
 		let mut freed = vec![];
 		for c in held {
 			self.store.set_coin_state(&c.leaf_id, "live", "")?;
@@ -3116,6 +3150,84 @@ impl Wallet {
 		}
 		self.store.set_swap(id, "cancelled", None)?;
 		Ok(json!({"swap": id, "cancelled": true, "freed": freed}))
+	}
+
+	/// The wallet's own coins signed into swap `id`, which it accepted: the
+	/// inputs of its acceptance past the offer's, by leaf id.
+	fn acceptance_coins(&mut self, id: &str) -> Result<Vec<String>, Error> {
+		let Some((_, offer, Some(accept), _)) = self.store.swap(id)? else { return Ok(vec![]) };
+		let (Ok(offer), Ok(accept)) = (serde_json::from_str::<Value>(&offer), serde_json::from_str::<Value>(&accept)) else {
+			return Ok(vec![]);
+		};
+		let n_in = offer["inputs"].as_array().map_or(0, |a| a.len());
+		let mut out = vec![];
+		for i in accept["inputs"].as_array().into_iter().flatten().skip(n_in) {
+			let l = i["leaf_id"].as_str().unwrap_or("");
+			if self.store.coin(l)?.is_some() {
+				out.push(l.to_string());
+			}
+		}
+		Ok(out)
+	}
+
+	/// A coin signed into acceptance `id` waits for the answer to a transfer
+	/// request of the wallet's (`sending`): a cancel's respend whose answer
+	/// was lost. Until the operator has co-signed that respend the maker can
+	/// complete the acceptance, so the wallet never calls it cancelled on
+	/// that coin: it posts the request again, the same bytes, which the
+	/// operator answers as it did the first time, or now. Co-signed: the
+	/// swap is cancelled. Refused because a coin of it is spent: the swap
+	/// completed, or something else spent the coin, which
+	/// [`Self::swap_cancel_spent`] tells apart. Unanswered again: the answer
+	/// says the wallet does not know yet, and the swap stays accepted.
+	/// `None` when no coin of the acceptance is sending, or a refusal put
+	/// them back live, to be respent afresh.
+	fn swap_cancel_sending(&mut self, id: &str) -> Result<Option<Value>, Error> {
+		let signed = self.acceptance_coins(id)?;
+		let mut requests = vec![];
+		for l in &signed {
+			if let Some(c) = self.store.coin(l)?.filter(|c| c.state == "sending") {
+				if let Some(n) = c.note.strip_prefix("transfer request ").and_then(|n| n.parse::<i64>().ok()) {
+					if !requests.contains(&n) {
+						requests.push(n);
+					}
+				}
+			}
+		}
+		if requests.is_empty() && !signed.iter().any(|l| self.store.coin(l).ok().flatten().is_some_and(|c| c.state == "sending")) {
+			return Ok(None);
+		}
+		let standing = self.store.transfers_in("requested")?;
+		let (mut respent, mut spent, mut errors) = (None, None, vec![]);
+		for n in requests {
+			let Some((_, body, inputs)) = standing.iter().find(|t| t.0 == n) else { continue };
+			let body: Value = serde_json::from_str(body).map_err(|e| Error::Store(e.to_string()))?;
+			let mine: Vec<String> = serde_json::from_str(inputs).map_err(|e| Error::Store(e.to_string()))?;
+			match self.post_transfer(n, &body, &mine) {
+				Ok(v) => respent = Some(v),
+				Err(Error::Server { code, message, .. }) if code == "double_spend" => spent = Some(message),
+				Err(e) => errors.push(e.to_string()),
+			}
+		}
+		let sending: Vec<String> = signed.iter().filter(|l| self.store.coin(l).ok().flatten().is_some_and(|c| c.state == "sending")).cloned().collect();
+		if !sending.is_empty() {
+			return Ok(Some(json!({"swap": id, "cancelled": false, "acceptance_stands": true, "unknown": true, "sending": sending,
+				"error": errors.join("; "),
+				"note": "the answer to the transfer that respends the coins signed into the acceptance has not come: the maker can \
+				complete the acceptance until the operator co-signs that transfer, and the wallet does not know yet whether it has; run \
+				swap cancel again shortly"})));
+		}
+		if let Some(message) = spent {
+			return self.swap_cancel_spent(id, &signed, &message).map(Some);
+		}
+		match respent {
+			Some(transfer) if !signed.iter().any(|l| self.store.coin(l).ok().flatten().is_some_and(|c| matches!(c.state.as_str(), "live" | "offered"))) => {
+				self.store.set_swap(id, "cancelled", None)?;
+				Ok(Some(json!({"swap": id, "cancelled": true, "respent": signed, "transfer": transfer,
+					"note": "the coins signed into the acceptance moved to a fresh leaf of the wallet's own: the acceptance can never complete"})))
+			},
+			_ => Ok(None),
+		}
 	}
 
 	/// The cancel of acceptance `id` found a coin signed into it (`ids`)
