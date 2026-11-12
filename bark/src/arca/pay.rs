@@ -620,7 +620,7 @@ impl Wallet {
 	/// [`Error::SettleFirst`] for a spend of `asset` that `live` of the
 	/// coins it may take now does not cover, needing `need`, when the coins
 	/// [`Self::round_first`] names would: `None` when they would not.
-	fn settle_first_of(&self, asset: AssetId, live: u64, need: u64, held: Vec<(String, u64, &'static str)>) -> Option<Error> {
+	pub(crate) fn settle_first_of(&self, asset: AssetId, live: u64, need: u64, held: Vec<(String, u64, &'static str)>) -> Option<Error> {
 		let more: u64 = held.iter().map(|(_, v, _)| *v).sum();
 		let mut whys: Vec<&str> = held.iter().map(|(_, _, w)| *w).collect();
 		whys.dedup();
