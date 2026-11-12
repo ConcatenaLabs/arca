@@ -34,6 +34,10 @@ sqlite-bundled = ["arca-wallet/sqlite-bundled"]
 
 barkd-swagger-ui = ["arca-rest/swagger-ui"]
 
+# The test of a trade refused after its coin was shaped, alone: see
+# arca-wallet's feature of the same name. Never in a shipped build.
+shape-probe = ["arca-wallet/shape-probe"]
+
 [dependencies]
 arca-lib = { version = "0.7.1", path = "../lib" }
 arca-json = { version = "0.7.1", path = "../bark-json" }
@@ -79,3 +83,7 @@ elements.workspace = true
 tokio-postgres = "0.7"
 rusqlite = "0.31.0"
 tokio = { workspace = true, features = [ "time" ] }
+
+[[test]]
+name = "arca_shaped"
+required-features = ["shape-probe"]
