@@ -2608,7 +2608,16 @@ impl Wallet {
 		}
 		// Published and spent: by a claim, which publishes the preimage, or by
 		// the wallet's own refund. Only a final spend decides the coin.
-		if let Some((ftx, h)) = self.chain.find_payment(&out, f.from_height)? {
+		// Searched from above the block the last empty search reached, when
+		// the stretch read now hangs from that very block (a hash names its
+		// ancestors, so the blocks below are the ones read); after a
+		// reorganisation below it, of any depth, from the forfeit's own
+		// height ([`super::chain::ChainSource::find_forfeit_payment`]). So a
+		// forfeit followed for days is read in the blocks since the last
+		// sync, not from its round at every session. What is kept is the top
+		// of the stretch the search itself read.
+		let found = self.chain.find_forfeit_payment(&self.store, f, &out, || ())?;
+		if let Some((ftx, h)) = found {
 			let vout = ftx.output.iter().position(|o| *o == out).expect("pays it") as u32;
 			let at = OutPoint::new(ftx.txid(), vout);
 			if let Some((spender, _)) = self.chain.spender(&at, h)? {

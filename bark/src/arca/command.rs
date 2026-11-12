@@ -217,6 +217,10 @@ fn run_costed(w: &mut Wallet, command: &str, args: &Value) -> (Result<Value, Err
 	let (t1, (n1, _), g1) = (web_time::Instant::now(), w.chain.calls(), super::chain::gaps());
 	let by1 = w.chain.asked_by_method();
 	let result = command_of(w, command, args);
+	// What the command's searches read of the chain is kept for the next
+	// session; a store that cannot keep it costs that session the reads, no
+	// more.
+	let _ = w.keep_chain_seen();
 	let (n2, _) = w.chain.calls();
 	let mut cost = json!({
 		"start": {"ms": (t1 - t0).as_millis() as u64, "node": n1 - n0, "operator": g1 - g0},
