@@ -140,16 +140,12 @@ impl Store {
 	/// indexes only (`chain::unfinal_with`).
 	pub async fn boards_credited_not_final(&self, certification: bool, anchor_depth: u64) -> Result<Vec<BoardRow>, StoreError> {
 		let conn = self.conn().await?;
-		let whole = !self.whole_read("boards");
 		let rows = conn.query(
 			&format!("WITH {} SELECT {} FROM board WHERE state = 'credited' AND txid IN (SELECT txid FROM unfinal)
 				ORDER BY created_at",
-				super::chain::unfinal_with("SELECT txid FROM board WHERE state = 'credited'", whole), BOARD_COLUMNS),
+				super::chain::unfinal_with("SELECT txid FROM board WHERE state = 'credited'"), BOARD_COLUMNS),
 			&[&certification, &i64::try_from(anchor_depth).unwrap_or(i64::MAX)],
 		).await?;
-		if whole {
-			self.whole_read_done("boards");
-		}
 		rows.iter().map(board_row).collect()
 	}
 

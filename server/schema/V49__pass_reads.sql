@@ -20,15 +20,19 @@ CREATE TABLE IF NOT EXISTS watch_touch (
 );
 CREATE INDEX IF NOT EXISTS watch_touch_by_xid ON watch_touch (xid);
 
--- Every watched transaction a block's disconnection takes out of the chain:
--- what the passes that find a final transaction no longer final read, rather
--- than every final transaction there is (`chain::unfinal_with`).
+-- Every transaction that may be held final (a final nursery transaction or
+-- round, a credited board) while no block holds it: one a block's
+-- disconnection took out of the chain, and one made final, or written final,
+-- while no block held it. The passes that find a final transaction no longer
+-- final read these rather than every final transaction there is
+-- (`chain::unfinal_with`); the triggers below fill it in the transaction that
+-- makes the change, whichever code path writes it, so it holds every such
+-- transaction any snapshot can show, and the rounds pass removes the ones a
+-- block holds again or that nothing holds final any more.
 CREATE TABLE IF NOT EXISTS tx_unblocked (
-	xid  xid8 NOT NULL DEFAULT pg_current_xact_id(),
-	txid BYTEA NOT NULL,
-	at   TIMESTAMPTZ NOT NULL DEFAULT now()
+	txid BYTEA NOT NULL
 );
-CREATE INDEX IF NOT EXISTS tx_unblocked_by_xid ON tx_unblocked (xid);
+CREATE INDEX IF NOT EXISTS tx_unblocked_by_txid ON tx_unblocked (txid);
 
 -- Where the watcher's reads stand, kept across restarts: the median time up
 -- to which it has taken the batches whose dates came due (`due_mtp`), and
@@ -150,6 +154,17 @@ BEGIN
 	RETURN NULL;
 END $$;
 
+-- A row written final (or credited) while no block holds its transaction:
+-- logged for the same passes.
+CREATE OR REPLACE FUNCTION final_unblocked() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	INSERT INTO tx_unblocked (txid)
+	SELECT DISTINCT n.txid FROM touched n
+	WHERE n.txid IS NOT NULL AND n.state::text = TG_ARGV[0]
+	  AND NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = n.txid);
+	RETURN NULL;
+END $$;
+
 DO $$
 DECLARE
 	t TEXT;
@@ -177,7 +192,21 @@ BEGIN
 	END LOOP;
 	CREATE TRIGGER watch_unblocked AFTER DELETE ON tx_block REFERENCING OLD TABLE AS touched
 		FOR EACH STATEMENT EXECUTE FUNCTION watch_unblocked();
+	FOREACH t IN ARRAY ARRAY['nursery_tx:final', 'round:final', 'board:credited']
+	LOOP
+		EXECUTE format('CREATE TRIGGER final_unblocked_ins AFTER INSERT ON %I REFERENCING NEW TABLE AS touched
+			FOR EACH STATEMENT EXECUTE FUNCTION final_unblocked(%L)', split_part(t, ':', 1), split_part(t, ':', 2));
+		EXECUTE format('CREATE TRIGGER final_unblocked_upd AFTER UPDATE ON %I REFERENCING NEW TABLE AS touched
+			FOR EACH STATEMENT EXECUTE FUNCTION final_unblocked(%L)', split_part(t, ':', 1), split_part(t, ':', 2));
+	END LOOP;
 END $$;
+
+-- Every transaction held final in no block before the schema step.
+INSERT INTO tx_unblocked (txid)
+SELECT f.txid FROM (SELECT txid FROM nursery_tx WHERE state = 'final'
+                    UNION SELECT txid FROM round WHERE state = 'final' AND txid IS NOT NULL
+                    UNION SELECT txid FROM board WHERE state = 'credited') f
+WHERE NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = f.txid);
 
 -- Every batch of a round not lost is read once, by the first pass after the
 -- schema step, as every pass read it before.

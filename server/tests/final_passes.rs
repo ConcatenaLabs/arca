@@ -85,7 +85,8 @@ impl World {
 		let (sql, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
 		tokio::spawn(conn);
 		// Boards and rounds without the leaves, batches and participations
-		// they hang from: this session skips foreign keys. The store's own
+		// they hang from: this session skips foreign keys while it inserts
+		// them. The store's own
 		// connections, which connect and disconnect blocks, keep them, so a
 		// rollback cascades to tx_block as it does in the server.
 		sql.batch_execute("SET session_replication_role = replica").await.unwrap();
@@ -125,6 +126,10 @@ impl World {
 				).await.unwrap();
 			}
 		}
+		// From here on the session's writes (rows entering and leaving the
+		// final state) fire the triggers as the server's own writes do: a
+		// replica role skips them along with the foreign keys.
+		sql.batch_execute("SET session_replication_role = origin").await.unwrap();
 		World { db, sql, chain: vec![], next_hash: 1, checks: 0, nonempty: 0, rows_seen: 0 }
 	}
 

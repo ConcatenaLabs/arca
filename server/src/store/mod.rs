@@ -299,10 +299,6 @@ pub struct Store {
 	/// The latest head of the signer's record this process gave the
 	/// database or read from it ([`Store::signer_head_latest`]).
 	head_seen: std::sync::Arc<std::sync::Mutex<Option<HeadSeen>>>,
-	/// The passes that found a final transaction no longer final over every
-	/// final transaction once in this process (`chain::unfinal_with`): after
-	/// that each reads only those a disconnection took out of a block.
-	whole_read: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<&'static str>>>,
 }
 
 /// A head of the signer's record: its entry, running hash, and the signer's
@@ -315,16 +311,6 @@ pub struct HeadSeen {
 }
 
 impl Store {
-	/// Whether the pass `name` has read every final transaction in this
-	/// process yet ([`Self::whole_read_done`]).
-	pub(crate) fn whole_read(&self, name: &'static str) -> bool {
-		self.whole_read.lock().unwrap_or_else(|e| e.into_inner()).contains(name)
-	}
-
-	pub(crate) fn whole_read_done(&self, name: &'static str) {
-		self.whole_read.lock().unwrap_or_else(|e| e.into_inner()).insert(name);
-	}
-
 	/// Connects to the database at `url` (a PostgreSQL connection string,
 	/// `postgres://user@host:port/db` or the key-value form) and brings its
 	/// schema up to date.
@@ -337,7 +323,7 @@ impl Store {
 			.connection_timeout(Duration::from_secs(10))
 			.build(manager)
 			.await?;
-		let store = Store { pool, head_seen: Default::default(), whole_read: Default::default() };
+		let store = Store { pool, head_seen: Default::default() };
 		store.migrate().await?;
 		Ok(store)
 	}

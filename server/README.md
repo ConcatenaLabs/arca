@@ -2159,10 +2159,12 @@ logged the same way, `rounds: took …`. The in-flight cap reads only the lowest
 participations at hand rest on, so a round's building does not grow with the
 operator's batches. Within one build of rounds it reads what is in flight
 once, and again only for an asset a round was built in since. The passes that
-find a final round, board or nursery transaction no longer final read every
-final transaction once per start; after that they read the recent blocks and
-only the transactions a block's disconnection took out of the chain in the
-last day (`tx_unblocked`, which a trigger on `tx_block` fills).
+find a final round, board or nursery transaction no longer final read the
+recent blocks and, of the transactions in no block, only those a block's
+disconnection took out of the chain or that were written final while no
+block held them (`tx_unblocked`, which triggers on `tx_block`, `nursery_tx`,
+`round` and `board` fill in the same transaction as the change, and the
+rounds pass empties of what a block holds again or nothing holds final).
 
 ## Issuer-operated assets
 
