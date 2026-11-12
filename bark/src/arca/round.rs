@@ -164,7 +164,7 @@ pub(crate) fn participation_parts(per: &BTreeMap<AssetId, (u64, u64)>, assets: &
 /// more coins of an asset is made in as many participations as it needs;
 /// every other selection stops at this many coins, the largest first when
 /// the wallet holds more.
-pub const MAX_GIVEN: usize = 16;
+pub const MAX_GIVEN: usize = arca_covenant::transfer::MAX_INPUTS;
 
 /// Whether a coin whose first expiry is `expiry` is in its free window at
 /// `now`.
@@ -884,6 +884,11 @@ impl Wallet {
 		let mut out = vec![];
 		let mut first_error = None;
 		let parts = participation_parts(&per, &assets, &coins, channel.is_some());
+		// A channel leaf is one participation, which the operator takes with
+		// at most MAX_GIVEN coins: more is refused here, nothing signed.
+		if channel.is_some() && parts.iter().any(|p| p.3.len() > MAX_GIVEN) {
+			return Err(Error::Refused(format!("a channel opens from at most {} coins: {} are named", MAX_GIVEN, rows.len())));
+		}
 		for (asset, total, fee, mine) in &parts {
 			let rows: Vec<&super::store::CoinRow> = mine.iter().map(|k| &rows[*k]).collect();
 			let ids: Vec<arca_covenant::LeafId> = mine.iter().map(|k| ids[*k]).collect();
