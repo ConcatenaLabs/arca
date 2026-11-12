@@ -368,6 +368,15 @@ pub const ORDER_BLOCK_SECONDS: u32 = 60;
 /// The default cap on a transfer's margins, as a multiple of the least.
 pub const MAX_MARGIN_MULTIPLE: u64 = 25;
 
+/// What a holder of a supervised asset can do with it when the operator
+/// refuses something it does not serve in it: words a page shows as they
+/// are. The wallet that meets this refusal is an older one (an up-to-date
+/// wallet refuses such things itself first), so they say what updating
+/// gives, and the exit, which every build has, until then.
+pub const SUPERVISED_INSTEAD: &str = "An up-to-date wallet can pay the asset to another wallet, swap it by a swap offer, withdraw \
+	it to an address on the chain, or sell it by an order on the chain. Until the wallet is updated, its coins of the asset can be \
+	taken home to its own key by their exit. Nothing was co-signed.";
+
 impl Params {
 	/// The specification's parameters: an exit delay of 36 to 48 hours and a
 	/// depth limit of 5.
@@ -520,7 +529,8 @@ impl Params {
 			(None, None) => Ok(()),
 			(None, Some(_)) => Err(format!("asset {} is not supervised: its leaves are not landing leaves", asset)),
 			(Some(_), None) => Err(format!("asset {} is supervised: every leaf of it is a landing leaf, naming the landing its owner's \
-				exit pays, where a freeze of the asset binds", asset)),
+				exit pays, where a freeze of the asset binds. {}", asset,
+				SUPERVISED_INSTEAD)),
 			(Some(s), Some(l)) => {
 				if self.landing_2_only && !l.own_index {
 					return Err(format!("this operator makes landing-2 leaves only (info.landing_2_only): a leaf of asset {} lands at its \

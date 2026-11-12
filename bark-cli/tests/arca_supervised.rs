@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use common::cli::Arca;
 use common::node::{self, op_true};
 use common::running::{keypair, Running, MIN_LEAF};
-use server::server::AssetSection;
+use server::server::{AssetSection, Server};
 use server::store::RoundState;
 
 fn hex(b: &[u8]) -> String {
@@ -485,6 +485,199 @@ async fn a_holder_takes_part_of_a_supervised_balance_out_and_keeps_the_rest_land
 	let _ = std::fs::remove_dir_all(&a.dir);
 }
 
+/// Fills and Lightning between two wallets holding a supervised asset Z,
+/// with the operator's `landing_2_only` on. Neither is served in Z, by
+/// design: a take's leaf, an `order-3` leaf and its credits, and an `htlc-1`
+/// leaf all pay keys a freeze cannot follow. Each attempt is refused before
+/// anything is signed, and every coin of both wallets keeps its state.
+///
+/// - A places an order on the chain selling Z (its change a `landing-2`
+///   leaf); B's take of it is refused (`supervised`).
+/// - A resting order selling Z, and one paid in Z, are refused.
+/// - The operator refuses to start with a Lightning leg in Z, so it makes
+///   no invoice in Z and pays none: B's receive in Z is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn under_the_switch_fills_and_lightning_in_a_supervised_asset_are_refused_before_signing() {
+	let mut r = Running::start().await;
+	let iss = serve_z(&mut r).await;
+	// The bond posted and an instant limit set: a take gives a coin of
+	// exactly its price, paid to itself first when it holds none.
+	post_bond(&mut r, 1_000_000_000_000).await;
+	let (z, x) = (iss.z.to_string(), r.x.to_string());
+	let (url, node_url) = (r.url(), r.node_url());
+	let (a, b) = (Arca::new("SFA"), Arca::new("SFB"));
+	// An older build, when one is named: the operator's own refusals, which
+	// only a wallet that does not refuse first meets, say what instead too.
+	let older = std::env::var("ARCA_CLI_OLDER").ok().map(|p| Arca::built_from("SFO", std::path::Path::new(&p)));
+	let all: Vec<&Arca> = [Some(&a), Some(&b), older.as_ref()].into_iter().flatten().collect();
+	for &w in &all {
+		w.ok(&create_args(&url, &node_url));
+		for (asset, v) in [(iss.z, 4_000_000), (r.x, 4_000_000)] {
+			let s = script(&w.ok(&["address"]));
+			r.pay_to(s, asset, v);
+		}
+	}
+	r.produce().await;
+	for asset in [&z, &x] {
+		for &w in &all {
+			w.ok(&["board", asset, "1500000"]);
+		}
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	for &w in &all {
+		r.wait("the boards credited", || w.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+		w.ok(&["sync"]);
+		w.ok(&["instant-limit", "1000000000000"]);
+	}
+	r.config.landing_2_only = true;
+	r.restart_server().await;
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+
+	// ---- A fill: an order on the chain selling Z, and B's take ---------------
+	let placed = a.ok(&["order", "place", "--sell", &z, "--amount", "200000", "--for", &x, "--rate-num", "1", "--rate-den", "1",
+		"--expires-in-hours", "48", "--wait", "0"]);
+	let order = placed["order"].as_str().unwrap().to_string();
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.iter().map(|b| b.offboards).sum::<usize>(), 1, "the round pays the order's output");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	let a_change: Vec<Value> = live_in(&a, &z).into_iter().filter(|c| c["value"] == placed["change"]).collect();
+	assert_eq!(a_change.len(), 1, "A's change of Z: {:?}", live_in(&a, &z));
+	assert_eq!(a_change[0]["template"], json!("landing-2"), "{}", a_change[0]);
+	// The order rests on the chain once unlocked into its address (by the
+	// wallet itself after the operator's grace); `orders` then shows its offer.
+	common::node::advance_mtp(&r.rt, 900);
+	r.synced().await;
+	a.ok(&["sync"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	a.ok(&["sync"]);
+	let o = a.ok(&["orders"]).as_array().unwrap().iter().find(|o| o["order"] == order.as_str()).cloned().unwrap();
+	assert_eq!(o["state"], "resting", "{}", o);
+	let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("order-sf-{}.json", std::process::id()));
+	std::fs::write(&path, o["offer"].to_string()).unwrap();
+	let offer = format!("@{}", path.display());
+	let before = (states(&a), states(&b));
+	let (ok, v, err) = b.run_full(&["order", "fill", &offer, "--amount", "200000"]);
+	println!("FILL of an order selling Z: ok {} {} {}", ok, v, err.lines().last().unwrap_or(""));
+	assert!(!ok, "{}", v);
+	says_what_instead(&v);
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	assert_eq!((states(&a), states(&b)), before, "every coin keeps its state after the refused take");
+
+	// ---- Resting orders: selling Z, and paid in Z ------------------------------
+	for (w, sell, want) in [(&a, &z, &x), (&b, &x, &z)] {
+		let before = states(w);
+		let (ok, v, err) = w.run_full(&["order", "rest", "--sell", sell, "--amount", "200000", "--for", want, "--rate-num", "1",
+			"--rate-den", "1", "--min-lot", "100000", "--expires-in-hours", "720"]);
+		println!("RESTING order selling {} for {}: ok {} {} {}", sell, want, ok, v, err.lines().last().unwrap_or(""));
+		assert!(!ok, "{}", v);
+		says_what_instead(&v);
+		w.ok(&["sync"]);
+		assert_eq!(states(w), before, "every coin keeps its state after the refused resting order");
+	}
+
+	// ---- Lightning in Z ----------------------------------------------------------
+	let mut with_leg = r.config.clone();
+	with_leg.listen = "127.0.0.1:0".into();
+	for s in with_leg.assets.iter_mut().filter(|s| s.asset == z) {
+		s.lightning = Some(server::server::LegSection::at("/nonexistent/lightning-rpc"));
+	}
+	let refused = match Server::start(&with_leg).await {
+		Ok(_) => panic!("the operator started with a Lightning leg in supervised Z"),
+		Err(e) => e.to_string(),
+	};
+	println!("REFUSED a Lightning leg in Z: {}", refused);
+	assert!(refused.contains("no Lightning leg serves it"), "{}", refused);
+	let before = (states(&a), states(&b));
+	let (ok, v, err) = b.run_full(&["lightning", "receive", &z, "100000"]);
+	println!("LIGHTNING receive in Z: ok {} {} {}", ok, v, err.lines().last().unwrap_or(""));
+	assert!(!ok, "{}", v);
+	says_what_instead(&v);
+	for w in [&a, &b] {
+		w.ok(&["sync"]);
+	}
+	assert_eq!((states(&a), states(&b)), before, "every coin keeps its state after the refused Lightning attempts");
+
+	// ---- What the refusals name instead, each run once in Z ----------------------
+	// Paid to another wallet.
+	let req = b.ok(&["receive", "--asset", &z, "--amount", "100000"])["request"].as_str().unwrap().to_string();
+	a.ok(&["send", &req]);
+	let s = b.ok(&["sync"]);
+	assert_eq!(s["mailbox"]["accepted"].as_array().map(|v| v.len()), Some(1), "B takes the payment of Z: {}", s);
+	println!("INSTEAD: paid 100000 of Z to another wallet");
+	// Swapped with another wallet by a swap offer: A gives Z for B's X.
+	let offer = a.ok(&["swap", "offer", "--give-asset", &z, "--give", "100000", "--want-asset", &x, "--want", "100000"]);
+	let acc = b.ok(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	a.ok(&["swap", "complete", acc["accept"].as_str().unwrap()]);
+	println!("INSTEAD: swapped 100000 of Z for X by a swap offer");
+	// Withdrawn to an address on the chain.
+	let addr = b.ok(&["address"])["address"].as_str().unwrap().to_string();
+	b.ok(&["sync"]);
+	let out = b.ok(&["offboard", "--asset", &z, "--amount", "100000", "--address", &addr]);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.iter().map(|b| b.offboards).sum::<usize>(), 1, "the round pays the withdrawal: {}", out);
+	println!("INSTEAD: withdrew 100000 of Z to an address, paid by round {}", built[0].tx.txid());
+	// Sold by an order on the chain the wallet places: A's order rests above.
+	println!("INSTEAD: A's order on the chain selling Z rests ({})", order);
+
+	// ---- The operator's own refusals, met by the older build ------------------
+	if let Some(o) = &older {
+		o.ok(&["sync"]);
+		let (ok, v, err) = o.run_full(&["order", "rest", "--sell", &z, "--amount", "200000", "--for", &x, "--rate-num", "1",
+			"--rate-den", "1", "--min-lot", "100000", "--expires-in-hours", "720"]);
+		let m = v.to_string() + &err;
+		println!("OLDER resting order selling Z: ok {} {}", ok, m.lines().next().unwrap_or(""));
+		for w in ["supervised", "An up-to-date wallet can pay the asset", "swap it by a swap offer", "withdraw it to an address",
+			"sell it by an order on the chain", "taken home to its own key by their exit", "Nothing was co-signed"]
+		{
+			assert!(!ok && m.contains(w), "the operator's refusal does not say {:?}: {}", w, m);
+		}
+		// What it names for the older build until it updates: its coin of Z
+		// taken home to its own key by the coin's exit.
+		let coin = live_in(o, &z).first().cloned().expect("the older build's coin of Z");
+		let id = coin["leaf_id"].as_str().unwrap().to_string();
+		let value = atoms(&coin["value"]);
+		let e = o.ok(&["exit", &id]);
+		assert!(matches!(e["state"].as_str(), Some("unrolling" | "waiting")), "{}", e);
+		for _ in 0..8 {
+			r.produce().await;
+			if o.ok(&["exit", &id])["state"] == "waiting" {
+				break;
+			}
+		}
+		tokio::task::block_in_place(|| node::advance_mtp(&r.rt, 512));
+		let e = o.ok(&["exit", &id]);
+		assert_eq!(e["state"], "claimed", "{}", e);
+		let claim_id = elements::Txid::from_str(e["claim"]["txid"].as_str().unwrap()).unwrap();
+		r.produce().await;
+		r.bury().await;
+		let claim = r.rt.client().raw_transaction(&claim_id).unwrap();
+		let landing = script_of(&r, o.ok(&["info"])["landing_address"].as_str().unwrap());
+		assert_eq!(claim.output[0].script_pubkey, landing, "the exit pays the older build's own landing key");
+		assert_eq!(claim.output[0].asset.explicit(), Some(iss.z));
+		let landed = claim.output[0].value.explicit().unwrap();
+		println!("OLDER exit under the switch: {} pays {} of {} of Z to its own landing key ({} vB)", claim_id, landed, value, claim.vsize());
+		o.ok(&["sync"]);
+		assert_eq!(o.ok(&["record", &id])["state"], "exited");
+	}
+	for &w in &all {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// Serves a new supervised asset Z, its signer reading freezes from a node
 /// of its own, as [`a_frozen_holder_lands_its_coin_in_its_own_key`] does.
 async fn serve_z(r: &mut Running) -> Issuer {
@@ -866,4 +1059,17 @@ async fn with_an_instant_limit_a_refusal_names_its_cause_and_nothing_moves_first
 	for w in [&a, &o] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+/// A refusal of something not served in a supervised asset says what its
+/// holder can do instead, and that nothing was signed, naming no command.
+fn says_what_instead(v: &Value) {
+	let m = v["error"]["message"].as_str().unwrap_or("");
+	for w in ["supervised", "paid to another wallet", "swapped with another wallet by a swap offer", "withdrawn to an address",
+		"sold by an order on the chain", "Nothing was signed"]
+	{
+		assert!(m.contains(w), "the refusal does not say {:?}: {}", w, m);
+	}
+	assert!(!m.contains("arca ") && !m.contains('`'), "the refusal names a command: {}", m);
+	println!("REFUSED, saying what instead: {}", m);
 }
