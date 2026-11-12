@@ -118,8 +118,8 @@ transfer the operator co-signed or in a participation the operator released,
 on the owner's own signatures (`given_elsewhere`), so every store shows the
 same coins after its next catch-up, and shows what it held until then. Two
 things make it catch up at once: a spend the operator refuses because a coin
-of the wallet's is spent already, and a re-check that finds the board a live
-coin is, or rests on, spent on the chain by nothing this store did (another
+of the wallet's is spent already, and a re-check that finds a live board coin's
+board spent on the chain by nothing this store did (another
 store gave the coin to a round, whose forfeit the operator then published from
 the board). Each
 store still draws its own nonces, and its mailbox read refuses a coin paid

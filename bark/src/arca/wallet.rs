@@ -2934,15 +2934,17 @@ impl Wallet {
 				if state != c.state {
 					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": state, "why": note}));
 				}
-				if c.state == "live" && state == "pending" && is_board_spent(&note) {
+				if c.state == "live" && state == "pending" && matches!(record, CoinRecord::Board(_)) && is_board_spent(&note) {
 					board_spent.push(c.leaf_id.clone());
 				}
 				self.store.set_coin_state(&c.leaf_id, state, &note)?;
 			}
 		}
-		// A live coin whose board is spent on the chain, by nothing this store
-		// did: most often another store of the mnemonic (a second device) gave
-		// it to a round, whose transaction spends the board. The wallet reads
+		// A live board coin whose board is spent on the chain, by nothing this
+		// store did: most often another store of the mnemonic (a second
+		// device) gave it to a round, and the operator then published its
+		// forfeit from the board. (A coin that only rests on a board spent is
+		// a sender's lineage brought on-chain: the lineage watch takes it.) The wallet reads
 		// what the other stores did now, rather than at its next catch-up, so
 		// it holds the round's coin in place of the one given up, and a
 		// payment that needs the value goes ahead.
