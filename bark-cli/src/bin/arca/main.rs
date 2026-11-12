@@ -1512,7 +1512,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			eprintln!("arca: re-check on start: {}", v);
 		}
 	}
-	match cli.command {
+	let out = match cli.command {
 		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } | Cmd::BtcWatchtower(_) => unreachable!("handled above"),
 		Cmd::Info => w.info(),
 		Cmd::Supply { asset: a } => w.supply(asset(&a)?),
@@ -1802,7 +1802,12 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		},
 		Cmd::Claims { scan } => w.claims(scan),
 		Cmd::Claim { claims, scan } => w.claim(&claims, scan),
-	}
+	};
+	// What the command's searches read of the chain is kept for the next
+	// command, each a process of its own: a store that cannot keep it costs
+	// that command the reads, no more.
+	let _ = w.keep_chain_seen();
+	out
 }
 
 /// The claims of a distribution's list: a file, or `-` for standard input,

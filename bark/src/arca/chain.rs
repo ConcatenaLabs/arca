@@ -30,6 +30,18 @@
 //! by its id, and with `-validateanchor`, without which it has no notion of
 //! finality.
 //!
+//! **The blocks seen.** A search of the chain (who pays a script, who spends
+//! an outpoint) reads each block it crosses once and keeps a summary of it
+//! by its hash: short digests of what it pays and spends, its height, its
+//! parent ([`BlockSeen`]). Each block's bytes are checked against the hash
+//! asked before anything of it is kept. The wallet keeps the summaries in its
+//! store too (`chain_seen`), so a new session (a page reloaded, a command of
+//! its own process) reads only the blocks it has not seen. Which blocks are in
+//! the active chain is read in each view, from the hash at the top of the
+//! chain down through each block's parent, so a summary of a block a
+//! reorganisation took out, of any depth, is never used. At most
+//! [`SEEN_MOST`] are kept, the lowest heights dropped first.
+//!
 //! **The view.** Every answer the wallet reads of the chain is fixed by three
 //! things: the tip of the active chain (`bestblockhash`), the node's view of
 //! its anchors (`getanchorstatus`), and the transactions in its mempool
@@ -322,8 +334,12 @@ struct Memo {
 	/// ([`ChainSource::seen_range`]). So a block is read and decoded once for
 	/// every search that crosses it, in every later command too: a wallet with
 	/// hundreds of coins resting on outputs spent long ago searched the same
-	/// blocks once for each coin, in each command.
+	/// blocks once for each coin, in each command. The wallet keeps them in
+	/// its store as well ([`ChainSource::seen_to_keep`]), so a new session
+	/// reads only the blocks it has not seen; at most [`SEEN_MOST`].
 	seen: HashMap<BlockHash, Arc<BlockSeen>>,
+	/// The blocks of [`Memo::seen`] read since the wallet last kept them.
+	unkept: Vec<BlockHash>,
 	/// Blocks decoded from the node's bytes ([`ChainSource::blocks_decoded`]).
 	decoded: u64,
 	/// What each script scanned for in this view's set of unspent outputs
@@ -338,32 +354,123 @@ struct Memo {
 	view_drops: u64,
 }
 
-/// What a block pays and spends, as a search of the chain needs it: each
-/// output's script and each input's outpoint, with the place of its
-/// transaction in the block; and the block's parent, which links the blocks
-/// of a search to the hash at its top.
-#[derive(Debug)]
+/// What a block pays and spends, as a search of the chain needs it: a short
+/// digest ([`digest`]) of each output's script and of each input's outpoint;
+/// the block's height; and its parent, which links the blocks of a search to
+/// the hash at its top. A digest only says where to look: a block whose
+/// digests match what a search looks for is read again and its transactions
+/// compared in full, so a digest that matches by chance costs one read and
+/// never a wrong answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockSeen {
 	prev: BlockHash,
-	/// Each output's script, with its transaction's place and its index.
-	pays: Vec<(Script, u32, u32)>,
-	/// Each input's outpoint, with its transaction's place.
-	spends: Vec<(OutPoint, u32)>,
+	height: u64,
+	pays: Box<[u64]>,
+	spends: Box<[u64]>,
+}
+
+/// The most blocks the wallet keeps a [`BlockSeen`] of, in memory and in its
+/// store: 100,000, about 69 days of one-minute blocks. A block of ten
+/// outputs and ten inputs costs about 315 bytes in the store and 200 to 330
+/// bytes in memory, so the index holds some 30 MB at the bound, and more
+/// where blocks are larger. Past it, the blocks of the
+/// lowest heights are dropped first ([`ChainSource::seen_to_keep`]); a search
+/// below them reads them again.
+pub const SEEN_MOST: usize = 100_000;
+
+/// The merkle root of `block`'s transactions, by their txids, as a header
+/// commits to it (an odd last node paired with itself); `None` for a block
+/// with none.
+fn merkle_root(block: &Block) -> Option<elements::TxMerkleNode> {
+	use elements::hashes::{sha256d, Hash};
+	let mut level: Vec<[u8; 32]> = block.txdata.iter().map(|t| t.txid().to_byte_array()).collect();
+	if level.is_empty() {
+		return None;
+	}
+	while level.len() > 1 {
+		if level.len() % 2 == 1 {
+			level.push(*level.last().expect("one at least"));
+		}
+		level = level.chunks(2).map(|p| {
+			let mut b = [0u8; 64];
+			b[..32].copy_from_slice(&p[0]);
+			b[32..].copy_from_slice(&p[1]);
+			sha256d::Hash::hash(&b).to_byte_array()
+		}).collect();
+	}
+	Some(elements::TxMerkleNode::from_byte_array(level[0]))
+}
+
+/// The first eight bytes of the SHA-256 of `bytes`, as a number.
+fn digest(bytes: &[u8]) -> u64 {
+	use elements::hashes::{sha256, Hash};
+	let h = sha256::Hash::hash(bytes);
+	u64::from_le_bytes(h.to_byte_array()[..8].try_into().expect("eight bytes"))
+}
+
+/// [`digest`] of an output's script.
+fn script_digest(script: &Script) -> u64 {
+	digest(script.as_bytes())
+}
+
+/// [`digest`] of an outpoint, as a transaction's input serialises it.
+fn outpoint_digest(o: &OutPoint) -> u64 {
+	digest(&elements::encode::serialize(o))
 }
 
 impl BlockSeen {
-	fn of(block: &Block) -> BlockSeen {
+	fn of(block: &Block, height: u64) -> BlockSeen {
 		let mut pays = vec![];
 		let mut spends = vec![];
-		for (t, tx) in block.txdata.iter().enumerate() {
-			for (v, o) in tx.output.iter().enumerate() {
-				pays.push((o.script_pubkey.clone(), t as u32, v as u32));
-			}
-			for i in &tx.input {
-				spends.push((i.previous_output, t as u32));
-			}
+		for tx in &block.txdata {
+			pays.extend(tx.output.iter().map(|o| script_digest(&o.script_pubkey)));
+			spends.extend(tx.input.iter().map(|i| outpoint_digest(&i.previous_output)));
 		}
-		BlockSeen { prev: block.header.prev_blockhash, pays, spends }
+		pays.sort_unstable();
+		pays.dedup();
+		spends.sort_unstable();
+		spends.dedup();
+		BlockSeen { prev: block.header.prev_blockhash, height, pays: pays.into(), spends: spends.into() }
+	}
+
+	fn may_pay(&self, d: u64) -> bool {
+		self.pays.binary_search(&d).is_ok()
+	}
+
+	fn may_spend(&self, d: u64) -> bool {
+		self.spends.binary_search(&d).is_ok()
+	}
+}
+
+/// A [`BlockSeen`] as the wallet's store keeps it: the block's hash, height
+/// and parent, and its digests, eight bytes each, little-endian.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenRow {
+	pub hash: BlockHash,
+	pub height: u64,
+	pub prev: BlockHash,
+	pub pays: Vec<u8>,
+	pub spends: Vec<u8>,
+}
+
+impl SeenRow {
+	fn of(hash: BlockHash, b: &BlockSeen) -> SeenRow {
+		let bytes = |d: &[u64]| d.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+		SeenRow { hash, height: b.height, prev: b.prev, pays: bytes(&b.pays), spends: bytes(&b.spends) }
+	}
+
+	/// The summary the row keeps; `None` for a row whose digests are not a
+	/// whole number of eight bytes or not in order (a store damaged or of
+	/// another kind): the block is then read again.
+	fn seen(&self) -> Option<BlockSeen> {
+		let digests = |b: &[u8]| -> Option<Box<[u64]>> {
+			if b.len() % 8 != 0 {
+				return None;
+			}
+			let d: Vec<u64> = b.chunks(8).map(|c| u64::from_le_bytes(c.try_into().expect("eight bytes"))).collect();
+			d.windows(2).all(|w| w[0] < w[1]).then(|| d.into())
+		};
+		Some(BlockSeen { prev: self.prev, height: self.height, pays: digests(&self.pays)?, spends: digests(&self.spends)? })
 	}
 }
 
@@ -1012,10 +1119,63 @@ impl ChainSource {
 		self.call("getblockchaininfo", &[])
 	}
 
+	/// The block of hash `hash`, as the node serves it, refused unless its
+	/// bytes hash to `hash`: a node or a route serving another block's bytes
+	/// for it would otherwise have the wallet take that block's payments and
+	/// spends as this one's, and keep them ([`Memo::seen`]).
 	fn raw_block(&self, hash: &BlockHash) -> Result<Block, RpcError> {
-		let hex: String = self.call("getblock", &[json!(hash.to_string()), json!(0)])?;
+		let params = [json!(hash.to_string()), json!(0)];
+		let hex: String = self.call("getblock", &params)?;
 		self.memo.lock().expect("the chain memo").decoded += 1;
-		decode("block", &hex)
+		let block: Block = decode("block", &hex)?;
+		if block.block_hash() != *hash {
+			self.memo.lock().expect("the chain memo").named.remove(&Self::read_key("getblock", &params));
+			return Err(RpcError::Decode { what: "block", error: format!("the node served block {} for block {}", block.block_hash(), hash) });
+		}
+		// The header's hash binds the header alone: the transactions are bound
+		// to it by the merkle root of their txids, which commits to every
+		// output's script and every input's outpoint a summary keeps (none of
+		// it is witness data). A block served with a transaction left out,
+		// added or changed is refused.
+		if merkle_root(&block) != Some(block.header.merkle_root) {
+			self.memo.lock().expect("the chain memo").named.remove(&Self::read_key("getblock", &params));
+			return Err(RpcError::Decode { what: "block", error: format!("the node served block {} with transactions its header does not commit to", hash) });
+		}
+		Ok(block)
+	}
+
+	/// Takes `rows`, the blocks a wallet's store kept ([`Self::seen_to_keep`]),
+	/// as blocks seen: a search reaches each only through the parent hashes
+	/// from the top of the active chain, so one a reorganisation took out is
+	/// never used, however deep it was. A row that does not read is left out.
+	pub fn see_kept(&self, rows: &[SeenRow]) {
+		let mut m = self.memo.lock().expect("the chain memo");
+		for r in rows {
+			if let Some(b) = r.seen() {
+				m.seen.entry(r.hash).or_insert_with(|| Arc::new(b));
+			}
+		}
+	}
+
+	/// The blocks seen since the last call, for the wallet's store to keep;
+	/// and, when more than [`SEEN_MOST`] are seen, the height below which
+	/// every block is dropped, here and from the store, the lowest first (to
+	/// nine tenths of the bound, so the drop is not made at every command).
+	/// Run between commands, never in a search: a search holds what it walks.
+	pub fn seen_to_keep(&self) -> (Vec<SeenRow>, Option<u64>) {
+		let mut m = self.memo.lock().expect("the chain memo");
+		let unkept = std::mem::take(&mut m.unkept);
+		let mut below = None;
+		if m.seen.len() > SEEN_MOST {
+			let mut heights: Vec<u64> = m.seen.values().map(|b| b.height).collect();
+			let drop = m.seen.len() - SEEN_MOST * 9 / 10;
+			let (_, cut, _) = heights.select_nth_unstable(drop);
+			let cut = *cut;
+			m.seen.retain(|_, b| b.height >= cut);
+			below = Some(cut);
+		}
+		let rows = unkept.iter().filter_map(|h| m.seen.get(h).map(|b| SeenRow::of(*h, b))).collect();
+		(rows, below)
 	}
 
 	/// How many blocks this source has decoded from the node's bytes: what a
@@ -1629,10 +1789,16 @@ impl ChainSource {
 			return Ok(seen);
 		}
 		let tip = self.tip()?.height;
-		for (_, _, b) in self.seen_range(from_height, tip)? {
-			for (script, _, _) in &b.pays {
-				if scripts.contains(script) {
-					seen.insert(script.clone());
+		let digests: BTreeSet<u64> = scripts.iter().map(script_digest).collect();
+		for (_, hash, b) in self.seen_range(from_height, tip)? {
+			if !digests.iter().any(|d| b.may_pay(*d)) {
+				continue;
+			}
+			for tx in self.raw_block(&hash).map_err(node)?.txdata {
+				for o in tx.output {
+					if scripts.contains(&o.script_pubkey) {
+						seen.insert(o.script_pubkey);
+					}
 				}
 			}
 		}
@@ -1660,18 +1826,82 @@ impl ChainSource {
 	/// [`Self::find_payment`] gives for it alone: the first transaction from
 	/// its own height up that pays it.
 	pub fn find_payments(&self, wanted: &[(TxOut, u64)]) -> Result<Vec<Option<(Transaction, u64)>>, Error> {
-		let mut found: Vec<Option<(Transaction, u64)>> = vec![None; wanted.len()];
+		let mut found = vec![None; wanted.len()];
 		let Some(from) = wanted.iter().map(|(_, h)| *h).min() else { return Ok(found) };
+		let tip = self.tip()?.height;
+		self.payments_in(wanted, self.seen_range(from, tip)?, &mut found)?;
+		Ok(found)
+	}
+
+	/// [`Self::find_payment`] from `from_height`, or, when `after` names a
+	/// block (height and hash) an earlier search of it read up to and found
+	/// nothing, from the block above it, provided the stretch read now hangs
+	/// from that very block: its lowest block's parent is it. Every block the
+	/// earlier search read is then this chain's, since a hash names all its
+	/// ancestors; otherwise (a reorganisation below it, of any depth) the
+	/// search reads from `from_height`. With the answer, the block at the top
+	/// of the stretch read: every block read is it or one of its ancestors,
+	/// so it is what a later search may start above.
+	/// The payment of forfeit `f`'s output `output` in the active chain, as
+	/// `watch_forfeit` follows it across sessions: searched from above the
+	/// block the store says the last empty search reached
+	/// (`forfeit.searched`), on the terms of [`Self::find_payment_after`],
+	/// and, when none is found, the top of the stretch read kept as the next
+	/// search's start. `between` runs after the mark is read and before the
+	/// search (a test's node moving meanwhile; `watch_forfeit` passes
+	/// nothing).
+	pub(crate) fn find_forfeit_payment(&self, store: &super::store::Store, f: &super::store::ForfeitRow, output: &TxOut,
+		between: impl FnOnce()) -> Result<Option<(Transaction, u64)>, Error>
+	{
+		let after = store.forfeit_searched(&f.leaf_id, &f.round)?
+			.and_then(|(h, hash)| BlockHash::from_str(&hash).ok().map(|b| (h, b)));
+		between();
+		let (found, top) = self.find_payment_after(output, f.from_height, after)?;
+		if let (None, Some((h, hash))) = (&found, top) {
+			store.set_forfeit_searched(&f.leaf_id, &f.round, h, &hash.to_string())?;
+		}
+		Ok(found)
+	}
+
+	pub fn find_payment_after(&self, output: &TxOut, from_height: u64, after: Option<(u64, BlockHash)>)
+		-> Result<(Option<(Transaction, u64)>, Option<(u64, BlockHash)>), Error>
+	{
+		let wanted = [(output.clone(), from_height)];
+		let mut found = vec![None];
+		let tip = self.tip()?.height;
+		if let Some((h, hash)) = after.filter(|(h, _)| *h >= from_height) {
+			let range = self.seen_range(h + 1, tip)?;
+			match range.first() {
+				// Nothing above it: the block itself must still stand.
+				None if self.block_hash(h)? == Some(hash) => return Ok((None, Some((h, hash)))),
+				Some((lo, _, b)) if *lo == h + 1 && b.prev == hash => {
+					let top = range.last().map(|(h, hash, _)| (*h, *hash));
+					self.payments_in(&wanted, range, &mut found)?;
+					return Ok((found.pop().flatten(), top));
+				},
+				_ => {},
+			}
+		}
+		let range = self.seen_range(from_height, tip)?;
+		let top = range.last().map(|(h, hash, _)| (*h, *hash));
+		self.payments_in(&wanted, range, &mut found)?;
+		Ok((found.pop().flatten(), top))
+	}
+
+	/// The first payment of each of `wanted` in the blocks of `range` (lowest
+	/// first), into `found`.
+	fn payments_in(&self, wanted: &[(TxOut, u64)], range: Vec<(u64, BlockHash, Arc<BlockSeen>)>, found: &mut [Option<(Transaction, u64)>]) -> Result<(), Error> {
 		let mut by_script: HashMap<&Script, Vec<usize>> = HashMap::new();
+		let mut by_digest: HashMap<u64, Vec<usize>> = HashMap::new();
 		for (i, (o, _)) in wanted.iter().enumerate() {
 			by_script.entry(&o.script_pubkey).or_default().push(i);
+			by_digest.entry(script_digest(&o.script_pubkey)).or_default().push(i);
 		}
-		let tip = self.tip()?.height;
-		let mut left = wanted.len();
-		for (h, hash, b) in self.seen_range(from, tip)? {
+		let mut left = found.iter().filter(|f| f.is_none()).count();
+		for (h, hash, b) in range {
 			// A script that one of them pays is in this block: the block is
 			// decoded and its outputs compared in full, in order.
-			if !b.pays.iter().any(|(script, _, _)| by_script.get(script).is_some_and(|ix| ix.iter().any(|&i| found[i].is_none() && h >= wanted[i].1))) {
+			if !by_digest.iter().any(|(d, ix)| ix.iter().any(|&i| found[i].is_none() && h >= wanted[i].1) && b.may_pay(*d)) {
 				continue;
 			}
 			let block = self.raw_block(&hash).map_err(node)?;
@@ -1690,7 +1920,7 @@ impl ChainSource {
 				break;
 			}
 		}
-		Ok(found)
+		Ok(())
 	}
 
 	/// The transaction that spends `outpoint`, in the mempool or in a block
@@ -1711,12 +1941,15 @@ impl ChainSource {
 			None => from_height,
 		};
 		let tip = self.tip()?.height;
+		let wanted = outpoint_digest(outpoint);
 		for (h, hash, b) in self.seen_range(from, tip)? {
-			let Some((_, t)) = b.spends.iter().find(|(o, _)| o == outpoint) else { continue };
-			let block = self.raw_block(&hash).map_err(node)?;
-			let tx = block.txdata.into_iter().nth(*t as usize).filter(|tx| spends(tx))
-				.ok_or_else(|| Error::Node(format!("block {} does not hold the spend of {} it held", hash, outpoint)))?;
-			return Ok(Some((tx, Some(h))));
+			if !b.may_spend(wanted) {
+				continue;
+			}
+			// A digest that matched by chance: the block holds no such spend.
+			if let Some(tx) = self.raw_block(&hash).map_err(node)?.txdata.into_iter().find(|tx| spends(tx)) {
+				return Ok(Some((tx, Some(h))));
+			}
 		}
 		Ok(None)
 	}
@@ -1775,29 +2008,31 @@ impl ChainSource {
 	/// another.
 	fn see_blocks(&self, lo: u64, hi: u64, top: &BlockHash) -> Result<(), Error> {
 		self.read_ahead((lo..=hi).map(|x| ("getblockhash".to_string(), vec![json!(x)])).collect());
-		let mut wanted: Vec<BlockHash> = vec![*top];
+		let mut wanted: Vec<(BlockHash, u64)> = vec![(*top, hi)];
 		for x in lo..=hi {
 			if let Some(hash) = self.block_hash(x)? {
 				if hash != *top {
-					wanted.push(hash);
+					wanted.push((hash, x));
 				}
 			}
 		}
 		{
 			let m = self.memo.lock().expect("the chain memo");
-			wanted.retain(|hash| !m.seen.contains_key(hash));
+			wanted.retain(|(hash, _)| !m.seen.contains_key(hash));
 		}
-		self.read_ahead(wanted.iter().map(|hash| ("getblock".to_string(), vec![json!(hash.to_string()), json!(0)])).collect());
-		for hash in wanted {
+		self.read_ahead(wanted.iter().map(|(hash, _)| ("getblock".to_string(), vec![json!(hash.to_string()), json!(0)])).collect());
+		for (hash, height) in wanted {
 			let block = self.raw_block(&hash).map_err(node)?;
-			let b = Arc::new(BlockSeen::of(&block));
+			let b = Arc::new(BlockSeen::of(&block, height));
 			// What a search needs of the block is kept; its bytes are not, so a
 			// long search holds a few bytes a transaction rather than every
 			// block it crossed. A search that finds what it looks for in it
 			// reads the block again.
 			let mut m = self.memo.lock().expect("the chain memo");
 			m.named.remove(&Self::read_key("getblock", &[json!(hash.to_string()), json!(0)]));
-			m.seen.insert(hash, b);
+			if m.seen.insert(hash, b).is_none() {
+				m.unkept.push(hash);
+			}
 		}
 		Ok(())
 	}
@@ -3525,5 +3760,764 @@ mod test {
 		println!("stage 4 (tip {}): {} answers agree", tip4, n);
 
 		assert!(stage_s.is_none(), "STAGE S: the tip moved down within one view: {}", stage_s.unwrap_or_default());
+	}
+
+	/// The index a wallet keeps in its store serves a new source, as a new
+	/// session of the wallet (a page reloaded) starts one (#838): the new
+	/// source reads only the blocks above what was kept, and answers every
+	/// search as the block-by-block search does, through a reorganisation
+	/// that takes kept blocks out of the active chain. A block the node
+	/// serves for another hash is refused, never kept (#836).
+	#[test]
+	fn a_kept_index_serves_a_new_source_and_follows_every_reorganisation() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1", "-par=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let open = || ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let node = r.node.client();
+		let op_true = Script::from(vec![0x51]);
+		let first = open();
+		let genesis = first.genesis().unwrap();
+		let block = first.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 100_000_000)).expect("free coins");
+		let (asset, value) = (coin.asset.explicit().unwrap(), coin.value.explicit().unwrap());
+		let mine = |n: u64| for _ in 0..n { r.produce_block().unwrap(); };
+		const V: u64 = 1_000_000;
+		let fee = 10_000;
+		let fan = spending_tx(&[(free, u32::MAX)], vec![explicit_out(asset, V, test_script(0x31)), explicit_out(asset, V, test_script(0x32)),
+			explicit_out(asset, value - 2 * V - fee, op_true.clone()), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&fan).unwrap();
+		mine(5);
+		let pay = spending_tx(&[(OutPoint::new(fan.txid(), 0), u32::MAX)], vec![explicit_out(asset, V - fee, test_script(0x33)), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&pay).unwrap();
+		mine(150);
+		gap();
+		first.new_command();
+		let paid = explicit_out(asset, V - fee, test_script(0x33));
+		let scripts: BTreeSet<Script> = [0x31u8, 0x32, 0x33, 0x34].into_iter().map(test_script).collect();
+		let outs = vec![("paid", paid.clone()), ("absent", explicit_out(asset, 1, test_script(0x3f)))];
+		let points = vec![("fan:0", OutPoint::new(fan.txid(), 0)), ("fan:1", OutPoint::new(fan.txid(), 1))];
+		assert!(first.spender(&OutPoint::new(fan.txid(), 0), 0).unwrap().is_some());
+		assert!(first.find_payment(&paid, 0).unwrap().is_some());
+		let (rows, below) = first.seen_to_keep();
+		let tip = first.tip().unwrap().height;
+		println!("kept: {} blocks of a chain of {}", rows.len(), tip + 1);
+		assert_eq!(rows.len() as u64, tip + 1, "every block the searches read, once");
+		assert!(below.is_none());
+		assert!(first.seen_to_keep().0.is_empty(), "each block is handed over once");
+
+		// The store keeps them as they are.
+		let store = super::super::store::Store::open(&dir.path().join("kept.sqlite")).unwrap();
+		store.keep_chain_seen(&rows, None).unwrap();
+		let mut back = store.chain_seen().unwrap();
+		back.sort_by_key(|r| r.height);
+		let mut sorted = rows.clone();
+		sorted.sort_by_key(|r| r.height);
+		assert_eq!(back, sorted);
+
+		// A new source over what was kept, five blocks later: it reads the
+		// five, and the blocks a search finds something in, no more.
+		mine(5);
+		let second = open();
+		second.see_kept(&store.chain_seen().unwrap());
+		gap();
+		second.new_command();
+		let (n, decoded) = compare_with_block_by_block_new_only(&second, &outs, &points, &scripts);
+		println!("a new source over the kept index: {} answers agree; blocks decoded by its searches {} (5 new)", n, decoded);
+		let fresh = open();
+		let (_, fresh_decoded) = compare_with_block_by_block_new_only(&fresh, &outs, &points, &scripts);
+		println!("a fresh source without it: blocks decoded {}", fresh_decoded);
+		// The five, and the blocks a search finds something in: a payment, a
+		// spend, and the two blocks paying the scripts.
+		assert!(decoded <= 5 + 4, "{} blocks decoded over a kept index, 5 new", decoded);
+		assert!(fresh_decoded > tip, "a fresh source reads the whole chain: {}", fresh_decoded);
+		store.keep_chain_seen(&second.seen_to_keep().0, None).unwrap();
+
+		// A reorganisation of the top: thirty blocks, the kept ones among
+		// them, replaced by thirty-one others, one of which pays 0x34.
+		let tip = second.tip().unwrap().height;
+		let cut = node.block_hash(tip - 29).unwrap();
+		let _: Value = node.call("invalidateblock", &[json!(cut.to_string())]).unwrap();
+		let later = spending_tx(&[(OutPoint::new(fan.txid(), 1), u32::MAX)], vec![explicit_out(asset, V - fee, test_script(0x34)), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&later).unwrap();
+		mine(31);
+		let third = open();
+		third.see_kept(&store.chain_seen().unwrap());
+		gap();
+		third.new_command();
+		let outs2 = vec![("paid", paid.clone()), ("later", later.output[0].clone())];
+		let (n, decoded) = compare_with_block_by_block_new_only(&third, &outs2, &points, &scripts);
+		println!("after a reorganisation of 30 blocks by 31: {} answers agree; blocks decoded {}", n, decoded);
+		// The 31 new blocks, and each block a search finds what it looks for
+		// in, read again for its transactions: two payments, two spends, and
+		// the three blocks paying the scripts.
+		assert!(decoded <= 31 + 7, "{} decoded: the 31 new blocks and the ones found in", decoded);
+		assert_eq!(third.find_payment(&later.output[0], 0).unwrap().map(|(t, _)| t.txid()), Some(later.txid()));
+
+		// #836: the bytes of another block served for a hash are refused,
+		// and nothing of them is kept.
+		let liar = open();
+		let h = node.block_hash(10).unwrap();
+		let other = node.block_hash(11).unwrap();
+		let wrong: String = node.call("getblock", &[json!(other.to_string()), json!(0)]).unwrap();
+		let key = ChainSource::read_key("getblock", &[json!(h.to_string()), json!(0)]);
+		liar.memo.lock().unwrap().named.insert(key.clone(), json!(wrong));
+		let e = liar.raw_block(&h).unwrap_err().to_string();
+		println!("a block served for another hash: {}", e);
+		assert!(e.contains(&format!("served block {} for block {}", other, h)), "{}", e);
+		assert!(!liar.memo.lock().unwrap().named.contains_key(&key), "its bytes are not kept");
+		liar.memo.lock().unwrap().named.insert(key, json!(wrong));
+		assert!(liar.seen_range(5, 20).is_err(), "a search over it stops");
+		assert!(!liar.memo.lock().unwrap().seen.contains_key(&h), "and nothing of it is kept");
+	}
+
+	/// Every search of `c` against the block-by-block search, from height 0;
+	/// with the blocks `c`'s own searches decoded, before the block-by-block
+	/// ones read anything.
+	fn compare_with_block_by_block_new_only(c: &ChainSource, outs: &[(&str, TxOut)], points: &[(&str, OutPoint)], scripts: &BTreeSet<Script>) -> (usize, u64) {
+		let d0 = c.blocks_decoded();
+		for (_, o) in outs {
+			c.find_payment(o, 0).unwrap();
+		}
+		for (_, p) in points {
+			c.spender(p, 0).unwrap();
+		}
+		c.scripts_seen(scripts, 0).unwrap();
+		let decoded = c.blocks_decoded() - d0;
+		let mut n = 0;
+		for (name, o) in outs {
+			assert_eq!(c.find_payment(o, 0).unwrap().map(|(t, h)| (t.txid(), h)), find_block_by_block(c, o, 0), "find_payment {}", name);
+			n += 1;
+		}
+		for (name, p) in points {
+			assert_eq!(c.spender(p, 0).unwrap().map(|(t, h)| (t.txid(), h)), spender_block_by_block(c, p, 0), "spender of {}", name);
+			n += 1;
+		}
+		assert_eq!(c.scripts_seen(scripts, 0).unwrap(), seen_block_by_block(c, scripts, 0), "scripts_seen");
+		(n + 1, decoded)
+	}
+
+	/// The index is bounded (#835): past [`SEEN_MOST`] blocks, those of the
+	/// lowest heights are dropped first, to nine tenths of the bound, here
+	/// and, by the height returned, from the store.
+	#[test]
+	fn the_kept_index_drops_its_lowest_blocks_past_its_bound() {
+		use elements::hashes::Hash;
+		let chain = ChainSource::new("http://127.0.0.1:1/", None, None, None);
+		{
+			let mut m = chain.memo.lock().unwrap();
+			for h in 0..(SEEN_MOST as u64 + 10) {
+				let mut b = [0u8; 32];
+				b[..8].copy_from_slice(&h.to_le_bytes());
+				let hash = BlockHash::from_byte_array(b);
+				m.seen.insert(hash, Arc::new(BlockSeen { prev: hash, height: h, pays: vec![h].into(), spends: vec![].into() }));
+				m.unkept.push(hash);
+			}
+		}
+		let (rows, below) = chain.seen_to_keep();
+		let m = chain.memo.lock().unwrap();
+		println!("{} blocks kept of {}, below {:?}; {} rows handed to the store", m.seen.len(), SEEN_MOST + 10, below, rows.len());
+		assert_eq!(m.seen.len(), SEEN_MOST * 9 / 10);
+		let cut = below.expect("a height to drop below");
+		assert!(m.seen.values().all(|b| b.height >= cut), "the lowest dropped first");
+		assert_eq!(cut, (SEEN_MOST as u64 + 10) - (SEEN_MOST * 9 / 10) as u64);
+		assert_eq!(rows.len(), SEEN_MOST * 9 / 10, "only what is kept goes to the store");
+		assert_eq!(rows.iter().map(|r| r.seen().unwrap()).filter(|b| b.may_pay(b.height)).count(), rows.len(), "each row reads back");
+	}
+
+
+	/// A search resumed above the block an earlier one reached
+	/// ([`ChainSource::find_payment_after`]) reads only the blocks above it
+	/// while the chain still hangs from that block, and never misses a
+	/// payment a reorganisation put at or below it: it then reads from the
+	/// start again. The case a forfeit followed across sessions meets.
+	#[test]
+	fn a_resumed_search_reads_only_new_blocks_and_misses_no_payment_after_a_reorganisation() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1", "-par=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let open = || ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let node = r.node.client();
+		let op_true = Script::from(vec![0x51]);
+		let c = open();
+		let genesis = c.genesis().unwrap();
+		let block = c.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 100_000_000)).expect("free coins");
+		let (asset, value) = (coin.asset.explicit().unwrap(), coin.value.explicit().unwrap());
+		let mine = |n: u64| for _ in 0..n { r.produce_block().unwrap(); };
+		const V: u64 = 1_000_000;
+		let fee = 10_000;
+		let fan = spending_tx(&[(free, u32::MAX)], vec![explicit_out(asset, V, test_script(0x41)), explicit_out(asset, V, test_script(0x42)),
+			explicit_out(asset, value - 2 * V - fee, op_true.clone()), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&fan).unwrap();
+		mine(100);
+		let wanted = explicit_out(asset, V - fee, test_script(0x4f));
+		let fresh = || { gap(); let s = open(); s.new_command(); s };
+
+		// The first search finds nothing and reaches the tip.
+		let s1 = fresh();
+		let (none, top) = s1.find_payment_after(&wanted, 1, None).unwrap();
+		assert!(none.is_none());
+		let (h, hash) = top.expect("a stretch was read");
+		assert_eq!((h, hash), (s1.tip().unwrap().height, s1.tip().unwrap().hash));
+
+		// Five blocks later, a new source resumed above it reads the five.
+		mine(5);
+		let s2 = fresh();
+		let d0 = s2.blocks_decoded();
+		let (none, top2) = s2.find_payment_after(&wanted, 1, Some((h, hash))).unwrap();
+		println!("resumed above {}: {} blocks decoded, top {:?}", h, s2.blocks_decoded() - d0, top2.map(|t| t.0));
+		assert!(none.is_none());
+		assert_eq!(s2.blocks_decoded() - d0, 5, "only the blocks above the one reached");
+		let (h2, hash2) = top2.unwrap();
+		assert_eq!(h2, h + 5);
+
+		// No block since: nothing read, the same top.
+		let s3 = fresh();
+		let d0 = s3.blocks_decoded();
+		assert_eq!(s3.find_payment_after(&wanted, 1, Some((h2, hash2))).unwrap(), (None, Some((h2, hash2))));
+		assert_eq!(s3.blocks_decoded() - d0, 0);
+
+		// A reorganisation below the block reached: the last 20 blocks
+		// replaced by 25, the first of them, 19 below the old top, paying the
+		// output. The resumed search does not hang from the block it reached
+		// any more, reads from the start, and finds the payment.
+		let cut = node.block_hash(h2 - 19).unwrap();
+		let _: Value = node.call("invalidateblock", &[json!(cut.to_string())]).unwrap();
+		let pay = spending_tx(&[(OutPoint::new(fan.txid(), 0), u32::MAX)], vec![wanted.clone(), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&pay).unwrap();
+		mine(25);
+		let s4 = fresh();
+		let (got, _) = s4.find_payment_after(&wanted, 1, Some((h2, hash2))).unwrap();
+		let at = s4.tx_block(&pay.txid()).unwrap().map(|(_, x)| x).unwrap();
+		println!("after the reorganisation: the payment at {} (the block reached was {}): found {:?}", at, h2, got.as_ref().map(|(_, x)| *x));
+		assert!(at <= h2, "the payment sits at or below the height reached");
+		assert_eq!(got.map(|(t, x)| (t.txid(), x)), Some((pay.txid(), at)), "a resumed search misses no payment a reorganisation put below it");
+		assert_eq!(s4.find_payment(&wanted, 1).unwrap().map(|(t, x)| (t.txid(), x)), Some((pay.txid(), at)));
+	}
+
+
+	// ---- From review RV50 of arca #854. ----
+
+	/// `watch_forfeit`'s resumed search (bark/src/arca/round.rs), the very
+	/// helper it calls ([`ChainSource::find_forfeit_payment`]), over the
+	/// store's `forfeit.searched`: the search resumes above the block the
+	/// last empty search reached only when the stretch it reads hangs from
+	/// that block, and keeps the top of the stretch it read. `between` runs
+	/// before the search: the node moving while a command runs.
+	fn rv50_watch_forfeit_resume(c: &ChainSource, store: &super::super::store::Store, f: &super::super::store::ForfeitRow, out: &TxOut,
+		between: impl FnOnce()) -> Option<(Txid, u64)> {
+		c.find_forfeit_payment(store, f, out, between).unwrap().map(|(t, h)| (t.txid(), h))
+	}
+
+	fn rv50_forfeit_row(from_height: u64) -> super::super::store::ForfeitRow {
+		super::super::store::ForfeitRow { leaf_id: "rv50-leaf".into(), participation: "rv50-p".into(), round: "rv50-round".into(),
+			connector_vout: 0, unlock_hash: "00".repeat(32), refund_units: 0, margin: 0, from_height, state: "signed".into(), note: String::new() }
+	}
+
+	/// A session of the wallet: a new source over what the store kept, as
+	/// `Wallet::open` makes one.
+	fn rv50_session(url: &str, store: &super::super::store::Store) -> ChainSource {
+		let c = ChainSource::new(url, Some("arca"), Some("arca"), None);
+		c.see_kept(&store.chain_seen().unwrap());
+		gap();
+		c.new_command();
+		c
+	}
+
+	fn rv50_keep(c: &ChainSource, store: &super::super::store::Store) {
+		let (rows, below) = c.seen_to_keep();
+		store.keep_chain_seen(&rows, below).unwrap();
+	}
+
+	/// Brief RV50, item 1: a resumed search answers as the search from the
+	/// forfeit's own height. Here the node moves to another branch while the
+	/// command runs (after the wallet read the tip, before its search walked
+	/// the chain), and later moves back, as a Bitcoin reorganisation that is
+	/// itself undone moves a Sequentia node. The search walked branch B and
+	/// found nothing; the wallet keeps branch A's tip, which it never walked,
+	/// as searched. Once A is the active chain again, every later search
+	/// starts above A's old tip, and the forfeit's payment in A is never seen.
+	#[test]
+	fn rv50_a_resumed_forfeit_search_never_skips_a_branch_it_did_not_walk() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1", "-par=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let node = r.node.client();
+		let op_true = Script::from(vec![0x51]);
+		let first = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let genesis = first.genesis().unwrap();
+		let block = first.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 100_000_000)).expect("free coins");
+		let (asset, value) = (coin.asset.explicit().unwrap(), coin.value.explicit().unwrap());
+		let mine = |n: u64| for _ in 0..n { r.produce_block().unwrap(); };
+		let empty = |n: u64| -> Vec<BlockHash> { (0..n).map(|_| node.generate_block("raw(51)", &[]).unwrap()).collect() };
+		const V: u64 = 1_000_000;
+		let fee = 10_000;
+		let fan = spending_tx(&[(free, u32::MAX)], vec![explicit_out(asset, V, test_script(0x41)),
+			explicit_out(asset, value - V - fee, op_true.clone()), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&fan).unwrap();
+		mine(3);
+		let from_height = first.tip().unwrap().height;
+		// The forfeit's output: what the claim's transaction pays.
+		let out = explicit_out(asset, V - fee, test_script(0x42));
+		let pay = spending_tx(&[(OutPoint::new(fan.txid(), 0), u32::MAX)], vec![out.clone(), TxOut::new_fee(fee, asset)]);
+
+		let store = super::super::store::Store::open(&dir.path().join("w.sqlite")).unwrap();
+		let f = rv50_forfeit_row(from_height);
+		store.put_forfeit(&f).unwrap();
+
+		// Session 1: nothing pays the output yet.
+		mine(4);
+		let s1 = rv50_session(&url, &store);
+		assert_eq!(rv50_watch_forfeit_resume(&s1, &store, &f, &out, || {}), None);
+		rv50_keep(&s1, &store);
+		println!("session 1: searched {:?}", store.forfeit_searched(&f.leaf_id, &f.round).unwrap());
+
+		// Branch A: the payment, then three more blocks.
+		let fork = s1.tip().unwrap().height;
+		node.send_raw_transaction(&pay).unwrap();
+		mine(1);
+		let a_first = node.block_hash(fork + 1).unwrap();
+		mine(3);
+		let a_tip = node.block_hash(fork + 4).unwrap();
+
+		// Session 2: the wallet reads A's tip; while it runs, the node moves
+		// to branch B (longer, the payment back in the mempool, not mined).
+		let s2 = rv50_session(&url, &store);
+		let mut b_first = None;
+		let found = rv50_watch_forfeit_resume(&s2, &store, &f, &out, || {
+			let _: Value = node.call("invalidateblock", &[json!(a_first.to_string())]).unwrap();
+			let b = empty(6);
+			b_first = Some(b[0]);
+			// The view is looked at again, as it is a second later.
+			gap();
+		});
+		rv50_keep(&s2, &store);
+		let kept = store.forfeit_searched(&f.leaf_id, &f.round).unwrap();
+		println!("session 2: found {:?}; the node's tip is now {} at {}; searched kept {:?}; A's tip was {} at {}",
+			found, node.best_block_hash().unwrap(), node.block_count().unwrap(), kept, a_tip, fork + 4);
+
+		// Branch A comes back: B leaves, A is the active chain again.
+		let _: Value = node.call("invalidateblock", &[json!(b_first.unwrap().to_string())]).unwrap();
+		let _: Value = node.call("reconsiderblock", &[json!(a_first.to_string())]).unwrap();
+		assert_eq!(node.best_block_hash().unwrap(), a_tip, "A is the active chain again");
+		mine(2);
+
+		// Session 3 and later: the resumed search against the block-by-block
+		// search from the forfeit's height.
+		for n in 3..5 {
+			let s = rv50_session(&url, &store);
+			let resumed = rv50_watch_forfeit_resume(&s, &store, &f, &out, || {});
+			let whole = find_block_by_block(&s, &out, from_height);
+			rv50_keep(&s, &store);
+			println!("session {}: resumed search {:?}; block-by-block from height {} {:?}", n, resumed, from_height, whole);
+			assert_eq!(resumed, whole, "session {}: the resumed search must find the claim's payment the whole search finds", n);
+		}
+	}
+
+	/// Brief RV50, item 1: with the node still between two sessions (its
+	/// moves made between commands), a resumed search answers as the search
+	/// from the forfeit's height through every place of a reorganisation:
+	/// above the resume point, at it (its block replaced by another at the
+	/// same height), below it; a branch that leaves and comes back; the store
+	/// reopened in a new process's way for every session.
+	#[test]
+	fn rv50_resumed_searches_agree_with_the_whole_search_through_reorganisations_between_sessions() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1", "-par=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let node = r.node.client();
+		let op_true = Script::from(vec![0x51]);
+		let first = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let genesis = first.genesis().unwrap();
+		let block = first.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 100_000_000)).expect("free coins");
+		let (asset, value) = (coin.asset.explicit().unwrap(), coin.value.explicit().unwrap());
+		// Each block to another coinbase script, so a block made in place of
+		// one taken out is never that block again.
+		let made = std::cell::Cell::new(0u32);
+		// Sequentia's coinbase pays no subsidy, so the script alone does not
+		// tell two blocks apart: each block also gets a time of its own.
+		let clock = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs() + 600;
+		let mine = |n: u64| for _ in 0..n {
+			made.set(made.get() + 1);
+			let _: Value = node.call("setmocktime", &[json!(clock + made.get() as u64)]).unwrap();
+			if let Err(e) = node.generate_to_descriptor(1, &format!("raw(02{:04x})", made.get())) {
+				let log = std::fs::read_to_string(r.node.datadir().join("elementsregtest/debug.log")).or_else(|_| std::fs::read_to_string(r.node.datadir().join("debug.log"))).unwrap_or_default();
+				let tail: Vec<&str> = log.lines().rev().take(15).collect();
+				panic!("{}: {:#?}", e, tail);
+			}
+		};
+		let empty = |n: u64| -> Vec<BlockHash> { (0..n).map(|_| { made.set(made.get() + 1);
+			let _: Value = node.call("setmocktime", &[json!(clock + made.get() as u64)]).unwrap(); node.generate_block(&format!("raw(02{:04x})", made.get()), &[]).unwrap() }).collect() };
+		let _ = &r;
+		const V: u64 = 1_000_000;
+		let fee = 10_000;
+		// Four coins, each to pay one forfeit's output in one stage.
+		let mut outs = vec![explicit_out(asset, V, test_script(0x50)), explicit_out(asset, V, test_script(0x51)),
+			explicit_out(asset, V, test_script(0x52)), explicit_out(asset, V, test_script(0x53))];
+		outs.push(explicit_out(asset, value - 4 * V - fee, op_true.clone()));
+		outs.push(TxOut::new_fee(fee, asset));
+		let fan = spending_tx(&[(free, u32::MAX)], outs);
+		node.send_raw_transaction(&fan).unwrap();
+		mine(3);
+		let from_height = first.tip().unwrap().height;
+		let path = dir.path().join("w.sqlite");
+		let pays: Vec<(TxOut, Transaction)> = (0..4u32).map(|i| {
+			let out = explicit_out(asset, V - fee, test_script(0x60 + i as u8));
+			(out.clone(), spending_tx(&[(OutPoint::new(fan.txid(), i), u32::MAX)], vec![out, TxOut::new_fee(fee, asset)]))
+		}).collect();
+		let rows: Vec<super::super::store::ForfeitRow> = (0..4).map(|i| super::super::store::ForfeitRow { leaf_id: format!("rv50-{}", i),
+			..rv50_forfeit_row(from_height) }).collect();
+		{
+			let store = super::super::store::Store::open(&path).unwrap();
+			for f in &rows {
+				store.put_forfeit(f).unwrap();
+			}
+		}
+		// One session: the store opened anew, a new source over its index,
+		// every forfeit's resumed search against the whole search.
+		let session = |stage: &str| {
+			let store = super::super::store::Store::open(&path).unwrap();
+			let s = rv50_session(&url, &store);
+			let mut answers = vec![];
+			for (f, (out, _)) in rows.iter().zip(&pays) {
+				let resumed = rv50_watch_forfeit_resume(&s, &store, f, out, || {});
+				let whole = find_block_by_block(&s, out, from_height);
+				assert_eq!(resumed, whole, "{}: forfeit {}", stage, f.leaf_id);
+				answers.push(resumed.map(|(_, h)| h));
+			}
+			rv50_keep(&s, &store);
+			println!("{}: tip {}; answers {:?}; searched {:?}", stage, s.tip().unwrap().height, answers,
+				rows.iter().map(|f| store.forfeit_searched(&f.leaf_id, &f.round).unwrap().map(|(h, _)| h)).collect::<Vec<_>>());
+		};
+		mine(5);
+		session("start");
+		let h0 = node.block_count().unwrap();
+
+		// Above the resume point: the top two blocks replaced, the first
+		// payment in the replacement.
+		let _: Value = node.call("invalidateblock", &[json!(node.block_hash(h0).unwrap().to_string())]).unwrap();
+		mine(2);
+		session("growth");
+		let h1 = node.block_count().unwrap();
+		let top = node.block_hash(h1 - 1).unwrap();
+		let _: Value = node.call("invalidateblock", &[json!(top.to_string())]).unwrap();
+		node.send_raw_transaction(&pays[0].1).unwrap();
+		mine(3);
+		session("above the resume point, payment 0 in the new top");
+
+		// At the resume point: its block replaced by another at the same
+		// height, which carries payment 1.
+		let h2 = node.block_count().unwrap();
+		let _: Value = node.call("invalidateblock", &[json!(node.block_hash(h2).unwrap().to_string())]).unwrap();
+		node.send_raw_transaction(&pays[1].1).unwrap();
+		mine(1);
+		assert_eq!(node.block_count().unwrap(), h2, "the same height, another block");
+		session("at the resume point, payment 1 in its replacement");
+
+		// Below the resume point: five blocks taken out, payment 2 at the
+		// lowest of their replacements.
+		mine(4);
+		session("growth 2");
+		let h3 = node.block_count().unwrap();
+		let a_first = node.block_hash(h3 - 4).unwrap();
+		let a_tip = node.block_hash(h3).unwrap();
+		let _: Value = node.call("invalidateblock", &[json!(a_first.to_string())]).unwrap();
+		node.send_raw_transaction(&pays[2].1).unwrap();
+		mine(7);
+		session("below the resume point, payment 2 in the new branch");
+
+		// The old branch comes back (it holds none of the payments the new
+		// one had above its fork: payment 2 goes back to the mempool and is
+		// mined again on it), payment 3 with it.
+		let b_first = node.block_hash(h3 - 4).unwrap();
+		let _: Value = node.call("invalidateblock", &[json!(b_first.to_string())]).unwrap();
+		let _: Value = node.call("reconsiderblock", &[json!(a_first.to_string())]).unwrap();
+		assert_eq!(node.best_block_hash().unwrap(), a_tip, "the old branch is back");
+		node.send_raw_transaction(&pays[3].1).unwrap();
+		mine(2);
+		session("the old branch back, payments 2 and 3 above it");
+		empty(3);
+		session("three empty blocks later");
+	}
+
+	/// Brief RV50, item 2: an input's outpoint digest is the outpoint's,
+	/// whatever flags the input's serialisation carries in its index (an
+	/// issuance, a peg-in): the digest of a spend read back from a block's
+	/// bytes is the digest of the outpoint the wallet watches.
+	#[test]
+	fn rv50_an_inputs_digest_ignores_the_flags_its_serialisation_carries() {
+		use elements::hashes::Hash;
+		let watched = OutPoint::new(Txid::from_byte_array([7u8; 32]), 3);
+		let mut issuing = elements::TxIn { previous_output: watched, ..Default::default() };
+		issuing.asset_issuance = elements::AssetIssuance { asset_entropy: [1u8; 32], amount: elements::confidential::Value::Explicit(5),
+			..Default::default() };
+		let mut pegin = elements::TxIn { previous_output: OutPoint::new(Txid::from_byte_array([8u8; 32]), 1), ..Default::default() };
+		pegin.is_pegin = true;
+		let tx = Transaction { version: 2, lock_time: elements::LockTime::ZERO, input: vec![issuing, pegin],
+			output: vec![TxOut::new_fee(1, AssetId::from_slice(&[9u8; 32]).unwrap())] };
+		let bytes = elements::encode::serialize(&tx);
+		let back: Transaction = elements::encode::deserialize(&bytes).unwrap();
+		assert!(back.input[0].has_issuance() && back.input[1].is_pegin, "the flags are read back");
+		let header = first_header();
+		let block = Block { header: header.clone(), txdata: vec![back] };
+		let seen = BlockSeen::of(&block, 1);
+		assert!(seen.may_spend(outpoint_digest(&watched)), "a spend with an issuance is seen by its outpoint");
+		assert!(seen.may_spend(outpoint_digest(&OutPoint::new(Txid::from_byte_array([8u8; 32]), 1))), "a peg-in's outpoint likewise");
+		// And as a store row read back.
+		let row = SeenRow::of(header.block_hash(), &seen);
+		assert_eq!(row.seen().unwrap(), seen);
+		println!("issuance and peg-in inputs: digests {:?}", seen.spends);
+	}
+
+	fn first_header() -> elements::BlockHeader {
+		use elements::hashes::Hash;
+		elements::BlockHeader { version: 0x20000000, prev_blockhash: BlockHash::all_zeros(), merkle_root: elements::TxMerkleNode::all_zeros(),
+			time: 0, height: 1, ext: Default::default(), bitcoin_anchor: Some((0, BlockHash::all_zeros())) }
+	}
+
+	/// Brief RV50, item 4: what a store holding the whole bound costs: its
+	/// size on disk, the time a session takes to load it (`Wallet::open`
+	/// reads every row), and the heap the loaded index holds. Rows of ten
+	/// outputs and ten inputs a block, a busier block than the testnet's
+	/// usual.
+	#[test]
+	fn rv50_what_a_full_kept_index_costs_a_session() {
+		use elements::hashes::Hash;
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("w.sqlite");
+		let store = super::super::store::Store::open(&path).unwrap();
+		let mut rows = vec![];
+		for h in 0..SEEN_MOST as u64 {
+			let mut b = [0u8; 32];
+			b[..8].copy_from_slice(&h.to_le_bytes());
+			let hash = BlockHash::from_byte_array(b);
+			let mut p = [0u8; 32];
+			p[..8].copy_from_slice(&h.wrapping_sub(1).to_le_bytes());
+			let mut pays: Vec<u64> = (0..10).map(|i| digest(&[h.to_le_bytes(), [i; 8]].concat())).collect();
+			pays.sort_unstable();
+			let mut spends: Vec<u64> = (10..20).map(|i| digest(&[h.to_le_bytes(), [i; 8]].concat())).collect();
+			spends.sort_unstable();
+			rows.push(SeenRow::of(hash, &BlockSeen { prev: BlockHash::from_byte_array(p), height: h, pays: pays.into(), spends: spends.into() }));
+		}
+		let t = std::time::Instant::now();
+		store.keep_chain_seen(&rows, None).unwrap();
+		let write_ms = t.elapsed().as_millis();
+		drop(store);
+		let size = std::fs::metadata(&path).unwrap().len();
+		let t = std::time::Instant::now();
+		let store = super::super::store::Store::open(&path).unwrap();
+		let back = store.chain_seen().unwrap();
+		let read_ms = t.elapsed().as_millis();
+		let c = ChainSource::new("http://127.0.0.1:1/", None, None, None);
+		let t = std::time::Instant::now();
+		c.see_kept(&back);
+		let see_ms = t.elapsed().as_millis();
+		assert_eq!(c.memo.lock().unwrap().seen.len(), SEEN_MOST);
+		let rss = std::fs::read_to_string("/proc/self/status").unwrap().lines().find(|l| l.starts_with("VmRSS")).unwrap_or("").to_string();
+		drop(back);
+		let rss_after = std::fs::read_to_string("/proc/self/status").unwrap().lines().find(|l| l.starts_with("VmRSS")).unwrap_or("").to_string();
+		println!("{} rows (10 pays, 10 spends each): written in {} ms; store file {} bytes ({} a block); loaded in {} ms; taken as seen in {} ms; {} with the rows, {} without",
+			SEEN_MOST, write_ms, size, size / SEEN_MOST as u64, read_ms, see_ms, rss, rss_after);
+	}
+
+	/// Brief RV50, item 3 (#836): the block's bytes are checked against the
+	/// hash asked by the header alone. A node or route that serves the right
+	/// header with a transaction left out of its list is not refused; the
+	/// summary of that list is kept in the store, and a later session, with
+	/// an honest node, answers from it: the spend is never seen while the
+	/// block is kept.
+	#[test]
+	fn rv50_a_block_served_without_one_of_its_transactions_is_refused() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1", "-par=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let node = r.node.client();
+		let op_true = Script::from(vec![0x51]);
+		let first = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let genesis = first.genesis().unwrap();
+		let block = first.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 100_000_000)).expect("free coins");
+		let (asset, value) = (coin.asset.explicit().unwrap(), coin.value.explicit().unwrap());
+		let mine = |n: u64| for _ in 0..n { r.produce_block().unwrap(); };
+		const V: u64 = 1_000_000;
+		let fee = 10_000;
+		let fan = spending_tx(&[(free, u32::MAX)], vec![explicit_out(asset, V, test_script(0x71)),
+			explicit_out(asset, value - V - fee, op_true.clone()), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&fan).unwrap();
+		mine(2);
+		let watched = OutPoint::new(fan.txid(), 0);
+		let claim = spending_tx(&[(watched, u32::MAX)], vec![explicit_out(asset, V - fee, test_script(0x72)), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&claim).unwrap();
+		mine(1);
+		let h = node.block_count().unwrap();
+		let hash = node.block_hash(h).unwrap();
+		mine(3);
+
+		// The route serves block `hash` with its header and without the claim.
+		let liar = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let mut real = liar.raw_block(&hash).unwrap();
+		assert!(real.txdata.iter().any(|t| t.txid() == claim.txid()));
+		real.txdata.retain(|t| t.txid() != claim.txid());
+		let forged = elements::encode::serialize_hex(&real);
+		let key = ChainSource::read_key("getblock", &[json!(hash.to_string()), json!(0)]);
+		liar.memo.lock().unwrap().named.insert(key, json!(forged));
+		let served = liar.raw_block(&hash);
+		println!("a block served with its header and without the claim: {}", match &served { Ok(_) => "taken".to_string(), Err(e) => e.to_string() });
+		let store = super::super::store::Store::open(&dir.path().join("w.sqlite")).unwrap();
+		if served.is_ok() {
+			let liar = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+			liar.memo.lock().unwrap().named.insert(ChainSource::read_key("getblock", &[json!(hash.to_string()), json!(0)]), json!(forged));
+			gap();
+			liar.new_command();
+			let _ = liar.spender(&watched, 0);
+			rv50_keep(&liar, &store);
+		}
+
+		// A later session, the node honest: the kept index against the
+		// block-by-block search.
+		let s = rv50_session(&url, &store);
+		let kept = s.spender(&watched, 0).unwrap().map(|(t, h)| (t.txid(), h));
+		let whole = spender_block_by_block(&s, &watched, 0);
+		println!("a later session with an honest node: spender over the kept index {:?}; block by block {:?}", kept, whole);
+		assert_eq!(kept, whole, "the spend in block {} must be seen", hash);
+		assert!(served.is_err(), "a block whose transactions do not make its header's merkle root must be refused");
+	}
+
+	/// The fault of `rv50_a_resumed_forfeit_search_never_skips_a_branch_it_did_not_walk`,
+	/// driven by Bitcoin: the blocks of branch A leave the chain because the
+	/// parent block they are anchored to is orphaned, during the command,
+	/// and come back when the parent chain reorganises back to it.
+	#[test]
+	fn rv50_a_resumed_forfeit_search_through_an_anchor_reorganisation_undone() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1", "-par=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let node = r.node.client();
+		let parent = r.parent.client();
+		let op_true = Script::from(vec![0x51]);
+		let first = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let genesis = first.genesis().unwrap();
+		let block = first.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 100_000_000)).expect("free coins");
+		let (asset, value) = (coin.asset.explicit().unwrap(), coin.value.explicit().unwrap());
+		const V: u64 = 1_000_000;
+		let fee = 10_000;
+		let fan = spending_tx(&[(free, u32::MAX)], vec![explicit_out(asset, V, test_script(0x41)),
+			explicit_out(asset, value - V - fee, op_true.clone()), TxOut::new_fee(fee, asset)]);
+		node.send_raw_transaction(&fan).unwrap();
+		r.mine_parent(3).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		let from_height = first.tip().unwrap().height;
+		let out = explicit_out(asset, V - fee, test_script(0x42));
+		let pay = spending_tx(&[(OutPoint::new(fan.txid(), 0), u32::MAX)], vec![out.clone(), TxOut::new_fee(fee, asset)]);
+		let store = super::super::store::Store::open(&dir.path().join("w.sqlite")).unwrap();
+		let f = rv50_forfeit_row(from_height);
+		store.put_forfeit(&f).unwrap();
+		let s1 = rv50_session(&url, &store);
+		assert_eq!(rv50_watch_forfeit_resume(&s1, &store, &f, &out, || {}), None);
+		rv50_keep(&s1, &store);
+
+		// Branch A, anchored to a new parent block T: the payment in it.
+		r.mine_parent(1).unwrap();
+		let t = parent.block_count().unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		let anchored_at = |h: u64| sequentia_ext::BlockHeaderExt::bitcoin_anchor(&node.block_header(&node.block_hash(h).unwrap()).unwrap()).height as u64;
+		node.send_raw_transaction(&pay).unwrap();
+		for _ in 0..3 { r.produce_block().unwrap(); }
+		let a_tip = node.best_block_hash().unwrap();
+		let a_height = node.block_count().unwrap();
+		let at = (from_height..=a_height).find(|h| first.raw_block(&node.block_hash(*h).unwrap()).map(|b| b.txdata.iter().any(|x| x.txid() == pay.txid())).unwrap_or(false));
+		println!("branch A: tip {} at {}; payment at {:?}, anchored to parent height {:?} (T = {})", a_tip, a_height, at, at.map(anchored_at), t);
+
+		// Session 2: while it runs, Bitcoin orphans T, and A leaves the chain.
+		let s2 = rv50_session(&url, &store);
+		let mut orphaned = vec![];
+		let found = rv50_watch_forfeit_resume(&s2, &store, &f, &out, || {
+			orphaned = r.orphan_parent_from(t).unwrap();
+			gap();
+		});
+		rv50_keep(&s2, &store);
+		println!("session 2: found {:?}; the node's tip now {} at {}; searched kept {:?}", found, node.best_block_hash().unwrap(),
+			node.block_count().unwrap(), store.forfeit_searched(&f.leaf_id, &f.round).unwrap());
+
+		// Bitcoin reorganises back to T's branch, longer.
+		let new_first = parent.block_hash(t).unwrap();
+		let _: Value = parent.call("invalidateblock", &[json!(new_first.to_string())]).unwrap();
+		let _: Value = parent.call("reconsiderblock", &[json!(orphaned[0].to_string())]).unwrap();
+		r.mine_parent(4).unwrap();
+		let start = std::time::Instant::now();
+		while node.best_block_hash().unwrap() != a_tip && node.block_count().unwrap() <= a_height && start.elapsed() < std::time::Duration::from_secs(20) {
+			std::thread::sleep(std::time::Duration::from_millis(250));
+		}
+		let came_back = node.block_hash(a_height).ok() == Some(a_tip);
+		println!("A back by itself after Bitcoin's reorganisation back: {} (tip {} at {})", came_back, node.best_block_hash().unwrap(), node.block_count().unwrap());
+		if !came_back {
+			// The anchor watcher marked A's blocks invalid: the node takes
+			// them back when told to, as an operator does.
+			let first_a = (from_height..=a_height).find(|h| anchored_at(*h) >= t);
+			println!("A's first block anchored to T: {:?}", first_a);
+			let tips: Value = node.call("getchaintips", &[]).unwrap();
+			for tip in tips.as_array().unwrap() {
+				if tip["status"] == "invalid" {
+					let _: Value = node.call("reconsiderblock", &[tip["hash"].clone()]).unwrap();
+				}
+			}
+			let _: Value = node.call("reconsiderblock", &[json!(a_tip.to_string())]).unwrap();
+			println!("after reconsiderblock: tip {} at {}; A's tip at its height: {}", node.best_block_hash().unwrap(), node.block_count().unwrap(),
+				node.block_hash(a_height).ok() == Some(a_tip));
+		}
+		for n in 3..5 {
+			let s = rv50_session(&url, &store);
+			let resumed = rv50_watch_forfeit_resume(&s, &store, &f, &out, || {});
+			let whole = find_block_by_block(&s, &out, from_height);
+			rv50_keep(&s, &store);
+			println!("session {}: resumed search {:?}; block-by-block from height {} {:?}", n, resumed, from_height, whole);
+			assert_eq!(resumed, whole, "session {}: the resumed search must find the claim's payment the whole search finds", n);
+		}
 	}
 }
