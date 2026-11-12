@@ -26,6 +26,12 @@ indexed-db = ["dep:indexed-db", "dep:web-sys", "dep:serde-wasm-bindgen"]
 
 rand = ["bitcoin/rand", "bip39/rand"]
 
+# For the test of a trade refused after its coin was shaped
+# (`arca-cli`'s `arca_shaped`, which alone enables it): `swap_accept` takes
+# `shape_off_by` and shapes the coin that many atoms off what was priced. No
+# shipped build enables it; CI checks that.
+shape-probe = []
+
 # The Arca wallet on Sequentia (`bark::arca`): its chain source over the
 # node's RPC, its SQLite store, its keys from the mnemonic as the Sequentia
 # Wallet Kit derives them, and its client of the Arca server over HTTPS.

@@ -146,6 +146,21 @@ pub enum Error {
 	/// The wallet refused: the reason is for the user.
 	#[error("refused: {0}")]
 	Refused(String),
+	/// A payment of `asset` the wallet's own coins cannot make as asked, with
+	/// nothing more of it on its way that would: what it holds in live coins,
+	/// less the margins the payment's transactions leave for their fees, falls
+	/// short of the amount, or would leave change below the operator's
+	/// smallest leaf. `most` is the most of `asset` below which every amount
+	/// pays now, in atoms (what its coins hold less the margins and the
+	/// operator's smallest leaf, so the change is never too small); `all`
+	/// the exact amount that pays with no change at all (more than `most`;
+	/// an amount between the two leaves change below the smallest leaf and
+	/// is refused); `live` what it holds of it in live coins when the margins
+	/// are what it falls short by. A program offers `most` ("up to") without
+	/// reading it out of `message`. Refused like [`Error::Refused`] otherwise
+	/// (its kind is `refused`).
+	#[error("refused: {message}")]
+	Short { asset: String, most: u64, all: Option<u64>, live: Option<u64>, message: String },
 	/// A payment of `asset` that the coins it may spend cannot cover, and
 	/// that the coins an offline-refresh plan names could: `release` names
 	/// the fewest of those, largest first, whose release through the next
@@ -180,6 +195,15 @@ pub enum Error {
 	/// `(final_in_seconds, usual_in_seconds, waiting_for)`.
 	#[error("refused: {message}")]
 	SettleFirst { asset: String, coins: Vec<String>, wait: Option<(u64, u64, &'static str)>, message: String },
+	/// A trade of `asset` refused after the wallet paid itself, out of
+	/// round, the coin of exactly what the trade gives ([`Wallet::swap_accept`]
+	/// with an instant limit set): that payment moved and left `fee` of
+	/// `asset` in margins, which the terms shown counted, and nothing else
+	/// did. The coin it made is the wallet's, live, and the trade's next
+	/// quote gives it with nothing more to shape: a program prices the trade
+	/// again at once, and counts `fee` as paid for that trade already.
+	#[error("refused: {message}")]
+	Shaped { asset: String, fee: u64, message: String },
 	/// The server refused, with its stable code.
 	#[error("the server refused {call} ({status} {code}): {message}")]
 	Server { call: String, status: i32, code: String, message: String },
@@ -215,13 +239,26 @@ pub enum Error {
 }
 
 impl Error {
+	/// This refusal without the figures of [`Error::Short`], for a payment
+	/// whose amount is not what its caller asks for (a take's price and its
+	/// fee, a distribution's claims and its fee): its figures would name an
+	/// amount of the payment that no ask of the caller's makes. Any other
+	/// error as it is.
+	pub(crate) fn without_figures(self) -> Error {
+		match self {
+			Error::Short { message, .. } => Error::Refused(message),
+			e => e,
+		}
+	}
+
 	/// A short machine-readable kind, for the command line's JSON.
 	pub fn kind(&self) -> &'static str {
 		match self {
-			Error::Refused(_) => "refused",
+			Error::Refused(_) | Error::Short { .. } => "refused",
 			Error::Planned { .. } => "planned",
 			Error::InChannel { .. } => "in_channel",
 			Error::SettleFirst { .. } => "settle_first",
+			Error::Shaped { .. } => "shaped",
 			Error::Server { .. } => "server_refused",
 			Error::SwapRefused { .. } => "swap_refused",
 			Error::Unreachable(_) => "unreachable",

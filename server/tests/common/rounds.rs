@@ -26,6 +26,12 @@ pub async fn start() -> Running {
 	start_tuned(true).await
 }
 
+/// [`start`] with batches without a sweep, whatever `ARCA_TEST_NO_SWEEP`
+/// says: every round held for its forfeits, as the public testnet runs.
+pub async fn start_held() -> Running {
+	start_config(true, true).await
+}
+
 /// [`start`] with the operator's unroll at release off, for a test that
 /// follows the sweep of a live coin.
 pub async fn start_sweeping() -> Running {
@@ -33,9 +39,16 @@ pub async fn start_sweeping() -> Running {
 }
 
 async fn start_tuned(unroll_at_release: bool) -> Running {
+	start_config(unroll_at_release, false).await
+}
+
+async fn start_config(unroll_at_release: bool, no_sweep: bool) -> Running {
 	let mut r = Running::start_with(|c, y| {
 		c.assets.push(AssetSection::new(y, MIN_LEAF));
 		c.watcher.unroll_at_release = unroll_at_release;
+		if no_sweep {
+			c.batches.no_sweep = true;
+		}
 	}).await;
 	let (x, y) = (r.x, r.y);
 	r.fund_wallet_in(x, 50_000_000).await;
@@ -107,6 +120,15 @@ pub async fn hand_over_held(r: &Running, round_txid: &Txid) -> usize {
 
 /// [`hand_over_held`] for one participation `id`, made of `m`.
 pub async fn hand_over(r: &Running, id: &[u8; 32], m: &super::client::Made) -> Value {
+	let body = hand_over_body(r, id, m).await;
+	let done = r.http.post("forfeit_leaves", &body).ok();
+	assert!(done.get("preimage").is_none(), "no preimage before the round is broadcast: {}", done);
+	done
+}
+
+/// The `forfeit_leaves` request [`hand_over`] makes for participation `id`,
+/// made of `m`, in a round held unbroadcast: built as a wallet builds it.
+pub async fn hand_over_body(r: &Running, id: &[u8; 32], m: &super::client::Made) -> Value {
 	use super::client::{auths_json, forfeit_sig, hex, unhex};
 	let st = status(r, id);
 	let round: Transaction = elements::encode::deserialize(&unhex(st["round"]["tx"].as_str().unwrap_or_else(|| panic!("the held round's transaction: {}", st)))).unwrap();
@@ -160,9 +182,7 @@ pub async fn hand_over(r: &Running, id: &[u8; 32], m: &super::client::Made) -> V
 		};
 		forfeits.push(json!({"leaf_id": h.id.to_string(), "signature": forfeit_sig(&f, &h.key)}));
 	}
-	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(id), "forfeits": forfeits, "leaves": leaves})).ok();
-	assert!(done.get("preimage").is_none(), "no preimage before the round is broadcast: {}", done);
-	done
+	json!({"participation_id": hex(id), "forfeits": forfeits, "leaves": leaves})
 }
 
 /// Waits until the server has the round `round_txid` in `state`.

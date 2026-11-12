@@ -64,9 +64,23 @@ pub fn refusal(e: &Error) -> Value {
 		out["error"]["coin"] = json!(coin);
 		out["error"]["whose"] = json!(whose);
 	}
+	if let Error::Short { asset, most, all, live, .. } = e {
+		out["error"]["asset"] = json!(asset);
+		out["error"]["most"] = json!(most.to_string());
+		if let Some(a) = all {
+			out["error"]["all"] = json!(a.to_string());
+		}
+		if let Some(l) = live {
+			out["error"]["live"] = json!(l.to_string());
+		}
+	}
 	if let Error::Planned { asset, release, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["release"] = json!(release);
+	}
+	if let Error::Shaped { asset, fee, .. } = e {
+		out["error"]["asset"] = json!(asset);
+		out["error"]["fee"] = json!(fee.to_string());
 	}
 	if let Error::SettleFirst { asset, coins, wait, .. } = e {
 		out["error"]["asset"] = json!(asset);
@@ -213,6 +227,10 @@ fn run_costed(w: &mut Wallet, command: &str, args: &Value) -> (Result<Value, Err
 	let (t1, (n1, _), g1) = (web_time::Instant::now(), w.chain.calls(), super::chain::gaps());
 	let by1 = w.chain.asked_by_method();
 	let result = command_of(w, command, args);
+	// What the command's searches read of the chain is kept for the next
+	// session; a store that cannot keep it costs that session the reads, no
+	// more.
+	let _ = w.keep_chain_seen();
 	let (n2, _) = w.chain.calls();
 	let mut cost = json!({
 		"start": {"ms": (t1 - t0).as_millis() as u64, "node": n1 - n0, "operator": g1 - g0},
@@ -535,6 +553,12 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"swap_read" => w.swap_read(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
 		"swap_accept" => {
 			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			// Only a build for the test of the shaped refusal reads this, and
+			// only when the call names it.
+			#[cfg(feature = "shape-probe")]
+			if let Some(off) = a["shape_off_by"].as_i64() {
+				return w.swap_accept_shaped_off(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false), shown, off);
+			}
 			w.swap_accept_shown(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false), shown)
 		},
 		"swap_complete" => w.swap_complete(req_str(&a["accept"], "the acceptance")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
@@ -780,6 +804,11 @@ mod test {
 		assert_eq!(r["error"]["status"], 409);
 		assert_eq!(r["error"]["message"], "the server refused cosign_transfer (409 key_reused): m");
 		assert_eq!(refusal(&Error::Refused("no".into())), json!({"error": {"kind": "refused", "message": "refused: no"}}));
+		// Short of what it pays, nothing more on its way: the most it pays now, as a figure.
+		let m = Error::Short { asset: "aa".into(), most: 1234, all: Some(2234), live: Some(1500), message: "short".into() };
+		assert_eq!(refusal(&m), json!({"error": {"kind": "refused", "message": "refused: short", "asset": "aa", "most": "1234", "all": "2234", "live": "1500"}}));
+		let m = Error::Short { asset: "aa".into(), most: 1234, all: None, live: None, message: "short".into() };
+		assert_eq!(refusal(&m), json!({"error": {"kind": "refused", "message": "refused: short", "asset": "aa", "most": "1234"}}));
 		let p = Error::Planned { asset: "aa".into(), release: vec!["c1".into(), "c2".into()], message: "short".into() };
 		assert_eq!(refusal(&p), json!({"error": {"kind": "planned", "message": "refused: short", "asset": "aa", "release": ["c1", "c2"]}}));
 		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], side: 7, most: None, fee: None, message: "short".into() };
@@ -787,6 +816,9 @@ mod test {
 		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], side: 7, most: Some(9), fee: Some(3), message: "short".into() };
 		assert_eq!(refusal(&c), json!({"error": {"kind": "in_channel", "message": "refused: short", "asset": "aa", "close": ["ch1"], "side": "7",
 			"most": "9", "fee": "3"}}));
+		// A trade refused after the wallet paid itself its coin: what that payment cost, to count as paid.
+		let sh = Error::Shaped { asset: "aa".into(), fee: 480, message: "shaped".into() };
+		assert_eq!(refusal(&sh), json!({"error": {"kind": "shaped", "message": "refused: shaped", "asset": "aa", "fee": "480"}}));
 		// A completion the operator refused: the swap, its code, and whose coin it named.
 		let s = Error::SwapRefused { swap: "ab".into(), status: 409, code: "double_spend".into(), coin: Some("cd".into()), whose: Some("taker"),
 			message: "leaf cd is already spent".into() };

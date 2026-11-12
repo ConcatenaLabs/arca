@@ -47,7 +47,11 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   about one a second, keeps the wallet working. The node runs one scan at a
   time for all its clients: a scan it refuses as busy with another's waits on
   the pause and is asked again, for two minutes at most, and the refusal is
-  never kept as the chain's answer.
+  never kept as the chain's answer. A block a search of the chain reads is
+  read once: a summary of what it pays and spends is kept in the wallet's
+  store, by its hash, checked against the active chain at every use, so a
+  page reloaded reads only the blocks it has not seen (at most 100,000 kept,
+  some 30 MB, the oldest dropped first).
 - **The pause** between two tries (a node or proxy that answers busy or "too
   many calls", an operator that does not answer) is the host's to give. A worker
   blocked in the library has nothing else to do, but a pause that watches the
@@ -234,7 +238,10 @@ chain another made within three seconds when asked with `"shared_view": true`.
 An in-tree swap passes two texts between two wallets. The maker's `swap_offer`
 holds its coins and signs nothing, and answers what it gives, gets and pays (the
 reassignment's margin and its checkpoints' margins). The taker's `swap_read`
-checks the offer as `swap_accept` does and answers what it gives, gets and pays,
+checks the offer as `swap_accept` does and answers what it gives, gets and pays
+(with an instant limit set, from the coin of exactly what it gives that the
+wallet pays itself first, whose margins it counts, also apart as
+`pays.shapes`),
 and the `hops` of what the swap makes (reassignments since a round, against the
 operator's `depth_limit`), signing, holding and storing nothing; `swap_accept`
 with `shown` (that answer)
@@ -245,7 +252,18 @@ with kind `swap_refused`, naming the `swap`, the `coin` the operator named and
 stands. A spend the operator refuses because a coin of the wallet's is spent
 already, by another store of the same mnemonic (a second device), has the
 wallet read what its other stores did at once, so it stops counting that coin
-and holds what replaced it; a `swap_cancel` that meets such a coin cancels the
+and holds what replaced it. While the other store's round is not final yet,
+that read finds nothing: the coin is then held out of every spend (every `sync`
+catches up while one is held out), and a spend it would have paid waits for it
+as `settle_first`. The hold is the operator's word with an age: it ends once the
+operator serves the coin live again (the other store's participation withdrawn
+or voided, its round dropped), once a catch-up settles it, and at the latest when
+the wait `settle_first` stated for it has passed, so a false refusal costs at most
+that one wait. While held, the coin counts in `balance` (as `spent_elsewhere`)
+and not in what `coin_places` calls spendable; `coin_places` and `coins` (full
+and `brief`) mark it with `spent_elsewhere_until` and the standing
+`spent_elsewhere`, so a program counts what it can spend now as the library does;
+and its exit is never barred; a `swap_cancel` that meets such a coin cancels the
 acceptance without a respend. A `swap_cancel` whose respend went unanswered
 never calls the acceptance cancelled until the operator has answered it: the
 next one posts the respend again and answers `cancelled`, `done`, or, while
@@ -299,7 +317,10 @@ or comes less often than that runs it on a short timer of its own.
 
 A refusal is thrown as the JSON `arca` prints, `{"error": {"kind",
 "message"}}`, with the server's `code` and `status` when the server refused
-(and `swap`, `coin` and `whose` for a `swap_refused`).
+(and `swap`, `coin` and `whose` for a `swap_refused`; `asset` and `fee` for a
+`shaped` refusal: a trade refused after the wallet paid itself the coin it
+gives, which left that fee; the coin is kept, and the trade priced again
+trades from it).
 
 The page shows what the library says as it says it. With no command line,
 the library names the act rather than a command ("run sync", "an exit takes

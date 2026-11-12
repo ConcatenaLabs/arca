@@ -180,6 +180,10 @@ struct Sorted {
 	waiting: Vec<String>,
 	done: Vec<String>,
 	rounds: Vec<Option<String>>,
+	/// The most seconds left of the hold of a coin held out as spent
+	/// elsewhere ([`Wallet::spent_elsewhere`]), when one is waiting: such a
+	/// coin waits for no round of this store's, only for its hold to end.
+	held_left: Option<u64>,
 }
 
 /// What [`Wallet::final_within`] answers: the most seconds a round still
@@ -626,16 +630,20 @@ impl Wallet {
 	/// while the wallet sets no instant limit. When the places cannot be
 	/// read, every coin of a lineage other than the wallet's own.
 	pub(crate) fn unspendable(&self, spend: Spend) -> Result<BTreeSet<String>, Error> {
+		// A coin another store of the mnemonic spent, which no catch-up has
+		// settled yet, is never taken ([`Wallet::spent_elsewhere`]).
+		let mut out = self.spent_elsewhere()?;
 		if self.own_instant_limit()?.is_none() {
-			return Ok(BTreeSet::new());
+			return Ok(out);
 		}
 		let barred = |p: Place| p == Place::Arriving || (spend == Spend::CrossChain && p == Place::Proceeds);
-		Ok(match self.places() {
-			Ok(p) => p.coins.into_iter().filter(|(_, _, p)| barred(*p)).map(|(c, ..)| c.leaf_id).collect(),
+		out.extend(match self.places() {
+			Ok(p) => p.coins.into_iter().filter(|(_, _, p)| barred(*p)).map(|(c, ..)| c.leaf_id).collect::<Vec<_>>(),
 			Err(_) => self.store.coins_in("live")?.into_iter()
 				.filter(|c| Self::record_of(c).map(|r| self.lineage(&r)).unwrap_or(Lineage::Received) != Lineage::Own)
 				.map(|c| c.leaf_id).collect(),
-		})
+		});
+		Ok(out)
 	}
 
 	/// Gives up in the next round every live coin of `asset` placed as trade
@@ -690,6 +698,11 @@ impl Wallet {
 	/// the refresh's fee per coin given up, within `max_fee_ppm` (by
 	/// default the wallet's bound).
 	pub fn settle_first(&mut self, coins: &[String], asset: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		// Coins another store of the mnemonic spent are settled by a catch-up,
+		// which this one runs while any is held out: one it settled is through.
+		if let Err(e) = self.settle_spent_elsewhere() {
+			self.store.refused("the catch-up for coins spent elsewhere", &e.to_string())?;
+		}
 		let info = self.server_info()?;
 		let ids: Vec<String> = if !coins.is_empty() {
 			coins.to_vec()
@@ -708,7 +721,7 @@ impl Wallet {
 		} else {
 			return Err(Error::Parse("name the coins to settle, or the asset".into()));
 		};
-		let Sorted { give, waiting, done, mut rounds } = self.sorted(ids)?;
+		let Sorted { give, waiting, done, mut rounds, held_left } = self.sorted(ids)?;
 		let mut left = vec![];
 		let mut settling = vec![];
 		if !give.is_empty() {
@@ -737,7 +750,7 @@ impl Wallet {
 		let ready = settling.is_empty() && waiting.is_empty();
 		let mut v = json!({"settling": settling, "waiting": waiting, "done": done, "left": left, "ready": ready});
 		if !ready {
-			let w = self.wait_of(&info, &rounds)?;
+			let w = self.wait_with_holds(&info, &rounds, held_left)?;
 			v["final_in_seconds"] = json!(w.most);
 			v["usual_in_seconds"] = json!(w.usual);
 			v["waiting_for"] = json!(w.step.name());
@@ -752,11 +765,24 @@ impl Wallet {
 	fn sorted(&self, ids: Vec<String>) -> Result<Sorted, Error> {
 		let (mut give, mut waiting, mut done) = (vec![], vec![], vec![]);
 		let mut rounds: Vec<Option<String>> = vec![];
+		let elsewhere = self.spent_elsewhere_until()?;
+		let now = if elsewhere.is_empty() { 0 } else { self.now()?.to_consensus_u32() };
+		let mut held_left: Option<u64> = None;
 		for id in ids {
 			let Some(c) = self.store.coin(&id)? else {
 				done.push(id);
 				continue;
 			};
+			// Another store's round spends it: never given up here; it waits
+			// for that round, which this store learns of only once a
+			// catch-up finds it released, or for its hold to end, whichever
+			// is first: the hold's end is the wait that really ends.
+			if let Some(until) = elsewhere.get(&id) {
+				let left = u64::from(until.saturating_sub(now));
+				held_left = Some(held_left.map_or(left, |h| h.max(left)));
+				waiting.push(id);
+				continue;
+			}
 			match c.state.as_str() {
 				"live" => give.push(id),
 				"given" => {
@@ -779,11 +805,23 @@ impl Wallet {
 				_ => done.push(id),
 			}
 		}
-		Ok(Sorted { give, waiting, done, rounds })
+		Ok(Sorted { give, waiting, done, rounds, held_left })
 	}
 
 	/// The wait of `rounds` together: the round furthest from done names the
 	/// step waited for, the most it takes and what it usually takes.
+	/// [`Self::wait_of`] `rounds`, and `held_left` seconds for a coin held
+	/// out as spent elsewhere, whose hold ends then at the latest.
+	fn wait_with_holds(&self, info: &Value, rounds: &[Option<String>], held_left: Option<u64>) -> Result<Within, Error> {
+		let mut w = if rounds.is_empty() { Within { most: 0, usual: 0, step: Wait::Release } } else { self.wait_of(info, rounds)? };
+		if let Some(h) = held_left {
+			w.most = w.most.max(h);
+			w.usual = w.usual.max(h);
+			w.step = w.step.min(Wait::Round);
+		}
+		Ok(w)
+	}
+
 	fn wait_of(&self, info: &Value, rounds: &[Option<String>]) -> Result<Within, Error> {
 		let mut out = Within { most: 0, usual: 0, step: Wait::Release };
 		for r in rounds {
@@ -801,15 +839,15 @@ impl Wallet {
 	/// spend can be asked again. `None` when it cannot be read now.
 	pub(crate) fn settle_wait(&self, coins: &[String]) -> Option<(u64, u64, &'static str)> {
 		let info = self.server_info().ok()?;
-		let Sorted { give, rounds, .. } = self.sorted(coins.to_vec()).ok()?;
+		let Sorted { give, rounds, held_left, .. } = self.sorted(coins.to_vec()).ok()?;
 		let mut rounds = rounds;
 		if !give.is_empty() {
 			rounds.push(None);
 		}
-		if rounds.is_empty() {
+		if rounds.is_empty() && held_left.is_none() {
 			return None;
 		}
-		let w = self.wait_of(&info, &rounds).ok()?;
+		let w = self.wait_with_holds(&info, &rounds, held_left).ok()?;
 		Some((w.most, w.usual, w.step.name()))
 	}
 
@@ -910,12 +948,15 @@ impl Wallet {
 	/// See the [module documentation](self).
 	pub fn coin_places(&self) -> Result<Value, Error> {
 		let p = self.places()?;
+		// A coin held out as spent elsewhere is the wallet's still, and not
+		// spendable now ([`Wallet::spent_elsewhere`]).
+		let held = self.spent_elsewhere_until()?;
 		let mut totals: BTreeMap<String, BTreeMap<&'static str, u128>> = BTreeMap::new();
 		let mut spendable: BTreeMap<String, u128> = BTreeMap::new();
 		let mut coins = vec![];
 		for (c, lineage, place) in &p.coins {
 			*totals.entry(c.asset.clone()).or_default().entry(place.name()).or_default() += c.value as u128;
-			if c.state == "live" && *place != Place::Arriving && !p.channels.contains(&c.leaf_id) {
+			if c.state == "live" && *place != Place::Arriving && !p.channels.contains(&c.leaf_id) && !held.contains_key(&c.leaf_id) {
 				*spendable.entry(c.asset.clone()).or_default() += c.value as u128;
 			}
 			let hops = Self::record_of(c).map(|r| record_hops(&r)).unwrap_or(0);
@@ -924,6 +965,9 @@ impl Wallet {
 				"place": place.name(), "hops": hops});
 			if p.channels.contains(&c.leaf_id) {
 				v["channel"] = json!(true);
+			}
+			if let Some(until) = held.get(&c.leaf_id) {
+				v["spent_elsewhere_until"] = json!(until);
 			}
 			coins.push(v);
 		}

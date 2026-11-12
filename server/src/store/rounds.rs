@@ -548,6 +548,43 @@ impl Store {
 		Ok(r.get(0))
 	}
 
+	/// Whether the operator's half of the forfeits of the round `round_id` is
+	/// asked of the signer as soon as the node holds the round, rather than
+	/// at the minute's run: a round held for its forfeits (a batch without a
+	/// sweep) that fills no order, mints nothing, and spends nothing but the
+	/// operator wallet's own coins, each input checked against the wallet's
+	/// record. All of it is read from the server's own record of the round
+	/// (its batches, its `round_fill` and `round_mint` rows, its stored
+	/// transaction and the wallet's coins), never from what a participant
+	/// sent; a round with any fill or mint counts out, whatever else it
+	/// holds. No one but the operator can spend an input of such a round
+	/// first. A coin whose forfeit the signer co-signed is not run again if
+	/// its round is lost, and a round with an input someone else can spend
+	/// (an order anyone may fill, an issuer's mint limiter, which its cold
+	/// key's arm signature spends) can be lost that way: such a round is
+	/// left to the minute.
+	pub async fn round_wakes_fill(&self, round_id: i64) -> Result<bool, StoreError> {
+		use elements::hashes::Hash;
+		let conn = self.conn().await?;
+		let token = arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
+		let Some(row) = conn.query_opt("SELECT tx FROM round WHERE round_id = $1", &[&round_id]).await? else {
+			return Ok(false);
+		};
+		let tx: elements::Transaction = elements::encode::deserialize(&row.get::<_, Vec<u8>>(0))
+			.map_err(|e| StoreError::Corrupt(format!("round {}'s transaction: {}", round_id, e)))?;
+		let txids: Vec<Vec<u8>> = tx.input.iter().map(|i| i.previous_output.txid.to_byte_array().to_vec()).collect();
+		let vouts: Vec<i32> = tx.input.iter().map(|i| i.previous_output.vout as i32).collect();
+		let r = conn.query_one(
+			"SELECT NOT EXISTS (SELECT 1 FROM round_fill WHERE round_id = $1)
+			    AND NOT EXISTS (SELECT 1 FROM round_mint WHERE round_id = $1)
+			    AND EXISTS (SELECT 1 FROM batch WHERE round_id = $1 AND token = $2)
+			    AND $5::bigint > 0
+			    AND (SELECT count(*) FROM unnest($3::bytea[], $4::int[]) o(txid, vout)
+			         WHERE EXISTS (SELECT 1 FROM wallet_coin c WHERE c.txid = o.txid AND c.vout = o.vout)) = $5::bigint",
+			&[&round_id, &&token[..], &txids, &vouts, &(tx.input.len() as i64)]).await?;
+		Ok(r.get(0))
+	}
+
 	/// The coins of `ids` and every coin each was paid on from out of round,
 	/// back to the batch leaf or board it rests on: a reassignment's output
 	/// names the coins its transaction spends, and so on up. A fill's outputs

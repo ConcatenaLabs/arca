@@ -865,6 +865,9 @@ impl Wallet {
 		let coin_type = if get("chain_name")? == "sequentia" { 0 } else { 1 };
 		let keys = Keys::new(mnemonic, cfg.account, coin_type)?;
 		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
+		// The blocks earlier sessions' searches read, so this one reads only
+		// those it has not seen ([`Wallet::keep_chain_seen`]).
+		chain.see_kept(&store.chain_seen()?);
 		// The operator's anchor depth as last read, until its `info` is read
 		// again ([`Self::server_info`]).
 		chain.follow_anchor_depth(opt(ANCHOR_DEPTH_META)?.and_then(|d| d.parse().ok()), &get("chain_name")?);
@@ -874,6 +877,16 @@ impl Wallet {
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
+	}
+
+	/// Keeps in the store the blocks the chain's searches read since it last
+	/// did, and drops those the bound leaves out
+	/// ([`super::chain::ChainSource::seen_to_keep`]): a new session of the
+	/// wallet (a page reloaded, a command run again) reads only the blocks
+	/// it has not seen. Run after each command.
+	pub fn keep_chain_seen(&self) -> Result<(), Error> {
+		let (rows, below) = self.chain.seen_to_keep();
+		self.store.keep_chain_seen(&rows, below)
 	}
 
 	/// Whether the wallet asks for `vtxo-2` leaves for itself: in a refresh,
@@ -3540,9 +3553,20 @@ impl Wallet {
 	/// records: an exit fee of a board reads every on-chain script the
 	/// wallet ever drew.
 	pub fn coins_listed(&self, held: bool, brief: bool) -> Result<Value, Error> {
+		// A coin held out as spent elsewhere ([`Self::spent_elsewhere`]): the
+		// wallet's, and not spendable now, whatever its state reads. Marked
+		// so, with when its hold ends, so a program counts what can be spent
+		// now as coin_places does.
+		let elsewhere = self.spent_elsewhere_until()?;
+		let mark = |v: &mut Value, id: &str| {
+			if let Some(until) = elsewhere.get(id) {
+				v["spent_elsewhere_until"] = json!(until);
+				v["standing"] = json!("spent_elsewhere");
+			}
+		};
 		if brief {
 			let rows = if held { self.store.coins_not_in(&GONE)? } else { self.store.coins()? };
-			return Ok(Value::Array(rows.iter().map(Self::coin_brief).collect()));
+			return Ok(Value::Array(rows.iter().map(|c| { let mut v = Self::coin_brief(c); mark(&mut v, &c.leaf_id); v }).collect()));
 		}
 		let alone = self.keepers()?.0.is_empty();
 		let stopped = self.rolled_back()?.is_some();
@@ -3556,6 +3580,7 @@ impl Wallet {
 		let mut out = vec![];
 		for c in if held { self.store.coins_not_in(&GONE)? } else { self.store.coins()? } {
 			let mut v = Self::coin_json(&c);
+			mark(&mut v, &c.leaf_id);
 			// Given up in a refresh the operator has not put in a round (as
 			// the wallet last knew): a payment or a trade that needs it takes
 			// that refresh back first, and its quote counts it.
@@ -3714,11 +3739,15 @@ impl Wallet {
 		// The coins the wallet holds, read once: those it spent or lost,
 		// which no figure here counts, are not read.
 		let held_coins = self.store.coins_not_in(&GONE)?;
+		// A coin held out as spent elsewhere: the wallet's still, counted in
+		// what it holds, and shown apart from what it can spend now.
+		let elsewhere = self.spent_elsewhere()?;
 		for c in &held_coins {
 			if matches!(c.state.as_str(), "spent" | "exited" | "lost") {
 				continue;
 			}
-			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" } else { Self::standing(c) };
+			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" }
+				else if elsewhere.contains(&c.leaf_id) { "spent_elsewhere" } else { Self::standing(c) };
 			// A channel coin counts the wallet's side of it alone.
 			let worth = self.channel_worth(c)?.unwrap_or(c.value);
 			*per.entry(c.asset.clone()).or_default().entry(standing.to_string()).or_default() += worth;

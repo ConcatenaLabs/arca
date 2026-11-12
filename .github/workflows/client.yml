@@ -96,6 +96,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The test-only hook of the shaped refusal (`shape-probe`) is in no
+      # shipped build: the wallet's command line, the operator's server and
+      # the browser's wallet package, each with its default features.
+      - name: No shipped build has the shape-probe feature
+        run: |
+          # The features arca-wallet is built with, in the build `cargo tree` is given.
+          wallet_features() { cargo tree --locked "$@" -e normal --prefix none -f '{p} {f}' | grep '^arca-wallet ' | sort -u || true; }
+          # The check sees the feature where it is on.
+          on=$(wallet_features -p arca-cli --features shape-probe)
+          grep -q shape-probe <<<"$on"
+          for build in "-p arca-cli" "-p arca-server" "--manifest-path wallet-wasm/Cargo.toml --target wasm32-unknown-unknown"; do
+            f=$(wallet_features $build)
+            echo "$build: ${f:-no arca-wallet}"
+            if grep -q shape-probe <<<"$f"; then
+              echo "$build is built with arca-wallet's shape-probe feature" >&2
+              exit 1
+            fi
+          done
+
       - name: The wallet's unit tests
         run: cargo test --locked -p arca-wallet --features arca --lib
 
@@ -123,6 +142,12 @@ jobs:
 
       - name: Scenarios
         run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer --test arca_command_view --test arca_bond --test arca_supervised --test arca_accumulator --test arca_channel --test arca_anchor_depth --test arca_owed --test arca_watchtower --test arca_speed_up --test arca_refresh_withdraw --test arca_quote_waiting_refresh --test arca_no_sweep --test arca_mailbox_reads --test arca_batch_bases --test arca_swap_coins --test arca_block_times_reorg --test arca_refresh_pieces --test arca_refresh_needed --test arca_checkpoint_exit --test arca_coin_places --test arca_bond_watch_reads --test arca_settle_first -- --nocapture
+
+      # Built with the test-only `shape-probe` feature, after every other
+      # test of this job: the one way to reach a trade refused after its
+      # coin was shaped.
+      - name: A trade refused after its coin was shaped
+        run: cargo test --locked -p arca-cli --features shape-probe --test arca_shaped -- --nocapture
 
   # The wallet's orders and fills, which the scenarios do not carry, and the
   # server kept running for a browser wallet (tests/arca_operator_for_browsers.rs),
