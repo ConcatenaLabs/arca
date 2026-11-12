@@ -1183,6 +1183,60 @@ impl Wallet {
 		Ok(json!({"participation": pid, "state": "void", "live_again": back, "void_reason": st["void_reason"]}))
 	}
 
+	/// The participation that gave up or spent coin `c`, as its `spent_by`
+	/// or its note names it (`participation <id>…`).
+	pub(crate) fn participation_of(c: &super::store::CoinRow) -> Option<String> {
+		let named = |s: &str| s.strip_prefix("participation ")
+			.map(|r| r.split([':', ';', ' ']).next().unwrap_or("").to_string())
+			.filter(|p| !p.is_empty());
+		c.spent_by.as_deref().and_then(named).or_else(|| named(&c.note))
+	}
+
+	/// What the new leaves participation `pid` validated before it signed
+	/// its forfeits hold of `asset` (the wallet's own leaves: not a claim,
+	/// not a payment held for its preimage): 0 before then.
+	pub(crate) fn news_value(&self, pid: &str, asset: AssetId) -> Result<u64, Error> {
+		let Some(news) = self.store.participation_news(pid)? else { return Ok(0) };
+		let news: Value = serde_json::from_str(&news).map_err(|e| Error::Store(e.to_string()))?;
+		let mut value = 0u64;
+		for n in news["leaves"].as_array().cloned().unwrap_or_default() {
+			let Ok(record) = NewRecord::from_bytes(&unhex(n["record"].as_str().unwrap_or(""))?) else { continue };
+			if record.htlc().is_none() && record.asset() == asset {
+				value = value.saturating_add(record.value());
+			}
+		}
+		Ok(value)
+	}
+
+	/// What the wallet's own rounds still owe it of `asset`: each
+	/// participation whose forfeits the wallet signed and whose new leaves
+	/// it has not taken yet (the operator has not handed their preimage
+	/// over: its round is not final there yet, or its answer is still to
+	/// come), with the coins it gave up that are held under those forfeits
+	/// (`forfeited`) and what its new leaves hold of `asset`. Neither those
+	/// coins nor the new leaves pay anything until a sync takes the leaves,
+	/// which it does once the operator releases the participation.
+	pub(crate) fn owed_by_own_rounds(&self, asset: AssetId) -> Result<Vec<(String, Vec<String>, u64)>, Error> {
+		let mut out = vec![];
+		for (pid, _, given, _, _, _, _) in self.store.participations_in(&["issued", "forfeiting"])? {
+			let back = self.news_value(&pid, asset)?;
+			if back == 0 {
+				continue;
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			let mut held = vec![];
+			for l in given {
+				if self.store.coin(&l)?.is_some_and(|c| c.state == "forfeited") {
+					held.push(l);
+				}
+			}
+			if !held.is_empty() {
+				out.push((pid, held, back));
+			}
+		}
+		Ok(out)
+	}
+
 	/// Whether participation `body` is a refresh: not a take, a distribution
 	/// or an offboard, its every output a leaf. Only a refresh is taken back
 	/// for the owner of its coins ([`Self::withdraw_refreshes`],

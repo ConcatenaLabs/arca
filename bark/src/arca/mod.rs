@@ -170,9 +170,12 @@ pub enum Error {
 	/// through the operator's next round first (at or near the operator's
 	/// depth limit, arriving, trade proceeds asked to pay a cross-chain leg,
 	/// or of a record format the other side does not read), some of which
-	/// may already be in a refresh or not final yet. A program settles them
-	/// ([`Wallet::settle_first`]), waits for the round, and asks again;
-	/// nothing was signed.
+	/// may already be in a refresh, not final yet, or given up in a round of
+	/// the wallet's own whose new coins it has not taken yet. A program
+	/// settles them ([`Wallet::settle_first`]), asks that again until it
+	/// answers `ready` (which it does once the coins the round made can be
+	/// spent, and which `final_in_seconds` bounds meanwhile), and asks the
+	/// spend again; nothing was signed.
 	#[error("refused: {message}")]
 	SettleFirst { asset: String, coins: Vec<String>, message: String },
 	/// The server refused, with its stable code.

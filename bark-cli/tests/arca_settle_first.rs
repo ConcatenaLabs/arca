@@ -19,6 +19,12 @@
 //!    wallet waits on, and pays once the round is final again.
 //! 5. An offboard past the instant limit's counted coins, from a payment
 //!    still arriving: settled first, then quoted and asked as any offboard.
+//! 6. Between a settling round's broadcast and the wallet taking the coin it
+//!    makes, with the operator following the chain behind the wallet (as a
+//!    busy operator's round pass does): `settle-first` is not ready and says
+//!    when it will be, and a payment, an offboard's quote and a trade's quote
+//!    each answer `settle_first`, never a plain shortfall. At anchor depth 0
+//!    (the testnet's) and 2.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -496,4 +502,117 @@ async fn an_offboard_from_a_payment_arriving_settles_first_then_goes() {
 	for w in [&s, &a] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 6. Between a settling round's broadcast and its finality.
+// ---------------------------------------------------------------------------
+
+/// What `w` answers, in the window between the settling round's broadcast
+/// and its finality, to `settle-first` and to each spend of `asset`: a send
+/// to `req`, an offboard to `address`, and the quote of `offer` (a trade).
+fn window_answers(w: &Arca, coins: &[String], asset: AssetId, req: &str, address: &str, offer: &str) -> Value {
+	let xs = asset.to_string();
+	let s = settle(w, coins);
+	let send = w.run(&["send", req, "--amount", "500000", "--asset", &xs]).1;
+	let off = w.run(&["offboard", "--asset", &xs, "--amount", "500000", "--address", address, "--quote"]).1;
+	let swap = library(w, "swap_read", json!({"offer": offer})).unwrap_or_else(|e| e);
+	json!({"settle": s, "send": send, "offboard": off, "swap_read": swap})
+}
+
+/// The window as the testnet has it: the operator broadcasts a round, the
+/// wallet signs its forfeits, and the round's block comes a while later
+/// (a minute there). Until the round is final at the operator's anchor
+/// depth the coin it makes cannot be spent: `settle-first` is not ready yet
+/// and says when it will be, and every spend of the asset answers
+/// `settle_first`, never a plain shortfall. Run at depth 0 (the testnet's)
+/// and depth 2 (the harness's default and the main chain's least).
+async fn window_case(depth: u32) {
+	let tag = format!("SF6 d{}", depth);
+	let mut r = Running::start_with(move |cfg, _, _| {
+		cfg.finality.anchor_depth = depth;
+		cfg.watcher.enabled = false;
+		// The operator follows the chain every 15 s, so the wallet sees the
+		// round final before the operator does.
+		cfg.finality.poll_interval_ms = 15_000;
+	}).await;
+	let (x, y) = (r.x, r.y);
+	let rx = rate(&r, x) as u64;
+	price(&r, y, rx);
+	post_bond(&mut r).await;
+	let (s, a, c) = (Arca::new(&format!("{} S", tag)), Arca::new(&format!("{} A", tag)), Arca::new(&format!("{} C", tag)));
+	boarded(&mut r, &s, &[(x, 4_000_000)]).await;
+	boarded(&mut r, &c, &[(y, 2_000_000), (x, 1_000_000)]).await;
+	create(&r, &a);
+	library(&a, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	let arriving = pay(&s, &a, x, 2_000_000);
+	assert_eq!(coin_line(&a, &arriving)["place"], "arriving");
+	let req = request(&c);
+	let address = a.ok(&["address"])["address"].as_str().unwrap().to_string();
+	let offer = c.ok(&["swap", "offer", "--give-asset", &y.to_string(), "--give", "400000", "--want-asset", &x.to_string(), "--want", "500000"]);
+	let offer = offer["offer"].as_str().unwrap().to_string();
+	let first = settle(&a, &[arriving.clone()]);
+	assert_eq!(names(&first["settling"]), vec![arriving.clone()], "{}: {}", tag, first);
+
+	// The round goes out; the wallet signs its forfeits; no block yet.
+	let (built, errs) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(errs.is_empty(), "{:?}", errs);
+	assert!(!built.is_empty(), "{}: the settling round is built", tag);
+	a.ok(&["sync"]);
+	// The operator's pass: the round goes out once every forfeit is in;
+	// the wallet's next sync finds it broadcast.
+	r.server.rounds.pass().await.unwrap();
+	a.ok(&["sync"]);
+	let states: Vec<Value> = a.ok(&["coins"]).as_array().unwrap().iter().filter(|k| k["asset"] == x.to_string())
+		.map(|k| json!([k["leaf_id"].as_str().unwrap()[..8].to_string(), k["state"], k["value"]])).collect();
+	println!("{}: A's coins of X in the window: {:?}; the round(s) in the mempool: {:?}", tag, states,
+		built.iter().map(|b| r.rt.client().call::<Value>("getmempoolentry", &[json!(b.tx.txid().to_string())]).is_ok()).collect::<Vec<_>>());
+	let w1 = window_answers(&a, &[arriving.clone()], x, &req, &address, &offer);
+	println!("{}: broadcast, no block: {}", tag, w1);
+	// The round's block, final at the operator's depth in the wallet's view
+	// (buried at depth 2), while the operator has not followed it yet: the
+	// wallet signs its forfeits and is answered with no preimage, its coin
+	// given up and the new one not yet in hand.
+	r.produce().await;
+	if depth > 0 {
+		r.bury().await;
+	}
+	a.ok(&["sync"]);
+	let states: Vec<Value> = a.ok(&["coins"]).as_array().unwrap().iter().filter(|k| k["asset"] == x.to_string())
+		.map(|k| json!([k["leaf_id"].as_str().unwrap()[..8].to_string(), k["state"], k["value"]])).collect();
+	println!("{}: A's coins of X once final in its view, the operator behind: {:?}", tag, states);
+	let w2 = window_answers(&a, &[arriving.clone()], x, &req, &address, &offer);
+	println!("{}: final in the wallet's view, not yet the operator's: {}", tag, w2);
+	for w in [&w1, &w2] {
+		assert_eq!(w["settle"]["ready"], false, "{}: not ready while the coin it makes cannot be spent: {}", tag, w["settle"]);
+		assert!(w["settle"]["final_in_seconds"].as_u64().is_some(), "{}: it says when: {}", tag, w["settle"]);
+		for k in ["send", "offboard", "swap_read"] {
+			assert_eq!(w[k]["error"]["kind"], "settle_first", "{}: {} waits for the round, never a plain shortfall: {}", tag, k, w[k]);
+		}
+	}
+	// Final: ready, and every spend goes.
+	r.synced().await;
+	for b in &built {
+		r.round_state(&b.tx.txid(), RoundState::Final).await;
+	}
+	a.ok(&["sync"]);
+	let done = settle(&a, &[arriving.clone()]);
+	println!("{}: final: {}", tag, done);
+	assert_eq!(done["ready"], true, "{}: {}", tag, done);
+	library(&a, "swap_read", json!({"offer": offer})).unwrap_or_else(|e| panic!("{}: the trade is priced once final: {}", tag, e));
+	a.ok(&["offboard", "--asset", &x.to_string(), "--amount", "500000", "--address", &address, "--quote"]);
+	a.ok(&["send", &req, "--amount", "500000", "--asset", &x.to_string()]);
+	for w in [&s, &a, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spend_settled_first_waits_until_its_round_is_final_at_the_testnets_depth() {
+	window_case(0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spend_settled_first_waits_until_its_round_is_final_at_depth_two() {
+	window_case(2).await;
 }

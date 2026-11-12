@@ -128,7 +128,8 @@ shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?, leaves?}` (`leaves`: those coins alone), `refresh_needed {idle_seconds?}` (whether what the wallet received out
 of round should be refreshed now, and by which rule: `arriving`, `depth`, `exposure`, `expiry`, `idle`, `shape`),
 `settle_first {coins? | asset?, max_fee_ppm?}` (puts through the next round the coins a `settle_first` refusal names, giving up
-nothing twice: `settling`, `waiting`, `done`, `left`, `ready`),
+nothing twice: `settling`, `waiting`, `done`, `left`, `ready` once the coins their round made can be spent, and while not,
+`final_in_seconds`, the most it should still take),
 `instant_limit {value}` (the wallet's instant limit, atoms of the reference unit, or `"off"`),
 `coin_places` (each coin's place, `settled`, `proceeds`, `counted` or `arriving`, the totals by asset,
 what is spendable now, and the limit),
