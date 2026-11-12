@@ -151,6 +151,7 @@ async fn a_database_holding_one_does_not_start() {
 	assert!(e.starts_with("the database holds 2 coin(s) of the retired enclave-1"), "{}", e);
 	assert!(e.contains(&hex(&paid_away)) && e.contains(&hex(&live)), "each coin named: {}", e);
 	assert!(e.contains("previous release") && e.contains("exit to its enclave"), "the way home: {}", e);
+	assert!(e.contains("https://github.com/ConcatenaLabs/arca/issues"), "where to report it: {}", e);
 	let after: i64 = c.query_one("SELECT count(*) FROM leaf", &[]).await.unwrap().get(0);
 	assert_eq!(before, after);
 }

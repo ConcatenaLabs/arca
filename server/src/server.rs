@@ -1454,10 +1454,10 @@ async fn retired_enclave_coins(store: &Store) -> Result<(), StartError> {
 		return Ok(());
 	}
 	Err(StartError(format!(
-		"the database holds {} coin(s) of the retired enclave-1, which this build can neither read nor defend: {}. Bring them \
-		 home with the previous release first: run a build from before the retirement on this database, under which each holder \
-		 takes its coin home by its exit to its enclave and the watcher defends every one until then (the server's README, \
-		 \"Restricted assets\")",
+		"the database holds {} coin(s) of the retired enclave-1, which this build can neither read nor defend: {}. This database \
+		 stays with the previous release: run a build from before the retirement on it, under which each holder brings its coin \
+		 home by its exit to its enclave and the watcher defends every one (the server's README, \"Restricted assets\"). \
+		 Report it at https://github.com/ConcatenaLabs/arca/issues: this build has no way to take such a database over",
 		found.len(), found.iter().map(|(id, what)| format!("{} ({})", crate::signer::hex(id), what)).collect::<Vec<_>>().join(", "))))
 }
 

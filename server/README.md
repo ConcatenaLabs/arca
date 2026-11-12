@@ -2404,9 +2404,11 @@ Such a database stays with a build that still serves `enclave-1`: commit
 retired. Under it, each holder brings its coin home by its exit to its own
 enclave on the chain (`enclave_exit_tx` in that build's `arca-covenant`;
 for a coin received out of round, its checkpoint and reassignment first),
-and the watcher keeps defending every coin until then. A wallet built from
-this repository cannot build that exit either: it reads the record as the
-same refusal, which names the way home.
+and the watcher keeps defending every coin. The server records no holder's
+exit, so the rows stay after the coins are home, and the database stays
+with that build; the refusal asks the operator to report it in this
+repository's issues. A wallet built from this repository cannot build that exit
+either: it reads the record as the same refusal, which names the way home.
 
 ## Channel leaves
 
