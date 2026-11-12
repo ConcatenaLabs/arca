@@ -1342,6 +1342,90 @@ async fn a_long_history_is_restored_after_the_balance() {
 	}
 }
 
+/// A restore's listed coin waits for a transaction it rests on only so long
+/// (`HISTORY_WAIT_MOST`): A pays B twice out of round from its board, so the
+/// board waits in A2's history. The server names for it, beside its own, a
+/// transaction that is in the mempool and never confirms. A2's step leaves the
+/// board waiting (`waiting_for_the_chain`), and the history stays loading.
+/// Once the wait is older than the bound (its `waiting_since` aged in the
+/// store, as six hours passing would leave it), the step takes the board as a
+/// restore that takes everything at once does, the history is complete, and
+/// A2's coins are A's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listed_coin_waits_for_a_transaction_that_never_confirms_only_so_long() {
+	let mut r = Running::start_kept(1, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, a2, b) = (Arca::new("WWA"), Arca::new("WWA2"), Arca::new("WWB"));
+	let board = boarded(&mut r, &a, &url, &[(x, 3_000_000)]).await[0].clone();
+	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+	for amount in ["1000000", "500000"] {
+		let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		a.ok(&["send", &req, "--amount", amount, "--asset", &xs]);
+		b.ok(&["sync"]);
+		a.ok(&["sync"]);
+	}
+	// A transaction that never confirms: in the mempool, kept out of blocks.
+	let stuck = r.pay_to(script(&b.ok(&["address"])), x, 10_000).txid().to_string();
+	let c = r.rt.client();
+	let _: Value = c.call("prioritisetransaction", &[json!(stuck), json!(0), json!(-1_000_000_000i64)]).unwrap();
+	r.produce().await;
+	let tx: Value = c.call("getrawtransaction", &[json!(stuck), json!(true)]).unwrap();
+	assert!(tx["blockhash"].is_null(), "the transaction is in no block");
+
+	let lie = Proxy::start(&url);
+	let (bid, st) = (board.clone(), stuck.clone());
+	lie.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/leaf_data" && status == 200 {
+			for l in v["leaves"].as_array_mut().into_iter().flatten() {
+				if l["leaf_id"] == bid.as_str() {
+					if let Some(bases) = l["bases"].as_array_mut() {
+						bases.push(json!({"txid": st}));
+					} else {
+						l["bases"] = json!([{"txid": st}]);
+					}
+				}
+			}
+		}
+		None
+	})));
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&lie.url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	println!("WW A2's restore: history {}", made["restore"]["history"]);
+	assert_eq!(made["restore"]["history"]["left"], 1, "the board is listed: {}", made["restore"]["history"]);
+	let step = a2.ok(&["restore-history"]);
+	println!("WW A2's step: {}", step);
+	assert_eq!((step["checked"].clone(), step["waiting_for_the_chain"].clone(), step["left"].clone()), (json!(0), json!(1), json!(1)), "{}", step);
+	assert_eq!(a2.ok(&["balance"])["history"]["loading"], true);
+	// Six hours pass while the transaction stays out of every block.
+	{
+		let db = rusqlite::Connection::open(a2.dir.join("arca.sqlite")).unwrap();
+		let list: String = db.query_row("SELECT value FROM meta WHERE key = 'restore_history'", [], |r| r.get(0)).unwrap();
+		let mut list: Value = serde_json::from_str(&list).unwrap();
+		let since = list[0]["waiting_since"].as_u64().expect("the wait is noted");
+		list[0]["waiting_since"] = json!(since - 6 * 3600 - 1);
+		db.execute("UPDATE meta SET value = ?1 WHERE key = 'restore_history'", [list.to_string()]).unwrap();
+	}
+	let step = a2.ok(&["restore-history"]);
+	println!("WW A2's step past the bound: checked {} | left {} | waiting {} | not_recovered {}", step["checked"], step["left"],
+		step["waiting_for_the_chain"], step["not_recovered"]);
+	assert_eq!((step["checked"].clone(), step["left"].clone()), (json!(1), json!(0)), "{}", step);
+	assert!(step["waiting_for_the_chain"].is_null(), "{}", step);
+	assert!(a2.ok(&["balance"])["history"].is_null(), "the history is complete");
+	a.ok(&["sync"]);
+	a2.ok(&["sync"]);
+	let diff = differences(&a.ok(&["coins"]), &a2.ok(&["coins"]));
+	println!("WW coins differing (A | A2): {:?}", diff);
+	assert!(diff.is_empty(), "A2's coins are A's: {:?}", diff);
+	assert_eq!(tree_balance(&a2), tree_balance(&a));
+	for w in [&a, &a2, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// Bitcoin anchoring is supreme, also while a restore's history waits: A
 /// holds a board B1 and pays B out of round twice from a board B2 whose block
 /// is anchored to Bitcoin parent block p, so B2 and its first change are

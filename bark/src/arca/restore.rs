@@ -138,6 +138,18 @@ pub(crate) const RESTORE_HISTORY: &str = "restore_history";
 /// the mailbox read, which leaves each to its step.
 pub(crate) const RESTORE_HISTORY_IDS: &str = "restore_history_ids";
 
+/// The longest a coin of a restore's history waits for a transaction it
+/// rests on, as the server names it, to be in a block of the active chain
+/// again ([`Wallet::restore_history`]), in seconds of median time: six hours,
+/// far past the time a transaction an anchor-driven reorganisation took out
+/// of the chain needs to be mined again. Past it, the coin is checked as a
+/// restore that takes everything at once checks it.
+pub const HISTORY_WAIT_MOST: u32 = 6 * 3600;
+
+/// The field of a listed coin that says since when (median time) it waits
+/// for a transaction it rests on ([`HISTORY_WAIT_MOST`]).
+pub(crate) const WAITING_SINCE: &str = "waiting_since";
+
 /// The most coins of a restore's history one step checks
 /// ([`Wallet::restore_history`]): a `sync` runs one step, so it holds the
 /// wallet for a bounded time while the history lasts.
@@ -874,6 +886,21 @@ impl Wallet {
 			.partition(|e| record(e).is_some_and(|r| parents.contains(&owner_of(&r).1)
 				|| r.parents().iter().any(|p| received.contains(&owner_of(p).1))));
 		later = kept;
+		// A coin taken at once is never named by a record left to the
+		// history: the records that spend a moved coin move with it, and
+		// theirs with them, as a restore that takes everything at once judges
+		// a coin beside the records that spend it.
+		let mut up: BTreeSet<[u8; 32]> = moved.iter().filter_map(|e| record(e)).map(|r| owner_of(&r).1).collect();
+		loop {
+			let (more, kept): (Vec<Value>, Vec<Value>) = later.into_iter()
+				.partition(|e| record(e).is_some_and(|r| r.parents().iter().any(|p| up.contains(&owner_of(p).1))));
+			later = kept;
+			if more.is_empty() {
+				break;
+			}
+			up.extend(more.iter().filter_map(|e| record(e)).map(|r| owner_of(&r).1));
+			moved.extend(more);
+		}
 		for e in &moved {
 			namers.remove(e["leaf_id"].as_str().unwrap_or(""));
 		}
@@ -940,8 +967,10 @@ impl Wallet {
 	}
 
 	/// How many coins of a restore's history are left to check.
+	/// Read from the ids alone, which are written with the list in one
+	/// transaction: `balance` asks it at every read.
 	pub(crate) fn history_left(&self) -> Result<usize, Error> {
-		Ok(self.history()?.len())
+		Ok(self.history_ids()?.len())
 	}
 
 	/// The ids of the coins a restore left to its history's steps.
@@ -977,19 +1006,29 @@ impl Wallet {
 		let ahead: Vec<Txid> = unheld.iter().take(2 * HISTORY_STEP).flat_map(Self::served_bases)
 			.filter_map(|t| Txid::from_str(&t).ok()).collect();
 		self.chain.read_ahead_of(&ahead, &[]);
+		// The wait is bounded ([`HISTORY_WAIT_MOST`]): a transaction the
+		// server names that never confirms (a lie, or one a reorganisation
+		// left out for good) holds no coin in the list for ever; past the
+		// bound the coin is taken as a restore that takes everything at once
+		// takes it.
+		let now = self.now()?.to_consensus_u32() as u64;
 		let (mut step, mut waiting) = (vec![], 0usize);
 		let mut later: Vec<Value> = vec![];
-		for e in unheld {
+		for mut e in unheld {
 			if step.len() >= HISTORY_STEP {
 				later.push(e);
 				continue;
 			}
 			if self.base_out_of_chain(&e)? {
-				waiting += 1;
-				later.push(e);
-			} else {
-				step.push(e);
+				let since = e[WAITING_SINCE].as_u64().unwrap_or(now);
+				if now.saturating_sub(since) < HISTORY_WAIT_MOST as u64 {
+					e[WAITING_SINCE] = json!(since);
+					waiting += 1;
+					later.push(e);
+					continue;
+				}
 			}
+			step.push(e);
 		}
 		let TakenServed { mut restored, not_recovered, notes: taken_notes, given_elsewhere: _ } =
 			self.take_served(&info, &step, &[], false, None)?;

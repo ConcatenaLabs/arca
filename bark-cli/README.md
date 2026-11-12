@@ -201,11 +201,14 @@ spend a coin before the coin itself, until none is left; `restore-history`
 runs one step on its own. A coin of the history is counted nowhere until its
 step has checked it. A coin resting on a transaction that a reorganisation
 took out of the chain waits in the list until it is mined again
-(`waiting_for_the_chain`), and a step cut short settles what it took when it
+(`waiting_for_the_chain`), six hours at most (`HISTORY_WAIT_MOST`): past that
+it is checked as a restore that takes everything at once checks it, so a
+transaction that never confirms holds nothing in the list for ever. A step cut short settles what it took when it
 runs again. While coins are left, `balance` carries `history: {"loading":
 true, "left": N}`, so an activity view can say the past is still loading;
 the balance itself is whole. The coin a live coin was made from is checked
-with it, at once. `restore` says how many are left (`history.left`), and
+with it, at once, and so are the coin a received Lightning leaf's claim made
+and every record that spends a coin taken at once. `restore` says how many are left (`history.left`), and
 each `sync` whose step ran answers it under `history`. A catch-up leaves
 those coins to the steps.
 
