@@ -604,6 +604,9 @@ impl Wallet {
 		let barred = self.unspendable(spend)?;
 		let planned = self.planned_coins()?;
 		let now = self.now()?.to_consensus_u32() as u64;
+		// Coins a settle gave up ([`Self::settle_first`]): no spend takes
+		// them back, so one that needs them waits for their round.
+		let settling = self.settle_asked()?;
 		let mut out = vec![];
 		for row in self.store.coins_in_states(&["live", "given", "pending"])?.into_iter().filter(|c| c.asset == asset.to_string()) {
 			if row.expiry != u32::MAX && now + WalletPolicy::EXIT_DEADLINE as u64 >= row.expiry as u64 {
@@ -615,6 +618,8 @@ impl Wallet {
 			let hops = Self::record_of(&row).map(|r| super::wallet::record_hops(&r)).unwrap_or(0);
 			let why = if row.state == "pending" {
 				"not final yet"
+			} else if row.state == "given" && settling.contains(&row.leaf_id) {
+				"given up in a round of the wallet's own that settles it"
 			} else if barred.contains(&row.leaf_id) {
 				if spend == Spend::CrossChain { "arriving, or trade proceeds, which no leg paid to another party spends" } else { "arriving" }
 			} else if deep.is_some_and(|d| hops >= d) {
@@ -2528,6 +2533,21 @@ impl Wallet {
 	/// before anything moves rather than paid and then refused.
 	fn shape_inputs(&self, info: &Value, asset: AssetId, need: u64, probe: &ExplicitOutput, reads: Reads) -> Result<(Vec<In>, u64), Error> {
 		let min = Self::min_leaf(info, asset)?;
+		// One coin alone first, in [`shape_order`]: the deepest that still has
+		// room, so one lineage is used up and refreshed while the others stay
+		// whole ([`Self::refresh_needed`]'s `shape`).
+		if let Some(limit) = depth_limit(info) {
+			let margins = Margins::of(info, asset)?;
+			let mut coins = self.spendable(asset, Spend::Trade)?;
+			coins.retain(|c| reads.record(&c.row.record));
+			let now = self.now()?.to_consensus_u32();
+			let order = shape_order(&coins.iter().map(|c| (c.coin.value, c.row.expiry, c.coin.hops)).collect::<Vec<_>>(), need, limit, now);
+			for i in order {
+				if let Some((inputs, _margin, change)) = self.pays_alone(&coins[i], &margins, need, std::slice::from_ref(probe), true, min, 0, asset)? {
+					return Ok((inputs, change));
+				}
+			}
+		}
 		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(probe), true, min, 0, false, reads, Spend::Trade)?;
 		if let Some(limit) = depth_limit(info) {
 			let deep: Vec<(String, u64)> = inputs.iter().filter(|i| i.coin.hops + 3 > limit).map(|i| (i.row.leaf_id.clone(), i.coin.value)).collect();
@@ -3565,9 +3585,55 @@ pub(crate) fn fit_order(coins: &[(u64, u32, usize, bool)], paid: u64, depth_limi
 	out_of_round.into_iter().chain(fresh).collect()
 }
 
+/// The coins a trade's shaping self-payment ([`Wallet::shape_coin`]) tries
+/// alone, in order, by index into `coins` (each its value, its expiry and its
+/// reassignments since a round, `hops`): those worth at least `need`, with at
+/// least [`FIT_LIFE`] left before their expiry at `now`, and room to shape a
+/// coin the trade can give (`hops` + 3 at most `depth_limit`), the deepest
+/// first and the smallest among those of one depth.
+///
+/// Each shaping makes its change one reassignment deeper, so a wallet
+/// trading again and again uses up a coin's room three trades at a time.
+/// Taken deepest first, one coin's room is used up before the next is
+/// touched, and that coin goes through the next round while the others
+/// still trade ([`Wallet::refresh_needed`]'s `shape`); taken largest or
+/// shallowest first, every coin of the asset came to the limit together,
+/// and the wallet could trade on from none while they were refreshed.
+pub(crate) fn shape_order(coins: &[(u64, u32, usize)], need: u64, depth_limit: usize, now: u32) -> Vec<usize> {
+	let lives = |e: u32| e == u32::MAX || e >= now.saturating_add(FIT_LIFE);
+	let mut out: Vec<usize> = (0..coins.len())
+		.filter(|&i| coins[i].0 >= need && lives(coins[i].1) && coins[i].2 + 3 <= depth_limit)
+		.collect();
+	out.sort_by_key(|&i| (std::cmp::Reverse(coins[i].2), coins[i].0, i));
+	out
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A trade's shaping tries the deepest coin with room first, the smallest
+	/// of one depth first; none at three or less from the limit, none too
+	/// small, none with less than seven days of life.
+	#[test]
+	fn shaping_uses_up_one_coin_before_the_next() {
+		let now = 1_000_000u32;
+		let t = now + 20 * 86_400;
+		let coins = [
+			(400_000, t, 0),               // 0: fresh
+			(300_000, t, 2),               // 1: two deep: one shaping left
+			(250_000, t, 1),               // 2: one deep
+			(900_000, t, 3),               // 3: three deep: no room
+			(350_000, t, 0),               // 4: fresh, smaller
+			(50_000, t, 2),                // 5: too small
+			(500_000, now + 86_400, 0),    // 6: a day of life
+			(600_000, u32::MAX, 1),        // 7: no expiry, one deep
+		];
+		assert_eq!(shape_order(&coins, 100_000, 5, now), vec![1, 2, 7, 4, 0]);
+		assert_eq!(shape_order(&coins, 320_000, 5, now), vec![7, 4, 0], "the two-deep coin is too small for it");
+		assert!(shape_order(&coins, 1_000_000, 5, now).is_empty());
+		assert_eq!(shape_order(&coins, 100_000, 3, now), vec![4, 0], "a lower limit leaves room only at depth 0");
+	}
 
 	/// The coin a refusal of the server's names: its first leaf id.
 	#[test]

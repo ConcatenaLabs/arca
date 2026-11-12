@@ -144,7 +144,8 @@ value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?, leaves?}` (`leaves`: those coins alone), `refresh_needed {idle_seconds?}` (whether what the wallet received out
 of round should be refreshed now, and by which rule: `arriving`, `depth`, `exposure`, `expiry`, `idle`, `shape`),
-`settle_first {coins? | asset?, max_fee_ppm?}` (puts through the next round the coins a `settle_first` refusal names, giving up
+`settle_first {coins? | asset?, max_fee_ppm?, spread?}` (puts through the next round the coins a `settle_first` refusal names, or
+the `shape` rule's coins, with `spread` cut into a few coins of the asset, at most four with the others the wallet holds; giving up
 nothing twice: `settling`, `waiting`, `done`, `left`, `ready` once the coins their round made can be spent, and while not,
 `final_in_seconds`, the most it should still take, `usual_in_seconds`, what it usually takes, and `waiting_for`, the step it
 waits for; a `settle_first` refusal carries the same three),

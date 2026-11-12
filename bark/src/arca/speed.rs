@@ -485,13 +485,20 @@ impl Wallet {
 	///   ([`CoinDates`]: from `refresh_from` until its exit deadline);
 	/// - `idle`: the person has left the wallet alone `idle_seconds` of at
 	///   least [`REFRESH_IDLE`] (the caller counts them);
-	/// - `shape`: once the person has left the wallet alone that long, a
-	///   live coin of the wallet's, received or not, within three
+	/// - `shape`: a live coin of the wallet's, received or not, within three
 	///   reassignments of the operator's depth limit: a trade from it that
 	///   gives part of it first shapes a coin of exactly what it gives,
-	///   which such a coin cannot make ([`Error::SettleFirst`]). Its coins
-	///   go through the next round by [`Self::settle_first`], each at the
-	///   refresh's fee, so the next trade from them goes at once.
+	///   which such a coin cannot make ([`Error::SettleFirst`]). Named at
+	///   once while the wallet holds another coin of its asset with room to
+	///   shape, which the next trade takes ([`super::pay::shape_order`]
+	///   uses up one coin's room before the next), so the asset is never
+	///   all in a round at once; otherwise only once the person has left the
+	///   wallet alone that long. While the person uses the wallet, only a
+	///   coin the operator refreshes for nothing now is named, and the rule
+	///   says so (`max_fee_ppm` 0): nobody asked for that refresh, so it
+	///   costs nobody anything. Its coins go through the next round by
+	///   [`Self::settle_first`] with `spread` ([`Self::spread_of`]), so the
+	///   next trades from them go at once.
 	///
 	/// Asks nothing of the operator but its `info`, and signs nothing.
 	pub fn refresh_needed(&self, idle_seconds: Option<u64>) -> Result<Value, Error> {
@@ -555,25 +562,120 @@ impl Wallet {
 				reasons.push(json!({"rule": "idle", "why": format!("the wallet has been left alone {} s", idle)}));
 			}
 		}
-		if let (Some(limit), Some(_), true) = (super::pay::depth_limit(&info), idle_seconds.filter(|i| *i >= REFRESH_IDLE), places.is_some()) {
-			let mut deep = vec![];
+		if let (Some(limit), true) = (super::pay::depth_limit(&info), places.is_some()) {
+			let idle = idle_seconds.is_some_and(|i| i >= REFRESH_IDLE);
+			let mut by_asset: std::collections::BTreeMap<String, Vec<String>> = Default::default();
 			for c in self.store.coins_in("live")? {
 				if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) || self.channel_worth(&c)?.is_some() {
 					continue;
 				}
 				if Self::record_of(&c).is_ok_and(|r| super::wallet::record_hops(&r) + 3 > limit) {
-					deep.push(c.leaf_id.clone());
+					by_asset.entry(c.asset.clone()).or_default().push(c.leaf_id.clone());
+				}
+			}
+			let mut deep = vec![];
+			for (asset, coins) in by_asset {
+				// While the person uses the wallet, only while a coin of the asset
+				// with room to shape stays live beside them: the asset is never
+				// all in a round at once, and the next trade goes from that coin.
+				let keeps = |w: &Self| -> Result<bool, Error> {
+					let a = AssetId::from_str(&asset).map_err(|e| Error::Store(e.to_string()))?;
+					Ok(w.coins_to_give(a, super::places::Spend::Trade)?.iter()
+						.any(|c| c.coin.hops + 3 <= limit && !coins.contains(&c.row.leaf_id)))
+				};
+				if idle {
+					deep.extend(coins);
+				} else if keeps(self)? {
+					// Nobody asked for it: only a coin the operator refreshes for
+					// nothing now goes while the person uses the wallet. One it
+					// charges for waits for the trade that needs it, whose
+					// ticket shows that fee.
+					for c in coins {
+						if self.refresh_quote(std::slice::from_ref(&c), Some(0)).is_ok() {
+							deep.push(c);
+						}
+					}
 				}
 			}
 			if !deep.is_empty() {
-				reasons.push(json!({"rule": "shape", "coins": deep, "why": format!("a coin is within three reassignments of the operator's \
-					depth limit, {}, so no part of it can be traded out of round", limit)}));
+				let mut rule = json!({"rule": "shape", "coins": deep, "spread": true,
+					"why": format!("a coin is within three reassignments of the operator's depth limit, {}, so no part of it can be traded \
+					out of round", limit)});
+				if !idle {
+					rule["max_fee_ppm"] = json!(0);
+				}
+				reasons.push(rule);
 			}
 		}
+		// What goes now: the received coins the rules name (those `arriving`
+		// alone when it is the only rule; every received coin with any other
+		// but `shape`) and the `shape` rule's coins; and, so no asset is all
+		// in a round at once, one coin of each asset kept back when they
+		// would be every coin of it the wallet can spend now (one with room
+		// to shape first, the largest of those).
+		let others: Vec<&Value> = reasons.iter().filter(|r| r["rule"] != "shape").collect();
+		let mut give: Vec<String> = if others.is_empty() {
+			vec![]
+		} else if others.iter().all(|r| r["rule"] == "arriving") {
+			others.iter().flat_map(|r| r["coins"].as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_str().map(String::from)).collect()
+		} else {
+			received.iter().map(|(c, _)| c.leaf_id.clone()).collect()
+		};
+		give.sort();
+		give.dedup();
+		let shaped: Vec<String> = reasons.iter().filter(|r| r["rule"] == "shape")
+			.flat_map(|r| r["coins"].as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_str().map(String::from)).collect();
+		// A coin inside its refresh window goes whatever else does.
+		let due: Vec<String> = reasons.iter().filter(|r| r["rule"] == "expiry")
+			.flat_map(|r| r["coins"].as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_str().map(String::from)).collect();
+		let kept = self.kept_back(&info, &give, &shaped, &due)?;
+		give.retain(|l| !kept.contains(l));
+		for r in reasons.iter_mut().filter(|r| r["rule"] == "shape") {
+			let coins: Vec<Value> = r["coins"].as_array().cloned().unwrap_or_default().into_iter()
+				.filter(|c| c.as_str().is_some_and(|l| !kept.contains(&l.to_string()))).collect();
+			r["coins"] = json!(coins);
+		}
+		reasons.retain(|r| r["rule"] != "shape" || r["coins"].as_array().is_some_and(|c| !c.is_empty()));
 		Ok(json!({
 			"needed": !reasons.is_empty(), "reasons": reasons, "rules": REFRESH_RULES,
 			"received": received.iter().map(|(c, _)| c.leaf_id.clone()).collect::<Vec<_>>(),
+			"give_up": give, "kept_back": kept,
 		}))
+	}
+
+	/// The coins [`Self::refresh_needed`] keeps back from a refresh of `give`
+	/// (received coins) and `shaped` (the `shape` rule's): for each asset,
+	/// when they are every coin of it the wallet can spend now, one of them,
+	/// so a payment or a trade asked meanwhile is paid at once from it. The
+	/// one kept is the largest with room to shape a trade's coin, else the
+	/// largest; never one of `due` (inside its refresh window, it goes). A
+	/// wallet holding one coin of an asset so keeps it: it goes into a round
+	/// when a payment or a trade needs it to (`settle_first`, the wait said),
+	/// or with others once another coin of its asset is spendable.
+	fn kept_back(&self, info: &Value, give: &[String], shaped: &[String], due: &[String]) -> Result<Vec<String>, Error> {
+		let going: std::collections::BTreeSet<&String> = give.iter().chain(shaped).collect();
+		let mut assets: std::collections::BTreeSet<String> = Default::default();
+		for l in &going {
+			if let Some(c) = self.store.coin(l)? {
+				assets.insert(c.asset);
+			}
+		}
+		let limit = super::pay::depth_limit(info);
+		let mut kept = vec![];
+		for a in assets {
+			let asset = AssetId::from_str(&a).map_err(|e| Error::Store(e.to_string()))?;
+			let spendable = self.coins_to_give(asset, super::places::Spend::Pay)?;
+			if spendable.is_empty() || spendable.iter().any(|c| !going.contains(&c.row.leaf_id)) {
+				continue;
+			}
+			let roomy = |h: usize| limit.is_none_or(|l| h + 3 <= l);
+			let keep = spendable.iter().filter(|c| !due.contains(&c.row.leaf_id))
+				.max_by_key(|c| (roomy(c.coin.hops), c.coin.value));
+			if let Some(k) = keep {
+				kept.push(k.row.leaf_id.clone());
+			}
+		}
+		Ok(kept)
 	}
 
 	/// Gives up in the operator's next round the coins the wallet received

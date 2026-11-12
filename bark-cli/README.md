@@ -415,8 +415,25 @@ and a board whose registration never reached the server, are not recovered.
   takes the coins at its next sync after the release. Asked again past that time, it answers the same
   step and its usual time while nothing has moved, and an earlier step when
   the round must start over (a new round, an anchor rollback). Once
-  `ready`, the same spend goes ahead. `refresh-needed` names such coins under the
-  rule `shape` once the wallet has been left alone two minutes.
+  `ready`, the same spend goes ahead. A coin a settle gave up is named to
+  any spend that needs it, which waits for its round rather than falling
+  short. With `--spread`, each asset's new value is cut into a few coins:
+  up to three working pieces of a sixth of what the wallet holds of the
+  asset, in half of it at most, and one reserve coin of the rest, never more
+  than four coins with the others the wallet keeps, and no piece below ten
+  times the operator's smallest leaf or a hundred times what one coin's exit
+  costs on the chain (a small holding stays one coin). The fee is the same:
+  the operator charges for the coins given up, not for the leaves made.
+- **Trading on without waiting.** A trade that gives part of a coin first
+  shapes a coin of exactly what it gives, and that self-payment makes the
+  change one reassignment deeper, so a coin pays three such trades before a
+  round must refresh it. The shaping takes one coin alone when one covers
+  it, the deepest that still has room first, so one coin's room is used up
+  while the others stay whole. `refresh-needed` names a coin with no room
+  left under the rule `shape` at once (with `spread`, and `max_fee_ppm` 0)
+  while the wallet holds another coin of its asset with room and the
+  operator refreshes it for nothing; one it charges for, or the last coin
+  of an asset, only once the wallet has been left alone two minutes.
 - **A coin received out of round** is validated back to every round and board
   it rests on, under the receipt policy: every pair, preimage and
   authorisation, the exit delay of every leaf of its lineage, the depth limit.
@@ -2108,7 +2125,7 @@ registry for both commands.
 | `instant-budget SHARE` | Sets the share of the bond's value the wallet holds out of round at most (`0.1`, or `off`): a counterparty's instant budget |
 | `instant-limit ATOMS` | Sets the wallet's instant limit, in atoms of the reference unit (or `off`): of coins received out of round, the most it counts as its own at once |
 | `coin-places` | Each coin's place (`settled`, `proceeds`, `counted`, `arriving`), the totals of each place by asset, what is spendable now, and the instant limit |
-| `settle-first [--coin LEAF]… [--asset ASSET] [--max-fee-ppm N]` | Puts through the next round the coins a `settle_first` refusal named (or every coin of the asset that waits for a round): what it gave up now (`settling`), what already waits for its round (`waiting`), what is through and spendable (`done`), what the operator would not take now (`left`), `ready` once nothing named settles or waits, and while not, `final_in_seconds`, the most it should still take, `usual_in_seconds`, what it usually takes, and `waiting_for`, the step it waits for |
+| `settle-first [--coin LEAF]… [--asset ASSET] [--max-fee-ppm N] [--spread]` | Puts through the next round the coins a `settle_first` refusal named (or every coin of the asset that waits for a round): what it gave up now (`settling`), what already waits for its round (`waiting`), what is through and spendable (`done`), what the operator would not take now (`left`), `ready` once nothing named settles or waits, and while not, `final_in_seconds`, the most it should still take, `usual_in_seconds`, what it usually takes, and `waiting_for`, the step it waits for |
 | `bond-evidence` | Every message the operator key signed that the wallet's coins rest on, as evidence lines (`lines`): what the wallet hands a watcher |
 | `watch-bond [--evidence FILE]… [--fee-asset ASSET]` | Compares the wallet's evidence and every file's under each salt, reads the chain and the mempool for spends of the coins they name, and burns the operator's bond on two different messages under one salt: what it counted (`evidence`), what it read (`scanned`), the `conflicts`, the slash it sent (`slashed`), and each slash sent before again until final (`resent`). What each coin's lineage yields is read once and kept, as a coin's record never changes, and a run reads coins not kept yet and blocks for about five seconds at most; what is left (`evidence.unread`, `scanned.more`) is read at the next run |
 | `address` | A new on-chain address, to pay the wallet's boards and fee coins from, and its key, which a payer names to pay the wallet a claim |

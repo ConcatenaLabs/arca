@@ -325,7 +325,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"coin_places" => w.coin_places(),
 		"settle_first" => {
 			let coins: Vec<String> = a["coins"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
-			w.settle_first(&coins, opt_asset(&a["asset"])?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)
+			w.settle_first_spread(&coins, opt_asset(&a["asset"])?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, a["spread"] == json!(true))
 		},
 		"watch_bond" => {
 			let lines = a["evidence"].as_array().cloned().unwrap_or_default();
