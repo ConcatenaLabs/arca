@@ -197,14 +197,16 @@ async fn payments_count_up_to_the_limit_in_the_order_they_arrive() {
 	let p = summary("CP1 under, paid on", &b);
 	assert!(p["coins"].as_array().unwrap().iter().all(|k| k["place"] == "counted" || k["state"] != "live"), "{}", p);
 
-	// 2. Over the limit: arriving. No payment and no trade takes it.
+	// 2. Over the limit: arriving. No payment and no trade takes it: each
+	// waits for its round (`settle_first`), naming it.
 	let big = pay(&s, &b, x, 1_500_000);
 	let p = summary("CP1 over", &b);
 	assert_eq!(place_of(&p, &big), "arriving", "{}", p);
-	pay_refused(&b, &c, x, 1_000_000, "live coins");
+	let why = pay_refused(&b, &c, x, 1_000_000, "settle_first");
+	assert!(why.contains("are arriving"), "{}", why);
 	let offer = library(&b, "swap_offer", json!({"give_asset": x, "give": "1000000", "want_asset": y, "want": "1000000"}));
 	println!("CP1 over: B offers it in a trade: {:?}", offer);
-	assert!(offer.as_ref().is_err_and(|e| e.contains("live coins")), "{:?}", offer);
+	assert!(offer.as_ref().is_err_and(|e| e.contains("settle_first") && e.contains("are arriving")), "{:?}", offer);
 	let need = library(&b, "refresh_needed", json!({})).unwrap();
 	println!("CP1 over: refresh_needed: {}", need);
 	assert_eq!(need["reasons"][0]["rule"], "arriving", "{}", need);

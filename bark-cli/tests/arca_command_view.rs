@@ -192,7 +192,9 @@ async fn sees_every_change(coins_only: bool) {
 	let (sent, n) = library(&mut w, "send", json!({"request": req, "amount": "300000", "asset": xs}));
 	let why = sent.expect_err("nothing is paid from a coin whose round the chain no longer holds");
 	println!("REFUSED (send after the round's block left the chain, {} node calls): {}", n, why);
-	assert!(why.contains("in live coins"), "{}", why);
+	// Its coin waits on its round again: the wallet settles it first rather
+	// than refusing outright, and nothing is signed meanwhile.
+	assert!(why.contains("not final yet") && why.contains("(settle_first)") && why.contains("nothing was signed"), "{}", why);
 	let (c, _) = library(&mut w, "coins", json!({}));
 	let c = c.unwrap();
 	assert_eq!(state_of(&c, &leaf), "pending", "the round's leaf waits on the round again: {}", c);

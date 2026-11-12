@@ -303,14 +303,14 @@ impl Wallet {
 		let htlc = Out { asset, value: value + fee, leaf, mailbox, until: None };
 		let min = Self::min_leaf(info, asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
+		// Proceeds a cross-chain leg may not spend are named by the
+		// selection ([`Error::SettleFirst`]); the leg's swap goes on asking
+		// until it lapses, so they go into the next round now, and it goes
+		// ahead once that round has made them the wallet's own.
 		let (inputs, margin, change) = match self.choose_coins_for(info, asset, value + fee, &htlc_out, min, spend) {
-			Err(Error::Refused(why)) if spend == super::places::Spend::CrossChain => {
-				let settling = self.settle_proceeds(asset)?;
-				if settling > 0 {
-					return Err(Error::Refused(format!("{}; {} of asset {} the wallet got in trades goes into the next round now, and this \
-						goes ahead once that round has made it the wallet's own, in about a minute", why, settling, asset)));
-				}
-				return Err(Error::Refused(why));
+			Err(e @ Error::SettleFirst { .. }) if spend == super::places::Spend::CrossChain => {
+				self.settle_proceeds(asset)?;
+				return Err(e);
 			},
 			r => r?,
 		};

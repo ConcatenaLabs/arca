@@ -45,7 +45,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?, brief?}, order_fill_resting_quote {order, amount?}, \
 	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
-	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, instant_limit {value}, coin_places, supervised_check {txid, vout}, channels, channel_open {leaves?, \
+	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, instant_limit {value}, coin_places, settle_first {coins? | asset?, max_fee_ppm?}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
 	fee_asset?}, channel_code {address?}, leaf_template {template?}, require_checkpoint_exit {on?}, offboard_quote {asset, amount, address | script, max_fee_ppm?}, offboard {asset, amount, \
 	address | script, fee_asset?, max_fee_ppm?, shown?}, offboards";
@@ -60,6 +60,10 @@ pub fn refusal(e: &Error) -> Value {
 	if let Error::Planned { asset, release, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["release"] = json!(release);
+	}
+	if let Error::SettleFirst { asset, coins, .. } = e {
+		out["error"]["asset"] = json!(asset);
+		out["error"]["coins"] = json!(coins);
 	}
 	if let Error::InChannel { asset, close, side, most, fee, .. } = e {
 		out["error"]["asset"] = json!(asset);
@@ -307,6 +311,10 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			w.set_instant_limit_text(&value)
 		},
 		"coin_places" => w.coin_places(),
+		"settle_first" => {
+			let coins: Vec<String> = a["coins"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
+			w.settle_first(&coins, opt_asset(&a["asset"])?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)
+		},
 		"watch_bond" => {
 			let lines = a["evidence"].as_array().cloned().unwrap_or_default();
 			let fee = a["fee_asset"].as_str().map(asset).transpose()?;

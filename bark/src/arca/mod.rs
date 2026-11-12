@@ -165,6 +165,16 @@ pub enum Error {
 	/// close gives back (before the round's fee, which the round sets).
 	#[error("refused: {message}")]
 	InChannel { asset: String, close: Vec<String>, side: u64, most: Option<u64>, fee: Option<u64>, message: String },
+	/// A spend of `asset` that the coins the wallet shows as its own cover,
+	/// and that waits only for a round: `coins` names those that must go
+	/// through the operator's next round first (at or near the operator's
+	/// depth limit, arriving, trade proceeds asked to pay a cross-chain leg,
+	/// or of a record format the other side does not read), some of which
+	/// may already be in a refresh or not final yet. A program settles them
+	/// ([`Wallet::settle_first`]), waits for the round, and asks again;
+	/// nothing was signed.
+	#[error("refused: {message}")]
+	SettleFirst { asset: String, coins: Vec<String>, message: String },
 	/// The server refused, with its stable code.
 	#[error("the server refused {call} ({status} {code}): {message}")]
 	Server { call: String, status: i32, code: String, message: String },
@@ -198,6 +208,7 @@ impl Error {
 			Error::Refused(_) => "refused",
 			Error::Planned { .. } => "planned",
 			Error::InChannel { .. } => "in_channel",
+			Error::SettleFirst { .. } => "settle_first",
 			Error::Server { .. } => "server_refused",
 			Error::Unreachable(_) => "unreachable",
 			Error::Missing(_) => "missing",

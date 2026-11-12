@@ -63,7 +63,7 @@ pub const RETRY_AFTER: u64 = 600;
 /// ([`Wallet::refresh_needed`]).
 pub const REFRESH_IDLE: u64 = 120;
 /// The rules [`Wallet::refresh_needed`] weighs, by name, in its order.
-pub const REFRESH_RULES: [&str; 5] = ["arriving", "depth", "exposure", "expiry", "idle"];
+pub const REFRESH_RULES: [&str; 6] = ["arriving", "depth", "exposure", "expiry", "idle", "shape"];
 
 /// The wall-clock time, in seconds.
 fn wall_now() -> u64 {
@@ -484,7 +484,14 @@ impl Wallet {
 	/// - `expiry`: a received coin inside its refresh window
 	///   ([`CoinDates`]: from `refresh_from` until its exit deadline);
 	/// - `idle`: the person has left the wallet alone `idle_seconds` of at
-	///   least [`REFRESH_IDLE`] (the caller counts them).
+	///   least [`REFRESH_IDLE`] (the caller counts them);
+	/// - `shape`: once the person has left the wallet alone that long, a
+	///   live coin of the wallet's, received or not, within three
+	///   reassignments of the operator's depth limit: a trade from it that
+	///   gives part of it first shapes a coin of exactly what it gives,
+	///   which such a coin cannot make ([`Error::SettleFirst`]). Its coins
+	///   go through the next round by [`Self::settle_first`], each at the
+	///   refresh's fee, so the next trade from them goes at once.
 	///
 	/// Asks nothing of the operator but its `info`, and signs nothing.
 	pub fn refresh_needed(&self, idle_seconds: Option<u64>) -> Result<Value, Error> {
@@ -546,6 +553,21 @@ impl Wallet {
 			}
 			if let Some(idle) = idle_seconds.filter(|i| *i >= REFRESH_IDLE) {
 				reasons.push(json!({"rule": "idle", "why": format!("the wallet has been left alone {} s", idle)}));
+			}
+		}
+		if let (Some(limit), Some(_), true) = (super::pay::depth_limit(&info), idle_seconds.filter(|i| *i >= REFRESH_IDLE), places.is_some()) {
+			let mut deep = vec![];
+			for c in self.store.coins_in("live")? {
+				if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) || self.channel_worth(&c)?.is_some() {
+					continue;
+				}
+				if Self::record_of(&c).is_ok_and(|r| super::wallet::record_hops(&r) + 3 > limit) {
+					deep.push(c.leaf_id.clone());
+				}
+			}
+			if !deep.is_empty() {
+				reasons.push(json!({"rule": "shape", "coins": deep, "why": format!("a coin is within three reassignments of the operator's \
+					depth limit, {}, so no part of it can be traded out of round", limit)}));
 			}
 		}
 		Ok(json!({

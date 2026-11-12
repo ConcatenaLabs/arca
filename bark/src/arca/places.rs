@@ -520,6 +520,69 @@ impl Wallet {
 		Ok(value)
 	}
 
+	/// `settle_first`: puts through the operator's next round the coins a
+	/// spend waits for ([`Error::SettleFirst`] names them, as `coins`), or,
+	/// with `asset` alone, every coin of it that pays out of round only
+	/// after a round ([`Wallet::round_first`] for a payment) and every coin
+	/// of it a round of the wallet's holds now (given up, not final yet). Each coin
+	/// still live is given up in a refresh for a coin of the wallet's own
+	/// (`settling`); one already given up, or not final yet, waits for its
+	/// round as it is (`waiting`); one the wallet no longer holds is through
+	/// (`done`); one the operator would not take now stays live, with why
+	/// (`left`). Asked again it gives up nothing twice, so a program asks it
+	/// again while it waits. `ready` once nothing named is settling or
+	/// waiting: the spend can be asked again. Costs the refresh's fee per
+	/// coin given up, within `max_fee_ppm` (by default the wallet's bound).
+	pub fn settle_first(&mut self, coins: &[String], asset: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let ids: Vec<String> = if !coins.is_empty() {
+			coins.to_vec()
+		} else if let Some(a) = asset {
+			let info = self.server_info()?;
+			let mut ids: Vec<String> = self.round_first(&info, a, Spend::Pay, super::pay::depth_limit(&info), super::pay::Reads::ALL)?.into_iter().map(|(l, ..)| l).collect();
+			// And every coin of it the wallet's own rounds hold now (given up in a
+			// refresh, or not final yet), which a spend waits for as it is.
+			for c in self.store.coins_in_states(&["given", "pending"])? {
+				if c.asset == a.to_string() && !ids.contains(&c.leaf_id) {
+					ids.push(c.leaf_id);
+				}
+			}
+			ids
+		} else {
+			return Err(Error::Parse("name the coins to settle, or the asset".into()));
+		};
+		let (mut give, mut waiting, mut done) = (vec![], vec![], vec![]);
+		for id in ids {
+			match self.store.coin(&id)?.map(|c| c.state) {
+				Some(st) if st == "live" => give.push(id),
+				Some(st) if st == "given" || st == "pending" => waiting.push(id),
+				_ => done.push(id),
+			}
+		}
+		let mut left = vec![];
+		let mut settling = vec![];
+		if !give.is_empty() {
+			// All in one refresh when the operator takes them so; else each
+			// alone, so one it refuses holds back no other.
+			match self.refresh_quote(&give, max_fee_ppm) {
+				Ok(q) => {
+					self.participate(q, None)?;
+					settling = give;
+				},
+				Err(_) => for id in give {
+					match self.refresh_quote(std::slice::from_ref(&id), max_fee_ppm) {
+						Ok(q) => {
+							self.participate(q, None)?;
+							settling.push(id);
+						},
+						Err(e) => left.push(json!({"leaf_id": id, "why": e.to_string()})),
+					}
+				},
+			}
+		}
+		let ready = settling.is_empty() && waiting.is_empty();
+		Ok(json!({"settling": settling, "waiting": waiting, "done": done, "left": left, "ready": ready}))
+	}
+
 	/// `coin_places`: every coin the wallet holds in a place (with its kind:
 	/// a `board` arriving waits on its board's block and anchor), the totals of
 	/// each place by asset, what can be spent now by asset (`settled`,

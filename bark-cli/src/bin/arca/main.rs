@@ -183,6 +183,21 @@ enum Cmd {
 	/// Every coin in its place (settled, proceeds, counted, arriving), the
 	/// totals of each place by asset, and the instant limit.
 	CoinPlaces,
+	/// Puts through the operator's next round the coins a refusal of kind
+	/// settle_first named (or, with --asset alone, every coin of it that
+	/// pays only after a round), so the spend can be asked again once the
+	/// answer is ready. Gives up nothing twice when asked again.
+	SettleFirst {
+		/// A coin to settle (the refusal's coins); repeat for each.
+		#[arg(long = "coin")]
+		coins: Vec<String>,
+		/// Every coin of this asset that waits for a round, without --coin.
+		#[arg(long)]
+		asset: Option<String>,
+		/// The most each refresh may cost, in millionths of each coin.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+	},
 	/// Every message the operator key signed that the wallet's coins rest
 	/// on, as evidence lines (`{"lines": […]}`): what the wallet hands a
 	/// watcher.
@@ -1495,6 +1510,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::InstantBudget { share } => w.set_instant_budget_text(&share),
 		Cmd::InstantLimit { value } => w.set_instant_limit_text(&value),
 		Cmd::CoinPlaces => w.coin_places(),
+		Cmd::SettleFirst { coins, asset: a, max_fee_ppm } => w.settle_first(&coins, a.as_deref().map(asset).transpose()?, max_fee_ppm),
 		Cmd::WatchBond { evidence, fee_asset } => {
 			// A file is what `bond-evidence` printed, or one line a line.
 			let mut lines = vec![];

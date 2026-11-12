@@ -814,6 +814,11 @@ async fn an_older_wallet_and_this_one_pay_each_other_and_the_switch() {
 	let req = o.ok(&["receive", "--asset", &z, "--amount", "50000"])["request"].as_str().unwrap().to_string();
 	let m = a.refused(&["send", &req], "landing-2 leaf");
 	println!("REFUSED new pays old, every coin holding a landing-2 leaf: {}", m);
+	// Never "settle first": a round makes the coin's landing-2 leaf again,
+	// so settling it would never let it pay the older build, and a program
+	// that settles on that answer would settle it forever.
+	let (ok, v) = a.run(&["send", &req]);
+	assert!(!ok && v["error"]["kind"] == "refused", "a landing-2 coin is never named to settle first for a side that reads no landing-2: {}", v);
 
 	// ---- The switch on --------------------------------------------------------
 	r.config.landing_2_only = true;
@@ -1054,6 +1059,11 @@ async fn with_an_instant_limit_a_refusal_names_its_cause_and_nothing_moves_first
 	let offer = o.ok(&["swap", "offer", "--give-asset", &x, "--give", "100000", "--want-asset", &z, "--want", "100000"]);
 	let m = a.refused(&["swap", "accept", offer["offer"].as_str().unwrap()], "still arriving");
 	println!("REFUSED, the readable coin arriving: {}", m);
+	// Never "settle first": a round would make the arriving coin a landing-2
+	// leaf (Z is supervised), which the older maker reads no better, so a
+	// program settling on that answer would settle forever.
+	let (ok, v) = a.run(&["swap", "accept", offer["offer"].as_str().unwrap()]);
+	assert!(!ok && v["error"]["kind"] == "refused", "nothing is named to settle first for a side that reads no landing-2: {}", v);
 	o.ok(&["swap", "cancel", offer["swap"].as_str().unwrap()]);
 
 	// ---- R2: the switch on, the older maker's offer, nothing shaped first ----

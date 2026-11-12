@@ -3384,6 +3384,11 @@ impl Wallet {
 		if let Some(t) = CoinRecord::from_bytes(&c.record).ok().as_ref().and_then(template_of) {
 			v["template"] = json!(t.to_string());
 		}
+		// A resting order's coin: the order its owner placed, which a fill, a
+		// cancel or its landing spends; never the wallet's own upkeep.
+		if super::resting::is_order_coin(c) {
+			v["order"] = json!(true);
+		}
 		v
 	}
 
@@ -3407,6 +3412,8 @@ impl Wallet {
 			// Reassignments since a round, as validation counts them: the operator co-signs no
 			// out-of-round spend past its `depth_limit`, and a refresh starts the count again.
 			"hops": record.as_ref().map(record_hops),
+			// A resting order's coin: the order its owner placed, never the wallet's own upkeep.
+			"order": record.as_ref().and_then(|r| r.order_policy()).is_some(),
 		})
 	}
 

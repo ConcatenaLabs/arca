@@ -567,6 +567,75 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// The coins of `asset` the wallet holds as its own that pay `spend`
+	/// out of round only once a round has refreshed them, each with its
+	/// value: live, given up in a refresh, or not final yet (`pending`,
+	/// which a round or a block makes final by itself), and held back now
+	/// because their place bars them from `spend` ([`super::places`]),
+	/// because they are `deep` reassignments or more from a round or a
+	/// board (the operator's depth limit for a payment, which no coin at it
+	/// can make; less for a coin a trade would shape first), or because
+	/// their record is of the format with its owner's exit, which the other
+	/// side does not read (`reads`). A round gives each of them back as a
+	/// coin of the wallet's own that pays anything at once. Coins an
+	/// offline-refresh plan keeps, a resting order's coin, a channel's and
+	/// one past its exit deadline are not among them: each has its own way.
+	/// None is named for a side that reads no `landing-2` when `asset` is
+	/// supervised (`info`): a round makes the wallet's leaf of it a
+	/// `landing-2` leaf, so settling would never let it pay that side.
+	pub(crate) fn round_first(&self, info: &Value, asset: AssetId, spend: Spend, deep: Option<usize>, reads: Reads)
+		-> Result<Vec<(String, u64, &'static str)>, Error>
+	{
+		if !reads.landing_2 && self.landing_rule(info, asset)?.is_some() {
+			return Ok(vec![]);
+		}
+		let barred = self.unspendable(spend)?;
+		let planned = self.planned_coins()?;
+		let now = self.now()?.to_consensus_u32() as u64;
+		let mut out = vec![];
+		for row in self.store.coins_in_states(&["live", "given", "pending"])?.into_iter().filter(|c| c.asset == asset.to_string()) {
+			if row.expiry != u32::MAX && now + WalletPolicy::EXIT_DEADLINE as u64 >= row.expiry as u64 {
+				continue;
+			}
+			if planned.contains(&row.leaf_id) || super::resting::is_order_coin(&row) || self.channel_worth(&row)?.is_some() {
+				continue;
+			}
+			let hops = Self::record_of(&row).map(|r| super::wallet::record_hops(&r)).unwrap_or(0);
+			let why = if row.state == "pending" {
+				"not final yet"
+			} else if barred.contains(&row.leaf_id) {
+				if spend == Spend::CrossChain { "arriving, or trade proceeds, which no leg paid to another party spends" } else { "arriving" }
+			} else if deep.is_some_and(|d| hops >= d) {
+				"at the operator's depth limit of reassignments since a round"
+			} else if !reads.exit && row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
+				"of the record format the other side's older build does not read"
+			} else {
+				continue;
+			};
+			out.push((row.leaf_id.clone(), row.value, why));
+		}
+		Ok(out)
+	}
+
+	/// [`Error::SettleFirst`] for a spend of `asset` that `live` of the
+	/// coins it may take now does not cover, needing `need`, when the coins
+	/// [`Self::round_first`] names would: `None` when they would not.
+	fn settle_first_of(&self, asset: AssetId, live: u64, need: u64, held: Vec<(String, u64, &'static str)>) -> Option<Error> {
+		let more: u64 = held.iter().map(|(_, v, _)| *v).sum();
+		let mut whys: Vec<&str> = held.iter().map(|(_, _, w)| *w).collect();
+		whys.dedup();
+		whys.sort();
+		whys.dedup();
+		let why = whys.join("; ");
+		if held.is_empty() || live.saturating_add(more) < need {
+			return None;
+		}
+		Some(Error::SettleFirst { asset: asset.to_string(), coins: held.into_iter().map(|(l, ..)| l).collect(),
+			message: format!("the wallet's coins of asset {} that pay this now hold {}, short of the {} it takes; {} more are {}, and pay it once \
+				the operator's next round has refreshed them: settle them first (settle_first), then ask again; nothing was signed", asset,
+				live, need, more, why) })
+	}
+
 	/// The checkpoint margin of `coin`, and the reassignment's of `inputs`
 	/// into `outputs`, each as the operator bounds them ([`Margins`]).
 	fn checkpoint_margin(&self, coin: &ValidCoin, m: &Margins) -> Result<u64, Error> {
@@ -676,6 +745,9 @@ impl Wallet {
 	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize, fit: bool, reads: Reads, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
+		// A spend that waits only for a round ([`Error::SettleFirst`]) takes
+		// back no refresh: the coins it names may be in one now, on their
+		// way to paying it.
 		let r = match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, reads, spend) {
 			Err(e @ Error::Refused(_)) => {
 				if self.free_refreshes(asset)? {
@@ -735,12 +807,13 @@ impl Wallet {
 		let margins = Margins::of(info, asset)?;
 		let mut candidates = self.spendable(asset, spend)?;
 		candidates.retain(|c| reads.record(&c.row.record));
-		let mut deep = 0u64;
+		// A coin at the operator's depth limit pays nothing out of round:
+		// what it would make is one reassignment past the limit, and the
+		// operator refuses it (#689). A round refreshes it.
+		if let Some(limit) = depth_limit(info) {
+			candidates.retain(|c| c.coin.hops < limit);
+		}
 		if fit {
-			if let Some(limit) = depth_limit(info) {
-				deep = candidates.iter().filter(|c| c.coin.hops >= limit).map(|c| c.coin.value).sum();
-				candidates.retain(|c| c.coin.hops < limit);
-			}
 			let now = self.now()?.to_consensus_u32();
 			let order = fit_order(&candidates.iter().map(|c| (c.coin.value, c.row.expiry, c.coin.hops, matches!(c.row.kind.as_str(), "transfer" | "fill")))
 				.collect::<Vec<_>>(), paid, depth_limit(info), now);
@@ -787,12 +860,13 @@ impl Wallet {
 			return Err(Error::Refused(format!("the change would be below the operator's smallest leaf in asset {} ({} atoms): \
 				pay a little less, or that much more", asset, min_leaf)));
 		}
-		// Coins at the operator's depth limit pay no swap: said so, since a
-		// refresh in a round lets them pay again.
-		if deep > 0 {
-			return Err(Error::Refused(format!("the wallet's coins of asset {} that a swap can spend hold {}, short of the {} it takes; \
-				{} more are at the operator's depth limit of reassignments since a round, and pay again once refreshed in a round", asset,
-				total_live, paid, deep)));
+		// Coins the wallet holds as its own that pay this only after a round
+		// (at the depth limit, arriving, proceeds for a cross-chain leg, of
+		// the format an older other side does not read): said so, naming
+		// them, so a program settles them and pays.
+		let held = self.round_first(info, asset, spend, depth_limit(info), reads)?;
+		if let Some(e) = self.settle_first_of(asset, kept, paid.saturating_add(margin), held) {
+			return Err(e);
 		}
 		// Coins an offline-refresh plan names are paid out of round by no
 		// wallet: say so, naming those whose release would cover it.
@@ -2381,28 +2455,61 @@ impl Wallet {
 			coins a round has shaped, after the next round", asset)))
 	}
 
+	/// The coins [`Self::shape_coin`] would pay itself a coin of exactly
+	/// `need` of `asset` from (into `probe`), and the change. The coin made
+	/// is one reassignment deeper than the deepest it comes from, and a
+	/// trade tries a coin out of round alone only with room for two more
+	/// below the depth limit ([`fit_order`]): coins within three of the
+	/// limit shape nothing a trade could give, so the shape waits for a
+	/// round that refreshes them ([`Error::SettleFirst`], naming them),
+	/// before anything moves rather than paid and then refused.
+	fn shape_inputs(&self, info: &Value, asset: AssetId, need: u64, probe: &ExplicitOutput, reads: Reads) -> Result<(Vec<In>, u64), Error> {
+		let min = Self::min_leaf(info, asset)?;
+		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(probe), true, min, 0, false, reads, Spend::Trade)?;
+		if let Some(limit) = depth_limit(info) {
+			let deep: Vec<(String, u64)> = inputs.iter().filter(|i| i.coin.hops + 3 > limit).map(|i| (i.row.leaf_id.clone(), i.coin.value)).collect();
+			if !deep.is_empty() {
+				let held: u64 = deep.iter().map(|(_, v)| *v).sum();
+				return Err(Error::SettleFirst { asset: asset.to_string(), coins: deep.into_iter().map(|(l, _)| l).collect(),
+					message: format!("the wallet's coins of asset {} that would make a coin of exactly the {} this trade gives hold {} too \
+						near the operator's depth limit of reassignments since a round, so the coin made could not be traded: settle them \
+						first (settle_first), then ask again; nothing moved", asset, need, held) });
+			}
+		}
+		Ok((inputs, change))
+	}
+
+	/// Whether a trade giving `paid` of `asset` from the coins
+	/// [`Self::choose`] took (`got`) needs a coin shaped first
+	/// ([`Self::choose_for_trade`]) that the wallet cannot shape before a
+	/// round: [`Error::SettleFirst`] then, as the trade itself would answer,
+	/// for a quote, which moves nothing.
+	#[allow(clippy::too_many_arguments)]
+	fn shape_check(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, other_inputs: usize,
+		reads: Reads, got: &(Vec<In>, u64, u64)) -> Result<(), Error>
+	{
+		if self.own_instant_limit()?.is_none() || got.2 == 0 {
+			return Ok(());
+		}
+		let template = got.0.first().map(|i| i.coin.clone()).ok_or_else(|| Error::Refused("a trade with no coin".into()))?;
+		let margins = Margins::of(info, asset)?;
+		let m = self.checkpoint_margin(&template, &margins)?;
+		let all: Vec<&ValidCoin> = std::iter::repeat(&template).take(1 + other_inputs).collect();
+		let r = if pays_margin { self.reassignment_margin(&all, others, &margins)? } else { 0 };
+		let need = paid.checked_add(m).and_then(|v| v.checked_add(r)).ok_or_else(|| Error::Refused("a trade above 2^64 atoms".into()))?;
+		let probe = ExplicitOutput::new(asset, need, leaf_probe());
+		self.shape_inputs(info, asset, need, &probe, reads).map(|_| ())
+	}
+
 	/// Pays the wallet itself, out of round, a coin of exactly `need` of
 	/// `asset`, and the rest as change, from coins a trade may give.
 	fn shape_coin(&mut self, info: &Value, asset: AssetId, need: u64, reads: Reads) -> Result<(), Error> {
-		let min = Self::min_leaf(info, asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		// The coin is given in the trade, so its leaf is one the other side
 		// reads.
 		let leaf = self.own_leaf_traded("shaped", info, asset, need, reads.landing_2)?;
 		let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
-		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(&probe), true, min, 0, false, reads, Spend::Trade)?;
-		// The coin made is one reassignment deeper than the deepest it comes
-		// from, and a trade tries a coin out of round alone only with room
-		// for two more below the depth limit ([`fit_order`]): refused before
-		// anything moves, rather than paid and then refused.
-		if let Some(limit) = depth_limit(info) {
-			let deep: u64 = inputs.iter().filter(|i| i.coin.hops + 3 > limit).map(|i| i.coin.value).sum();
-			if deep > 0 {
-				return Err(Error::Refused(format!("the wallet's coins of asset {} that would make a coin of exactly the {} this trade \
-					gives hold {} too near the operator's depth limit of reassignments since a round, so the coin made could not be \
-					traded; they trade again once refreshed in a round, and nothing moved", asset, need, deep)));
-			}
-		}
+		let (inputs, change) = self.shape_inputs(info, asset, need, &probe, reads)?;
 		let mut outs = vec![Out { asset, value: need, leaf, mailbox, until: None }];
 		if change > 0 {
 			outs.push(Out { asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });
@@ -2629,8 +2736,12 @@ impl Wallet {
 		others.push(ExplicitOutput::new(o.give_asset, o.give, leaf_probe()));
 		others.push(ExplicitOutput::new(o.want_asset, 1, leaf_probe()));
 		self.swap_exit_required(&o, &info)?;
-		let (mine, _, change) = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true, Reads::of(&o.offer),
-			Spend::Trade)?;
+		let reads = Reads::of(&o.offer);
+		let got = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true, reads, Spend::Trade)?;
+		// A trade that would shape a coin first answers here, as it would at
+		// the acceptance, when the coin cannot be shaped before a round.
+		self.shape_check(&info, o.want_asset, o.want, &others, false, 0, reads, &got)?;
+		let (mine, _, change) = got;
 		Self::swap_depth(&info, &o, &mine)?;
 		let outputs = o.maker_outs.len() + 1 + usize::from(change > 0);
 		if outputs > arca_covenant::leaf::MAX_OUTPUTS as usize {
