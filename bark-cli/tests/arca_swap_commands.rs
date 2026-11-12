@@ -806,8 +806,8 @@ async fn a_coin_forfeited_in_a_round_not_final_keeps_the_acceptance_standing() {
 	let (x, y) = (r.x.to_string(), r.y.to_string());
 	let (url, node) = (r.url(), r.node_url());
 	let proxy = common::proxy::Proxy::start(&url);
-	let a = Arca::new("GA");
-	let b = Arca::new("GB");
+	let a = Arca::new("KA");
+	let b = Arca::new("KB");
 	a.ok(&["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
 	b.ok(&["create", "--server", &proxy.url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
 	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000)] {
