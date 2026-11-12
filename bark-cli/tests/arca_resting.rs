@@ -906,3 +906,88 @@ async fn a_held_coin_across_an_anchor_rollback_of_the_other_devices_round() {
 	}
 	assert!(filled, "the fill goes once the round is final again");
 }
+
+// ---------------------------------------------------------------------------
+// A participation refused `in_use` (RV48 on arca #852, note 2): the coin it
+// gives up is given up already by another device of the wallet. The wallet
+// catches up and holds the coin exactly as for a fill refused
+// `double_spend`: the operator's word with an end time, shown apart, lifted
+// when a catch-up finds the coin served live or settles it.
+// ---------------------------------------------------------------------------
+
+/// The second device gives the taker's coin to a participation of its own;
+/// the first, not caught up, gives the same coin to a refresh of its own,
+/// which the operator refuses `in_use`. -> (the first device, the second,
+/// the second's participation, the order, the coin).
+async fn refresh_refused_in_use(r: &mut Running, tag: &str, broadcast: bool) -> (Arca, Arca, String, String, String, Vec<elements::Txid>) {
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let maker = holder(r, &format!("{} M", tag), x, 1_500_000, 0).await;
+	let order = rest_no_sweep(r, &maker, 1_000_000, 100_000).await;
+	let t = holder(r, &format!("{} T", tag), y, 1_000_000, 0).await;
+	let coin = live_of(&t, y)[0]["leaf_id"].as_str().unwrap().to_string();
+	let t2 = second_device(&t, &format!("{} T2", tag));
+	let p = t2.ok(&["participate", "--leaf", &coin]);
+	let pid = p["participations"][0]["participation"].as_str().or(p["participations"][0]["id"].as_str())
+		.unwrap_or_else(|| panic!("no participation id: {}", p)).to_string();
+	let txids = if broadcast { rounds_broadcast(r, &[&t2]).await } else { vec![] };
+	println!("{} THE SECOND DEVICE GIVES THE COIN: participation {} | operator's leaf {}", tag, pid, server_state(r, &coin));
+	let (ok, e) = t.run(&["participate", "--leaf", &coin]);
+	println!("{} THE FIRST DEVICE'S REFRESH OF THE SAME COIN: ok {} {}", tag, ok, e);
+	assert!(!ok && e.to_string().contains("in_use"), "{}", e);
+	(t, t2, pid, order, coin, txids)
+}
+
+/// The other device's participation is pending; the first device's refresh
+/// of the coin is refused `in_use`: the coin is held (in the balance,
+/// apart; not spendable; a spend from it waits, naming it), and the other
+/// device's withdrawal ends the hold at the next sync. Before, the refusal
+/// left the coin live and spendable, and the next spend from it was
+/// refused `double_spend`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_refused_in_use_holds_the_coin_until_the_other_devices_participation_is_withdrawn() {
+	let mut r = Running::start_with(|c, x, _| testnet_like(c, x)).await;
+	let y = r.y;
+	let (t, t2, pid, order, coin, _) = refresh_refused_in_use(&mut r, "IW", false).await;
+	assert_held("IW HELD", &t, &coin, 1_000_000, y);
+	let (ok, q) = t.run(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	println!("IW THE QUOTE WHILE HELD: ok {} {}", ok, q);
+	assert!(!ok, "the coin given elsewhere is not given: {}", q);
+	assert_eq!(q["error"]["kind"], "settle_first", "{}", q);
+	assert_eq!(q["error"]["coins"], json!([coin]), "{}", q);
+	let w = t2.ok(&["withdraw-participation", &pid]);
+	println!("IW THE SECOND DEVICE WITHDRAWS: {} | operator's leaf {}", w["state"], server_state(&r, &coin));
+	assert_eq!(server_state(&r, &coin), "Live");
+	let s = t.ok(&["sync"]);
+	println!("IW ONE SYNC: caught_up {}", s["caught_up"]);
+	assert_eq!(s["caught_up"]["live_again"], json!([coin]), "{}", s["caught_up"]);
+	assert_free("IW", &t, &order, &coin, y);
+}
+
+/// The other device's round is broadcast, not final; the first device's
+/// refresh of the coin is refused `in_use`: the coin is held, and once the
+/// round is final one sync catches up, the round's coin is held in its
+/// place, and the fill goes from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_refused_in_use_holds_the_coin_until_the_other_devices_round_is_final() {
+	let mut r = Running::start_with(|c, x, _| testnet_like(c, x)).await;
+	let y = r.y;
+	let (t, t2, _pid, order, coin, txids) = refresh_refused_in_use(&mut r, "IF", true).await;
+	assert_held("IF HELD", &t, &coin, 1_000_000, y);
+	let (ok, q) = t.run(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	println!("IF THE QUOTE WHILE HELD: ok {} {}", ok, q);
+	assert!(!ok && q["error"]["kind"] == "settle_first" && q["error"]["coins"] == json!([coin]), "{}", q);
+	rounds_final(&mut r, &txids, &[&t2]).await;
+	t.ok(&["sync"]);
+	let ids = |w: &Arca| -> Vec<String> { live_of(w, y).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect() };
+	let fresh = ids(&t2);
+	println!("IF THE FIRST DEVICE'S LIVE Y ONCE THE ROUND IS FINAL: {:?} (the second device: {:?})", ids(&t), fresh);
+	assert!(!ids(&t).contains(&coin), "the coin given elsewhere is no longer counted");
+	assert!(!fresh.is_empty() && fresh.iter().all(|f| ids(&t).contains(f)), "the round's coin is held");
+	let b = t.ok(&["balance"]);
+	assert!(b["arca"][y.to_string()]["spent_elsewhere"].is_null(), "settled, no longer held: {}", b);
+	let q = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	let f = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q.to_string()]);
+	println!("IF THE FILL ONCE SETTLED: {}", f["filled"]);
+	assert_eq!(f["filled"], "200000", "{}", f);
+}

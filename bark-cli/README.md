@@ -392,7 +392,8 @@ and a board whose registration never reached the server, are not recovered.
   round of the wallet's own whose new coins it has not taken yet, or held
   under a forfeit for a round that went unbroadcast; given up by another
   device of the wallet in a round not final yet, which the operator refused
-  a spend of as spent already: such a coin is held out of every spend, shown
+  a spend of as spent already, or a refresh of as given up already (`in_use`,
+  for a coin no participation of this store's holds): such a coin is held out of every spend, shown
   apart in `balance` as `spent_elsewhere` and left out of what `coin-places`
   counts as spendable, and every `sync` catches up while it is held; the
   hold ends once the operator serves the coin live again, once a catch-up

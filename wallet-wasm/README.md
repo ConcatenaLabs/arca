@@ -246,8 +246,9 @@ operator co-sign; one the operator refuses withdraws the offer and is refused
 with kind `swap_refused`, naming the `swap`, the `coin` the operator named and
 `whose` it is (`maker` or `taker`). `swaps` lists each swap with where it
 stands. A spend the operator refuses because a coin of the wallet's is spent
-already, by another store of the same mnemonic (a second device), has the
-wallet read what its other stores did at once, so it stops counting that coin
+already, by another store of the same mnemonic (a second device), or a
+participation (a refresh) it refuses `in_use` because such a store gave one of its
+coins up already, has the wallet read what its other stores did at once, so it stops counting that coin
 and holds what replaced it. While the other store's round is not final yet,
 that read finds nothing: the coin is then held out of every spend (every `sync`
 catches up while one is held out), and a spend it would have paid waits for it
