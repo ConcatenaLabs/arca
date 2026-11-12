@@ -35,7 +35,7 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "lapsed", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
-	"nonce_used", "not_accepted", "not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "not_synced", "not_withdrawable", "on_chain", "open_reassignment",
+	"nonce_used", "not_accepted", "not_an_order", "not_declined", "not_in_round", "not_live", "not_on_node", "not_participating", "not_synced", "not_withdrawable", "on_chain", "open_reassignment",
 	"operator_key", "order", "order_expiring", "order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed",
 	"owed_withdrawn", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
@@ -473,6 +473,11 @@ pub struct ParticipationsInfo {
 	/// in a refresh that may wait and still pay with it.
 	#[serde(default)]
 	pub withdraw: bool,
+	/// The operator takes a participation out of the round it is in for the
+	/// owners of its coins (`decline_participation`), so a wallet that
+	/// refuses a new leaf of that round has its coins back at once.
+	#[serde(default)]
+	pub decline: bool,
 	/// The operator reads `forfeits_before_broadcast` on a participation:
 	/// a wallet that hands over its forfeits against a round's transaction
 	/// before it is broadcast says so, and one that does not is refused, in
@@ -2205,6 +2210,20 @@ pub struct TransferOutputStatus {
 pub struct WithdrawParticipation {
 	pub participation_id: String,
 	pub signatures: Vec<String>,
+}
+
+/// `POST /v1/decline_participation`: the owners of the coins a participation
+/// gives up take it out of the round it is in, whose new leaf their wallet
+/// refuses; each signs the decline digest for that round
+/// (`participations::decline_digest`). `reason` is the wallet's, logged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclineParticipation {
+	pub participation_id: String,
+	pub round_txid: String,
+	pub signatures: Vec<String>,
+	#[serde(default)]
+	pub reason: String,
 }
 
 /// `POST /v1/holding_back`: of a wallet's coins ([`HOLDING_BACK_ASKED`] at

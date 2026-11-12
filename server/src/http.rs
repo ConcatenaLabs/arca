@@ -456,7 +456,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"owed_claimed" | "owed_withdrawn" => StatusCode::CONFLICT,
 		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" | "unknown_fill" => StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
-			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" | "frozen" | "in_round" | "not_withdrawable" =>
+			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" | "frozen" | "in_round" | "not_withdrawable" | "not_declined" =>
 			StatusCode::CONFLICT,
 		"policy" => StatusCode::FORBIDDEN,
 		"policy_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
@@ -892,6 +892,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			exit_deadline_seconds: Params::PARTICIPATION_HORIZON,
 			forfeit_deadline_seconds: Params::FORFEIT_DEADLINE,
 			withdraw: true,
+			decline: true,
 			forfeits_before_broadcast: true,
 			record_formats: true,
 			arriving: true,
@@ -1570,6 +1571,20 @@ async fn withdraw_participation(State(app): State<Arc<App>>, body: Result<Bytes,
 	Ok(Json(participation_status(&app.participations.withdraw(&id, &sigs, &app.rounds).await?)))
 }
 
+/// `POST /v1/decline_participation`: the owners of the coins a participation
+/// gives up take it out of the round it is in ([`api::DeclineParticipation`]);
+/// answered as `participation_status` answers, the participation void or
+/// expired; refused `not_declined` when it cannot be.
+async fn decline_participation(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
+	-> Result<Json<api::ParticipationStatus>, Refusal>
+{
+	let req: api::DeclineParticipation = parse(body, app.max_request)?;
+	let id = unhex32(&req.participation_id).map_err(Refusal::malformed)?;
+	let round = elements::Txid::from_str(&req.round_txid).map_err(|e| Refusal::malformed(format!("round_txid: {}", e)))?;
+	let sigs = req.signatures.iter().map(|s| sig(s)).collect::<Result<Vec<_>, _>>()?;
+	Ok(Json(participation_status(&app.participations.decline(&id, &round, &sigs, &req.reason, &app.rounds).await?)))
+}
+
 async fn tree(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap,
 	body: Result<Bytes, BytesRejection>) -> Result<Json<api::PublishedTree>, Refusal>
 {
@@ -2219,6 +2234,7 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/holding_back", post(holding_back))
 		.route("/v1/withdraw_participation", post(withdraw_participation))
+		.route("/v1/decline_participation", post(decline_participation))
 		.route("/v1/transfer_status", post(transfer_status))
 		.route("/v1/take_order", post(take_order))
 		.route("/v1/issuer_supply", post(issuer_supply))
