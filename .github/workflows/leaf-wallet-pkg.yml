@@ -50,6 +50,12 @@ jobs:
           export CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; echo "${flags[*]}")"
           cd wallet-wasm
           wasm-pack build --target web --release --out-name leaf_wallet
+          # The test-only hook (arca-wallet's `shape-probe` feature) is never
+          # in the package: its argument's name is in no other code.
+          if grep -a -q -F "shape_off_by" pkg/leaf_wallet_bg.wasm; then
+            echo "pkg/leaf_wallet_bg.wasm carries the shape-probe feature" >&2
+            exit 1
+          fi
           for p in "$HOME" "$src" "$cargo_home"; do
             if grep -a -q -F "$p" pkg/leaf_wallet_bg.wasm; then
               echo "pkg/leaf_wallet_bg.wasm still contains $p" >&2

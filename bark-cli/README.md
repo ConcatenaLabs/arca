@@ -390,7 +390,14 @@ and a board whose registration never reached the server, are not recovered.
   proceeds asked to pay a cross-chain leg; of the record format an older
   build on the other side does not read; not final yet; given up in a
   round of the wallet's own whose new coins it has not taken yet, or held
-  under a forfeit for a round that went unbroadcast), or a part sale
+  under a forfeit for a round that went unbroadcast; given up by another
+  device of the wallet in a round not final yet, which the operator refused
+  a spend of as spent already: such a coin is held out of every spend, shown
+  apart in `balance` as `spent_elsewhere` and left out of what `coin-places`
+  counts as spendable, and every `sync` catches up while it is held; the
+  hold ends once the operator serves the coin live again, once a catch-up
+  settles it, and at the latest when the wait stated for it has passed, and
+  never bars its exit), or a part sale
   would shape a coin from one within three reassignments of that limit, the
   refusal is of kind `settle_first` and names those coins (`coins`), at the
   quote as at the spend, with how long they wait as `settle-first` reads it
@@ -2686,6 +2693,16 @@ pays with nothing signed, held or stored; `swap_accept` given terms other than
 those (`shown`) is refused, naming them, before anything is signed; given them,
 it signs, and `swap_complete` settles the swap with each side paying exactly what
 it was shown. `swap_cancel` frees an offer's coin, and `swaps` lists both.
+
+`tests/arca_shaped.rs` runs the same way, built with the `shape-probe` feature
+(`cargo test -p arca-cli --features shape-probe --test arca_shaped`), which only
+this test enables and no shipped build has: in default mode (an instant limit
+set), a trade that no single coin holds first pays the wallet itself a coin of
+exactly what it gives. When the coin made is not the one priced (the test's own
+call asks for it one atom short, `shape_off_by`), `swap_accept` is refused as
+`shaped`, naming the cost of that payment (`fee`, in the terms shown), which is
+all that left the wallet; the coin made is kept, and the next read trades from it
+alone, with nothing more to shape.
 
 `tests/arca_lightning_commands.rs` runs the same way, with the operator's SeqLN
 node in X (`LIGHTNINGD_EXEC`): a payment under a hash between two wallets of one

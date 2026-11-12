@@ -248,7 +248,16 @@ with kind `swap_refused`, naming the `swap`, the `coin` the operator named and
 stands. A spend the operator refuses because a coin of the wallet's is spent
 already, by another store of the same mnemonic (a second device), has the
 wallet read what its other stores did at once, so it stops counting that coin
-and holds what replaced it; a `swap_cancel` that meets such a coin cancels the
+and holds what replaced it. While the other store's round is not final yet,
+that read finds nothing: the coin is then held out of every spend (every `sync`
+catches up while one is held out), and a spend it would have paid waits for it
+as `settle_first`. The hold is the operator's word with an age: it ends once the
+operator serves the coin live again (the other store's participation withdrawn
+or voided, its round dropped), once a catch-up settles it, and at the latest when
+the wait `settle_first` stated for it has passed, so a false refusal costs at most
+that one wait. While held, the coin counts in `balance` (as `spent_elsewhere`)
+and not in what `coin_places` calls spendable (`spent_elsewhere_until` on its
+line), and its exit is never barred; a `swap_cancel` that meets such a coin cancels the
 acceptance without a respend. A `swap_cancel` whose respend went unanswered
 never calls the acceptance cancelled until the operator has answered it: the
 next one posts the respend again and answers `cancelled`, `done`, or, while

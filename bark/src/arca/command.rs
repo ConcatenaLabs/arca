@@ -549,6 +549,12 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"swap_read" => w.swap_read(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
 		"swap_accept" => {
 			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			// Only a build for the test of the shaped refusal reads this, and
+			// only when the call names it.
+			#[cfg(feature = "shape-probe")]
+			if let Some(off) = a["shape_off_by"].as_i64() {
+				return w.swap_accept_shaped_off(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false), shown, off);
+			}
 			w.swap_accept_shown(req_str(&a["offer"], "the offer")?, a["accept_near_deadline"].as_bool().unwrap_or(false), shown)
 		},
 		"swap_complete" => w.swap_complete(req_str(&a["accept"], "the acceptance")?, a["accept_near_deadline"].as_bool().unwrap_or(false)),
