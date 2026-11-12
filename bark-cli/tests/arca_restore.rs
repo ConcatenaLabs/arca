@@ -1112,7 +1112,12 @@ async fn two_stores_of_one_mnemonic_spending_in_turn_show_the_same_coins() {
 	let s = a.ok(&["sync"]);
 	println!("TS A's catch-up after A2's offboard: {}", s["caught_up"]);
 	assert!(s["caught_up"]["error"].is_null(), "{}", s["caught_up"]);
-	assert!(!s["caught_up"]["given_elsewhere"].as_array().unwrap().is_empty(), "A gives up the coin A2 offboarded: {}", s["caught_up"]);
+	// The offboard's round spends the board A2 gave up (its forfeit, published from the board): A's
+	// re-check at the start of the sync finds the board spent and catches up at once, or the sync's
+	// own catch-up does.
+	let early = s["recheck"]["changes"].as_array().is_some_and(|c| c.iter().any(|x| x["caught_up"] == true));
+	assert!(early || s["caught_up"]["given_elsewhere"].as_array().is_some_and(|g| !g.is_empty()),
+		"A gives up the coin A2 offboarded: {} {}", s["recheck"], s["caught_up"]);
 	a2.ok(&["sync"]);
 	assert_eq!(live(&a), live(&a2), "the same coins after A2's offboard");
 	assert_eq!(tree_balance(&a), tree_balance(&a2), "the same balance after A2's offboard");
