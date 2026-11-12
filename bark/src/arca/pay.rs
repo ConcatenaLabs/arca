@@ -667,6 +667,7 @@ impl Wallet {
 			return Ok(vec![]);
 		}
 		let barred = self.unspendable(spend)?;
+		let elsewhere = self.spent_elsewhere()?;
 		let planned = self.planned_coins()?;
 		let now = self.now()?.to_consensus_u32() as u64;
 		// Coins a settle gave up ([`Self::settle_first`]): no spend takes
@@ -674,6 +675,10 @@ impl Wallet {
 		let settling = self.settle_asked()?;
 		let mut out = vec![];
 		for row in self.store.coins_in_states(&["live", "given", "pending"])?.into_iter().filter(|c| c.asset == asset.to_string()) {
+			if elsewhere.contains(&row.leaf_id) {
+				out.push((row.leaf_id.clone(), row.value, "given up by another device of this wallet, in a round that is not final yet"));
+				continue;
+			}
 			if row.expiry != u32::MAX && now + WalletPolicy::EXIT_DEADLINE as u64 >= row.expiry as u64 {
 				continue;
 			}
@@ -1515,11 +1520,10 @@ impl Wallet {
 				// the other stores did now, rather than at its next catch-up, so
 				// it stops counting and offering the coin and holds what replaced
 				// it.
+				// Held out of every spend until a catch-up settles it.
 				if let Error::Server { code, message, .. } = &e {
-					if code == "double_spend" && forfeited.is_none() && leaf_named(message).is_some_and(|l| mine.contains(&l)) {
-						if let Err(c) = self.catch_up() {
-							self.store.refused("the catch-up after a coin spent elsewhere", &c.to_string())?;
-						}
+					if let Some(l) = leaf_named(message).filter(|l| code == "double_spend" && forfeited.is_none() && mine.contains(l)) {
+						self.caught_up_after_spent(&l)?;
 					}
 				}
 				Err(e)
@@ -2505,7 +2509,7 @@ impl Wallet {
 		if let Some(i) = priced.mine.iter().find(|i| !i.coin.exit_allowed()) {
 			self.exit_required(&format!("coin {} it would give cannot have it (its kind of leaf takes no checkpoint exit)", i.coin.id))?;
 		}
-		let made = self.shape_for_trade(&info, give_asset, priced, give, &others, true, min_give, 1, Reads::ALL)?;
+		let made = self.shape_for_trade(&info, give_asset, priced, give, &others, true, min_give, 1, Reads::ALL, 0)?;
 		let shaped = made.shaped();
 		let TradeCoins { mine: inputs, margin, change, .. } = made;
 		let mut outs = vec![wanted];
@@ -2649,12 +2653,16 @@ impl Wallet {
 	/// terms), and the coin made is kept for the same trade, whose next
 	/// quote trades from it with nothing to shape. The only call that moves
 	/// anything before a trade is signed.
+	///
+	/// `off` is 0 but in the test of that refusal (the `shape-probe`
+	/// feature, [`Self::swap_accept_shaped_off`]): the coin paid is that many
+	/// atoms off what was priced, the change the other way.
 	#[allow(clippy::too_many_arguments)]
 	fn shape_for_trade(&mut self, info: &Value, asset: AssetId, priced: TradeCoins, paid: u64, others: &[ExplicitOutput], pays_margin: bool,
-		min_leaf: u64, other_inputs: usize, reads: Reads) -> Result<TradeCoins, Error>
+		min_leaf: u64, other_inputs: usize, reads: Reads, off: i64) -> Result<TradeCoins, Error>
 	{
 		let Some(s) = priced.shaping else { return Ok(priced) };
-		self.shape_coin(info, asset, &s, reads)?;
+		self.shape_coin(info, asset, &s, reads, off)?;
 		let shaped = |why: String| Error::Shaped { asset: asset.to_string(), fee: s.cost, message: format!("the wallet paid itself a coin of \
 			exactly the {} of asset {} this trade gives first, which left {} in margins, counted in the terms shown; {}: ask for the terms \
 			again, which trade from that coin with nothing more to pay itself", s.need, asset, s.cost, why) };
@@ -2719,14 +2727,18 @@ impl Wallet {
 	/// Pays the wallet itself, out of round, the coin of exactly `s.need` of
 	/// `asset` that [`Self::trade_coins`] priced, and the rest as change,
 	/// from the coins it priced it from.
-	fn shape_coin(&mut self, info: &Value, asset: AssetId, s: &Shaping, reads: Reads) -> Result<(), Error> {
+	fn shape_coin(&mut self, info: &Value, asset: AssetId, s: &Shaping, reads: Reads, off: i64) -> Result<(), Error> {
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
+		let (need, change) = match (s.need.checked_add_signed(off), s.change.checked_add_signed(-off)) {
+			(Some(n), Some(c)) if n > 0 => (n, c),
+			_ => return Err(Error::Refused(format!("a coin {} atoms off {} with {} of change cannot be made", off, s.need, s.change))),
+		};
 		// The coin is given in the trade, so its leaf is one the other side
 		// reads.
-		let leaf = self.own_leaf_traded("shaped", info, asset, s.need, reads.landing_2)?;
-		let mut outs = vec![Out { asset, value: s.need, leaf, mailbox, until: None }];
-		if s.change > 0 {
-			outs.push(Out { asset, value: s.change, leaf: self.own_leaf_of("change", info, asset, s.change)?, mailbox, until: None });
+		let leaf = self.own_leaf_traded("shaped", info, asset, need, reads.landing_2)?;
+		let mut outs = vec![Out { asset, value: need, leaf, mailbox, until: None }];
+		if change > 0 {
+			outs.push(Out { asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });
 		}
 		self.transfer_back(&s.inputs, &outs)?;
 		Ok(())
@@ -3125,6 +3137,19 @@ impl Wallet {
 	/// showed (`shown`, a [`Wallet::swap_read`]'s answer): the same swap, what
 	/// the wallet gives and gets, and no more in margins.
 	pub fn swap_accept_shown(&mut self, offer_text: &str, near_deadline: bool, shown: Option<&Value>) -> Result<Value, Error> {
+		self.swap_accept_with(offer_text, near_deadline, shown, 0)
+	}
+
+	/// [`Self::swap_accept_shown`], with the payment that shapes the coin
+	/// first made `off` atoms off what was priced: the one way to reach
+	/// [`Error::Shaped`] on purpose, for its test. Built only with the
+	/// `shape-probe` feature, which no shipped build enables.
+	#[cfg(feature = "shape-probe")]
+	pub fn swap_accept_shaped_off(&mut self, offer_text: &str, near_deadline: bool, shown: Option<&Value>, off: i64) -> Result<Value, Error> {
+		self.swap_accept_with(offer_text, near_deadline, shown, off)
+	}
+
+	fn swap_accept_with(&mut self, offer_text: &str, near_deadline: bool, shown: Option<&Value>, off: i64) -> Result<Value, Error> {
 		let o = self.swap_offer_checked(offer_text)?;
 		let (id, give_asset, give, want_asset, want) = (o.id.clone(), o.give_asset, o.give, o.want_asset, o.want);
 		// The coin the swap pays this wallet comes out of round.
@@ -3164,7 +3189,7 @@ impl Wallet {
 		}
 		// The one step that moves anything before the acceptance is signed:
 		// the coin priced, made. Refused past it only as [`Error::Shaped`].
-		let made = self.shape_for_trade(&info, want_asset, priced, want, &others, false, min_want, 0, maker_reads)?;
+		let made = self.shape_for_trade(&info, want_asset, priced, want, &others, false, min_want, 0, maker_reads, off)?;
 		let shaped = made.shaped();
 		let (made_terms, _) = self.swap_priced(&info, &o, &others, &made, near_deadline).map_err(|e| Error::Shaped { asset: want_asset.to_string(),
 			fee: shaped, message: format!("the wallet paid itself a coin of exactly what this trade gives first, which left {} of asset {} in \
