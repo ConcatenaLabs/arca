@@ -206,6 +206,24 @@ pub struct Info {
 	/// False for an operator that makes both, or a server that predates it.
 	#[serde(default)]
 	pub landing_2_only: bool,
+	/// How the operator moves a released participation's offboard outputs
+	/// to their destinations.
+	#[serde(default)]
+	pub offboards: OffboardsInfo,
+}
+
+/// How the operator moves a released participation's offboard outputs to
+/// their destinations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OffboardsInfo {
+	/// The most seconds from a participation's release to the unlock of its
+	/// offboard outputs being in a block, the block included: what the
+	/// operator keeps from its chain poll and the block interval, or the
+	/// longest it has measured over its latest releases if that is longer.
+	/// 0 from an operator whose watcher does not act on its own, or a server
+	/// that predates it.
+	pub unlock_within_seconds: u32,
 }
 
 /// How the operator builds its batches.
