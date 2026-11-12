@@ -1699,8 +1699,15 @@ median time) is voided, its coins its owner's again; the round is dropped
 unbroadcast, killed on the chain by a spend of one of its own coins, and the
 participations that did hand theirs over run again in the next round. The
 signer is asked for its half of a forfeit only once the node holds the
-round, and the preimage goes out once the round is final, as for any
-participation. A participation that gives up no coin (a payment received
+round: for a round whose every input is the operator wallet's own coin,
+as the pass over the rounds hands the round to the node and as the node
+takes it at a later broadcast after refusing it; for every held round, each
+minute (and for any the signer was slow or away for). A participation whose
+forfeit the signer has co-signed is not run again when its round is lost,
+so a round with an input someone else can spend first (an order of a fill
+round, an issuer's mint limiter, which its cold key's arm signature spends)
+leaves that signature to the minute's run. The preimage goes
+out once the round is final, as for any participation. A participation that gives up no coin (a payment received
 over Lightning, a repayment of a swept coin) has no forfeit to hand over: it
 runs in a round of its own, built first at each round interval, which goes
 out at the next pass over the rounds and never waits on a holder's forfeits,
@@ -2528,8 +2535,10 @@ anyone, and leaves the server only inside a forfeit the operator publishes.
 An owner therefore never holds a forfeit it could publish itself. Then, in
 one database transaction, the participation is released and its new leaves
 credited; only then does the preimage go back. A forfeit left without the
-operator's half (the server stopped before the signer's answer was stored)
-is given it at start and every minute after; the signer signs again what it
+operator's half (the server stopped before the signer's answer was stored,
+or a held round's, waiting for the node to hold it) is given it at start, as
+a round held for its forfeits that spends only the operator's own coins
+goes to the node or is taken there, and every minute after; the signer signs again what it
 signed, and a forfeit is its owner's consent, so completing it takes
 nothing from anyone. The same request again gets
 the same preimage, whatever the chain has seen of the coins given up

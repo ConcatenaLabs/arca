@@ -64,13 +64,24 @@ fn participate(r: &Running, old: &Held, new_key: &Keypair) -> ([u8; 32], [u8; 32
 	(id, nonce)
 }
 
-/// A forfeit the signer declines for what it asks is refused for good, 422
-/// `declined`, and it records nothing: the participation is not released and
-/// no preimage goes out. The signer here gets every owner's signature with
-/// one character changed (a tap in front of it), so none verifies. Once the
-/// signer signs again, the same forfeit releases the participation. A signer
-/// that cannot be reached is answered `signer_unavailable` (503), the
-/// forfeit recorded with its owner's half, and the same request completes it.
+/// A forfeit the signer declines for what it asks is refused for good, and
+/// it records nothing: the participation is not released and no preimage
+/// goes out. The signer here gets every owner's signature with one character
+/// changed (a tap in front of it), so none verifies. Once the signer signs
+/// again, the same forfeit releases the participation. A signer that cannot
+/// be reached leaves the forfeit recorded with its owner's half, and it is
+/// completed once the signer answers.
+///
+/// With batches with a sweep, the forfeit is handed over once the round is
+/// final, and the signer is asked for the operator's half in that request:
+/// `declined` (422), then `signer_unavailable` (503), then the same request
+/// completes it. With batches without a sweep (the round held for its
+/// forfeits), the forfeit is handed over before the round goes out, and the
+/// signer is asked only once the node holds the round
+/// ([`server::forfeits::Forfeits::fill_unsigned`], woken as the round goes
+/// out): the declined fill leaves it without the operator's half, an
+/// unreachable signer fails the fill, and the fill once the signer answers
+/// completes it; the round's release follows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_forfeit_the_signer_declines_is_refused_for_good() {
 	let mut r = start().await;
@@ -81,31 +92,182 @@ async fn a_forfeit_the_signer_declines_is_refused_for_good() {
 	let (pa, a2_nonce) = participate(&r, &a_board, &a2);
 	let a_old = coin_of(&r, &a_board, std::slice::from_ref(&a_tx));
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
-	r.produce().await;
-	r.bury().await;
-	round_final(&r, &built.tx.txid()).await;
-	let st = status(&r, &pa);
-	let (a2_valid, a2_record, round) = validate_new_leaf(&r, &pa, 0, &a2, &a2_nonce);
-	let f = forfeit_for(&a_old, &a2_valid, &round, &st, 0);
-	let good = forfeit_body(&pa, &[(a_board.id, forfeit_sig(&f, &a))], &[auths_json(&a2_valid, &a2, created(&a2_record))]);
+	let round_txid = built.tx.txid();
+	let held = r.server.store.round_by_txid(&round_txid.to_byte_array()).await.unwrap()
+		.is_some_and(|x| x.state == server::store::RoundState::Built);
+	let round_id = r.server.store.round_by_txid(&round_txid.to_byte_array()).await.unwrap().unwrap().round_id;
+	assert_eq!(r.server.store.round_wakes_fill(round_id).await.unwrap(), held,
+		"a refresh round wakes the fill as it goes out exactly when it is held (no sweep)");
+	let good = if held {
+		let body = common::rounds::hand_over_body(&r, &pa, &common::client::made(&pa).unwrap()).await;
+		let done = r.http.post("forfeit_leaves", &body).ok();
+		assert!(done.get("preimage").is_none(), "no preimage before the round is broadcast: {}", done);
+		body
+	} else {
+		r.produce().await;
+		r.bury().await;
+		round_final(&r, &round_txid).await;
+		let st = status(&r, &pa);
+		let (a2_valid, a2_record, round) = validate_new_leaf(&r, &pa, 0, &a2, &a2_nonce);
+		let f = forfeit_for(&a_old, &a2_valid, &round, &st, 0);
+		forfeit_body(&pa, &[(a_board.id, forfeit_sig(&f, &a))], &[auths_json(&a2_valid, &a2, created(&a2_record))])
+	};
 	let entries = r.signer_entries().await.len();
 	let genesis = r.chain.genesis_hash();
 	let key = r.s;
 	let tap = common::signer::SignerTap::on(&r.signer);
 	tap.garble(true);
-	for _ in 0..2 {
-		refused(r.http.post("forfeit_leaves", &good), 422, "declined");
+	if held {
+		// The round goes out, and the fill it wakes is declined; so is
+		// every fill while the signer declines.
+		r.server.rounds.pass().await.unwrap();
+		assert_eq!(r.server.store.round_by_txid(&round_txid.to_byte_array()).await.unwrap().unwrap().state,
+			server::store::RoundState::Broadcast, "the round went out with its forfeits in");
+		for _ in 0..2 {
+			assert_eq!(r.server.forfeits.fill_unsigned().await.unwrap(), 0, "a declined forfeit is not filled");
+		}
+	} else {
+		for _ in 0..2 {
+			refused(r.http.post("forfeit_leaves", &good), 422, "declined");
+		}
 	}
 	assert_eq!(status(&r, &pa)["state"], "issued", "not released");
 	assert_eq!(r.signer_entries().await.len(), entries, "the signer recorded nothing");
 	drop(tap);
 	r.signer.kill();
-	refused(r.http.post("forfeit_leaves", &good), 503, "signer_unavailable");
+	if held {
+		let e = r.server.forfeits.fill_unsigned().await.unwrap_err().to_string();
+		println!("the fill with the signer away: {}", e);
+		assert!(e.contains("cannot reach the signer"), "{}", e);
+	} else {
+		refused(r.http.post("forfeit_leaves", &good), 503, "signer_unavailable");
+	}
 	tokio::task::block_in_place(|| r.signer.restart(&key, genesis));
-	let done = r.http.post("forfeit_leaves", &good).ok();
-	println!("the same forfeit once the signer signs: {} {}", done["state"], done["preimage"]);
-	assert_eq!(done["state"], "released", "{}", done);
+	if held {
+		// Filled by this call, or by the fill the minute's run made first.
+		let filled = r.server.forfeits.fill_unsigned().await.unwrap();
+		println!("filled once the signer signs: {}", filled);
+		assert_eq!(r.server.forfeits.fill_unsigned().await.unwrap(), 0, "nothing left to fill");
+		r.produce().await;
+		r.bury().await;
+		round_final(&r, &round_txid).await;
+		let http = r.http.clone();
+		let id = pa;
+		r.wait("the participation to be released", || {
+			http.post("participation_status", &json!({"participation_id": hex(&id)})).ok()["state"] == "released"
+		}).await;
+		let done = r.http.post("forfeit_leaves", &good).ok();
+		println!("the same forfeit once the signer signs: {} {}", done["state"], done["preimage"]);
+		assert_eq!(done["state"], "released", "{}", done);
+	} else {
+		let done = r.http.post("forfeit_leaves", &good).ok();
+		println!("the same forfeit once the signer signs: {} {}", done["state"], done["preimage"]);
+		assert_eq!(done["state"], "released", "{}", done);
+	}
 	assert_eq!(r.signer_entries().await.len(), entries + 1, "the forfeit, recorded once");
+}
+
+/// A refresh round held for its forfeits (no sweep) has the operator's half
+/// of its forfeits signed as the pass over the rounds hands it to the node,
+/// not at the minute's run, which comes up to 60 s after: whole within 20 s
+/// of the go-out (tens of milliseconds alone, a few seconds with the suite in
+/// parallel on a loaded machine). Without a sweep whatever
+/// `ARCA_TEST_NO_SWEEP` says.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_refresh_round_has_its_forfeits_co_signed_as_it_goes_out() {
+	let mut r = common::rounds::start_held().await;
+	let x = r.x;
+	let a = keypair("A");
+	let (a_board, _) = credited_board(&mut r, &a, x).await;
+	let (pa, _) = participate(&r, &a_board, &keypair("A, new"));
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	let round_txid = built.tx.txid();
+	let row = r.server.store.round_by_txid(&round_txid.to_byte_array()).await.unwrap().unwrap();
+	assert_eq!(row.state, server::store::RoundState::Built, "held for its forfeits");
+	assert!(r.server.store.round_wakes_fill(row.round_id).await.unwrap(), "a refresh round without a sweep wakes the fill");
+	common::rounds::hand_over_held(&r, &round_txid).await;
+	let unsigned = || async { r.server.store.unsigned_forfeits().await.unwrap().iter().filter(|f| f.round_id == row.round_id).count() };
+	r.server.rounds.pass().await.unwrap();
+	let out = std::time::Instant::now();
+	let n = r.server.store.nursery_get(&round_txid.to_byte_array()).await.unwrap().unwrap();
+	assert_eq!(n.last_result.as_deref(), Some("accepted"), "the node holds the round");
+	loop {
+		if unsigned().await == 0 {
+			break;
+		}
+		assert!(out.elapsed() < std::time::Duration::from_secs(20), "the forfeit still lacks the operator's half 20 s after the round went out (the minute's run comes at 60 s)");
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+	}
+	println!("the operator's half filled {} ms after the round went out", out.elapsed().as_millis());
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &round_txid).await;
+	let http = r.http.clone();
+	r.wait("the participation to be released", || {
+		http.post("participation_status", &json!({"participation_id": hex(&pa)})).ok()["state"] == "released"
+	}).await;
+}
+
+/// A round held for its forfeits that the node refuses when it goes out (its
+/// fee asset delisted there), and takes at the nursery's next broadcast once
+/// the asset is listed again, has the operator's half of its forfeits signed
+/// as the node takes it, not at the next minute's run: the forfeits are
+/// whole within 15 s of the node's acceptance, where the minute's run comes
+/// about 30 s after it. Without a sweep whatever
+/// `ARCA_TEST_NO_SWEEP` says.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_round_the_node_takes_late_has_its_forfeits_completed_at_once() {
+	let mut r = common::rounds::start_held().await;
+	let x = r.x;
+	let a = keypair("A");
+	let (a_board, _) = credited_board(&mut r, &a, x).await;
+	let (pa, _) = participate(&r, &a_board, &keypair("A, new"));
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	let round_txid = built.tx.txid();
+	let row = r.server.store.round_by_txid(&round_txid.to_byte_array()).await.unwrap().unwrap();
+	assert_eq!(row.state, server::store::RoundState::Built, "held for its forfeits");
+	common::rounds::hand_over_held(&r, &round_txid).await;
+	// The node refuses the round: its fee asset is not listed there.
+	let fee_asset = elements::AssetId::from_byte_array(row.fee_asset);
+	let rates: Value = r.rt.client().call("getfeeexchangerates", &[]).unwrap();
+	let rate = rates[fee_asset.to_string()].as_u64().unwrap();
+	let mut without = rates.as_object().unwrap().clone();
+	without.remove(&fee_asset.to_string());
+	let _: Value = r.rt.client().call("setfeeexchangerates", &[Value::Object(without)]).unwrap();
+	r.server.rounds.pass().await.unwrap();
+	let n = r.server.store.nursery_get(&round_txid.to_byte_array()).await.unwrap().unwrap();
+	println!("the round handed to the node: {:?}", n.last_result);
+	assert_ne!(n.last_result.as_deref(), Some("accepted"), "the node refused it");
+	let unsigned = || async { r.server.store.unsigned_forfeits().await.unwrap().iter().filter(|f| f.round_id == row.round_id).count() };
+	assert_eq!(unsigned().await, 1, "the forfeit waits for the node to hold the round");
+	// Listed again: the nursery's next broadcast (every 30 s) is taken.
+	common::node::list_fee_asset(&r.rt, fee_asset, rate);
+	let store = r.server.store.clone();
+	let t = round_txid.to_byte_array();
+	let taken = loop {
+		let n = store.nursery_get(&t).await.unwrap().unwrap();
+		if n.last_result.as_deref() == Some("accepted") {
+			break std::time::Instant::now();
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	};
+	println!("the node took the round at the nursery's broadcast #{}", store.nursery_get(&t).await.unwrap().unwrap().broadcasts);
+	loop {
+		if unsigned().await == 0 {
+			break;
+		}
+		assert!(taken.elapsed() < std::time::Duration::from_secs(15),
+			"the forfeit still lacks the operator's half 15 s after the node took the round (the nursery broadcasts every 30 s)");
+		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+	}
+	println!("the operator's half filled {} ms after the node took the round", taken.elapsed().as_millis());
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &round_txid).await;
+	let http = r.http.clone();
+	r.wait("the participation to be released", || {
+		http.post("participation_status", &json!({"participation_id": hex(&pa)})).ok()["state"] == "released"
+	}).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
