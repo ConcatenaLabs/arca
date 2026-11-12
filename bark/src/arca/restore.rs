@@ -151,9 +151,22 @@ pub const HISTORY_WAIT_MOST: u32 = 6 * 3600;
 pub(crate) const WAITING_SINCE: &str = "waiting_since";
 
 /// The most coins of a restore's history one step checks
-/// ([`Wallet::restore_history`]): a `sync` runs one step, so it holds the
-/// wallet for a bounded time while the history lasts.
+/// ([`Wallet::restore_history`]).
 pub const HISTORY_STEP: usize = 20;
+
+/// How long a slice of a restore's history `sync` runs, at most, past the
+/// coin it was checking when the time ran out (milliseconds,
+/// [`Wallet::restore_history_within`]): a sync holds the wallet that much
+/// longer while the history lasts, not the time of a whole step.
+pub const SYNC_HISTORY_MS: u64 = 1_000;
+
+/// Where the wallet keeps what a coin of a restore's history last cost to
+/// check, in milliseconds: how many coins a slice takes together.
+pub(crate) const HISTORY_PACE: &str = "restore_history_pace";
+
+/// Where the wallet keeps when (seconds) the last step of a restore's
+/// history looked at the coins held: the next looks at those taken since.
+pub(crate) const HISTORY_LOOKED: &str = "restore_history_looked";
 
 /// Where the wallet keeps the median time it last caught up with what the
 /// server serves to its mailbox key ([`Wallet::catch_up`]).
@@ -961,12 +974,8 @@ impl Wallet {
 	/// Keeps `history` as the coins left to [`Self::restore_history`],
 	/// those the store does not hold, in place of any list kept before.
 	fn keep_history(&self, history: &[Value]) -> Result<(), Error> {
-		let mut left = vec![];
-		for e in history {
-			if self.store.coin(e["leaf_id"].as_str().unwrap_or(""))?.is_none() {
-				left.push(e.clone());
-			}
-		}
+		let ids = self.store.coin_ids()?;
+		let left: Vec<Value> = history.iter().filter(|e| !ids.contains(e["leaf_id"].as_str().unwrap_or(""))).cloned().collect();
 		if left.is_empty() {
 			self.store.delete_meta(RESTORE_HISTORY)?;
 			self.store.delete_meta(RESTORE_HISTORY_IDS)
@@ -999,68 +1008,130 @@ impl Wallet {
 	/// owner key, its tree, the chain, then how it was given up, on its
 	/// owner's own signatures); then what the records of every coin held
 	/// say of the coins they spend, and the birthday lowered to the oldest
-	/// base. `None` when nothing is left. `sync` runs one step; a step that
-	/// stops at an error keeps what it took, and the next takes the rest.
+	/// base. `None` when nothing is left. A step that stops at an error keeps
+	/// what it took, and the next takes the rest.
 	pub fn restore_history(&mut self) -> Result<Option<Value>, Error> {
+		self.restore_history_within(None)
+	}
+
+	/// [`Self::restore_history`]; with `budget_ms`, a slice of it: coins are
+	/// taken a few at a time until the slice has run that long, at least one
+	/// and at most [`HISTORY_STEP`]. How many go together follows what a coin
+	/// has cost to check ([`HISTORY_PACE`]), so a slice ends close to its
+	/// budget on a far link and on a near one alike, with the coin it was
+	/// checking when the budget ran out. A program that answers a person
+	/// from the wallet runs slices while nobody asks, and the person's ask
+	/// waits at most for the end of one. `sync` runs one slice of
+	/// [`SYNC_HISTORY_MS`].
+	pub fn restore_history_within(&mut self, budget_ms: Option<u64>) -> Result<Option<Value>, Error> {
+		let started = web_time::Instant::now();
 		let all = self.history()?;
 		if all.is_empty() {
 			return Ok(None);
 		}
 		let info = self.server_info()?;
+		// The coins taken since the last step looked (a participation completed,
+		// a catch-up, the mailbox, or a step cut short): what this step looks
+		// at beside its own.
+		let since = self.store.meta(HISTORY_LOOKED)?.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+		let looked = store_now();
 		// A step cut short (the program closed, the link lost) may have taken
 		// a coin and not yet applied how it was given up, and a participation
 		// completed or a catch-up may have taken one of the list since: each
 		// such coin is settled first, by its own served record, as a restore
 		// that took everything at once settles it, so none is left counted.
 		let (unheld, mut notes) = self.settle_held_history(&all)?;
+		let ops0 = super::chain::operator_calls();
+		let mut parts = json!({"settle": started.elapsed().as_millis() as u64, "take": 0, "chain": 0});
 		// The next coins of the list, those whose bases are in a block of the
 		// active chain: a coin resting on a transaction an anchor-driven
 		// reorganisation took out of the chain waits in the list until it is
 		// mined again (or can never return), as it would have been taken
 		// while it was in a block. Bitcoin anchoring decides, not the order.
-		let ahead: Vec<Txid> = unheld.iter().take(2 * HISTORY_STEP).flat_map(Self::served_bases)
-			.filter_map(|t| Txid::from_str(&t).ok()).collect();
-		self.chain.read_ahead_of(&ahead, &[]);
 		// The wait is bounded ([`HISTORY_WAIT_MOST`]): a transaction the
 		// server names that never confirms (a lie, or one a reorganisation
 		// left out for good) holds no coin in the list for ever; past the
 		// bound the coin is taken as a restore that takes everything at once
 		// takes it.
 		let now = self.now()?.to_consensus_u32() as u64;
-		let (mut step, mut waiting) = (vec![], 0usize);
-		let mut later: Vec<Value> = vec![];
-		for mut e in unheld {
-			if step.len() >= HISTORY_STEP {
-				later.push(e);
-				continue;
-			}
-			if self.base_out_of_chain(&e)? {
-				let since = e[WAITING_SINCE].as_u64().unwrap_or(now);
-				if now.saturating_sub(since) < HISTORY_WAIT_MOST as u64 {
-					e[WAITING_SINCE] = json!(since);
-					waiting += 1;
-					later.push(e);
-					continue;
+		let mut pace: u64 = self.store.meta(HISTORY_PACE)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+		let mut queue: std::collections::VecDeque<Value> = unheld.into();
+		let (mut later, mut waiting, mut checked) = (vec![], 0usize, 0usize);
+		let (mut restored, mut not_recovered) = (vec![], vec![]);
+		// A batch grows to at most twice the last: coins that cost little
+		// teach a pace that the next, dearer ones would overrun.
+		let mut last = 1usize;
+		while checked < HISTORY_STEP {
+			let room = HISTORY_STEP - checked;
+			let k = match budget_ms {
+				None => room,
+				Some(budget) => {
+					let spent = started.elapsed().as_millis() as u64;
+					if checked > 0 && spent >= budget {
+						break;
+					}
+					if pace == 0 { 1 } else { ((budget.saturating_sub(spent) / pace) as usize).clamp(1, room.min(2 * last)) }
+				},
+			};
+			let tc = web_time::Instant::now();
+			let ahead: Vec<Txid> = queue.iter().take(2 * k).flat_map(Self::served_bases).filter_map(|t| Txid::from_str(&t).ok()).collect();
+			self.chain.read_ahead_of(&ahead, &[]);
+			let mut batch = vec![];
+			while batch.len() < k {
+				let Some(mut e) = queue.pop_front() else { break };
+				if self.base_out_of_chain(&e)? {
+					let since = e[WAITING_SINCE].as_u64().unwrap_or(now);
+					if now.saturating_sub(since) < HISTORY_WAIT_MOST as u64 {
+						e[WAITING_SINCE] = json!(since);
+						waiting += 1;
+						later.push(e);
+						continue;
+					}
 				}
+				batch.push(e);
 			}
-			step.push(e);
+			if batch.is_empty() {
+				break;
+			}
+			parts["chain"] = json!(parts["chain"].as_u64().unwrap_or(0) + tc.elapsed().as_millis() as u64);
+			let t = web_time::Instant::now();
+			let TakenServed { restored: r, not_recovered: n, notes: taken_notes, given_elsewhere: _ } =
+				self.take_served(&info, &batch, &[], false, None)?;
+			parts["take"] = json!(parts["take"].as_u64().unwrap_or(0) + t.elapsed().as_millis() as u64);
+			let per = t.elapsed().as_millis() as u64 / batch.len() as u64;
+			// The pace rises at once to a dearer coin's cost and falls by halves.
+			pace = if per >= pace { per.max(1) } else { ((pace + per) / 2).max(1) };
+			last = batch.len();
+			checked += batch.len();
+			restored.extend(r);
+			not_recovered.extend(n);
+			notes.extend(taken_notes);
 		}
-		let TakenServed { mut restored, not_recovered, notes: taken_notes, given_elsewhere: _ } =
-			self.take_served(&info, &step, &[], false, None)?;
-		notes.extend(taken_notes);
+		later.extend(queue);
+		let ta = web_time::Instant::now();
 		let (rest, settled) = self.settle_held_history(&later)?;
 		notes.extend(settled);
-		notes.extend(self.held_records_spend()?);
-		self.lower_birthday(&[])?;
+		// What the records of the coins taken since the last step say of the
+		// coins they spend, and what every record held says of those coins;
+		// and the birthday lowered to their bases. Once the list is done, both
+		// over every coin held, as a restore that takes everything at once
+		// leaves them.
+		let whole = rest.is_empty();
+		let new = if whole { None } else { Some(self.store.coin_ids_since(since)?) };
+		notes.extend(self.held_records_spend(new.as_ref())?);
+		self.lower_birthday_of(new.as_ref(), &[])?;
 		self.keep_history(&rest)?;
+		self.store.set_metas(&[(HISTORY_LOOKED, looked.to_string()), (HISTORY_PACE, pace.to_string())])?;
 		for v in restored.iter_mut() {
 			if let Some(c) = self.store.coin(v["leaf_id"].as_str().unwrap_or(""))? {
 				v["state"] = json!(c.state);
 			}
 		}
 		let left = self.history_left()?;
-		let mut out = json!({"checked": step.len(), "restored": restored, "not_recovered": not_recovered, "notes": notes,
-			"left": left, "loading": left > 0});
+		parts["after"] = json!(ta.elapsed().as_millis() as u64);
+		parts["operator"] = super::chain::operator_between(&ops0, &super::chain::operator_calls()).1;
+		let mut out = json!({"checked": checked, "restored": restored, "not_recovered": not_recovered, "notes": notes,
+			"left": left, "loading": left > 0, "ms": started.elapsed().as_millis() as u64, "parts": parts});
 		if waiting > 0 {
 			out["waiting_for_the_chain"] = json!(waiting);
 		}
@@ -1123,8 +1194,12 @@ impl Wallet {
 	fn settle_held_history(&mut self, list: &[Value]) -> Result<(Vec<Value>, Vec<Value>), Error> {
 		let now = self.now()?;
 		let (mut held, mut rest) = (vec![], vec![]);
+		// One read of the ids held for the whole list, which a long history
+		// makes hundreds of coins; each coin held is read then.
+		let ids = self.store.coin_ids()?;
 		for e in list {
-			match self.store.coin(e["leaf_id"].as_str().unwrap_or(""))? {
+			let id = e["leaf_id"].as_str().unwrap_or("");
+			match if ids.contains(id) { self.store.coin(id)? } else { None } {
 				Some(c) => held.push((e.clone(), c)),
 				None => rest.push(e.clone()),
 			}
@@ -1150,15 +1225,21 @@ impl Wallet {
 	/// record spends in a transfer, which the operator co-signed, is spent.
 	/// A restore's own pass looks at the coins it took; the history steps
 	/// take a record and the coin it spends in any order, so each looks at
-	/// every coin held.
-	fn held_records_spend(&mut self) -> Result<Vec<Value>, Error> {
+	/// the pairs of a record and a coin it spends of which either was taken
+	/// since the last step (`new`), and the last step, with `new` `None`,
+	/// at every coin held: a pair of two coins held before was looked at
+	/// when the later of them was taken.
+	fn held_records_spend(&mut self, new: Option<&BTreeSet<String>>) -> Result<Vec<Value>, Error> {
 		let coins = self.store.coins()?;
 		let open: BTreeSet<[u8; 32]> = coins.iter().filter(|c| c.state != "spent").map(|c| c.owner_nonce).collect();
+		let new_open: BTreeSet<[u8; 32]> = coins.iter().filter(|c| c.state != "spent" && new.is_none_or(|n| n.contains(&c.leaf_id)))
+			.map(|c| c.owner_nonce).collect();
 		let now = self.now()?;
 		let mut notes = vec![];
 		for c in &coins {
 			let Ok(record) = Self::record_of(c) else { continue };
-			if !matches!(record, CoinRecord::Transfer(_)) || !record.parents().iter().any(|p| open.contains(&owner_of(p).1)) {
+			let spends = if new.is_none_or(|n| n.contains(&c.leaf_id)) { &open } else { &new_open };
+			if !matches!(record, CoinRecord::Transfer(_)) || !record.parents().iter().any(|p| spends.contains(&owner_of(p).1)) {
 				continue;
 			}
 			let Some(valid) = self.held_valid(c, now) else { continue };
@@ -1181,7 +1262,16 @@ impl Wallet {
 	/// Lowers the birthday to the block of the oldest base of a coin held,
 	/// or of `more`: the chain is read from there on.
 	fn lower_birthday(&self, more: &[Txid]) -> Result<(), Error> {
-		let mut bases: BTreeSet<Txid> = self.store.coins()?.iter().flat_map(|c| c.bases.iter().filter_map(|b| Txid::from_str(b).ok()))
+		self.lower_birthday_of(None, more)
+	}
+
+	/// [`Self::lower_birthday`], from the bases of the coins of `only` (every
+	/// coin held when `None`) and of `more`: a step of a restore's history
+	/// looks at the coins taken since the last, whose bases are the only
+	/// ones that can be lower than the birthday the last step left.
+	fn lower_birthday_of(&self, only: Option<&BTreeSet<String>>, more: &[Txid]) -> Result<(), Error> {
+		let mut bases: BTreeSet<Txid> = self.store.coins()?.iter().filter(|c| only.is_none_or(|o| o.contains(&c.leaf_id)))
+			.flat_map(|c| c.bases.iter().filter_map(|b| Txid::from_str(b).ok()))
 			.collect();
 		bases.extend(more.iter().copied());
 		let bases: Vec<Txid> = bases.into_iter().collect();
@@ -1934,4 +2024,9 @@ impl Wallet {
 		}
 		Ok(notes)
 	}
+}
+
+/// Now, in the seconds a coin's `created_at` counts.
+fn store_now() -> i64 {
+	web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }

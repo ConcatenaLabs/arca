@@ -1690,3 +1690,107 @@ async fn a_restore_reads_each_block_once_whatever_the_coins_resting_on_a_spent_b
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// A restore's history keeps no ask waiting (web wallet #694): a program that
+/// answers a person from the wallet runs the history in slices while nobody
+/// asks, so an ask waits for one slice at most; and `sync` carries a slice of
+/// about a second, never a whole step. A pays B forty-five times out of round
+/// with a refresh after every four, as in `a_long_history_is_restored_after_the_balance`;
+/// A2 is restored from A's mnemonic, and then reaches the operator over a far
+/// link (each call waits 150 ms, about a browser's round trip to the
+/// testnet's operator). A2's sync takes one slice of its history, and every
+/// `restore-history --budget-ms 500` after it one more, until none is left:
+/// none runs much past its budget, whatever it costs to check a coin. The
+/// history done, A2's coins and birthday are A's, and those of A3, restored
+/// with every coin checked before its restore returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_in_slices_keeps_no_ask_waiting() {
+	use std::time::Duration;
+	let mut r = Running::start_kept(1, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, a2, b) = (Arca::new("HSA"), Arca::new("HSA2"), Arca::new("HSB"));
+	boarded(&mut r, &a, &url, &[(x, 3_000_000)]).await;
+	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+	let board_tx = a.ok(&["boards"])[0]["server"]["txid"].as_str().unwrap().to_string();
+	for k in 0..45 {
+		if k > 0 && k % 4 == 0 {
+			let coin: Vec<String> = live(&a).into_keys().collect();
+			a.ok(&["participate", "--leaf", &coin[0], "--max-fee-ppm", "1000000"]);
+			final_round(&r).await;
+			a.ok(&["sync"]);
+		}
+		let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		a.ok(&["send", &req_b, "--amount", "20000", "--asset", &xs]);
+	}
+	b.ok(&["sync"]);
+	a.ok(&["sync"]);
+
+	let p = Proxy::start(&url);
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&p.url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	let restore = &made["restore"];
+	assert!(restore["error"].is_null(), "{}", restore);
+	let mut left = restore["history"]["left"].as_u64().unwrap();
+	println!("HS A2's restore: served {} | history left {}", restore["served"], left);
+	assert!(left > 40, "a long history: {}", restore["history"]);
+	p.delay(Duration::from_millis(150));
+
+	// The sync's slice: about a second, then the coin it was checking.
+	const SLICE_BOUND_MS: u64 = 2_000;
+	let s = a2.ok(&["sync"]);
+	let step = &s["cost_by_step"]["history"];
+	println!("HS A2's sync over the far link: {} ms in all; its history slice {} ms, checked {}, left {}, parts {}", s["cost_by_step"].as_object()
+		.map(|o| o.values().filter_map(|v| v["ms"].as_u64()).sum::<u64>()).unwrap_or(0), step["ms"], s["history"]["checked"], s["history"]["left"],
+		s["history"]["parts"]);
+	assert!(s["history"]["checked"].as_u64().unwrap() >= 1, "{}", s["history"]);
+	assert!(std::env::var_os("HS_MEASURE").is_some() || step["ms"].as_u64().unwrap() <= SLICE_BOUND_MS,
+		"the sync's history slice held the wallet {} ms", step["ms"]);
+	left = s["history"]["left"].as_u64().unwrap();
+
+	// Slices of half a second, as a page runs them while nobody asks.
+	let (mut slices, mut longest, mut checked_all) = (0, 0u64, 0u64);
+	while left > 0 {
+		let t = std::time::Instant::now();
+		let slice = a2.ok(&["restore-history", "--budget-ms", "500"]);
+		let whole = t.elapsed().as_millis() as u64;
+		let ms = slice["ms"].as_u64().expect("a slice says how long it ran");
+		println!("HS slice {}: {} ms ({} ms with the command's start), checked {}, left {}, parts {}", slices, ms, whole, slice["checked"],
+			slice["left"], slice["parts"]);
+		assert!(slice["checked"].as_u64().unwrap() >= 1 || slice["waiting_for_the_chain"].as_u64().unwrap_or(0) > 0, "{}", slice);
+		if std::env::var_os("HS_MEASURE").is_none() {
+			assert!(ms <= SLICE_BOUND_MS, "a slice of 500 ms held the wallet {} ms", ms);
+		}
+		longest = longest.max(ms);
+		checked_all += slice["checked"].as_u64().unwrap();
+		left = slice["left"].as_u64().unwrap();
+		slices += 1;
+		assert!(slices < 200, "the history ends");
+	}
+	println!("HS {} slices, the longest {} ms, {} coins checked", slices, longest, checked_all);
+	p.delay(Duration::ZERO);
+	assert!(a2.ok(&["balance"])["history"].is_null(), "the history is whole");
+	a2.ok(&["sync"]);
+	a.ok(&["sync"]);
+	let diff = differences(&a.ok(&["coins"]), &a2.ok(&["coins"]));
+	assert!(diff.is_empty(), "A2's coins are A's: {:?}", diff);
+	assert_eq!(tree_balance(&a2), tree_balance(&a));
+	assert_eq!(birthday(&a2), block_height(&r, &board_tx), "the birthday is the board's block");
+
+	let a3 = Arca::new("HSA3");
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic, "--restore-at-once"]);
+	let made3 = a3.ok(&args);
+	assert!(made3["restore"]["error"].is_null(), "{}", made3["restore"]);
+	a2.ok(&["sync"]);
+	a3.ok(&["sync"]);
+	let diff = differences(&a3.ok(&["coins"]), &a2.ok(&["coins"]));
+	assert!(diff.is_empty(), "A2's coins, its history taken in slices, are A3's, taken at once: {:?}", diff);
+	assert_eq!(birthday(&a2), birthday(&a3));
+	for w in [&a, &a2, &a3, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
