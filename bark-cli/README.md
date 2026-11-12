@@ -2681,6 +2681,16 @@ those (`shown`) is refused, naming them, before anything is signed; given them,
 it signs, and `swap_complete` settles the swap with each side paying exactly what
 it was shown. `swap_cancel` frees an offer's coin, and `swaps` lists both.
 
+`tests/arca_shaped.rs` runs the same way, built with the `shape-probe` feature
+(`cargo test -p arca-cli --features shape-probe --test arca_shaped`), which only
+this test enables and no shipped build has: in default mode (an instant limit
+set), a trade that no single coin holds first pays the wallet itself a coin of
+exactly what it gives. When the coin made is not the one priced (the test's own
+call asks for it one atom short, `shape_off_by`), `swap_accept` is refused as
+`shaped`, naming the cost of that payment (`fee`, in the terms shown), which is
+all that left the wallet; the coin made is kept, and the next read trades from it
+alone, with nothing more to shape.
+
 `tests/arca_lightning_commands.rs` runs the same way, with the operator's SeqLN
 node in X (`LIGHTNINGD_EXEC`): a payment under a hash between two wallets of one
 operator through the library's commands. `lightning_receive_quote` answers what
