@@ -64,9 +64,12 @@ pub fn refusal(e: &Error) -> Value {
 		out["error"]["coin"] = json!(coin);
 		out["error"]["whose"] = json!(whose);
 	}
-	if let Error::Short { asset, most, live, .. } = e {
+	if let Error::Short { asset, most, all, live, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["most"] = json!(most.to_string());
+		if let Some(a) = all {
+			out["error"]["all"] = json!(a.to_string());
+		}
 		if let Some(l) = live {
 			out["error"]["live"] = json!(l.to_string());
 		}
@@ -792,9 +795,9 @@ mod test {
 		assert_eq!(r["error"]["message"], "the server refused cosign_transfer (409 key_reused): m");
 		assert_eq!(refusal(&Error::Refused("no".into())), json!({"error": {"kind": "refused", "message": "refused: no"}}));
 		// Short of what it pays, nothing more on its way: the most it pays now, as a figure.
-		let m = Error::Short { asset: "aa".into(), most: 1234, live: Some(1500), message: "short".into() };
-		assert_eq!(refusal(&m), json!({"error": {"kind": "refused", "message": "refused: short", "asset": "aa", "most": "1234", "live": "1500"}}));
-		let m = Error::Short { asset: "aa".into(), most: 1234, live: None, message: "short".into() };
+		let m = Error::Short { asset: "aa".into(), most: 1234, all: Some(2234), live: Some(1500), message: "short".into() };
+		assert_eq!(refusal(&m), json!({"error": {"kind": "refused", "message": "refused: short", "asset": "aa", "most": "1234", "all": "2234", "live": "1500"}}));
+		let m = Error::Short { asset: "aa".into(), most: 1234, all: None, live: None, message: "short".into() };
 		assert_eq!(refusal(&m), json!({"error": {"kind": "refused", "message": "refused: short", "asset": "aa", "most": "1234"}}));
 		let p = Error::Planned { asset: "aa".into(), release: vec!["c1".into(), "c2".into()], message: "short".into() };
 		assert_eq!(refusal(&p), json!({"error": {"kind": "planned", "message": "refused: short", "asset": "aa", "release": ["c1", "c2"]}}));

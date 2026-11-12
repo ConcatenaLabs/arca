@@ -189,6 +189,49 @@ pub(crate) fn fee_of(info: &Value, asset: AssetId, amount: u64) -> Result<u64, E
 	Ok(((amount as u128 * ppm as u128).div_ceil(1_000_000) + base as u128).min(u64::MAX as u128) as u64)
 }
 
+/// A payment's [`Error::Short`] as the invoice amounts its figures are: the
+/// selection counts what the payment takes, the invoice's amount and the
+/// operator's fee on it ([`fee_of`]), and a program asks for an amount.
+/// `most` becomes the largest amount whose payment and fee fit in it (the fee
+/// only grows with the amount, so every smaller amount fits too), no more
+/// than the operator's most for one payment; `all` the amount whose payment
+/// and fee make it exactly, when one does. No figure, the words alone, when
+/// that amount is nothing or its fee is above the wallet's bound `bound`
+/// (ppm), which refuses it. Any other error as it is.
+pub(crate) fn invoice_short(info: &Value, asset: AssetId, bound: u64, e: Error) -> Error {
+	let Error::Short { asset: a, most, all, live, message } = e else { return e };
+	let figures = || -> Result<Option<(u64, Option<u64>)>, Error> {
+		let cap = max_payment(info, asset, "send").as_str().and_then(|m| m.parse::<u64>().ok()).unwrap_or(u64::MAX);
+		let takes = |v: u64| -> Result<u64, Error> { Ok(v.saturating_add(fee_of(info, asset, v)?)) };
+		// The largest amount whose payment and fee are at most `t`.
+		let within = |t: u64| -> Result<u64, Error> {
+			let (mut lo, mut hi) = (0u64, t);
+			while lo < hi {
+				let mid = lo + (hi - lo).div_ceil(2);
+				if takes(mid)? <= t { lo = mid } else { hi = mid - 1 }
+			}
+			Ok(lo)
+		};
+		let pays = |v: u64| -> Result<bool, Error> { Ok(v > 0 && v <= cap && super::round::fee_within(fee_of(info, asset, v)?, v, bound)) };
+		let m = within(most)?.min(cap);
+		if !pays(m)? {
+			return Ok(None);
+		}
+		let all = match all {
+			Some(t) => {
+				let v = within(t)?;
+				if v > m && takes(v)? == t && pays(v)? { Some(v) } else { None }
+			},
+			None => None,
+		};
+		Ok(Some((m, all)))
+	};
+	match figures() {
+		Ok(Some((most, all))) => Error::Short { asset: a, most, all, live, message },
+		_ => Error::Refused(message),
+	}
+}
+
 fn amount_of(v: &Value) -> Result<u64, Error> {
 	amount(v, "an amount")
 }
@@ -244,7 +287,9 @@ impl Wallet {
 		let htlc = Out { asset: p.asset, value: p.value + p.fee, leaf, mailbox, until: None };
 		let min = Self::min_leaf(&p.info, p.asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
-		let (inputs, margin, change) = self.choose_coins(&p.info, p.asset, p.value + p.fee, &htlc_out, min)?;
+		let bound = max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM);
+		let (inputs, margin, change) = self.choose_coins(&p.info, p.asset, p.value + p.fee, &htlc_out, min)
+			.map_err(|e| invoice_short(&p.info, p.asset, bound, e))?;
 		self.quoted(Ok(Self::pay_quote_of(&p, &inputs, margin, change)))
 	}
 
@@ -312,6 +357,7 @@ impl Wallet {
 				self.settle_proceeds(asset)?;
 				return Err(e);
 			},
+			Err(e) => return Err(invoice_short(info, asset, max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM), e)),
 			r => r?,
 		};
 		if let Some(s) = shown {
@@ -1419,6 +1465,54 @@ impl ExplicitOutputOf {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	/// A refusal's figures, counted with the operator's fee, become the
+	/// invoice amounts whose payment and fee fit them: the most is the
+	/// largest such (one more does not fit), every amount below fits, `all`
+	/// stays only when an amount makes it exactly, the operator's most for
+	/// one payment caps it, and nothing is given when the fee bound refuses
+	/// it. Any other error is left alone.
+	#[test]
+	fn a_payments_figures_are_invoice_amounts() {
+		let asset = AssetId::from_slice(&[7; 32]).unwrap();
+		let info = |max: Option<&str>| json!({"assets": [{"asset": asset.to_string(), "fees": {"lightning_ppm": 1000, "lightning_base": "7"},
+			"lightning": {"max_payment": {"send": max}}}]});
+		let short = |most: u64, all: Option<u64>| Error::Short { asset: asset.to_string(), most, all, live: Some(5), message: "m".into() };
+		let takes = |i: &Value, v: u64| v + fee_of(i, asset, v).unwrap();
+		let i = info(None);
+		match invoice_short(&i, asset, 10_000, short(1_998_904, Some(1_999_904))) {
+			Error::Short { most, all, live, .. } => {
+				assert!(takes(&i, most) <= 1_998_904 && takes(&i, most + 1) > 1_998_904, "{}", most);
+				assert_eq!(most, 1_996_900);
+				for v in [most - 1, most - 1_000, most / 2] {
+					assert!(takes(&i, v) <= 1_998_904);
+				}
+				assert_eq!(all, Some(1_997_899));
+				assert_eq!(takes(&i, 1_997_899), 1_999_904);
+				assert_eq!(live, Some(5));
+			},
+			e => panic!("{}", e),
+		}
+		match invoice_short(&i, asset, 10_000, short(1_000_000, Some(1_001_007))) {
+			Error::Short { most, all, .. } => assert_eq!((most, all), (998_994, Some(1_000_000))),
+			e => panic!("{}", e),
+		}
+		// An `all` no amount makes exactly is dropped: 1,001,008 lies
+		// between what 1,000,000 and 1,000,001 take.
+		match invoice_short(&i, asset, 10_000, short(1_000_000, Some(1_001_008))) {
+			Error::Short { most, all, .. } => assert_eq!((most, all), (998_994, None)),
+			e => panic!("{}", e),
+		}
+		// The operator's most for one payment.
+		match invoice_short(&info(Some("500000")), asset, 10_000, short(1_000_000, Some(1_001_007))) {
+			Error::Short { most, all, .. } => assert_eq!((most, all), (500_000, None)),
+			e => panic!("{}", e),
+		}
+		// The base alone is above 1% of what is left: the bound refuses it.
+		assert!(matches!(invoice_short(&i, asset, 10_000, short(600, None)), Error::Refused(m) if m == "m"));
+		assert!(matches!(invoice_short(&i, asset, 10_000, short(7, None)), Error::Refused(_)));
+		assert!(matches!(invoice_short(&i, asset, 10_000, Error::Refused("r".into())), Error::Refused(m) if m == "r"));
+	}
 
 	#[test]
 	fn an_invoice_of_seqln_is_read_with_its_asset() {
