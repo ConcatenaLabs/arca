@@ -180,6 +180,15 @@ pub enum Error {
 	/// `(final_in_seconds, usual_in_seconds, waiting_for)`.
 	#[error("refused: {message}")]
 	SettleFirst { asset: String, coins: Vec<String>, wait: Option<(u64, u64, &'static str)>, message: String },
+	/// A trade of `asset` refused after the wallet paid itself, out of
+	/// round, the coin of exactly what the trade gives ([`Wallet::swap_accept`]
+	/// with an instant limit set): that payment moved and left `fee` of
+	/// `asset` in margins, which the terms shown counted, and nothing else
+	/// did. The coin it made is the wallet's, live, and the trade's next
+	/// quote gives it with nothing more to shape: a program prices the trade
+	/// again at once, and counts `fee` as paid for that trade already.
+	#[error("refused: {message}")]
+	Shaped { asset: String, fee: u64, message: String },
 	/// The server refused, with its stable code.
 	#[error("the server refused {call} ({status} {code}): {message}")]
 	Server { call: String, status: i32, code: String, message: String },
@@ -222,6 +231,7 @@ impl Error {
 			Error::Planned { .. } => "planned",
 			Error::InChannel { .. } => "in_channel",
 			Error::SettleFirst { .. } => "settle_first",
+			Error::Shaped { .. } => "shaped",
 			Error::Server { .. } => "server_refused",
 			Error::SwapRefused { .. } => "swap_refused",
 			Error::Unreachable(_) => "unreachable",

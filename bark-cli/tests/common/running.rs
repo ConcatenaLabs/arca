@@ -169,8 +169,11 @@ impl Running {
 			lightning: Default::default(),
 			batches: Default::default(),
 			// The operator offers checkpoints with their owners' exit; a test
-			// of an operator that does not turns it off.
-			checkpoint_exit: true,
+			// of an operator that does not turns it off, and
+			// ARCA_TEST_CHECKPOINT_EXIT=0 runs every test operator without it
+			// (the testnet's operator publishes `checkpoint_exit: false`), so a
+			// proof runs at the settings it meets there too.
+			checkpoint_exit: test_checkpoint_exit(),
 			landing_2_only: false,
 		};
 		tune(&mut config, x, y);
@@ -280,6 +283,18 @@ impl Running {
 			assert!(start.elapsed() < Duration::from_secs(60), "timed out waiting for {}", what);
 			tokio::time::sleep(Duration::from_millis(200)).await;
 		}
+	}
+}
+
+/// Whether the test operator offers checkpoints with their owners' exit:
+/// ARCA_TEST_CHECKPOINT_EXIT (`0` or `false` for not, `1` or `true` for so),
+/// else it does.
+fn test_checkpoint_exit() -> bool {
+	match std::env::var("ARCA_TEST_CHECKPOINT_EXIT").ok().map(|v| v.trim().to_ascii_lowercase()) {
+		None => true,
+		Some(v) if v == "0" || v == "false" => false,
+		Some(v) if v == "1" || v == "true" => true,
+		Some(v) => panic!("ARCA_TEST_CHECKPOINT_EXIT is 0 or 1, not {}", v),
 	}
 }
 

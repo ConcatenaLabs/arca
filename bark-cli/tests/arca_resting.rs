@@ -399,3 +399,58 @@ async fn a_resting_quote_is_refused_as_the_fill_would_be_when_the_exit_is_requir
 	let q = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
 	assert_eq!(q["gets"]["amount"], "200000", "{}", q);
 }
+
+/// A copy of the wallet in `from`'s directory, as a second device holding
+/// the same mnemonic and the same store holds it.
+fn second_device(from: &Arca, name: &str) -> Arca {
+	fn copy(a: &std::path::Path, b: &std::path::Path) {
+		std::fs::create_dir_all(b).unwrap();
+		for e in std::fs::read_dir(a).unwrap() {
+			let e = e.unwrap();
+			if e.file_type().unwrap().is_dir() { copy(&e.path(), &b.join(e.file_name())) } else { std::fs::copy(e.path(), b.join(e.file_name())).unwrap(); }
+		}
+	}
+	let d = Arca::new(name);
+	copy(&from.dir, &d.dir);
+	d
+}
+
+/// One phrase on two devices: the second gives the taker's coin to a round;
+/// the first, not caught up, fills a resting order from it. The operator
+/// refuses the fill (`double_spend`), and the wallet reads what its other
+/// store did at once, as it does for a refused transfer (arca #809): it no
+/// longer counts the coin given up, holds the round's coin in its place, and
+/// the same fill asked again goes from it (arca #839).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fill_refused_for_a_coin_spent_elsewhere_catches_up_at_once() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+	}).await;
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let maker = holder(&mut r, "CM", x, 1_500_000, 0).await;
+	let (order, _) = rest(&mut r, &maker, 1_000_000, 100_000).await;
+	let t = holder(&mut r, "CT", y, 1_000_000, 0).await;
+	let coin = live_of(&t, y)[0]["leaf_id"].as_str().unwrap().to_string();
+	// The second device gives the coin to a round.
+	let t2 = second_device(&t, "CT2");
+	t2.ok(&["participate", "--leaf", &coin]);
+	rounds(&mut r, &[&t2]).await;
+	let fresh: Vec<String> = live_of(&t2, y).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	assert!(!fresh.is_empty() && !fresh.contains(&coin), "the second device holds the round's coin: {:?}", fresh);
+	let ids = |w: &Arca| -> Vec<String> { live_of(w, y).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect() };
+	assert_eq!(ids(&t), vec![coin.clone()], "the first device, not caught up, still counts the coin given elsewhere");
+	// The first device fills from it.
+	let q = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	let (ok, e) = t.run(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q.to_string()]);
+	println!("THE FILL FROM THE COIN GIVEN ELSEWHERE: ok {} {}", ok, e);
+	assert!(!ok && e.to_string().contains("double_spend"), "{}", e);
+	println!("THE TAKER'S LIVE COINS AFTER THE REFUSAL: {:?}", ids(&t));
+	assert!(!ids(&t).contains(&coin), "the coin given elsewhere is no longer counted");
+	assert!(fresh.iter().all(|f| ids(&t).contains(f)), "the round's coin is held");
+	// The same fill asked again goes from the round's coin.
+	let q = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	let f = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q.to_string()]);
+	println!("THE FILL ASKED AGAIN: {}", f["filled"]);
+	assert_eq!(f["filled"], "200000", "{}", f);
+}

@@ -41,7 +41,7 @@
 //!
 //! The mnemonic is not here; it is the `mnemonic` file beside the database.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -687,6 +687,20 @@ impl Store {
 	pub fn coin(&self, leaf_id: &str) -> Result<Option<CoinRow>, Error> {
 		self.conn.query_row(&format!("SELECT {} FROM coin WHERE leaf_id = ?1", Self::COIN_COLS), params![leaf_id], Self::coin_row)
 			.optional().map_err(db)
+	}
+
+	/// The ids of every coin held, in any state.
+	pub fn coin_ids(&self) -> Result<BTreeSet<String>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id FROM coin").map_err(db)?;
+		let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(db)?.collect::<Result<BTreeSet<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// The ids of the coins the store took at `since` (seconds) or later.
+	pub fn coin_ids_since(&self, since: i64) -> Result<BTreeSet<String>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id FROM coin WHERE created_at >= ?1").map_err(db)?;
+		let rows = st.query_map(params![since], |r| r.get::<_, String>(0)).map_err(db)?.collect::<Result<BTreeSet<_>, _>>().map_err(db)?;
+		Ok(rows)
 	}
 
 	pub fn coin_by_salt(&self, salt: &[u8; 32]) -> Result<Option<CoinRow>, Error> {

@@ -84,9 +84,14 @@ data cleared, another browser) is created again from its mnemonic with
 the server and the chain hold of it, every record checked, as `arca create
 --mnemonic` does (`bark-cli/README.md`, Restoring from the mnemonic). It
 returns once the coins that make the balance are checked; the coins given up
-for good, the wallet's history, are checked a step at each `sync` after it.
-While they are, `balance` carries `history: {"loading": true, "left": N}`: a
-page shows its activity as still loading until it is gone. The restore leaves
+for good, the wallet's history, are checked after it, in slices:
+`run('restore_history', {budget_ms})` checks coins for about that long (past
+it only by the coin it was checking, at least one) and answers how many are
+`left` and how long it ran (`ms`); each `sync` runs a slice of about a second.
+A page runs slices while nobody asks the wallet for anything, one after the
+other, so a person's ask waits for one slice at most, never for the whole
+history. While they are left, `balance` carries `history: {"loading": true,
+"left": N}`: a page shows its activity as still loading until it is gone. The restore leaves
 the watchtowers' deposits owed (`deposits.owed`): the page runs `deposits` as
 soon as `restore` returns, and a `sync` makes them first while they are owed.
 `restore {at_once: true}` checks everything before it returns instead.
@@ -137,7 +142,7 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 `balance`, `coins {held?, brief?}`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?, channels?}` (`channels: false` names none of the wallet's channels), `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
-`mailbox`, `restore {at_once?}`, `restore_history`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
+`mailbox`, `restore {at_once?}`, `restore_history {budget_ms?}`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_quote {asset,
 value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
@@ -231,7 +236,10 @@ chain another made within three seconds when asked with `"shared_view": true`.
 An in-tree swap passes two texts between two wallets. The maker's `swap_offer`
 holds its coins and signs nothing, and answers what it gives, gets and pays (the
 reassignment's margin and its checkpoints' margins). The taker's `swap_read`
-checks the offer as `swap_accept` does and answers what it gives, gets and pays,
+checks the offer as `swap_accept` does and answers what it gives, gets and pays
+(with an instant limit set, from the coin of exactly what it gives that the
+wallet pays itself first, whose margins it counts, also apart as
+`pays.shapes`),
 and the `hops` of what the swap makes (reassignments since a round, against the
 operator's `depth_limit`), signing, holding and storing nothing; `swap_accept`
 with `shown` (that answer)
@@ -296,7 +304,10 @@ or comes less often than that runs it on a short timer of its own.
 
 A refusal is thrown as the JSON `arca` prints, `{"error": {"kind",
 "message"}}`, with the server's `code` and `status` when the server refused
-(and `swap`, `coin` and `whose` for a `swap_refused`).
+(and `swap`, `coin` and `whose` for a `swap_refused`; `asset` and `fee` for a
+`shaped` refusal: a trade refused after the wallet paid itself the coin it
+gives, which left that fee; the coin is kept, and the trade priced again
+trades from it).
 
 The page shows what the library says as it says it. With no command line,
 the library names the act rather than a command ("run sync", "an exit takes
