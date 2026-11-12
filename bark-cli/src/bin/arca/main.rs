@@ -197,6 +197,11 @@ enum Cmd {
 		/// The most each refresh may cost, in millionths of each coin.
 		#[arg(long)]
 		max_fee_ppm: Option<u64>,
+		/// Cut each asset's new value into a few coins (at most four with
+		/// the others the wallet holds), so the wallet trades on from one
+		/// while another goes through a round; a small holding stays one.
+		#[arg(long)]
+		spread: bool,
 	},
 	/// Every message the operator key signed that the wallet's coins rest
 	/// on, as evidence lines (`{"lines": […]}`): what the wallet hands a
@@ -1528,7 +1533,8 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::InstantBudget { share } => w.set_instant_budget_text(&share),
 		Cmd::InstantLimit { value } => w.set_instant_limit_text(&value),
 		Cmd::CoinPlaces => w.coin_places(),
-		Cmd::SettleFirst { coins, asset: a, max_fee_ppm } => w.settle_first(&coins, a.as_deref().map(asset).transpose()?, max_fee_ppm),
+		Cmd::SettleFirst { coins, asset: a, max_fee_ppm, spread } =>
+			w.settle_first_spread(&coins, a.as_deref().map(asset).transpose()?, max_fee_ppm, spread),
 		Cmd::WatchBond { evidence, fee_asset } => {
 			// A file is what `bond-evidence` printed, or one line a line.
 			let mut lines = vec![];

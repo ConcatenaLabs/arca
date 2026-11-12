@@ -91,6 +91,35 @@ use super::{Error, Wallet};
 /// for an operator that publishes none (one that publishes no pass time is
 /// counted as in [`Wallet::final_within`]). A Bitcoin block is Bitcoin's target
 /// interval, ten minutes, for each anchor block still to bury a round.
+/// The most working pieces a refresh with `spread` cuts an asset's
+/// holding into, beside one reserve coin ([`Wallet::spread_of`]): with a
+/// trade every 15 s and a round about two minutes from asked to spendable,
+/// four coins of an asset, each used up three trades at a time, keep one
+/// with room while the others go through rounds.
+pub const SPREAD_PIECES: usize = 3;
+/// A working piece is at least this many times the operator's smallest
+/// leaf in its asset.
+pub const SPREAD_LEAF_MULTIPLE: u64 = 10;
+/// A working piece is at least this many times what one coin's exit costs
+/// on the chain: an exit never takes more than a hundredth of a piece.
+pub const SPREAD_EXIT_MULTIPLE: u64 = 100;
+/// The vbytes a coin's exit is counted at for [`SPREAD_EXIT_MULTIPLE`]: one
+/// leaf's whole exit measured 1,119 to 1,792 vbytes on regtest.
+pub const SPREAD_EXIT_VSIZE: u64 = 2_000;
+
+/// [`Wallet::spread_of`] for a holding of `held` atoms, the operator's
+/// smallest leaf `min`, one exit's cost `exit` (atoms) and `others` coins of
+/// the asset the refresh leaves as they are: pieces of `held` / 6, but at
+/// least the floor, as many as fit in half the holding, up to
+/// [`SPREAD_PIECES`] less `others`, so the wallet holds at most
+/// [`SPREAD_PIECES`] + 1 coins of it; `None` when not one fits.
+pub(crate) fn spread_plan(held: u64, min: u64, exit: u64, others: usize) -> Option<(u64, usize)> {
+	let floor = min.saturating_mul(SPREAD_LEAF_MULTIPLE).max(exit.saturating_mul(SPREAD_EXIT_MULTIPLE)).max(1);
+	let piece = (held / (2 * SPREAD_PIECES as u64)).max(floor);
+	let count = ((held / 2) / piece).min(SPREAD_PIECES.saturating_sub(others) as u64) as usize;
+	(count > 0).then_some((piece, count))
+}
+
 const ROUND_SECONDS: u64 = 60;
 const BLOCK_SECONDS: u64 = 60;
 const FORFEIT_WINDOW_SECONDS: u64 = 600;
@@ -141,6 +170,25 @@ mod wait_tests {
 			}
 		}
 		v
+	}
+
+	/// A spread keeps at most half the holding in up to three working pieces
+	/// of a sixth, the rest one reserve coin; never a piece below ten
+	/// smallest leaves or a hundred exits; never more than four coins with
+	/// those the wallet keeps.
+	#[test]
+	fn a_spread_is_bounded_by_the_holding_the_smallest_leaf_and_an_exit() {
+		// 6,000,000 held, smallest leaf 10,000, an exit 800: three pieces of 1,000,000.
+		assert_eq!(spread_plan(6_000_000, 10_000, 800, 0), Some((1_000_000, 3)));
+		// Two coins kept beside: one piece more makes four.
+		assert_eq!(spread_plan(6_000_000, 10_000, 800, 2), Some((1_000_000, 1)));
+		assert_eq!(spread_plan(6_000_000, 10_000, 800, 3), None, "four coins already");
+		// A piece is at least ten smallest leaves (100,000): 300,000 held makes one.
+		assert_eq!(spread_plan(300_000, 10_000, 800, 0), Some((100_000, 1)));
+		// And at least a hundred exits (80,000 × 100 = 8,000,000).
+		assert_eq!(spread_plan(6_000_000, 10_000, 80_000, 0), None, "a small holding stays one coin");
+		assert_eq!(spread_plan(20_000_000, 10_000, 80_000, 0), Some((8_000_000, 1)));
+		assert_eq!(spread_plan(150_000, 10_000, 800, 0), None);
 	}
 
 	#[test]
@@ -311,6 +359,10 @@ pub struct Places {
 	pub coins: Vec<(CoinRow, Lineage, Place)>,
 	/// What the counted coins are worth, in atoms of the reference unit.
 	pub counted: u128,
+	/// What each counted coin counts of `counted`, by leaf id (a coin
+	/// waiting on a reserve for coins it was made from is in `counted` only
+	/// through that reserve, and not here).
+	pub counted_of: BTreeMap<String, u128>,
 	/// The assets of received coins the node gives no rate for.
 	pub unvalued: Vec<String>,
 	/// The channel coins, by leaf id, each counted at the wallet's side.
@@ -466,7 +518,7 @@ impl Wallet {
 			coins.push((c, lineage, place));
 		}
 		let Some(limit) = limit else {
-			return Ok(Places { limit: None, coins, counted: 0, unvalued: vec![], channels });
+			return Ok(Places { limit: None, coins, counted: 0, counted_of: BTreeMap::new(), unvalued: vec![], channels });
 		};
 		received.sort();
 		let held: BTreeSet<String> = received.iter().map(|(_, i)| coins[*i].0.leaf_id.clone()).collect();
@@ -577,11 +629,14 @@ impl Wallet {
 			caps.get(&c.leaf_id).map_or(w, |cap| w.min(*cap))
 		};
 		let mut counted = reserved;
+		let mut counted_of: BTreeMap<String, u128> = BTreeMap::new();
 		let mut unvalued: BTreeSet<String> = BTreeSet::new();
 		for (_, i) in &received {
 			let c = &coins[*i].0;
 			if sticky.contains(&c.leaf_id) {
-				counted += counts(c);
+				let n = counts(c);
+				counted += n;
+				counted_of.insert(c.leaf_id.clone(), n);
 			}
 		}
 		let mut grew = false;
@@ -605,6 +660,7 @@ impl Wallet {
 				},
 				Some(v) if open && counted + v <= limit.value => {
 					counted += v;
+					counted_of.insert(c.leaf_id.clone(), v);
 					sticky.insert(c.leaf_id.clone());
 					grew = true;
 					Place::Counted
@@ -623,7 +679,7 @@ impl Wallet {
 			self.store.set_metas(&[(INSTANT_COUNTED, serde_json::to_string(&sticky).expect("a set")),
 				(INSTANT_COUNTED_CAPS, serde_json::to_string(&caps).expect("a map"))])?;
 		}
-		Ok(Places { limit: Some(limit), coins, counted, unvalued: unvalued.into_iter().collect(), channels })
+		Ok(Places { limit: Some(limit), coins, counted, counted_of, unvalued: unvalued.into_iter().collect(), channels })
 	}
 
 	/// The coins a selection for `spend` may not take, by leaf id: none
@@ -698,6 +754,18 @@ impl Wallet {
 	/// the refresh's fee per coin given up, within `max_fee_ppm` (by
 	/// default the wallet's bound).
 	pub fn settle_first(&mut self, coins: &[String], asset: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		self.settle_first_spread(coins, asset, max_fee_ppm, false)
+	}
+
+	/// [`Self::settle_first`], and with `spread` each asset's refresh cut
+	/// into pieces as [`Self::spread_of`] plans them (a small holding, or a
+	/// supervised asset, stays one coin), so a wallet that trades on uses
+	/// up one coin's room at a time while the others trade. The fee is the
+	/// same: the operator charges for the coins given up, not for the
+	/// leaves made.
+	pub fn settle_first_spread(&mut self, coins: &[String], asset: Option<AssetId>, max_fee_ppm: Option<u64>, spread: bool)
+		-> Result<Value, Error>
+	{
 		// Coins another store of the mnemonic spent are settled by a catch-up,
 		// which this one runs while any is held out: one it settled is through.
 		if let Err(e) = self.settle_spent_elsewhere() {
@@ -722,17 +790,43 @@ impl Wallet {
 		let Sorted { give, waiting, done, mut rounds, held_left } = self.sorted(ids)?;
 		let mut left = vec![];
 		let mut settling = vec![];
-		if !give.is_empty() {
+		// With `spread`, each asset on its own, so each is cut by its own
+		// plan; else all together.
+		let groups: Vec<Vec<String>> = if spread {
+			let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+			for id in give {
+				let a = self.store.coin(&id)?.map(|c| c.asset).unwrap_or_default();
+				by.entry(a).or_default().push(id);
+			}
+			by.into_values().collect()
+		} else if give.is_empty() {
+			vec![]
+		} else {
+			vec![give]
+		};
+		for give in groups {
+			let plan = match (spread, self.store.coin(&give[0])?) {
+				(true, Some(c)) => self.spread_of(&info, AssetId::from_str(&c.asset).map_err(|e| Error::Store(e.to_string()))?, &give)?,
+				_ => None,
+			};
+			let cut = |q: &mut super::round::RefreshQuote| {
+				if let Some((piece, count)) = plan {
+					// A plan the value cannot be cut by leaves it one coin.
+					let _ = q.in_pieces(piece, count);
+				}
+			};
 			// All in one refresh when the operator takes them so; else each
 			// alone, so one it refuses holds back no other.
 			match self.refresh_quote(&give, max_fee_ppm) {
-				Ok(q) => {
+				Ok(mut q) => {
+					cut(&mut q);
 					self.participate(q, None)?;
-					settling = give;
+					settling.extend(give);
 				},
 				Err(_) => for id in give {
 					match self.refresh_quote(std::slice::from_ref(&id), max_fee_ppm) {
-						Ok(q) => {
+						Ok(mut q) => {
+							cut(&mut q);
 							self.participate(q, None)?;
 							settling.push(id);
 						},
@@ -754,6 +848,44 @@ impl Wallet {
 			v["waiting_for"] = json!(w.step.name());
 		}
 		Ok(v)
+	}
+
+	/// How [`Self::settle_first_spread`] cuts a refresh of `asset`: pieces
+	/// of what size, and at most how many, the rest one reserve coin
+	/// ([`super::round::pieces_of`]); `None` for one coin. The wallet's
+	/// holding of the asset `h` (its own coins live, in a refresh or in a
+	/// round) keeps at most half in up to [`SPREAD_PIECES`] working pieces
+	/// of `h` / 6, and the rest in one reserve coin: at most
+	/// [`SPREAD_PIECES`] + 1 coins with the wallet's others of the asset
+	/// (`giving` are those the refresh gives up), as many as the makers
+	/// keep working,
+	/// and a trade of up to half the holding still goes from one coin. A
+	/// piece is never below [`SPREAD_LEAF_MULTIPLE`] times the operator's
+	/// smallest leaf, nor below [`SPREAD_EXIT_MULTIPLE`] times what one
+	/// coin's exit costs on the chain at the reserves' cover of the node's
+	/// floor ([`SPREAD_EXIT_VSIZE`] vbytes), so a small holding stays one
+	/// coin and the pieces grow in number with the holding. A supervised
+	/// asset's leaf is a landing leaf, which is not cut: one coin.
+	pub(crate) fn spread_of(&self, info: &Value, asset: AssetId, giving: &[String]) -> Result<Option<(u64, usize)>, Error> {
+		if self.landing_rule(info, asset)?.is_some() {
+			return Ok(None);
+		}
+		let (mut held, mut others): (u64, usize) = (0, 0);
+		// A coin held out as spent by another device is not the wallet's to count.
+		let elsewhere = self.spent_elsewhere()?;
+		for c in self.store.coins_in_states(&["live", "given", "pending", "forfeited"])? {
+			if c.asset != asset.to_string() || super::resting::is_order_coin(&c) || self.channel_worth(&c)?.is_some()
+				|| elsewhere.contains(&c.leaf_id)
+			{
+				continue;
+			}
+			held = held.saturating_add(c.value);
+			others += usize::from(!giving.contains(&c.leaf_id));
+		}
+		let min = Self::min_leaf(info, asset)?;
+		let exit = self.chain.floor_per_kvb(asset)?
+			.map(|f| SPREAD_EXIT_VSIZE.saturating_mul(f).saturating_mul(super::wallet::RESERVE_MULTIPLE) / 1_000).unwrap_or(0);
+		Ok(spread_plan(held, min, exit, others))
 	}
 
 	/// `ids` as `settle_first` sorts them: the live ones it gives up, the
