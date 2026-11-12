@@ -564,9 +564,15 @@ impl Wallet {
 		}
 		if let (Some(limit), true) = (super::pay::depth_limit(&info), places.is_some()) {
 			let idle = idle_seconds.is_some_and(|i| i >= REFRESH_IDLE);
+			// A coin another device of the wallet spent is held out of every
+			// spend until a catch-up settles it ([`Self::spent_elsewhere`]):
+			// never given up here either.
+			let elsewhere = self.spent_elsewhere()?;
 			let mut by_asset: std::collections::BTreeMap<String, Vec<String>> = Default::default();
 			for c in self.store.coins_in("live")? {
-				if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) || self.channel_worth(&c)?.is_some() {
+				if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) || self.channel_worth(&c)?.is_some()
+					|| elsewhere.contains(&c.leaf_id)
+				{
 					continue;
 				}
 				if Self::record_of(&c).is_ok_and(|r| super::wallet::record_hops(&r) + 3 > limit) {
@@ -623,6 +629,9 @@ impl Wallet {
 		};
 		give.sort();
 		give.dedup();
+		// Never a coin held out as spent by another device of the wallet.
+		let elsewhere = self.spent_elsewhere()?;
+		give.retain(|l| !elsewhere.contains(l));
 		let shaped: Vec<String> = reasons.iter().filter(|r| r["rule"] == "shape")
 			.flat_map(|r| r["coins"].as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_str().map(String::from)).collect();
 		// A coin inside its refresh window goes whatever else does.

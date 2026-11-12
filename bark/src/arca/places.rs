@@ -863,8 +863,12 @@ impl Wallet {
 			return Ok(None);
 		}
 		let (mut held, mut others): (u64, usize) = (0, 0);
+		// A coin held out as spent by another device is not the wallet's to count.
+		let elsewhere = self.spent_elsewhere()?;
 		for c in self.store.coins_in_states(&["live", "given", "pending", "forfeited"])? {
-			if c.asset != asset.to_string() || super::resting::is_order_coin(&c) || self.channel_worth(&c)?.is_some() {
+			if c.asset != asset.to_string() || super::resting::is_order_coin(&c) || self.channel_worth(&c)?.is_some()
+				|| elsewhere.contains(&c.leaf_id)
+			{
 				continue;
 			}
 			held = held.saturating_add(c.value);
