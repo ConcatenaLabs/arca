@@ -688,6 +688,12 @@ impl Wallet {
 			return Ok(None);
 		}
 		let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+		// A settle a person asked for is never taken back: its coins could pay
+		// nothing more as they are ([`Self::keep_settling`]).
+		let asked = self.settle_asked()?;
+		if given.iter().any(|l| asked.contains(l)) {
+			return Ok(None);
+		}
 		for l in &given {
 			if self.store.coin(l)?.is_some_and(|c| c.expiry != u32::MAX && super::round::in_free_window(c.expiry, wall as u32)) {
 				return Ok(None);

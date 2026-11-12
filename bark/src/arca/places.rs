@@ -106,12 +106,13 @@ pub(crate) fn wait_counts(info: &Value, depth: u64, finality: Option<&Finality>)
 	// The operator builds a round and releases its participations in its
 	// passes over the rounds, which run at its round interval and on each
 	// block. An operator that publishes how long its passes take
-	// (`fills.round_pass_seconds`) is counted one pass to build the round and
-	// two to release it (a pass under way and the next); one that does not, a
-	// round interval and a block to release it.
+	// (`fills.round_pass_seconds`, its finality poll included) is counted one
+	// pass to build the round and three to release it (a build and a pass
+	// that may be under way when the round turns final, and the pass after
+	// them); one that does not, a round interval and a block to release it.
 	let pass_s = info["fills"]["round_pass_seconds"].as_u64().filter(|s| *s > 0);
 	let build = pass_s.unwrap_or(0);
-	let release = pass_s.map_or(round_s + block_s, |p| 2 * p);
+	let release = pass_s.map_or(round_s + block_s, |p| 3 * p);
 	let bury = |have: u64| depth.saturating_sub(have).saturating_mul(BITCOIN_BLOCK_SECONDS);
 	let held = info["batches"]["no_sweep"].as_bool() == Some(true);
 	let after_block = 2 * block_s + bury(0) + release;
@@ -165,9 +166,9 @@ mod wait_tests {
 	fn a_published_pass_time_replaces_the_release_guess() {
 		let fast = info(json!({"round_pass_seconds": 3}));
 		let w = wait_counts(&fast, 0, Some(&Finality::Final { height: 1, depth: 0 }));
-		assert_eq!(w.most, 6, "two passes of 3 s");
+		assert_eq!(w.most, 9, "a build and a pass under way, and the next pass, 3 s each");
 		let w = wait_counts(&fast, 0, None);
-		assert_eq!(w.usual, 60 + 3 + 60 + 120 + 6, "a pass to build, the forfeits, block and certificate, two passes to release");
+		assert_eq!(w.usual, 60 + 3 + 60 + 120 + 9, "a pass to build, the forfeits, block and certificate, three passes to release");
 		let unheld = json!({"fills": {"round_interval_seconds": 30, "block_seconds": 60}});
 		assert_eq!(wait_counts(&unheld, 0, None).most, 30 + 120 + 30 + 60, "a sweeping operator holds no round for forfeits");
 	}
@@ -823,10 +824,13 @@ impl Wallet {
 	///   a round not built yet.
 	/// - It is released and a coin it made is `pending` (its round not
 	///   final): its round.
-	/// - It is void or expired, and the coin is held under a forfeit it
-	///   signed for a round that is not gone ([`Self::give_back`]): the coin
-	///   is the wallet's again once that round can no longer confirm, and
-	///   then goes into a round anew, so a round not built yet.
+	/// - It is void or expired, and the operator gave the coin back while a
+	///   forfeit it signed for a round that is not gone stands (D75, marked
+	///   by `given_back_key`): the coin is the wallet's again once that round
+	///   can no longer confirm, and then goes into a round anew, so a round
+	///   not built yet. A coin the operator keeps under its forfeit is not
+	///   waiting for a round: it goes home by the claim, the refund or its
+	///   exit.
 	/// `None` once they can be spent, or for a coin spent otherwise.
 	fn made_by_round_waits(&self, c: &CoinRow) -> Result<Option<String>, Error> {
 		// The participation its note or `spent_by` names, else, for a coin
@@ -865,7 +869,9 @@ impl Wallet {
 				let made_pending = self.store.coins_in("pending")?.into_iter().any(|n| n.bases.contains(&round));
 				Ok(made_pending.then_some(round))
 			},
-			"void" | "expired" if c.state == "forfeited" => Ok(Some(String::new())),
+			"void" | "expired" if c.state == "forfeited" && self.store.meta(&super::round::given_back_key(&c.leaf_id))?.is_some() => {
+				Ok(Some(String::new()))
+			},
 			_ => Ok(None),
 		}
 	}

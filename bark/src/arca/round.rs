@@ -1218,18 +1218,27 @@ impl Wallet {
 	///   preimage over: its round is not final there yet, or its answer is
 	///   still to come): what its new leaves hold of `asset`, which a sync
 	///   takes once the operator releases them.
-	/// - A participation that went back to waiting for a round, or that is
-	///   void or expired, whose coins are held under a forfeit signed for a
-	///   held round that went unbroadcast ([`Self::give_back`]): the coins
-	///   themselves, the wallet's again once that round can no longer
-	///   confirm.
+	/// - A participation that went back to waiting for a round, whose coins
+	///   are held under a forfeit signed for a held round that went
+	///   unbroadcast, or a void or expired one whose coins the operator gave
+	///   back while such a forfeit stands (D75, [`Self::give_back`], marked
+	///   by `given_back_key`): the coins themselves, the wallet's again once
+	///   that round can no longer confirm. A coin the operator keeps under a
+	///   forfeit is not among them: no round returns it.
 	pub(crate) fn owed_by_own_rounds(&self, asset: AssetId) -> Result<Vec<(String, Vec<String>, u64)>, Error> {
 		let mut out = vec![];
 		for (pid, _, given, _, state, _, _) in self.store.participations_in(&["issued", "forfeiting", "pending", "void", "expired"])? {
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
 			let mut held = vec![];
 			let mut value = 0u64;
+			let given_back = matches!(state.as_str(), "void" | "expired");
 			for l in given {
+				// A void or expired participation's coin comes back only when the
+				// operator gave it back (D75, marked): one it keeps under a forfeit
+				// goes home by the claim, the refund or its exit, never a round.
+				if given_back && self.store.meta(&given_back_key(&l))?.is_none() {
+					continue;
+				}
 				if let Some(c) = self.store.coin(&l)?.filter(|c| c.state == "forfeited") {
 					if c.asset == asset.to_string() {
 						value = value.saturating_add(c.value);
@@ -1248,6 +1257,10 @@ impl Wallet {
 		Ok(out)
 	}
 
+	/// Whether participation `body` is a refresh: not a take, a distribution
+	/// or an offboard, its every output a leaf. Only a refresh is taken back
+	/// for the owner of its coins ([`Self::withdraw_refreshes`],
+	/// [`Self::withdraw_waited`]).
 	pub(crate) fn is_refresh(body: &Value) -> bool {
 		!Self::is_take(body) && body.get("claims").is_none()
 			&& body["outputs"].as_array().is_some_and(|o| !o.is_empty() && o.iter().all(|o| o.get("leaf").is_some()))
@@ -1273,8 +1286,6 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// The wallet's refreshes the store holds pending that give up a coin of
-	/// `asset`, oldest first: each one's id and the coins it gives up.
 	/// Keeps `coins`, given up just now by `settle_first`, among the coins a
 	/// person asked to settle: a refresh that gives one of them up is never
 	/// taken back for a payment or a trade ([`Self::pending_refreshes_of`]),
@@ -1290,13 +1301,15 @@ impl Wallet {
 		self.store.set_meta(SETTLE_ASKED, &serde_json::to_string(&keep).expect("a set"))
 	}
 
-	fn settle_asked(&self) -> Result<std::collections::BTreeSet<String>, Error> {
+	/// The coins a person asked to settle that a refresh still gives up.
+	pub(crate) fn settle_asked(&self) -> Result<std::collections::BTreeSet<String>, Error> {
 		Ok(self.store.meta(SETTLE_ASKED)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
 	}
 
-	/// The refreshes of `asset` the operator holds pending that a spend may
-	/// take back: none that gives up a coin a person asked to settle
-	/// ([`Self::keep_settling`]).
+	/// The wallet's refreshes the store holds pending that give up a coin of
+	/// `asset`, oldest first: each one's id and the coins it gives up. None
+	/// that gives up a coin a person asked to settle ([`Self::keep_settling`]):
+	/// a spend never takes such a refresh back.
 	fn pending_refreshes_of(&self, asset: AssetId) -> Result<Vec<(String, Vec<String>)>, Error> {
 		let asked = self.settle_asked()?;
 		let mut out = vec![];
@@ -2989,13 +3002,13 @@ impl Wallet {
 /// final; the preimage is in hand).
 pub(crate) const FOLLOWED: [&str; 3] = ["signed", "refunding", "claiming"];
 
-/// Where the wallet marks a coin the operator gave back while a forfeit the
-/// wallet signed for it could still be claimed (D75): held `forfeited` until
-/// the round of that forfeit is gone. The value is the participation.
 /// The store's key for the coins a person asked to settle
 /// ([`Wallet::keep_settling`]).
 const SETTLE_ASKED: &str = "settle_asked";
 
+/// Where the wallet marks a coin the operator gave back while a forfeit the
+/// wallet signed for it could still be claimed (D75): held `forfeited` until
+/// the round of that forfeit is gone. The value is the participation.
 pub(crate) fn given_back_key(leaf_id: &str) -> String {
 	format!("given_back_{}", leaf_id)
 }
