@@ -530,3 +530,60 @@ async fn a_maker_chosen_nonce_does_not_make_a_swap_done() {
 	assert_ne!(c["done"], true, "nothing traded, yet the cancel reads done: {}", c);
 	assert_ne!(state(&b, &id2), "done", "nothing traded, yet the swap reads done");
 }
+
+/// A board coin that a second device of the wallet gave to a round: the
+/// first device's re-check finds the board spent on the chain by nothing it
+/// did, and reads what its other stores did at once, rather than at its next
+/// catch-up (up to ten minutes later). It then holds the round's coin in place
+/// of the board, and a payment that needs the value goes ahead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_board_another_device_gave_to_a_round_is_followed_at_once() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("GA");
+	let b = Arca::new("GB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for (w, asset, v) in [(&a, r.x, 1_000_000), (&b, r.y, 10_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "500000"]);
+	b.ok(&["board", &y, "3000000", "--fee-asset", &x]);
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let b2 = second_device(&b, "GB2");
+	let board = coins(&b2, "live", &y).into_iter().find(|c| value(c) == 3_000_000).expect("the board coin");
+	let board_id = board["leaf_id"].as_str().unwrap().to_string();
+	let new = given_to_a_round(&r, &b2, &board_id).await;
+	// The operator publishes the forfeit of a board given up in a final
+	// round, from the board's output: the board is spent on the chain.
+	for _ in 0..6 {
+		r.server.watcher.pass().await.unwrap();
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	let req = library(&a, "receive", json!({"asset": y, "amount": "2900000"})).unwrap();
+	let paid = library(&b, "send", json!({"request": req["request"]}));
+	println!("PAYMENT AFTER THE SECOND DEVICE GAVE THE BOARD TO A ROUND: {:?}", paid.as_ref().map(|v| v["transfer_id"].clone()));
+	let paid = paid.unwrap();
+	assert!(paid.get("error").is_none(), "{}", paid);
+	let states: Vec<Value> = b.ok(&["coins"]).as_array().unwrap().iter()
+		.filter(|c| c["leaf_id"] == board_id.as_str() || c["leaf_id"] == new["leaf_id"]).map(|c| json!([c["leaf_id"], c["state"]])).collect();
+	println!("THE BOARD AND THE ROUND'S COIN ON THE FIRST DEVICE: {:?}", states);
+	assert!(coins(&b, "pending", &y).is_empty(), "nothing left pending: {}", b.ok(&["coins"]));
+	assert!(!live_ids(&b, &y).contains(&board_id), "the board given up is not counted");
+}

@@ -2877,6 +2877,7 @@ impl Wallet {
 		let revived: Vec<String> = self.lost_boards_credited()?.into_iter().map(|c| c.leaf_id).collect();
 		let mut checked = self.store.coins_in_states(&["pending", "live"])?;
 		let mut unpaid_claims = vec![];
+		let mut board_spent: Vec<String> = vec![];
 		for id in &revived {
 			if !checked.iter().any(|c| &c.leaf_id == id) {
 				checked.extend(self.store.coin(id)?);
@@ -2933,8 +2934,22 @@ impl Wallet {
 				if state != c.state {
 					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": state, "why": note}));
 				}
+				if c.state == "live" && state == "pending" && is_board_spent(&note) {
+					board_spent.push(c.leaf_id.clone());
+				}
 				self.store.set_coin_state(&c.leaf_id, state, &note)?;
 			}
+		}
+		// A live coin whose board is spent on the chain, by nothing this store
+		// did: most often another store of the mnemonic (a second device) gave
+		// it to a round, whose transaction spends the board. The wallet reads
+		// what the other stores did now, rather than at its next catch-up, so
+		// it holds the round's coin in place of the one given up, and a
+		// payment that needs the value goes ahead.
+		if !board_spent.is_empty() {
+			let caught = self.catch_up().map(|_| json!(true)).unwrap_or_else(|e| json!({"error": e.to_string()}));
+			changes.push(json!({"leaf_ids": board_spent, "caught_up": caught,
+				"why": "a coin's board is spent on the chain by nothing this store did: the wallet read what its other stores did at once"}));
 		}
 		lap("coins", &mut at);
 		// A claim-1 coin the wallet holds unpaid (an earlier take-up stopped
@@ -4721,4 +4736,10 @@ mod tests {
 		let not_accepted = WalletPolicy { min_reserve: reserve_floor(None), ..policy };
 		assert!(not_accepted.check(&record).is_ok());
 	}
+}
+
+/// Whether a re-check's note says the board a coin is, or rests on, is
+/// spent on the chain ([`arca_covenant::transfer::TransferError::BoardSpent`]).
+fn is_board_spent(note: &str) -> bool {
+	note.starts_with("the board at ") && note.contains(" is spent")
 }

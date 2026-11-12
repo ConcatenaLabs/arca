@@ -116,7 +116,12 @@ it. It takes every coin the store does not hold under a nonce it never drew
 (another store's), checked as a restore checks it, and gives up every coin it holds as live that another store gave up in a
 transfer the operator co-signed or in a participation the operator released,
 on the owner's own signatures (`given_elsewhere`), so every store shows the
-same coins after its next catch-up, and shows what it held until then. Each
+same coins after its next catch-up, and shows what it held until then. Two
+things make it catch up at once: a spend the operator refuses because a coin
+of the wallet's is spent already, and a re-check that finds the board a live
+coin is, or rests on, spent on the chain by nothing this store did (another
+store gave the coin to a round, whose forfeit the operator then published from
+the board). Each
 store still draws its own nonces, and its mailbox read refuses a coin paid
 under a nonce it never drew ("a coin for owner nonce …, which this wallet
 never drew"), which its catch-up takes instead. A restore that stops at an error keeps what it took
