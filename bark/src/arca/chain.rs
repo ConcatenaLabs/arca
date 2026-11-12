@@ -1734,8 +1734,18 @@ impl ChainSource {
 		if from > to {
 			return Ok(out);
 		}
-		let Some(mut hash) = self.block_hash(to)? else { return Ok(out) };
+		// The node's chain may be shorter than the view's tip (a
+		// reorganisation since the look): start at the highest height it
+		// still has, as the block-by-block search ran up to the first height
+		// missing.
 		let mut h = to;
+		let mut hash = loop {
+			match self.block_hash(h)? {
+				Some(hash) => break hash,
+				None if h > from => h -= 1,
+				None => return Ok(out),
+			}
+		};
 		loop {
 			let known = self.memo.lock().expect("the chain memo").seen.get(&hash).cloned();
 			let b = match known {
@@ -3167,5 +3177,400 @@ mod test {
 		// root's block: never below it.
 		assert_eq!(chain.spender(&root, 0).unwrap().map(|(t, _)| t.txid()), Some(unroll.txid()));
 		println!("AFTER (block {}): the lineage output is found, the root's spender {}", height, unroll.txid());
+	}
+
+	// ---- Review of pull request 829: local tests, not part of the pull request. ----
+
+	fn rv_old_unhex(s: &str) -> Result<Vec<u8>, Error> {
+		if s.len() % 2 != 0 || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+			return Err(Error::Parse(format!("not hex: {}", s)));
+		}
+		Ok((0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("checked")).collect())
+	}
+
+	#[test]
+	fn rv_unhex_is_the_parse_it_replaced() {
+		let mut n = 0u64;
+		let mut valid = 0u64;
+		let mut same = |s: &str| {
+			let (a, b) = (unhex(s).ok(), rv_old_unhex(s).ok());
+			assert_eq!(a, b, "{:?}", s);
+			n += 1;
+			if a.is_some() {
+				valid += 1;
+			}
+		};
+		same("");
+		let mut chars: Vec<char> = (0u32..0x250).filter_map(char::from_u32).collect();
+		chars.extend(['\u{ff10}', '\u{0663}', '\u{ff21}', '\u{1d7d8}', '\u{feff}']);
+		for &a in &chars {
+			same(&a.to_string());
+			for &b in &chars {
+				same(&format!("{}{}", a, b));
+			}
+		}
+		let alphabet: Vec<char> = "0123456789abcdefABCDEF0123456789abcdefABCDEFgGxz -+\u{e9}\u{ff10}".chars().collect();
+		let mut seed = 0x2545_F491_4F6C_DD1Du64;
+		let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+		for _ in 0..200_000 {
+			let len = (next() % 41) as usize;
+			let s: String = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+			same(&s);
+			let h: String = s.chars().map(|c| if c.is_ascii_hexdigit() { c } else { 'F' }).collect();
+			same(&h);
+		}
+		let all: Vec<u8> = (0..=255u8).collect();
+		assert_eq!(unhex(&hex(&all)).unwrap(), all);
+		assert_eq!(unhex(&hex(&all).to_uppercase()).unwrap(), all);
+		println!("unhex: {} strings, {} of them hex, answered as the old parse answered", n, valid);
+	}
+
+	fn rv_script(k: u8) -> Script {
+		Script::from(vec![0x01, k, 0x75, 0x51])
+	}
+
+	fn rv_out(asset: AssetId, value: u64, script: Script) -> TxOut {
+		use elements::confidential;
+		TxOut { asset: confidential::Asset::Explicit(asset), value: confidential::Value::Explicit(value), nonce: confidential::Nonce::Null,
+			script_pubkey: script, witness: Default::default() }
+	}
+
+	fn rv_tx(inputs: &[(OutPoint, u32)], output: Vec<TxOut>) -> Transaction {
+		Transaction { version: 2, lock_time: elements::LockTime::ZERO, output,
+			input: inputs.iter().map(|(o, s)| elements::TxIn { previous_output: *o, sequence: elements::Sequence(*s), ..Default::default() }).collect() }
+	}
+
+	/// The searches as they were before the pull request, block by block
+	/// through `each_block_to` (unchanged by it).
+	fn rv_old_find(c: &ChainSource, output: &TxOut, from_height: u64) -> Option<(Txid, u64)> {
+		let tip = c.tip().unwrap().height;
+		let mut found = None;
+		c.each_block_to(from_height, tip, |h, block| {
+			found = block.txdata.into_iter().find(|tx| tx.output.iter().any(|o| o == output)).map(|tx| (tx.txid(), h));
+			Ok(found.is_some())
+		}).unwrap();
+		found
+	}
+
+	fn rv_old_spender(c: &ChainSource, outpoint: &OutPoint, from_height: u64) -> Option<(Txid, Option<u64>)> {
+		if c.unspent(outpoint).unwrap() {
+			return None;
+		}
+		let spends = |tx: &Transaction| tx.input.iter().any(|i| i.previous_output == *outpoint);
+		if let Some(tx) = c.mempool_txs().unwrap().into_iter().find(|tx| spends(tx)) {
+			return Some((tx.txid(), None));
+		}
+		let from = match c.tx_block(&outpoint.txid).unwrap() {
+			Some((_, h)) => from_height.max(h),
+			None => from_height,
+		};
+		let tip = c.tip().unwrap().height;
+		let mut found = None;
+		c.each_block_to(from, tip, |h, block| {
+			found = block.txdata.into_iter().find(|tx| spends(tx)).map(|tx| (tx.txid(), Some(h)));
+			Ok(found.is_some())
+		}).unwrap();
+		found
+	}
+
+	fn rv_old_seen(c: &ChainSource, scripts: &BTreeSet<Script>, from_height: u64) -> BTreeSet<Script> {
+		let mut seen = BTreeSet::new();
+		if scripts.is_empty() {
+			return seen;
+		}
+		let tip = c.tip().unwrap().height;
+		c.each_block_to(from_height, tip, |_, block| {
+			for tx in &block.txdata {
+				for o in &tx.output {
+					if scripts.contains(&o.script_pubkey) {
+						seen.insert(o.script_pubkey.clone());
+					}
+				}
+			}
+			Ok(false)
+		}).unwrap();
+		for tx in c.mempool_txs().unwrap() {
+			for o in &tx.output {
+				if scripts.contains(&o.script_pubkey) {
+					seen.insert(o.script_pubkey.clone());
+				}
+			}
+		}
+		seen
+	}
+
+	/// Every search of `c`, new against old, for each output, outpoint and
+	/// script from each height; and `find_payments` of every output from
+	/// every height at once. The number of answers compared.
+	fn rv_compare(c: &ChainSource, label: &str, outs: &[(&str, TxOut)], points: &[(&str, OutPoint)], scripts: &BTreeSet<Script>,
+		froms: &[u64]) -> usize
+	{
+		let mut n = 0;
+		for (name, o) in outs {
+			for &f in froms {
+				let new = c.find_payment(o, f).unwrap().map(|(t, h)| (t.txid(), h));
+				assert_eq!(new, rv_old_find(c, o, f), "{}: find_payment {} from {}", label, name, f);
+				n += 1;
+			}
+		}
+		let wanted: Vec<(TxOut, u64)> = outs.iter().flat_map(|(_, o)| froms.iter().map(move |f| (o.clone(), *f))).collect();
+		let all = c.find_payments(&wanted).unwrap();
+		for ((o, f), got) in wanted.iter().zip(all) {
+			assert_eq!(got.map(|(t, h)| (t.txid(), h)), rv_old_find(c, o, *f), "{}: find_payments of {:?} from {}", label, o.script_pubkey, f);
+			n += 1;
+		}
+		for (name, p) in points {
+			for &f in froms {
+				let new = c.spender(p, f).unwrap().map(|(t, h)| (t.txid(), h));
+				assert_eq!(new, rv_old_spender(c, p, f), "{}: spender of {} from {}", label, name, f);
+				n += 1;
+			}
+		}
+		for &f in froms {
+			assert_eq!(c.scripts_seen(scripts, f).unwrap(), rv_old_seen(c, scripts, f), "{}: scripts_seen from {}", label, f);
+			n += 1;
+		}
+		n
+	}
+
+	#[test]
+	fn rv_searches_answer_as_the_block_by_block_search_through_reorganisations() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1", "-par=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let open = || ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let chain = open();
+		let node = r.node.client();
+		let op_true = Script::from(vec![0x51]);
+		let genesis = chain.genesis().unwrap();
+		let block = chain.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 100_000_000)).expect("free coins");
+		let (asset, value) = (coin.asset.explicit().unwrap(), coin.value.explicit().unwrap());
+		let send = |tx: &Transaction| { node.send_raw_transaction(tx).unwrap(); };
+		let mine = |n: u64| for _ in 0..n { r.produce_block().unwrap(); };
+		const V: u64 = 1_000_000;
+		let fee = 10_000;
+		let pay = |from: OutPoint, out: TxOut, seq: u32, fee: u64| rv_tx(&[(from, seq)], vec![out, TxOut::new_fee(fee, asset)]);
+
+		let mut fan_out: Vec<TxOut> = (0..10u8).map(|i| rv_out(asset, V, rv_script(0x20 + i))).collect();
+		fan_out.push(rv_out(asset, value - 10 * V - fee, op_true.clone()));
+		fan_out.push(TxOut::new_fee(fee, asset));
+		let fan = rv_tx(&[(free, u32::MAX)], fan_out);
+		send(&fan);
+		mine(1);
+		let u = |i: u32| OutPoint::new(fan.txid(), i);
+		// D is paid twice, by tA and, a batch of blocks later, by tB.
+		let d = rv_out(asset, V - fee, rv_script(0xd0));
+		mine(3);
+		let ta = pay(u(0), d.clone(), u32::MAX, fee);
+		send(&ta);
+		mine(1);
+		mine(BATCH_MOST as u64 + 5);
+		let tb = pay(u(1), d.clone(), u32::MAX, fee);
+		send(&tb);
+		mine(1);
+		// E is paid twice in one block.
+		let e = rv_out(asset, V - fee, rv_script(0xe0));
+		let (tc, td) = (pay(u(2), e.clone(), u32::MAX, fee), pay(u(3), e.clone(), u32::MAX, fee));
+		send(&tc);
+		send(&td);
+		mine(1);
+		let ts = pay(OutPoint::new(ta.txid(), 0), rv_out(asset, V - 2 * fee, rv_script(0xe1)), u32::MAX, fee);
+		send(&ts);
+		mine(2);
+		// D's script, another value.
+		let tv = pay(u(6), rv_out(asset, V - 2 * fee, rv_script(0xd0)), u32::MAX, 2 * fee);
+		send(&tv);
+		mine(1);
+		// What an anchor reorganisation takes: blocks anchored to a parent
+		// block that is then orphaned.
+		r.mine_parent(1).unwrap();
+		r.anchor_to_parent_tip().unwrap();
+		let parent_h = r.parent.client().block_count().unwrap();
+		mine(2);
+		let tr = pay(u(4), rv_out(asset, V - fee, rv_script(0xf0)), 0xffff_fffd, fee);
+		let tk = pay(u(5), rv_out(asset, V - fee, rv_script(0xf1)), u32::MAX, fee);
+		send(&tr);
+		send(&tk);
+		mine(1);
+		let tr2 = pay(OutPoint::new(tr.txid(), 0), rv_out(asset, V - 2 * fee, rv_script(0xf2)), u32::MAX, fee);
+		send(&tr2);
+		mine(1);
+		mine(BATCH_MOST as u64 + 10);
+		gap();
+		chain.new_command();
+		let tip0 = chain.tip().unwrap().height;
+		let at = |c: &ChainSource, t: &Transaction| c.tx_block(&t.txid()).unwrap().map(|(_, h)| h);
+		let (h_fan, h_a, h_b, h_c, h_s, h_v, h_r, h_r2) = (at(&chain, &fan).unwrap(), at(&chain, &ta).unwrap(), at(&chain, &tb).unwrap(),
+			at(&chain, &tc).unwrap(), at(&chain, &ts).unwrap(), at(&chain, &tv).unwrap(), at(&chain, &tr).unwrap(), at(&chain, &tr2).unwrap());
+		assert_eq!(at(&chain, &tc), at(&chain, &td), "tC and tD in one block");
+		println!("heights: fan {} tA {} tB {} tC/tD {} tS {} tV {} tR/tK {} tR2 {} tip {}", h_fan, h_a, h_b, h_c, h_s, h_v, h_r, h_r2, tip0);
+		let outs = vec![("D", d.clone()), ("E", e.clone()), ("S", ts.output[0].clone()), ("V", tv.output[0].clone()), ("R", tr.output[0].clone()),
+			("K", tk.output[0].clone()), ("R2", tr2.output[0].clone()), ("absent", rv_out(asset, 1, rv_script(0xaa)))];
+		let points = vec![("u0", u(0)), ("tA:0", OutPoint::new(ta.txid(), 0)), ("tS:0", OutPoint::new(ts.txid(), 0)), ("u4", u(4)),
+			("u5", u(5)), ("tR:0", OutPoint::new(tr.txid(), 0)), ("u7 unspent", u(7))];
+		let scripts: BTreeSet<Script> = [0xd0u8, 0xe0, 0xe1, 0xf0, 0xf1, 0xf2, 0xf3, 0xaa].into_iter().map(rv_script).collect();
+		let froms = |tip: u64| -> Vec<u64> {
+			let mut v = vec![0, 1, h_fan, h_a - 1, h_a, h_a + 1, h_b - 1, h_b, h_b + 1, h_c, h_c + 1, h_s, h_v, h_r - 1, h_r, h_r + 1, h_r2,
+				tip0 - 1, tip0, tip0 + 1, tip - 1, tip, tip + 1, tip + 100];
+			v.sort();
+			v.dedup();
+			v
+		};
+
+		// Stage 0: the long-lived source fills its index; a fresh source too.
+		let n = rv_compare(&chain, "stage 0", &outs, &points, &scripts, &froms(tip0));
+		let n2 = rv_compare(&open(), "stage 0, fresh", &outs, &points, &scripts, &froms(tip0));
+		println!("stage 0 (tip {}): {} + {} answers agree", tip0, n, n2);
+		assert_eq!(chain.find_payment(&d, 0).unwrap().map(|(t, h)| (t.txid(), h)), Some((ta.txid(), h_a)));
+		assert_eq!(chain.find_payment(&d, h_a + 1).unwrap().map(|(t, h)| (t.txid(), h)), Some((tb.txid(), h_b)));
+		assert_eq!(chain.find_payment(&d, h_b + 1).unwrap(), None);
+		let first_e = chain.find_payment(&e, 0).unwrap().unwrap().0.txid();
+		println!("E's first payment in its block: {} (tC {}, tD {})", first_e, tc.txid(), td.txid());
+
+		let mut stage_s: Option<String> = None;
+		// Stage S: the tip moves down after the look and before the search
+		// reads the top of its range, within one view.
+		{
+			// A new tip first, so the view this stage reads in holds no
+			// answer of an earlier one.
+			mine(1);
+			gap();
+			chain.new_command();
+			let started = std::time::Instant::now();
+			let t = chain.tip().unwrap().height;
+			let cut = node.block_hash(t - 3).unwrap();
+			let _: Value = node.call("invalidateblock", &[json!(cut.to_string())]).unwrap();
+			let new_sp = chain.spender(&u(0), 0).unwrap().map(|(t, h)| (t.txid(), h));
+			let new_seen = chain.scripts_seen(&scripts, 0).unwrap();
+			let new_find = chain.find_payment(&d, 0).unwrap().map(|(t, h)| (t.txid(), h));
+			let old_sp = rv_old_spender(&chain, &u(0), 0);
+			let old_seen = rv_old_seen(&chain, &scripts, 0);
+			let old_find = rv_old_find(&chain, &d, 0);
+			let took = started.elapsed();
+			let _: Value = node.call("reconsiderblock", &[json!(cut.to_string())]).unwrap();
+			println!("stage S (view tip {}, node tip {} after the cut, {} ms within the view): spender of u0 new {:?} old {:?}; \
+				scripts_seen new {} old {}; find_payment D new {:?} old {:?}", t, t - 4, took.as_millis(), new_sp, old_sp, new_seen.len(),
+				old_seen.len(), new_find, old_find);
+			if took < VIEW_FOR {
+				assert_eq!(old_sp, Some((ta.txid(), Some(h_a))), "the old search finds the spend below the cut");
+				if new_sp != old_sp || new_find != old_find || new_seen != old_seen {
+					stage_s = Some(format!("spender {:?} vs old {:?}; find_payment {:?} vs old {:?}; scripts_seen {} vs old {}", new_sp, old_sp,
+						new_find, old_find, new_seen.len(), old_seen.len()));
+				}
+			}
+		}
+
+		// Stage 1: an anchor reorganisation takes every block anchored to the
+		// orphaned parent block, below the index's top.
+		r.orphan_parent_from(parent_h).unwrap();
+		gap();
+		chain.new_command();
+		let tip1 = chain.tip().unwrap().height;
+		println!("stage 1: the parent orphaned from {}; tip {} -> {}; tR in the chain {:?}, in the mempool {}", parent_h, tip0, tip1,
+			at(&chain, &tr), chain.mempool().unwrap().contains(&tr.txid()));
+		assert!(tip1 < h_r, "the blocks holding tR are gone");
+		let n = rv_compare(&chain, "stage 1", &outs, &points, &scripts, &froms(tip1));
+		println!("stage 1 (tip {}): {} answers agree", tip1, n);
+		assert_eq!(chain.find_payment(&tr.output[0], 0).unwrap().map(|(t, _)| t.txid()), None, "tR is in no block of the active chain");
+
+		// Stage 2: tR replaced by tR' paying another script; a shorter branch.
+		let trx = pay(u(4), rv_out(asset, V - 3 * fee, rv_script(0xf3)), 0xffff_fffd, 3 * fee);
+		send(&trx);
+		mine(5);
+		gap();
+		chain.new_command();
+		let tip2 = chain.tip().unwrap().height;
+		assert!(tip2 < tip0, "a branch shorter than the one taken");
+		let n = rv_compare(&chain, "stage 2", &outs, &points, &scripts, &froms(tip2));
+		let h_rx = at(&chain, &trx).unwrap();
+		println!("stage 2 (tip {}): tR' at {}, tK at {:?}; {} answers agree", tip2, h_rx, at(&chain, &tk), n);
+		assert_eq!(chain.spender(&u(4), 0).unwrap().map(|(t, h)| (t.txid(), h)), Some((trx.txid(), Some(h_rx))));
+		assert_eq!(chain.find_payment(&tr.output[0], 0).unwrap(), None);
+		assert!(!chain.scripts_seen(&[rv_script(0xf0)].into(), 0).unwrap().contains(&rv_script(0xf0)), "tR's script is gone");
+
+		// Stage 3: the new branch grows past the old tip.
+		mine(tip0 - tip2 + 20);
+		gap();
+		chain.new_command();
+		let tip3 = chain.tip().unwrap().height;
+		let n = rv_compare(&chain, "stage 3", &outs, &points, &scripts, &froms(tip3));
+		let n2 = rv_compare(&open(), "stage 3, fresh", &outs, &points, &scripts, &froms(tip3));
+		println!("stage 3 (tip {}): {} + {} answers agree", tip3, n, n2);
+
+		// Stage 4: a plain reorganisation of the top: invalidate and replace
+		// the last 30 blocks with 31 others.
+		let cut = node.block_hash(tip3 - 29).unwrap();
+		let _: Value = node.call("invalidateblock", &[json!(cut.to_string())]).unwrap();
+		let tz = pay(u(8), rv_out(asset, V - fee, rv_script(0xaa)), u32::MAX, fee);
+		send(&tz);
+		mine(31);
+		gap();
+		chain.new_command();
+		let tip4 = chain.tip().unwrap().height;
+		let n = rv_compare(&chain, "stage 4", &outs, &points, &scripts, &froms(tip4));
+		println!("stage 4 (tip {}): {} answers agree", tip4, n);
+
+		// The index: what it holds.
+		{
+			let m = chain.memo.lock().unwrap();
+			let (mut outs_n, mut ins_n, mut script_bytes, mut vec_bytes) = (0usize, 0usize, 0usize, 0usize);
+			for b in m.seen.values() {
+				outs_n += b.pays.len();
+				ins_n += b.spends.len();
+				script_bytes += b.pays.iter().map(|(s, _, _)| s.len()).sum::<usize>();
+				vec_bytes += b.pays.capacity() * std::mem::size_of::<(Script, u32, u32)>() + b.spends.capacity() * std::mem::size_of::<(OutPoint, u32)>();
+			}
+			let blocks_named = m.named.iter().filter(|(k, _)| k.starts_with("getblock ")).count();
+			let named_bytes: usize = m.named.iter().filter(|(k, _)| k.starts_with("getblock ")).map(|(_, v)| v.as_str().map_or(0, str::len)).sum();
+			println!("index: {} blocks (active chain {}), {} outputs, {} inputs; vectors {} B, scripts {} B, per block ~{} B before allocator \
+				overhead; raw blocks kept in `named`: {} ({} B of hex)", m.seen.len(), tip4 + 1, outs_n, ins_n, vec_bytes, script_bytes,
+				(vec_bytes + script_bytes) / m.seen.len().max(1) + std::mem::size_of::<BlockSeen>() + 48, blocks_named, named_bytes);
+		}
+
+		// What a source that ran only the new searches holds.
+		{
+			let pure = open();
+			let wanted: Vec<(TxOut, u64)> = outs.iter().map(|(_, o)| (o.clone(), 0)).collect();
+			let _ = pure.find_payments(&wanted).unwrap();
+			for (_, p) in &points {
+				let _ = pure.spender(p, 0).unwrap();
+			}
+			let _ = pure.scripts_seen(&scripts, 0).unwrap();
+			let m = pure.memo.lock().unwrap();
+			let (mut vec_bytes, mut script_bytes) = (0usize, 0usize);
+			for b in m.seen.values() {
+				script_bytes += b.pays.iter().map(|(s, _, _)| s.len()).sum::<usize>();
+				vec_bytes += b.pays.capacity() * std::mem::size_of::<(Script, u32, u32)>() + b.spends.capacity() * std::mem::size_of::<(OutPoint, u32)>();
+			}
+			let named: Vec<usize> = m.named.iter().filter(|(k, _)| k.starts_with("getblock ")).map(|(_, v)| v.as_str().map_or(0, str::len)).collect();
+			println!("pure new source: index {} blocks, {} B of vectors and scripts; raw blocks kept in `named`: {} ({} B of hex); decoded {}",
+				m.seen.len(), vec_bytes + script_bytes, named.len(), named.iter().sum::<usize>(), m.decoded);
+		}
+
+		// The cost of one search whose answer is just above its start, the
+		// tip far above: a fresh source each, new and old.
+		mine(400);
+		gap();
+		let tip5 = open().tip().unwrap().height;
+		let fresh = open();
+		let (c0, d0) = (fresh.calls().0, fresh.blocks_decoded());
+		let new = fresh.spender(&u(0), h_fan).unwrap().map(|(t, h)| (t.txid(), h));
+		let (c1, d1) = (fresh.calls().0, fresh.blocks_decoded());
+		let fresh = open();
+		let (o0, e0) = (fresh.calls().0, fresh.blocks_decoded());
+		let old = rv_old_spender(&fresh, &u(0), h_fan);
+		let (o1, e1) = (fresh.calls().0, fresh.blocks_decoded());
+		assert_eq!(new, old);
+		println!("one spender search, the spend {} block(s) above its start, the tip {} above: new {} requests, {} blocks decoded; old {} \
+			requests, {} blocks decoded", h_a - h_fan, tip5 - h_fan, c1 - c0, d1 - d0, o1 - o0, e1 - e0);
+		assert!(stage_s.is_none(), "STAGE S: the tip moved down within one view: {}", stage_s.unwrap_or_default());
 	}
 }
