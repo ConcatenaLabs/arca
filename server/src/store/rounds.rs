@@ -548,6 +548,25 @@ impl Store {
 		Ok(r.get(0))
 	}
 
+	/// Whether the operator's half of the forfeits of the round `round_id` is
+	/// asked of the signer as soon as the node holds the round, rather than
+	/// at the minute's run: a round held for its forfeits that fills no
+	/// order, read from the server's own record of the round (its batches
+	/// and its `round_fill` rows), never from what a participant sent. A
+	/// round with any fill counts as a fill round, whatever else it holds.
+	/// Such a round spends the operator's own coins and nothing else, so no
+	/// one else can spend an input of it first; a take whose forfeit the
+	/// signer co-signed is not run again if an order of its round is taken
+	/// before the round confirms, so a fill round is left to the minute.
+	pub async fn round_wakes_fill(&self, round_id: i64) -> Result<bool, StoreError> {
+		let conn = self.conn().await?;
+		let token = arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
+		let r = conn.query_one(
+			"SELECT NOT EXISTS (SELECT 1 FROM round_fill WHERE round_id = $1) AND EXISTS (SELECT 1 FROM batch WHERE round_id = $1 AND token = $2)",
+			&[&round_id, &&token[..]]).await?;
+		Ok(r.get(0))
+	}
+
 	/// The coins of `ids` and every coin each was paid on from out of round,
 	/// back to the batch leaf or board it rests on: a reassignment's output
 	/// names the coins its transaction spends, and so on up. A fill's outputs

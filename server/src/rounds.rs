@@ -1134,10 +1134,11 @@ pub struct Rounds {
 	wake: tokio::sync::Notify,
 	/// Each participation released, for the watcher's unlock lane.
 	releases: Arc<crate::watcher::Releases>,
-	/// Rung when a round held for its forfeits is handed to the node: the
-	/// operator's half of those forfeits is signed only once the node holds
-	/// the round ([`crate::forfeits::Forfeits::fill_unsigned`]), and every
-	/// release of the round waits for it.
+	/// Rung when a round held for its forfeits, and filling no order, is
+	/// handed to the node: the operator's half of those forfeits is signed
+	/// only once the node holds the round
+	/// ([`crate::forfeits::Forfeits::fill_unsigned`]), and every release of
+	/// the round waits for it.
 	fill_due: Arc<tokio::sync::Notify>,
 }
 
@@ -1303,8 +1304,8 @@ impl Rounds {
 			fill_due: Arc::new(tokio::sync::Notify::new()) })
 	}
 
-	/// Rung each time a round held for its forfeits goes to the node, so
-	/// the forfeits' operator halves are filled in then
+	/// Rung each time a round held for its forfeits, and filling no order,
+	/// goes to the node, so the forfeits' operator halves are filled in then
 	/// ([`crate::forfeits::Forfeits::fill_unsigned`]), not at the next minute.
 	pub fn fill_due(&self) -> Arc<tokio::sync::Notify> {
 		self.fill_due.clone()
@@ -3450,7 +3451,10 @@ impl Rounds {
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
 			let fee = AssetAmount::new(AssetId::from_byte_array(r.fee_asset), r.fee);
 			let answer = self.submit(r.round_id, &tx, fee).await?;
-			if held {
+			// Not for a round that fills orders: its takes run again if an
+			// order is taken before it confirms, but not a take whose
+			// forfeit the signer has co-signed ([`Store::round_wakes_fill`]).
+			if self.store.round_wakes_fill(r.round_id).await? {
 				self.fill_due.notify_one();
 			}
 			// An order taken between that check and the node's answer: the

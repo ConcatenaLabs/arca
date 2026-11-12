@@ -2081,21 +2081,47 @@ impl Server {
 		});
 		tasks.push(housekeeping(store.clone(), Duration::from_secs(config.limits.nonce_ttl_seconds),
 			Duration::from_secs(config.limits.cleanup_interval_seconds.max(1))));
-		// Once a minute, and at once when a round held for its forfeits goes
-		// to the node: the forfeits without the operator's half, the fills of
+		// Once a minute, and at once when a round held for its forfeits, and
+		// filling no order, goes to the node (handed to it by the rounds pass,
+		// or taken by it at a later broadcast of the nursery's, after a
+		// refusal): the forfeits without the operator's half, the fills of
 		// resting orders left unsigned, and the keepers the signer names,
-		// against the pinned set.
+		// against the pinned set. The minute's run keeps its own schedule,
+		// whatever wakes it between.
 		let replaced: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
 		let pinned_keepers = Arc::new(std::sync::Mutex::new(keepers.clone()));
 		tasks.push({
 			let (forfeits, orders) = (forfeits.clone(), orders.clone());
 			let (signer, pinned, replaced) = (cosigner.signer().clone(), pinned_keepers.clone(), replaced.clone());
 			let fill_due = rounds.fill_due();
+			let (store, mut events) = (store.clone(), nursery.subscribe());
 			tokio::spawn(async move {
+				let mut minute = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(60), Duration::from_secs(60));
+				minute.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+				let mut listening = true;
 				loop {
 					tokio::select! {
-						_ = tokio::time::sleep(Duration::from_secs(60)) => {},
+						_ = minute.tick() => {},
 						_ = fill_due.notified() => {},
+						event = events.recv(), if listening => match event {
+							Ok(crate::nursery::NurseryEvent::Broadcast { txid, result }) if result == "accepted" => {
+								match held_round(&store, &txid).await {
+									Ok(true) => {},
+									Ok(false) => continue,
+									Err(e) => {
+										log::warn!("forfeits: whether {} is a round held for its forfeits: {}", txid, e);
+										continue;
+									},
+								}
+							},
+							Ok(_) => continue,
+							// Events missed: one of them may have been such a round.
+							Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+							Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+								listening = false;
+								continue;
+							},
+						},
 					}
 					if crate::http::keepers_replaced(&signer, &pinned, &replaced).await {
 						continue;
@@ -2285,5 +2311,15 @@ mod tests {
 			let e = super::assets_of(&c).err().expect("a restricted section is refused").0;
 			assert!(e.contains(asset) && e.contains(arca_covenant::ENCLAVE_RETIRED), "{}", e);
 		}
+	}
+}
+
+/// Whether `txid` is a round whose forfeits the signer is asked for as soon
+/// as the node holds it ([`crate::store::Store::round_wakes_fill`]).
+async fn held_round(store: &Store, txid: &elements::Txid) -> Result<bool, crate::store::StoreError> {
+	use elements::hashes::Hash;
+	match store.round_by_txid(&txid.to_byte_array()).await? {
+		Some(r) => store.round_wakes_fill(r.round_id).await,
+		None => Ok(false),
 	}
 }
