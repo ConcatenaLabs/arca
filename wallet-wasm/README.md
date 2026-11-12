@@ -47,7 +47,11 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   about one a second, keeps the wallet working. The node runs one scan at a
   time for all its clients: a scan it refuses as busy with another's waits on
   the pause and is asked again, for two minutes at most, and the refusal is
-  never kept as the chain's answer.
+  never kept as the chain's answer. A block a search of the chain reads is
+  read once: a summary of what it pays and spends is kept in the wallet's
+  store, by its hash, checked against the active chain at every use, so a
+  page reloaded reads only the blocks it has not seen (at most 100,000 kept,
+  some 30 MB, the oldest dropped first).
 - **The pause** between two tries (a node or proxy that answers busy or "too
   many calls", an operator that does not answer) is the host's to give. A worker
   blocked in the library has nothing else to do, but a pause that watches the
@@ -258,8 +262,10 @@ operator serves the coin live again (the other store's participation withdrawn
 or voided, its round dropped), once a catch-up settles it, and at the latest when
 the wait `settle_first` stated for it has passed, so a false refusal costs at most
 that one wait. While held, the coin counts in `balance` (as `spent_elsewhere`)
-and not in what `coin_places` calls spendable (`spent_elsewhere_until` on its
-line), and its exit is never barred; a `swap_cancel` that meets such a coin cancels the
+and not in what `coin_places` calls spendable; `coin_places` and `coins` (full
+and `brief`) mark it with `spent_elsewhere_until` and the standing
+`spent_elsewhere`, so a program counts what it can spend now as the library does;
+and its exit is never barred; a `swap_cancel` that meets such a coin cancels the
 acceptance without a respend. A `swap_cancel` whose respend went unanswered
 never calls the acceptance cancelled until the operator has answered it: the
 next one posts the respend again and answers `cancelled`, `done`, or, while

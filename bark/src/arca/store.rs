@@ -176,6 +176,8 @@ CREATE INDEX IF NOT EXISTS tower_deposit_owner ON tower_deposit(owner);
 CREATE INDEX IF NOT EXISTS forfeit_participation ON forfeit(participation);
 CREATE TABLE IF NOT EXISTS tower_sealed (id TEXT PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tower_hint (hint TEXT NOT NULL, id TEXT NOT NULL, k INTEGER NOT NULL, PRIMARY KEY (hint, id));
+CREATE TABLE IF NOT EXISTS chain_seen (hash BLOB PRIMARY KEY, height INTEGER NOT NULL, prev BLOB NOT NULL, pays BLOB NOT NULL, spends BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS chain_seen_height ON chain_seen(height);
 ";
 
 /// A deposit a watchtower holds ([`super::tower`]).
@@ -327,6 +329,7 @@ impl Store {
 		store.add_column("signer_seen", "signature", "TEXT")?;
 		store.add_column("mailbox_retry", "head", "TEXT")?;
 		store.add_column("coin", "bound", "INTEGER")?;
+		store.add_column("forfeit", "searched", "TEXT")?;
 		store.follow_lost_participations()?;
 		Ok(store)
 	}
@@ -510,6 +513,42 @@ impl Store {
 				params![id, state, note, now()]),
 		}.map_err(db)?;
 		Ok(())
+	}
+
+	// --- the blocks the chain's searches have seen ([`super::chain::SeenRow`]) ---
+
+	/// Every block kept.
+	pub fn chain_seen(&self) -> Result<Vec<super::chain::SeenRow>, Error> {
+		use elements::hashes::Hash;
+		let mut st = self.conn.prepare("SELECT hash, height, prev, pays, spends FROM chain_seen").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, Vec<u8>>(3)?,
+			r.get::<_, Vec<u8>>(4)?))).map_err(db)?;
+		let mut out = vec![];
+		for row in rows {
+			let (hash, height, prev, pays, spends) = row.map_err(db)?;
+			// A row that does not read is left out: the block is read again.
+			let (Ok(hash), Ok(prev)) = (elements::BlockHash::from_slice(&hash), elements::BlockHash::from_slice(&prev)) else { continue };
+			out.push(super::chain::SeenRow { hash, height: height.max(0) as u64, prev, pays, spends });
+		}
+		Ok(out)
+	}
+
+	/// Keeps `rows`, and drops every block kept below height `below`, in one
+	/// transaction.
+	pub fn keep_chain_seen(&self, rows: &[super::chain::SeenRow], below: Option<u64>) -> Result<(), Error> {
+		use elements::hashes::Hash;
+		if rows.is_empty() && below.is_none() {
+			return Ok(());
+		}
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		if let Some(b) = below {
+			tx.execute("DELETE FROM chain_seen WHERE height < ?1", params![b as i64]).map_err(db)?;
+		}
+		for r in rows {
+			tx.execute("INSERT OR REPLACE INTO chain_seen (hash, height, prev, pays, spends) VALUES (?1, ?2, ?3, ?4, ?5)",
+				params![r.hash.to_byte_array().to_vec(), r.height as i64, r.prev.to_byte_array().to_vec(), r.pays, r.spends]).map_err(db)?;
+		}
+		tx.commit().map_err(db)
 	}
 
 	// --- meta ---
@@ -696,11 +735,27 @@ impl Store {
 		Ok(rows)
 	}
 
-	/// The ids of the coins the store took at `since` (seconds) or later.
+	/// The ids of the coins the store took (or wrote again) after the one of
+	/// row `since` ([`Self::coin_row_last`]): an order the store keeps, not a
+	/// clock that can step back.
 	pub fn coin_ids_since(&self, since: i64) -> Result<BTreeSet<String>, Error> {
-		let mut st = self.conn.prepare("SELECT leaf_id FROM coin WHERE created_at >= ?1").map_err(db)?;
+		let mut st = self.conn.prepare("SELECT leaf_id FROM coin WHERE rowid > ?1").map_err(db)?;
 		let rows = st.query_map(params![since], |r| r.get::<_, String>(0)).map_err(db)?.collect::<Result<BTreeSet<_>, _>>().map_err(db)?;
 		Ok(rows)
+	}
+
+	/// The row of the coin the store took (or wrote again) last; 0 for none.
+	pub fn coin_row_last(&self) -> Result<i64, Error> {
+		self.conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM coin", [], |r| r.get(0)).map_err(db)
+	}
+
+	/// Deletes every key of `keys` in one transaction: all of them or none.
+	pub fn delete_metas(&self, keys: &[&str]) -> Result<(), Error> {
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		for k in keys {
+			tx.execute("DELETE FROM meta WHERE key = ?1", params![k]).map_err(db)?;
+		}
+		tx.commit().map_err(db)
 	}
 
 	pub fn coin_by_salt(&self, salt: &[u8; 32]) -> Result<Option<CoinRow>, Error> {
@@ -1070,6 +1125,25 @@ impl Store {
 			state, note FROM forfeit WHERE state = ?1 ORDER BY created_at").map_err(db)?;
 		let rows = st.query_map(params![state], Self::forfeit_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
 		Ok(rows)
+	}
+
+	/// How far the chain was searched for the forfeit's output and found
+	/// none: the height and hash of the block the search reached.
+	pub fn forfeit_searched(&self, leaf_id: &str, round: &str) -> Result<Option<(u64, String)>, Error> {
+		let v: Option<Option<String>> = self.conn.query_row("SELECT searched FROM forfeit WHERE leaf_id = ?1 AND round = ?2",
+			params![leaf_id, round], |r| r.get(0)).optional().map_err(db)?;
+		Ok(v.flatten().and_then(|s| {
+			let (h, hash) = s.split_once(' ')?;
+			Some((h.parse().ok()?, hash.to_string()))
+		}))
+	}
+
+	/// Keeps how far the chain was searched for the forfeit's output
+	/// ([`Self::forfeit_searched`]).
+	pub fn set_forfeit_searched(&self, leaf_id: &str, round: &str, height: u64, hash: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE forfeit SET searched = ?3 WHERE leaf_id = ?1 AND round = ?2",
+			params![leaf_id, round, format!("{} {}", height, hash)]).map_err(db)?;
+		Ok(())
 	}
 
 	pub fn set_forfeit_state(&self, leaf_id: &str, round: &str, state: &str, note: &str) -> Result<(), Error> {

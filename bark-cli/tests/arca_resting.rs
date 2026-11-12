@@ -630,6 +630,16 @@ fn assert_held(tag: &str, t: &Arca, coin: &str, value: u64, y: AssetId) -> u64 {
 	println!("{} COIN-PLACES spendable {} | the coin {}", tag, p["spendable"], line);
 	assert!(p["spendable"][y.to_string()].is_null() || p["spendable"][y.to_string()] == "0", "not spendable now: {}", p["spendable"]);
 	let until = line["spent_elsewhere_until"].as_u64().unwrap_or_else(|| panic!("the hold's end is shown: {}", line));
+	// The coin list says the same, in full and brief, so a program never counts it as spendable now.
+	for brief in [false, true] {
+		let listed = tokio::task::block_in_place(|| {
+			let mut w = bark::arca::Wallet::open(&t.dir).expect("open the wallet");
+			bark::arca::command::run(&mut w, "coins", &json!({"brief": brief})).map(|v| v["result"].clone()).unwrap()
+		});
+		let c = listed.as_array().and_then(|a| a.iter().find(|c| c["leaf_id"] == coin)).cloned().unwrap_or(Value::Null);
+		assert_eq!(c["spent_elsewhere_until"].as_u64(), Some(until), "brief {}: the coin listed is marked held: {}", brief, c);
+		assert_eq!(c["standing"], "spent_elsewhere", "{}", c);
+	}
 	let (_, s) = t.run(&["settle-first", "--coin", coin]);
 	println!("{} SETTLE-FIRST: {}", tag, s);
 	assert_eq!(s["ready"], false, "{}", s);

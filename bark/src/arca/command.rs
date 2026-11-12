@@ -64,6 +64,16 @@ pub fn refusal(e: &Error) -> Value {
 		out["error"]["coin"] = json!(coin);
 		out["error"]["whose"] = json!(whose);
 	}
+	if let Error::Short { asset, most, all, live, .. } = e {
+		out["error"]["asset"] = json!(asset);
+		out["error"]["most"] = json!(most.to_string());
+		if let Some(a) = all {
+			out["error"]["all"] = json!(a.to_string());
+		}
+		if let Some(l) = live {
+			out["error"]["live"] = json!(l.to_string());
+		}
+	}
 	if let Error::Planned { asset, release, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["release"] = json!(release);
@@ -217,6 +227,10 @@ fn run_costed(w: &mut Wallet, command: &str, args: &Value) -> (Result<Value, Err
 	let (t1, (n1, _), g1) = (web_time::Instant::now(), w.chain.calls(), super::chain::gaps());
 	let by1 = w.chain.asked_by_method();
 	let result = command_of(w, command, args);
+	// What the command's searches read of the chain is kept for the next
+	// session; a store that cannot keep it costs that session the reads, no
+	// more.
+	let _ = w.keep_chain_seen();
 	let (n2, _) = w.chain.calls();
 	let mut cost = json!({
 		"start": {"ms": (t1 - t0).as_millis() as u64, "node": n1 - n0, "operator": g1 - g0},
@@ -790,6 +804,11 @@ mod test {
 		assert_eq!(r["error"]["status"], 409);
 		assert_eq!(r["error"]["message"], "the server refused cosign_transfer (409 key_reused): m");
 		assert_eq!(refusal(&Error::Refused("no".into())), json!({"error": {"kind": "refused", "message": "refused: no"}}));
+		// Short of what it pays, nothing more on its way: the most it pays now, as a figure.
+		let m = Error::Short { asset: "aa".into(), most: 1234, all: Some(2234), live: Some(1500), message: "short".into() };
+		assert_eq!(refusal(&m), json!({"error": {"kind": "refused", "message": "refused: short", "asset": "aa", "most": "1234", "all": "2234", "live": "1500"}}));
+		let m = Error::Short { asset: "aa".into(), most: 1234, all: None, live: None, message: "short".into() };
+		assert_eq!(refusal(&m), json!({"error": {"kind": "refused", "message": "refused: short", "asset": "aa", "most": "1234"}}));
 		let p = Error::Planned { asset: "aa".into(), release: vec!["c1".into(), "c2".into()], message: "short".into() };
 		assert_eq!(refusal(&p), json!({"error": {"kind": "planned", "message": "refused: short", "asset": "aa", "release": ["c1", "c2"]}}));
 		let c = Error::InChannel { asset: "aa".into(), close: vec!["ch1".into()], side: 7, most: None, fee: None, message: "short".into() };

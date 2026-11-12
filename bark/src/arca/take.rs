@@ -155,7 +155,8 @@ impl Wallet {
 			Some(_) => None,
 			None => {
 				let probe = ExplicitOutput::new(b, need, leaf_probe());
-				let (inputs, margin, change) = self.choose_coins(info, b, need, &probe, Self::min_leaf(info, b)?)?;
+				let (inputs, margin, change) = self.choose_coins(info, b, need, &probe, Self::min_leaf(info, b)?)
+					.map_err(Error::without_figures)?;
 				let margins: u64 = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
 				// The change rests on every coin the payment spends: the earliest
 				// expiry among them, for a program that settles it in a round
@@ -215,7 +216,8 @@ impl Wallet {
 				let out = Out { asset: b, value: need, leaf: own, mailbox, until: None };
 				let min_leaf = Self::min_leaf(&info, b)?;
 				let explicit = ExplicitOutput::new(b, need, own.policy(self.operator, self.genesis).script_pubkey());
-				let (inputs, _, change): (Vec<In>, u64, u64) = self.choose_coins(&info, b, need, &explicit, min_leaf)?;
+				let (inputs, _, change): (Vec<In>, u64, u64) = self.choose_coins(&info, b, need, &explicit, min_leaf)
+					.map_err(Error::without_figures)?;
 				let mut outs = vec![out];
 				if change > 0 {
 					let back = self.own_leaf_for("change")?;

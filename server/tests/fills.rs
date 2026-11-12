@@ -331,6 +331,10 @@ async fn a_round_fills_two_orders_and_pays_takers_as_leaves() {
 	assert_eq!(built.len(), 1, "one fill round of X");
 	let b = &built[0];
 	let tx = b.tx.clone();
+	// A fill round's forfeits wait for the minute's run, never the wake as
+	// the node takes the round (arca #866).
+	let row = r.server.store.round_by_txid(&tx.txid().to_byte_array()).await.unwrap().unwrap();
+	assert!(!r.server.store.round_wakes_fill(row.round_id).await.unwrap(), "a fill round does not wake the fill");
 	print_round(&r, &tx, &[(at1, &o1), (at2, &o2)]);
 	assert_eq!(b.fills, vec![at1, at2]);
 	assert_eq!(b.batches, vec![(x, 4, 2)], "the batch after the orders' four outputs, holding both takers' leaves");
