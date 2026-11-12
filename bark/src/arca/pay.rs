@@ -311,7 +311,7 @@ fn forfeit_held(e: &Error) -> Option<[u8; 32]> {
 /// The leaf a refusal of the server's names, as its coin refusals name it
 /// ("leaf … is already spent", "coin … is not live"): the first 64 hex
 /// digits after "leaf " or "coin ". An asset id it names is no leaf.
-fn leaf_named(message: &str) -> Option<String> {
+pub(crate) fn leaf_named(message: &str) -> Option<String> {
 	let words: Vec<&str> = message.split(|c: char| c.is_whitespace() || c == ':' || c == ',' || c == '(' || c == ')').collect();
 	words.windows(2).find(|w| matches!(w[0], "leaf" | "coin") && w[1].len() == 64 && w[1].chars().all(|c| c.is_ascii_hexdigit()))
 		.map(|w| w[1].to_ascii_lowercase())
