@@ -183,7 +183,9 @@ async fn create_board_pay_refresh_swap_rollback_and_exit() {
 	assert!(down.len() >= 2, "every coin on the round is un-credited: {}", rc);
 	assert!(down.iter().all(|c| c["why"].as_str().unwrap().contains(&round.to_string())), "{}", rc);
 	assert!(coins(&a, "live", &y).is_empty(), "the Y leaf rests on the round too");
-	a.refused(&["swap", "offer", "--give-asset", &x, "--give", "300000", "--want-asset", &y, "--want", "1000"], "holds 0 of asset");
+	// Its coins wait on the round again: settled first, nothing signed meanwhile.
+	let why = a.refused(&["swap", "offer", "--give-asset", &x, "--give", "300000", "--want-asset", &y, "--want", "1000"], "not final yet");
+	assert!(why.contains("(settle_first)") && why.contains("nothing was signed"), "{}", why);
 	r.produce().await;
 	r.bury().await;
 	r.round_state(&round, RoundState::Final).await;
