@@ -93,7 +93,9 @@ async fn the_record_compacted_against_the_expired_salts_still_starts_the_server(
 	use arca_covenant::CoinRecord;
 	use common::flow::{refresh, Coin};
 	use common::rounds::{advance_mtp, mtp};
-	let mut r = common::rounds::start().await;
+	// A batch with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: its salts
+	// expire with it.
+	let mut r = common::rounds::start_with_sweep().await;
 	let (s, x, chain) = (xonly(&r.s), r.x, r.chain);
 
 	// A's board refreshed into a batch leaf, which pays B out of round.

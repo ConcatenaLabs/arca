@@ -20,12 +20,15 @@ use arca_covenant::{RecordError, RoundCheckFailure, WalletPolicy};
 use common::client::{hex, participation_body, rebuild, txid, want_leaf};
 use common::keys::{keypair, xonly};
 use common::node;
-use common::rounds::{accept_policy, credited_board, round_final, start, VALUE};
+use common::rounds::{accept_policy, credited_board, round_final, start, start_with_sweep, VALUE};
 use server::participations::OutputRequest;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_round_in_two_assets_published_and_validated() {
-	let mut r = start().await;
+	// Batches with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: the token and
+	// its clock are what this checks, and such a round is broadcast at once
+	// (no_sweep.rs tests the held round of batches without one).
+	let mut r = start_with_sweep().await;
 	let (x, y, s, chain) = (r.x, r.y, xonly(&r.s), r.chain);
 	let policy_asset = r.purse.policy;
 	let balance = r.server.wallet.balance().await.unwrap();

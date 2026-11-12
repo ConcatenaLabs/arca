@@ -3886,8 +3886,13 @@ horizon (`lightning_pay.rs`); and a claim taken up out of round, landing
 under its holder's key while the claims nobody took up lapse
 (`distributions.rs`). `ARCA_TEST_NO_SWEEP=1` runs
 any suite against such an operator: the shared harness hands every held
-round's forfeits over for the tests' own participations before it goes out
-(a test of the sweep itself fails there by design).
+round's forfeits over for the tests' own participations before it goes out,
+and validates their leaves under the exit-delay bounds the test sets. A test
+of what only a batch with a sweep does (its token, release and sweep, a
+round broadcast before its forfeits, a plan) starts its operator with a
+sweep whatever the variable says (`common::rounds::start_with_sweep`), and
+the refusals of an operator without one are tested apart (`plans.rs`,
+`held_strikes.rs`, `supervised.rs`, `no_sweep.rs`).
 
 `tests/supervised.rs` issues an asset under the supervision descriptor,
 with the pause capability, and serves it supervised after a reload (a

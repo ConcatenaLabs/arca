@@ -31,6 +31,10 @@ async fn a_batch_is_released_and_swept_in_its_own_asset() {
 		// it on the chain at its batch's release first.
 		c.watcher.unroll_at_release = false;
 		c.assets.push(toml::from_str(&format!("asset = \"{}\"\nmin_leaf = \"1000\"\n", y)).unwrap());
+		// A batch with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: its sweep is
+		// what this test follows (accumulator_no_sweep.rs and no_sweep.rs test the
+		// batches without one).
+		c.batches.no_sweep = false;
 	}).await;
 	let (x, y) = (r.x, r.y);
 	common::node::list_fee_asset(&r.rt, y, 100_000_000);

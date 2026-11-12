@@ -57,6 +57,10 @@ async fn an_accumulator_batch_is_built_held_left_and_swept() {
 		c.watcher.unroll_at_release = false;
 		c.assets.push(server::server::AssetSection::new(y, MIN_LEAF));
 		c.batches.accumulator_exit_rate_ppm = Some(10_000);
+		// A batch with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: its sweep is
+		// what this test follows (accumulator_no_sweep.rs and no_sweep.rs test the
+		// batches without one).
+		c.batches.no_sweep = false;
 	}).await;
 	let x = r.x;
 	for _ in 0..3 {

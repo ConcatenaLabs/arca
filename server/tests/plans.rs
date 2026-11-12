@@ -25,6 +25,10 @@
 //!    planned coin whose holder's participation never completes keeps its
 //!    plan, whose step then runs.
 //!
+//! 6. An operator whose batches have no sweep refuses a plan: its coins never
+//!    expire, so a plan has nothing to outlive. Every other test here runs
+//!    with a sweep, whatever `ARCA_TEST_NO_SWEEP` says.
+//!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
 mod common;
@@ -176,7 +180,7 @@ fn step_leaf(r: &Running, st: &Value, m: &Made, idx: usize) -> (ValidLeaf, LeafR
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plan_refreshes_a_coin_twice_without_its_holder_and_answers_a_coin_it_gave_up() {
-	let mut r = common::rounds::start().await;
+	let mut r = common::rounds::start_with_sweep().await;
 	let x = r.x;
 	let c0 = round_coin(&mut r, "P").await;
 	let e0 = expiry_of(&c0);
@@ -269,7 +273,7 @@ async fn a_plan_refreshes_a_coin_twice_without_its_holder_and_answers_a_coin_it_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_current_coin_of_a_stopped_plan_is_not_released_until_its_holder_cancels_the_plan() {
-	let mut r = common::rounds::start().await;
+	let mut r = common::rounds::start_with_sweep().await;
 	let c0 = round_coin(&mut r, "G").await;
 	let e0 = expiry_of(&c0);
 	let m = make_plan(&r, &c0, "G", 1);
@@ -303,7 +307,7 @@ async fn the_current_coin_of_a_stopped_plan_is_not_released_until_its_holder_can
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plan_is_refused_for_what_it_breaks() {
-	let mut r = common::rounds::start().await;
+	let mut r = common::rounds::start_with_sweep().await;
 	let c0 = round_coin(&mut r, "R").await;
 	let try_ = |r: &Running, m: &Made, edit: &dyn Fn(&mut Value), code: &str, what: &str| {
 		let mut b = m.body.clone();
@@ -387,7 +391,7 @@ async fn a_plan_is_refused_for_what_it_breaks() {
 ///    the holder takes it home.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_whose_round_is_lost_is_void_and_the_coin_it_gave_up_stays_its_holders() {
-	let mut r = common::rounds::start().await;
+	let mut r = common::rounds::start_with_sweep().await;
 	let c0 = round_coin(&mut r, "L").await;
 	let e0 = expiry_of(&c0);
 	let m = make_plan(&r, &c0, "L", 1);
@@ -481,7 +485,7 @@ async fn a_step_whose_round_is_lost_is_void_and_the_coin_it_gave_up_stays_its_ho
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_planned_coin_given_up_by_its_holder_in_a_round_ends_its_plan_and_one_never_given_up_keeps_it() {
-	let mut r = common::rounds::start().await;
+	let mut r = common::rounds::start_with_sweep().await;
 	let (x, s, chain) = (r.x, xonly(&r.s), r.chain);
 	let (cq, cr) = (round_coin(&mut r, "Q").await, round_coin(&mut r, "R").await);
 	let (mq, mr) = (make_plan(&r, &cq, "Q", 1), make_plan(&r, &cr, "R", 1));
@@ -565,4 +569,13 @@ async fn a_planned_coin_given_up_by_its_holder_in_a_round_ends_its_plan_and_one_
 	println!("R's plan after its step's round {}: {} step 1 {}", round_r, st["state"], st["steps"][0]["state"]);
 	assert_eq!(st["steps"][0]["state"], "done");
 	assert_eq!(st["steps"][0]["gives_up"], json!(cr.held.id.to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_is_refused_where_batches_have_no_sweep() {
+	let mut r = common::rounds::start_without_sweep().await;
+	let c0 = round_coin(&mut r, "NS").await;
+	let nonces = [random32(), random32()];
+	let m = refused(quote(&r, &c0, &nonces), "out_of_bounds", "a plan's quote where batches have no sweep");
+	assert_eq!(m, server::plans::NO_SWEEP_PLANS);
 }

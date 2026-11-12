@@ -192,6 +192,8 @@ async fn a_restored_database_that_forgot_a_round_does_not_start() {
 	let (body, _) = participation_body(&[&a_held], &[w], &[], None, xonly(&r.s), r.chain);
 	assert_eq!(r.http.post("submit_participation", &body).ok()["state"], "pending");
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	// Held for its forfeits where batches have no sweep: handed over, and out.
+	common::rounds::send_held(&r, &built.tx.txid()).await;
 	r.produce().await;
 	r.bury().await;
 	r.synced().await;

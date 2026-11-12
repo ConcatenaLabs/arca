@@ -10,7 +10,7 @@ use elements::secp256k1_zkp::Keypair;
 use elements::{AssetId, Transaction, Txid};
 use serde_json::{json, Value};
 
-use arca_covenant::{CoinRecord, LeafRecord, MedianTime, ValidLeaf, WalletPolicy};
+use arca_covenant::{CoinRecord, LeafRecord, MedianTime, RelativeTime, ValidLeaf, WalletPolicy};
 use server::server::AssetSection;
 use server::store::RoundState;
 
@@ -23,23 +23,37 @@ pub const VALUE: u64 = 1_000_000;
 /// A server serving X and Y, its wallet paid two coins of X and one of Y,
 /// all final.
 pub async fn start() -> Running {
-	start_tuned(true).await
+	start_tuned(true, None).await
 }
 
 /// [`start`] with the operator's unroll at release off, for a test that
 /// follows the sweep of a live coin.
 pub async fn start_sweeping() -> Running {
-	start_tuned(false).await
+	start_tuned(false, Some(true)).await
 }
 
-async fn start_tuned(unroll_at_release: bool) -> Running {
+/// [`start`] with batches that have a sweep, whatever `ARCA_TEST_NO_SWEEP`
+/// says: for a test of a round broadcast before its forfeits are handed
+/// over, which a round of batches without a sweep never is (it is held until
+/// they are, and `no_sweep.rs` tests what happens when they never come).
+pub async fn start_with_sweep() -> Running {
+	start_tuned(true, Some(true)).await
+}
+
+/// [`start`] with batches without a sweep, whatever `ARCA_TEST_NO_SWEEP`
+/// says: for a test of what such an operator refuses.
+pub async fn start_without_sweep() -> Running {
+	start_tuned(true, Some(false)).await
+}
+
+/// `sweep`: batches with a sweep (`Some(true)`), without (`Some(false)`), or
+/// as `ARCA_TEST_NO_SWEEP` says (`None`).
+async fn start_tuned(unroll_at_release: bool, sweep: Option<bool>) -> Running {
 	let mut r = Running::start_with(|c, y| {
 		c.assets.push(AssetSection::new(y, MIN_LEAF));
 		c.watcher.unroll_at_release = unroll_at_release;
-		// A test that follows a sweep needs batches with one, whatever
-		// `ARCA_TEST_NO_SWEEP` says.
-		if !unroll_at_release {
-			c.batches.no_sweep = false;
+		if let Some(sweep) = sweep {
+			c.batches.no_sweep = !sweep;
 		}
 	}).await;
 	let (x, y) = (r.x, r.y);
@@ -149,7 +163,7 @@ pub async fn hand_over(r: &Running, id: &[u8; 32], m: &super::client::Made) -> V
 	for h in &m.coins {
 		let mut bases = vec![];
 		server::coins::bases(&r.server.store, &h.record, &mut bases).await.unwrap();
-		let old = h.record.resolve(&bases, &r.policy()).unwrap();
+		let old = h.record.resolve(&bases, &with_test_delays(r, r.policy())).unwrap();
 		let input = st["inputs"].as_array().unwrap().iter().find(|i| i["leaf_id"] == json!(h.id.to_string())).unwrap();
 		let margin: u64 = input["margin"].as_str().unwrap().parse().unwrap();
 		// A participation with no leaf of its own (a distribution's payer)
@@ -205,7 +219,21 @@ pub async fn advance_mtp(r: &Running, seconds: u32) {
 
 /// A wallet's acceptance policy at the chain's tip.
 pub fn accept_policy(r: &Running) -> WalletPolicy {
-	WalletPolicy::new(r.chain, xonly(&r.s), mtp(r))
+	with_test_delays(r, WalletPolicy::new(r.chain, xonly(&r.s), mtp(r)))
+}
+
+/// `policy` with the exit-delay bounds the test set for its operator, where
+/// it set them: a wallet reading them from `info` accepts the leaves they
+/// make.
+pub fn with_test_delays(r: &Running, policy: WalletPolicy) -> WalletPolicy {
+	match r.config.exit_delay_units {
+		Some((min, max)) => WalletPolicy {
+			min_exit_delay: RelativeTime::from_units(min).unwrap(),
+			max_exit_delay: RelativeTime::from_units(max).unwrap(),
+			..policy
+		},
+		None => policy,
+	}
 }
 
 /// The status of participation `id`.
