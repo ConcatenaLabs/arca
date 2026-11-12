@@ -18,7 +18,8 @@
 //!    a Bitcoin anchor rollback while the wallet waits: nothing is lost, the
 //!    wallet waits on, and pays once the round is final again.
 //! 5. An offboard past the instant limit's counted coins, from a payment
-//!    still arriving: settled first, then quoted and asked as any offboard.
+//!    still arriving, by amount or naming the arriving coin itself: settled
+//!    first, then quoted and asked as any offboard.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -477,6 +478,10 @@ async fn an_offboard_from_a_payment_arriving_settles_first_then_goes() {
 	assert_eq!(settle_first_named(&a, &["offboard", "--asset", &xs, "--amount", "500000", "--address", &address, "--quote"]),
 		vec![arriving.clone()]);
 	assert_eq!(settle_first_named(&a, &["offboard", "--asset", &xs, "--amount", "500000", "--address", &address]), vec![arriving.clone()]);
+	// Named, the arriving coin itself: settle first too, naming it.
+	assert_eq!(settle_first_named(&a, &["offboard", "--asset", &xs, "--coins", &arriving, "--address", &address, "--quote"]),
+		vec![arriving.clone()]);
+	assert_eq!(settle_first_named(&a, &["offboard", "--asset", &xs, "--coins", &arriving, "--address", &address]), vec![arriving.clone()]);
 	// More than the wallet holds at all is still a plain refusal.
 	let (ok, v) = a.run(&["offboard", "--asset", &xs, "--amount", "5000000", "--address", &address, "--quote"]);
 	println!("SF5: more than held: {}", v);

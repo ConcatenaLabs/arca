@@ -487,13 +487,25 @@ enum Cmd {
 	/// leaves, through the operator's next round: the coins given up, an
 	/// offboard output paying the address and change as a leaf. `sync` hands
 	/// over the forfeits once the round is final; the operator then pays the
-	/// address. The fee is in the asset paid.
+	/// address. The fee is in the asset paid. With `--coins`, the whole of
+	/// those coins less the fee, and no change; with `--value` and
+	/// `--expiry` (a quote only), what moving a coin of that value and exit
+	/// date whole would pay and cost, before the wallet holds it.
 	Offboard {
 		#[arg(long)]
 		asset: String,
 		/// In the asset's atoms.
-		#[arg(long)]
-		amount: u64,
+		#[arg(long, required_unless_present_any = ["coins", "value"], conflicts_with_all = ["coins", "value"])]
+		amount: Option<u64>,
+		/// The coins given up, whole, by their ids, comma-separated.
+		#[arg(long, value_delimiter = ',', conflicts_with = "value")]
+		coins: Option<Vec<String>>,
+		/// A coin's value, in the asset's atoms (with `--quote`).
+		#[arg(long, requires_all = ["expiry", "quote"])]
+		value: Option<u64>,
+		/// That coin's exit date, a median time (with `--value`).
+		#[arg(long, requires = "value")]
+		expiry: Option<u32>,
 		/// An unconfidential address of the chain the node follows.
 		#[arg(long, conflicts_with = "script", required_unless_present = "script")]
 		address: Option<String>,
@@ -1701,15 +1713,23 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			w.order_cancel_resting(&order, shown.as_ref())
 		},
 		Cmd::Orders => w.orders(),
-		Cmd::Offboard { asset: a, amount, address, script, fee_asset, max_fee_ppm, quote, shown } => {
+		Cmd::Offboard { asset: a, amount, coins, value, expiry, address, script, fee_asset, max_fee_ppm, quote, shown } => {
 			let a = asset(&a)?;
 			let script = w.offboard_script(address.as_deref(), script.as_deref())?;
+			if let (Some(value), Some(expiry)) = (value, expiry) {
+				return w.offboard_whole_quote(a, value, expiry, &script, max_fee_ppm);
+			}
+			let of = match (&coins, amount) {
+				(Some(ids), _) => bark::arca::offboard::OffboardOf::Coins(ids),
+				(None, Some(n)) => bark::arca::offboard::OffboardOf::Amount(n),
+				(None, None) => return Err(bark::arca::Error::Parse("name an amount or the coins".into())),
+			};
 			if quote {
-				return w.offboard_quote(a, amount, &script, max_fee_ppm);
+				return w.offboard_quote_of(a, of, &script, max_fee_ppm);
 			}
 			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
 				.map_err(|e| bark::arca::Error::Parse(format!("the offboard shown: {}", e)))).transpose()?;
-			w.offboard(a, amount, &script, fee_asset.as_deref().map(asset).transpose()?, max_fee_ppm, shown.as_ref())
+			w.offboard_of(a, of, &script, fee_asset.as_deref().map(asset).transpose()?, max_fee_ppm, shown.as_ref())
 		},
 		Cmd::Offboards => w.offboards(),
 		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
