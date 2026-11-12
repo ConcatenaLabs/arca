@@ -210,7 +210,8 @@ pub enum Wanted {
 	Leaf {
 		asset: AssetId, value: u64, template: Template, owner: XOnlyPublicKey, owner_nonce: [u8; 32], exit_delay: RelativeTime,
 		order: Option<arca_covenant::OrderLeafTerms>,
-		/// `landing-1`'s landing, for a leaf of a supervised asset.
+		/// The landing, for a leaf of a supervised asset: `landing-1`'s or
+		/// `landing-2`'s, as the template names.
 		landing: Option<arca_covenant::Landing>,
 		/// `channel-1`'s terms, for a channel leaf.
 		channel: Option<arca_covenant::Channel>,

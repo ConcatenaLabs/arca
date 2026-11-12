@@ -191,9 +191,28 @@ impl Out {
 		}
 		if let Some(l) = self.leaf.landing.and_then(|t| t.landing(self.asset, self.value).ok()) {
 			v["landing"] = arca_covenant::record_json::landing_json(&l);
+			// landing-2 is named by its template beside its landing.
+			if l.own_index {
+				v["template"] = json!(arca_covenant::LANDING_2);
+			}
 		}
 		if self.leaf.v2 && self.leaf.landing.is_none() {
 			v["template"] = json!("vtxo-2");
+		}
+		v
+	}
+
+	/// [`Self::json`] for another wallet to sign over (an offer's outputs,
+	/// an acceptance's): a `landing-2` leaf's landing also names its
+	/// template inside itself. A library that does not read `landing-2`
+	/// takes a landing with any key beyond `program` and `allowance` for
+	/// malformed, so it refuses the offer before it signs anything, where
+	/// it would otherwise read the leaf as `landing-1` and sign a transfer
+	/// that cannot complete. The server is sent [`Self::json`].
+	fn for_wallet(&self) -> Value {
+		let mut v = self.json();
+		if v["template"].as_str() == Some(arca_covenant::LANDING_2) {
+			v["landing"]["template"] = json!(arca_covenant::LANDING_2);
 		}
 		v
 	}
@@ -202,8 +221,20 @@ impl Out {
 		let asset = asset_of(&v["asset"], "an output's asset")?;
 		let value = amount(&v["value"], "an output's value")?;
 		let landing = match v.get("landing").filter(|g| !g.is_null()) {
-			Some(g) => Some(arca_covenant::record_json::landing_from_json(g).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))?
-				.terms(asset, value).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))?),
+			Some(g) => {
+				// A landing written for another wallet names `landing-2`
+				// inside itself too ([`Self::for_wallet`]).
+				let mut g = g.clone();
+				let inner = g.as_object_mut().and_then(|m| m.remove("template"));
+				let landing_2 = match inner {
+					None => v["template"].as_str() == Some(arca_covenant::LANDING_2),
+					Some(t) if t.as_str() == Some(arca_covenant::LANDING_2) && v["template"].as_str() == Some(arca_covenant::LANDING_2) => true,
+					Some(t) => return Err(Error::Parse(format!("an output's landing names template {} beside the leaf's {}", t, v["template"]))),
+				};
+				Some(arca_covenant::Landing { own_index: landing_2,
+					..arca_covenant::record_json::landing_from_json(&g).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))? }
+					.terms(asset, value).map_err(|e| Error::Parse(format!("an output's landing: {}", e)))?)
+			},
 			None => None,
 		};
 		Ok(Out {
@@ -394,13 +425,28 @@ impl Wallet {
 	}
 
 	/// [`Self::own_leaf`] of `value` of `asset`: for a supervised asset a
-	/// `landing-1` leaf at the wallet's landing key ([`Wallet::landing_rule`]).
+	/// landing leaf at the wallet's landing key ([`Wallet::landing_rule`]).
 	pub(crate) fn own_leaf_of(&self, purpose: &str, info: &Value, asset: AssetId, value: u64) -> Result<NewLeaf, Error> {
 		let mut leaf = self.own_leaf(purpose)?;
 		leaf.landing = self.landing_rule(info, asset)?.map(|l| l.terms(asset, value)).transpose()
 			.map_err(|e| Error::Refused(e.to_string()))?;
-		// A leaf of a supervised asset is landing-1, never vtxo-2.
+		// A leaf of a supervised asset is a landing leaf, never vtxo-2.
 		leaf.v2 &= leaf.landing.is_none();
+		Ok(leaf)
+	}
+
+	/// [`Self::own_leaf_of`] for a trade, whose other side parses the leaf
+	/// (an offer's, read by an unknown taker; an acceptance's, read by the
+	/// maker): `landing-2` only where that side reads it (`other_reads`) or
+	/// the operator makes `landing-2` only, so every client reads it; else
+	/// `landing-1`, which every build reads.
+	pub(crate) fn own_leaf_traded(&self, purpose: &str, info: &Value, asset: AssetId, value: u64, other_reads: bool)
+		-> Result<NewLeaf, Error>
+	{
+		let mut leaf = self.own_leaf_of(purpose, info, asset, value)?;
+		if !other_reads && !super::wallet::landing_2_only(info) {
+			leaf.landing = leaf.landing.map(|l| arca_covenant::LandingTerms { own_index: false, ..l });
+		}
 		Ok(leaf)
 	}
 
@@ -421,14 +467,14 @@ impl Wallet {
 	pub(crate) fn choose_coins(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64)
 		-> Result<(Vec<In>, u64, u64), Error>
 	{
-		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, false, Spend::Pay)
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, Reads::ALL, Spend::Pay)
 	}
 
 	/// [`Self::choose_coins`] for a spend of `spend`.
 	pub(crate) fn choose_coins_for(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64, spend: Spend)
 		-> Result<(Vec<In>, u64, u64), Error>
 	{
-		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, false, spend)
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, Reads::ALL, spend)
 	}
 
 	/// The live coins of `asset` the wallet can pay with ([`Self::spendable`]).
@@ -528,13 +574,21 @@ impl Wallet {
 	/// because their place bars them from `spend` ([`super::places`]),
 	/// because they are `deep` reassignments or more from a round or a
 	/// board (the operator's depth limit for a payment, which no coin at it
-	/// can make; less for a coin a trade would shape first), or, with
-	/// `old_reader`, because their record is of the format the other side
-	/// does not read. A round gives each of them back as a coin of the
-	/// wallet's own that pays anything at once. Coins an offline-refresh
-	/// plan keeps, a resting order's coin, a channel's and one past its
-	/// exit deadline are not among them: each has its own way.
-	pub(crate) fn round_first(&self, asset: AssetId, spend: Spend, deep: Option<usize>, old_reader: bool) -> Result<Vec<(String, u64, &'static str)>, Error> {
+	/// can make; less for a coin a trade would shape first), or because
+	/// their record is of the format with its owner's exit, which the other
+	/// side does not read (`reads`). A round gives each of them back as a
+	/// coin of the wallet's own that pays anything at once. Coins an
+	/// offline-refresh plan keeps, a resting order's coin, a channel's and
+	/// one past its exit deadline are not among them: each has its own way.
+	/// None is named for a side that reads no `landing-2` when `asset` is
+	/// supervised (`info`): a round makes the wallet's leaf of it a
+	/// `landing-2` leaf, so settling would never let it pay that side.
+	pub(crate) fn round_first(&self, info: &Value, asset: AssetId, spend: Spend, deep: Option<usize>, reads: Reads)
+		-> Result<Vec<(String, u64, &'static str)>, Error>
+	{
+		if !reads.landing_2 && self.landing_rule(info, asset)?.is_some() {
+			return Ok(vec![]);
+		}
 		let barred = self.unspendable(spend)?;
 		let planned = self.planned_coins()?;
 		let now = self.now()?.to_consensus_u32() as u64;
@@ -553,7 +607,7 @@ impl Wallet {
 				if spend == Spend::CrossChain { "arriving, or trade proceeds, which no leg paid to another party spends" } else { "arriving" }
 			} else if deep.is_some_and(|d| hops >= d) {
 				"at the operator's depth limit of reassignments since a round"
-			} else if old_reader && row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
+			} else if !reads.exit && row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
 				"of the record format the other side's older build does not read"
 			} else {
 				continue;
@@ -689,18 +743,46 @@ impl Wallet {
 	/// would.
 	#[allow(clippy::too_many_arguments)]
 	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize, fit: bool, old_reader: bool, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
+		other_inputs: usize, fit: bool, reads: Reads, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		// A spend that waits only for a round ([`Error::SettleFirst`]) takes
 		// back no refresh: the coins it names may be in one now, on their
 		// way to paying it.
-		match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, old_reader, spend) {
+		let r = match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, reads, spend) {
 			Err(e @ Error::Refused(_)) => {
 				if self.free_refreshes(asset)? {
-					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, old_reader, spend)
+					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, reads, spend)
 				} else {
 					Err(e)
 				}
+			},
+			r => r,
+		};
+		// Coins enough, but only of a format the other side does not read:
+		// say so, and say when coins it reads are held back only while they
+		// arrive (the wallet's instant limit), which is the cause then.
+		match r {
+			Err(Error::Refused(_)) if reads != Reads::ALL
+				&& self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, Reads::ALL, spend).is_ok() =>
+			{
+				let unread = match (reads.exit, reads.landing_2) {
+					(false, false) => "a checkpoint with its owner's exit or a landing-2 leaf",
+					(false, true) => "a checkpoint with its owner's exit",
+					_ => "a landing-2 leaf",
+				};
+				let barred = self.unspendable(spend)?;
+				let arriving: u64 = self.store.coins_in("live")?.into_iter()
+					.filter(|c| c.asset == asset.to_string() && barred.contains(&c.leaf_id) && reads.record(&c.record))
+					.map(|c| c.value).sum();
+				if arriving > 0 {
+					return Err(Error::Refused(format!("the wallet's coins of asset {} that the other side's wallet reads, {} in all, are \
+						still arriving, and a coin is given only once it has arrived (the wallet's instant limit): they pay {} once they \
+						arrive; its other coins hold in their past {}, which the other side, an older build, does not read; nothing was \
+						signed", asset, arriving, paid, unread)));
+				}
+				Err(Error::Refused(format!("the other side's wallet is an older build, which reads no coin whose past holds {}, and the \
+					wallet's coins of asset {} that would pay {} are such coins: they pay it once the other side updates{}; nothing was \
+					signed", unread, asset, paid, if reads.exit { "" } else { ", or once a round refreshes them (refresh-received)" })))
 			},
 			r => r,
 		}
@@ -713,18 +795,18 @@ impl Wallet {
 	/// change is none or at least the smallest leaf, and whose margins are
 	/// within the wallet's bound, pays. Only when none does are the coins
 	/// taken as a payment takes them.
-	/// With `old_reader`, the other side reads only the first coin record
-	/// format: no coin whose record is of the second (its past holds a
-	/// checkpoint with its owner's exit) is taken.
+	/// Only coins the other side can read are taken (`reads`): for a side
+	/// that reads only the first coin record format, no coin whose record is
+	/// of the second (its past holds a checkpoint with its owner's exit); for
+	/// one that does not read `landing-2`, no coin whose past holds a
+	/// `landing-2` leaf, which its new coin's record would carry.
 	#[allow(clippy::too_many_arguments)]
 	fn choose_live(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize, fit: bool, old_reader: bool, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
+		other_inputs: usize, fit: bool, reads: Reads, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		let margins = Margins::of(info, asset)?;
 		let mut candidates = self.spendable(asset, spend)?;
-		if old_reader {
-			candidates.retain(|c| c.row.record.first() != Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT));
-		}
+		candidates.retain(|c| reads.record(&c.row.record));
 		// A coin at the operator's depth limit pays nothing out of round:
 		// what it would make is one reassignment past the limit, and the
 		// operator refuses it (#689). A round refreshes it.
@@ -782,7 +864,7 @@ impl Wallet {
 		// (at the depth limit, arriving, proceeds for a cross-chain leg, of
 		// the format an older other side does not read): said so, naming
 		// them, so a program settles them and pays.
-		let held = self.round_first(asset, spend, depth_limit(info), old_reader)?;
+		let held = self.round_first(info, asset, spend, depth_limit(info), reads)?;
 		if let Some(e) = self.settle_first_of(asset, kept, paid.saturating_add(margin), held) {
 			return Err(e);
 		}
@@ -1027,17 +1109,23 @@ impl Wallet {
 		if value < min {
 			return Err(Error::Refused(format!("{} is below the operator's smallest leaf in asset {}, {}", value, asset, min)));
 		}
-		// A supervised asset is paid into a landing-1 leaf at the landing the
-		// request names, with the operator's allowance; the change lands at
-		// the wallet's own.
+		// A supervised asset is paid into a landing leaf at the landing the
+		// request names, with the operator's allowance: landing-2 where the
+		// operator makes it and the receiver reads it, landing-1 for an older
+		// receiver; the change lands at the wallet's own.
 		let rule = self.landing_rule(&info, asset)?;
+		let reads = Reads::of(&req);
 		let theirs = match &rule {
 			Some(own) => {
 				let program: [u8; 20] = unhex(req["landing"].as_str().unwrap_or(""))?.try_into().map_err(|_| Error::Refused(format!(
 					"asset {} is supervised, and the request names no landing: a coin of it lands only at its receiver's own key, which a \
 					request from an older wallet does not name; ask the receiver for a new request", asset)))?;
-				Some(arca_covenant::Landing { program, allowance: own.allowance, own_index: false }.terms(asset, value)
-					.map_err(|e| Error::Refused(e.to_string()))?)
+				if !reads.landing_2 && super::wallet::landing_2_only(&info) {
+					return Err(Error::Refused(format!("asset {} is supervised, the operator makes landing-2 leaves only, and the receiver's \
+						wallet is an older build that reads none: it can be paid once it updates; nothing was signed", asset)));
+				}
+				Some(arca_covenant::Landing { program, allowance: own.allowance, own_index: own.own_index && reads.landing_2 }
+					.terms(asset, value).map_err(|e| Error::Refused(e.to_string()))?)
 			},
 			None => None,
 		};
@@ -1053,7 +1141,7 @@ impl Wallet {
 					.map_err(|e| Error::Parse(e.to_string()))?,
 				htlc: None,
 				// The leaf the request asks for: vtxo-2 when it names it, and
-				// never for a supervised asset, whose leaves are landing-1.
+				// never for a supervised asset, whose leaves are landing leaves.
 				v2: theirs.is_none() && req["template"].as_str() == Some("vtxo-2"),
 				landing: theirs,
 			},
@@ -1064,8 +1152,8 @@ impl Wallet {
 		};
 		let to_out = to.explicit(self);
 		// A receiver that names no format it reads is an older build.
-		let old_reader = !Self::reads_exit_format(&req);
-		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, false, old_reader, Spend::Pay)?;
+		let (inputs, margin, change) = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, false, reads,
+			Spend::Pay)?;
 		Ok(SendPlan { asset, value, to, to_out, inputs, margin, change, rule })
 	}
 
@@ -1447,7 +1535,7 @@ impl Wallet {
 					another", hex(&t.program))));
 			}
 		} else if self.chain.supervised_assets()?.contains(&a.valid.asset) {
-			return Err(Error::Refused(format!("the coin is of asset {}, which is supervised on the chain, and it is no landing-1 leaf: its \
+			return Err(Error::Refused(format!("the coin is of asset {}, which is supervised on the chain, and it is no landing leaf: its \
 				exit would pay where a freeze of the asset does not follow", a.valid.asset)));
 		}
 		// D57: a coin a day or less from its exit date, or past it, goes on
@@ -2223,7 +2311,9 @@ impl Wallet {
 			return Err(Error::Refused("each side of a swap is at least the operator's smallest leaf in its asset".into()));
 		}
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let want_leaf = self.own_leaf_of("swap", &info, want_asset, want)?;
+		// The taker is not known yet: a leaf it parses is landing-2 only once
+		// every client reads it.
+		let want_leaf = self.own_leaf_traded("swap", &info, want_asset, want, false)?;
 		let wanted = Out { asset: want_asset, value: want, leaf: want_leaf, mailbox, until: None };
 		// The taker's leaf of `give`, and its change, are not known yet: size
 		// with probes of the same shape.
@@ -2237,14 +2327,15 @@ impl Wallet {
 		// no coin record of the newer format and refuses such an offer when
 		// it reads it, before signing anything: it never holds a coin it
 		// cannot read.
-		let (inputs, margin, change) = self.choose_for_trade(&info, give_asset, give, &others, true, min_give, 1, false)?;
+		let (inputs, margin, change) = self.choose_for_trade(&info, give_asset, give, &others, true, min_give, 1, Reads::ALL)?;
 		// The wallet's own coins are what the switch protects first.
 		if let Some(i) = inputs.iter().find(|i| !i.coin.exit_allowed()) {
 			self.exit_required(&format!("coin {} it would give cannot have it (its kind of leaf takes no checkpoint exit)", i.coin.id))?;
 		}
 		let mut outs = vec![wanted];
 		if change > 0 {
-			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_of("change", &info, give_asset, change)?, mailbox, until: None });
+			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_traded("change", &info, give_asset, change, false)?, mailbox,
+				until: None });
 		}
 		let mut offer = json!({
 			"kind": OFFER_KIND.name, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
@@ -2253,7 +2344,7 @@ impl Wallet {
 			"margin": margin.to_string(),
 			"inputs": inputs.iter().map(|i| json!({"leaf_id": i.coin.id.to_string(), "record": hex(&i.row.record),
 				"checkpoint_value": i.checkpoint_value.to_string()})).collect::<Vec<_>>(),
-			"outputs": outs.iter().map(Out::json).collect::<Vec<_>>(),
+			"outputs": outs.iter().map(Out::for_wallet).collect::<Vec<_>>(),
 		});
 		// The maker reads the record format of checkpoints with their
 		// owners' exit, and the operator co-signs them: a taker that reads it
@@ -2313,9 +2404,9 @@ impl Wallet {
 	/// lineage, not the trade's.
 	#[allow(clippy::too_many_arguments)]
 	fn choose_for_trade(&mut self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize, old_reader: bool) -> Result<(Vec<In>, u64, u64), Error>
+		other_inputs: usize, reads: Reads) -> Result<(Vec<In>, u64, u64), Error>
 	{
-		let mut got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, old_reader, Spend::Trade)?;
+		let mut got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, reads, Spend::Trade)?;
 		if self.own_instant_limit()?.is_none() || got.2 == 0 {
 			return Ok(got);
 		}
@@ -2328,8 +2419,8 @@ impl Wallet {
 			let all: Vec<&ValidCoin> = std::iter::repeat(&template).take(1 + other_inputs).collect();
 			let r = if pays_margin { self.reassignment_margin(&all, others, &margins)? } else { 0 };
 			let need = paid.checked_add(m).and_then(|v| v.checked_add(r)).ok_or_else(|| Error::Refused("a trade above 2^64 atoms".into()))?;
-			self.shape_coin(info, asset, need, old_reader)?;
-			got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, old_reader, Spend::Trade)?;
+			self.shape_coin(info, asset, need, reads)?;
+			got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, reads, Spend::Trade)?;
 			if got.2 == 0 {
 				return Ok(got);
 			}
@@ -2346,9 +2437,9 @@ impl Wallet {
 	/// limit shape nothing a trade could give, so the shape waits for a
 	/// round that refreshes them ([`Error::SettleFirst`], naming them),
 	/// before anything moves rather than paid and then refused.
-	fn shape_inputs(&self, info: &Value, asset: AssetId, need: u64, probe: &ExplicitOutput, old_reader: bool) -> Result<(Vec<In>, u64), Error> {
+	fn shape_inputs(&self, info: &Value, asset: AssetId, need: u64, probe: &ExplicitOutput, reads: Reads) -> Result<(Vec<In>, u64), Error> {
 		let min = Self::min_leaf(info, asset)?;
-		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(probe), true, min, 0, false, old_reader, Spend::Trade)?;
+		let (inputs, _margin, change) = self.choose(info, asset, need, std::slice::from_ref(probe), true, min, 0, false, reads, Spend::Trade)?;
 		if let Some(limit) = depth_limit(info) {
 			let deep: Vec<(String, u64)> = inputs.iter().filter(|i| i.coin.hops + 3 > limit).map(|i| (i.row.leaf_id.clone(), i.coin.value)).collect();
 			if !deep.is_empty() {
@@ -2369,7 +2460,7 @@ impl Wallet {
 	/// for a quote, which moves nothing.
 	#[allow(clippy::too_many_arguments)]
 	fn shape_check(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, other_inputs: usize,
-		old_reader: bool, got: &(Vec<In>, u64, u64)) -> Result<(), Error>
+		reads: Reads, got: &(Vec<In>, u64, u64)) -> Result<(), Error>
 	{
 		if self.own_instant_limit()?.is_none() || got.2 == 0 {
 			return Ok(());
@@ -2381,16 +2472,18 @@ impl Wallet {
 		let r = if pays_margin { self.reassignment_margin(&all, others, &margins)? } else { 0 };
 		let need = paid.checked_add(m).and_then(|v| v.checked_add(r)).ok_or_else(|| Error::Refused("a trade above 2^64 atoms".into()))?;
 		let probe = ExplicitOutput::new(asset, need, leaf_probe());
-		self.shape_inputs(info, asset, need, &probe, old_reader).map(|_| ())
+		self.shape_inputs(info, asset, need, &probe, reads).map(|_| ())
 	}
 
 	/// Pays the wallet itself, out of round, a coin of exactly `need` of
 	/// `asset`, and the rest as change, from coins a trade may give.
-	fn shape_coin(&mut self, info: &Value, asset: AssetId, need: u64, old_reader: bool) -> Result<(), Error> {
+	fn shape_coin(&mut self, info: &Value, asset: AssetId, need: u64, reads: Reads) -> Result<(), Error> {
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let leaf = self.own_leaf_of("shaped", info, asset, need)?;
+		// The coin is given in the trade, so its leaf is one the other side
+		// reads.
+		let leaf = self.own_leaf_traded("shaped", info, asset, need, reads.landing_2)?;
 		let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
-		let (inputs, change) = self.shape_inputs(info, asset, need, &probe, old_reader)?;
+		let (inputs, change) = self.shape_inputs(info, asset, need, &probe, reads)?;
 		let mut outs = vec![Out { asset, value: need, leaf, mailbox, until: None }];
 		if change > 0 {
 			outs.push(Out { asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });
@@ -2609,6 +2702,7 @@ impl Wallet {
 		let _quote = self.quoting();
 		let o = self.swap_offer_checked(offer_text)?;
 		let info = self.server_info()?;
+		self.swap_landing_guard(&info, &o)?;
 		let min_want = Self::min_leaf(&info, o.want_asset)?;
 		// The leaf the wallet would get is not made here: a probe of its size
 		// prices the same margins.
@@ -2616,11 +2710,11 @@ impl Wallet {
 		others.push(ExplicitOutput::new(o.give_asset, o.give, leaf_probe()));
 		others.push(ExplicitOutput::new(o.want_asset, 1, leaf_probe()));
 		self.swap_exit_required(&o, &info)?;
-		let old_reader = !Self::reads_exit_format(&o.offer);
-		let got = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true, old_reader, Spend::Trade)?;
+		let reads = Reads::of(&o.offer);
+		let got = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true, reads, Spend::Trade)?;
 		// A trade that would shape a coin first answers here, as it would at
 		// the acceptance, when the coin cannot be shaped before a round.
-		self.shape_check(&info, o.want_asset, o.want, &others, false, 0, old_reader, &got)?;
+		self.shape_check(&info, o.want_asset, o.want, &others, false, 0, reads, &got)?;
 		let (mine, _, change) = got;
 		Self::swap_depth(&info, &o, &mine)?;
 		let outputs = o.maker_outs.len() + 1 + usize::from(change > 0);
@@ -2630,6 +2724,34 @@ impl Wallet {
 		}
 		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
 		self.quoted(Ok(Self::swap_terms(&o, &mine, change, dates)))
+	}
+
+	/// Refuses, before anything is signed, an offer that trades a
+	/// supervised asset and cannot complete while the operator makes
+	/// `landing-2` leaves only (`info.landing_2_only`): the maker's wallet is
+	/// an older build, which writes its own leaves as `landing-1` and would
+	/// read this wallet's `landing-2` leaves as `landing-1`, or the offer
+	/// carries a `landing-1` leaf (made before the switch). The operator
+	/// co-signs neither, and the maker could not take back what it signed.
+	fn swap_landing_guard(&self, info: &Value, o: &OfferChecked) -> Result<(), Error> {
+		if !super::wallet::landing_2_only(info) {
+			return Ok(());
+		}
+		if let Some(out) = o.maker_outs.iter().find(|m| m.leaf.landing.is_some_and(|l| !l.own_index)) {
+			return Err(Error::Refused(format!("the offer pays the maker a landing-1 leaf of asset {}, and this operator makes landing-2 \
+				leaves only (info.landing_2_only): the swap could never complete; ask the maker for a new offer; nothing was signed",
+				out.asset)));
+		}
+		if !Reads::of(&o.offer).landing_2 {
+			for a in [o.give_asset, o.want_asset] {
+				if self.landing_rule(info, a)?.is_some() {
+					return Err(Error::Refused(format!("asset {} is supervised, this operator makes landing-2 leaves only \
+						(info.landing_2_only), and the maker's wallet is an older build that reads none: the swap could never complete; \
+						it can trade once the maker updates; nothing was signed", a)));
+				}
+			}
+		}
+		Ok(())
 	}
 
 	/// Refuses, before anything is signed, a swap the wallet would take
@@ -2684,19 +2806,23 @@ impl Wallet {
 		// The coin the swap pays this wallet comes out of round.
 		self.bond_gate(Some((give_asset, give)))?;
 		let info = self.server_info()?;
+		self.swap_landing_guard(&info, &o)?;
 		let min_want = Self::min_leaf(&info, want_asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let mut outs = o.maker_outs.clone();
-		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf_of("swap", &info, give_asset, give)?, mailbox, until: None });
+		// The maker parses the leaves this acceptance makes: landing-2 only
+		// where it reads it.
+		let maker_reads = Reads::of(&o.offer);
+		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf_traded("swap", &info, give_asset, give, maker_reads.landing_2)?,
+			mailbox, until: None });
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
 		self.swap_exit_required(&o, &info)?;
-		let (mine, _, change) = self.choose_for_trade(&info, want_asset, want, &others, false, min_want, 0,
-			!Self::reads_exit_format(&o.offer))?;
+		let (mine, _, change) = self.choose_for_trade(&info, want_asset, want, &others, false, min_want, 0, maker_reads)?;
 		Self::swap_depth(&info, &o, &mine)?;
 		if change > 0 {
-			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf_of("change", &info, want_asset, change)?, mailbox,
-				until: None });
+			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf_traded("change", &info, want_asset, change,
+				maker_reads.landing_2)?, mailbox, until: None });
 		}
 		if outs.len() > arca_covenant::leaf::MAX_OUTPUTS as usize {
 			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outs.len(),
@@ -2744,7 +2870,7 @@ impl Wallet {
 			"kind": ACCEPT_KIND.name, "swap": id,
 			"inputs": inputs.iter().map(|i| json!({"leaf_id": i.coin.id.to_string(), "record": hex(&i.row.record),
 				"checkpoint_value": i.checkpoint_value.to_string()})).collect::<Vec<_>>(),
-			"outputs": outs.iter().map(Out::json).collect::<Vec<_>>(),
+			"outputs": outs.iter().map(Out::for_wallet).collect::<Vec<_>>(),
 			"signatures": sigs,
 		});
 		if checkpoint_exit {
@@ -2938,7 +3064,7 @@ impl Wallet {
 	pub(crate) fn respend_to_self(&mut self, rows: Vec<CoinRow>) -> Result<Value, Error> {
 		let mut leaf = self.own_leaf("cancel")?;
 		let (asset, inputs, value) = self.respend_plan(rows, &leaf)?;
-		// A coin of a supervised asset goes back into a landing-1 leaf at the
+		// A coin of a supervised asset goes back into a landing leaf at the
 		// wallet's own landing; the plan sized it with a leaf of the same shape.
 		let info = self.server_info()?;
 		leaf.landing = self.landing_rule(&info, asset)?.map(|l| l.terms(asset, value)).transpose()
@@ -2983,6 +3109,40 @@ impl Wallet {
 /// The record format a checkpoint with its owner's exit makes, as
 /// [`arca_covenant::RECORD_FORMATS`] names it.
 pub(crate) const EXIT_RECORD_FORMAT: &str = "coin-2";
+
+/// What the other side of a payment or a trade reads, as its receive
+/// request, offer or acceptance names it (`reads`): only coins it reads are
+/// given to it, and a leaf it parses is of a template it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reads {
+	/// The coin record with checkpoints that carry their owners' exit
+	/// (`coin-2`).
+	pub exit: bool,
+	/// The `landing-2` leaf ([`arca_covenant::LANDING_2`]).
+	pub landing_2: bool,
+}
+
+impl Reads {
+	/// A side that reads every format: the wallet itself, or a side not
+	/// known yet, whose library refuses before signing a coin it cannot
+	/// read.
+	pub(crate) const ALL: Reads = Reads { exit: true, landing_2: true };
+
+	/// What the writer of `v` reads; a side that names nothing is an older
+	/// build that reads neither.
+	pub(crate) fn of(v: &Value) -> Reads {
+		Reads { exit: Wallet::reads_exit_format(v), landing_2: super::wallet::reads_landing_2(v) }
+	}
+
+	/// Whether a side that reads this can read a new coin whose past is the
+	/// coin record `record`: none of the second format (a checkpoint with
+	/// its owner's exit) unless it reads that, and none whose past holds a
+	/// `landing-2` leaf unless it reads that.
+	pub(crate) fn record(&self, record: &[u8]) -> bool {
+		(self.exit || record.first() != Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT))
+			&& (self.landing_2 || !CoinRecord::from_bytes(record).is_ok_and(|r| r.has_landing_2()))
+	}
+}
 
 /// Whether a coin refused with `e` may be accepted later: what it rests on
 /// is not on the chain now, or the node, the server or the store did not
@@ -3090,6 +3250,36 @@ mod tests {
 		assert_eq!(fit_order(&coins, 25_000, None, now), vec![6, 3, 2, 1, 8, 0], "no limit published: every change has room");
 		assert!(fit_order(&coins, 3_000_000_000, Some(5), now).is_empty(), "no coin holds it alone");
 		assert!(fit_order(&[], 1, Some(5), now).is_empty());
+	}
+
+	/// An offer's or an acceptance's `landing-2` leaf, as written for another
+	/// wallet, is malformed to a library that reads no `landing-2` (the
+	/// covenant's `landing_from_json` is the reader every older build has),
+	/// so it refuses the offer before it signs; this library reads it back
+	/// as `landing-2`. The server's form, and a `landing-1` leaf's, are
+	/// unchanged, and a landing that names another template is refused.
+	#[test]
+	fn a_landing_2_leaf_written_for_another_wallet_is_malformed_to_an_older_library() {
+		let key = xonly("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap();
+		let asset = AssetId::from_str(&"07".repeat(32)).unwrap();
+		let out = |own_index: bool| Out { asset, value: 100_000, mailbox: key, until: None, leaf: NewLeaf { enclave: None, owner: key,
+			owner_nonce: [1; 32], creator_nonce: [2; 32], exit_delay: RelativeTime::from_units(1).unwrap(), htlc: None, v2: false,
+			landing: Some(arca_covenant::Landing { program: [3; 20], allowance: 1_000, own_index }.terms(asset, 100_000).unwrap()) } };
+		let older = |v: &Value| arca_covenant::record_json::landing_from_json(&v["landing"]);
+		let two = out(true);
+		let w = two.for_wallet();
+		assert_eq!(w["template"], json!(arca_covenant::LANDING_2));
+		assert!(older(&w).is_err(), "an older library refuses it: {}", w);
+		assert!(older(&two.json()).is_ok(), "the server's form is unchanged");
+		assert_eq!(Out::from_json(&w).unwrap().leaf.landing, two.leaf.landing, "read back as landing-2");
+		assert_eq!(Out::from_json(&two.json()).unwrap().leaf.landing, two.leaf.landing, "the template beside the landing alone");
+		let one = out(false);
+		assert_eq!(one.for_wallet(), one.json(), "a landing-1 leaf is written as ever");
+		assert!(older(&one.for_wallet()).is_ok());
+		assert_eq!(Out::from_json(&one.for_wallet()).unwrap().leaf.landing, one.leaf.landing);
+		let mut bad = w.clone();
+		bad["template"] = Value::Null;
+		assert!(Out::from_json(&bad).is_err(), "a landing naming landing-2 on a leaf that does not");
 	}
 
 	/// The signer's refusal of a spend for a forfeit it holds names the salt

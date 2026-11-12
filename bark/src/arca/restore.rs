@@ -1055,14 +1055,16 @@ impl Wallet {
 				Some(o) => Some(arca_covenant::record_json::order_terms_from_json(o, asset).map_err(|e| e.to_string())?),
 				None => None,
 			};
-			// A landing-1 leaf's landing, likewise covered by the id: the
-			// wallet's own landing key, or the participation is not its own.
+			// A landing leaf's landing, likewise covered by the id, as the
+			// template names it: the wallet's own landing key, or the
+			// participation is not its own.
 			let landing = match l.get("landing").filter(|g| !g.is_null()) {
-				Some(g) => Some(arca_covenant::record_json::landing_from_json(g).map_err(|e| e.to_string())?),
+				Some(g) => Some(arca_covenant::Landing { own_index: template == Template::Landing2,
+					..arca_covenant::record_json::landing_from_json(g).map_err(|e| e.to_string())? }),
 				None => None,
 			};
 			if landing.is_some_and(|g| self.keys.landing_program().is_ok_and(|p| p != g.program)) {
-				return Err(format!("participation {} wants a landing-1 leaf landing at another key than this wallet's: the wallet takes the \
+				return Err(format!("participation {} wants a landing leaf landing at another key than this wallet's: the wallet takes the \
 					coin as not given up to it", pid));
 			}
 			// A channel leaf's terms, likewise covered by the id.
@@ -1081,6 +1083,9 @@ impl Wallet {
 			}
 			if let Some(g) = &landing {
 				w["landing"] = arca_covenant::record_json::landing_json(g);
+				if g.own_index {
+					w["template"] = json!(arca_covenant::LANDING_2);
+				}
 			}
 			wanted_json.push(w);
 		}

@@ -534,8 +534,9 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 			htlc: super::lightning::htlc_terms_of(&l["htlc"])?,
 			order,
 			landing: match l.get("landing").filter(|g| !g.is_null()) {
-				Some(g) => Some(arca_covenant::record_json::landing_from_json(g)
-					.map_err(|e| Error::Parse(format!("a published leaf's landing: {}", e)))?),
+				Some(g) => Some(Landing { own_index: l["template"].as_str() == Some(arca_covenant::LANDING_2),
+					..arca_covenant::record_json::landing_from_json(g)
+						.map_err(|e| Error::Parse(format!("a published leaf's landing: {}", e)))? }),
 				None => None,
 			},
 			// A channel leaf's terms, another holder's or the wallet's own:
@@ -557,9 +558,9 @@ fn published_parts(t: &Value) -> Result<(TreeParams, Vec<LeafSpec>), Error> {
 /// knows can be claimed out of the tree by the operator; an order leaf is
 /// filled under the operator's signature alone. So a leaf is `vtxo-1` unless
 /// the wallet asked for something else: `order-3` (or `order-2`, as the terms name) on the terms of a resting
-/// order it asked for (`w["order"]`), `landing-1` for a supervised asset at
+/// order it asked for (`w["order"]`), a landing leaf for a supervised asset at
 /// the landing it asked for (`w["landing"]`, which the caller compares with
-/// the leaf's), or `htlc-1` in the one participation that names one, a
+/// the leaf's; `landing-2` where `w["template"]` names it, else `landing-1`), or `htlc-1` in the one participation that names one, a
 /// payment received over Lightning, locked to that payment's hash
 /// (`receive`) in the receiving direction.
 pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option<&[u8; 32]>) -> Result<(), String> {
@@ -590,6 +591,7 @@ pub(crate) fn leaf_as_asked<R: LeafTerms>(w: &Value, record: &R, receive: Option
 		// before it, restored or taken up as it is.
 		(None, true, ..) => w.get("order").and_then(|o| arca_covenant::record_json::order_terms_from_json(o, record.asset()).ok())
 			.map_or(Template::Order3, |o| o.template()),
+		(None, false, true, _) if w["template"].as_str() == Some(arca_covenant::LANDING_2) => Template::Landing2,
 		(None, false, true, _) => Template::Landing1,
 		(None, false, false, Some(_)) => Template::Channel1,
 		(None, false, false, None) if asked_v2 => Template::Vtxo2,
@@ -938,8 +940,9 @@ impl Wallet {
 		if value < min {
 			return Err(Error::Refused(format!("the new leaf in asset {} would hold {}, below the operator's smallest leaf {}", asset, value, min)));
 		}
-		// A leaf of a supervised asset is landing-1, at the wallet's landing
-		// key; the operator's statement is checked against the wallet's node.
+		// A leaf of a supervised asset is a landing leaf at the wallet's
+		// landing key, landing-2 where the operator makes it; the operator's
+		// statement is checked against the wallet's node.
 		let landing = self.landing_rule(info, asset)?;
 		let nonce = super::random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
@@ -952,8 +955,8 @@ impl Wallet {
 		};
 		let template = if channel.is_some() {
 			Template::Channel1
-		} else if landing.is_some() {
-			Template::Landing1
+		} else if let Some(l) = &landing {
+			l.template()
 		} else if self.asks_vtxo2() {
 			Template::Vtxo2
 		} else {
@@ -1009,8 +1012,8 @@ impl Wallet {
 			if let Some(c) = &channel {
 				entry["channel"] = arca_covenant::record_json::channel_json(c);
 			}
-			if template == Template::Vtxo2 {
-				entry["template"] = json!("vtxo-2");
+			if matches!(template, Template::Vtxo2 | Template::Landing2) {
+				entry["template"] = json!(template.to_string());
 			}
 			let mut nonces = vec![entry];
 			if let Some(k) = kept {
@@ -1872,15 +1875,18 @@ impl Wallet {
 			check_profile(&info, &record).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
 			// The supervised profile: a leaf of a supervised asset lands at the
 			// wallet's own key, with the published allowance, and its round
-			// keeps every output explicit; no other asset's leaf is landing-1.
+			// keeps every output explicit; no other asset's leaf is a landing
+			// leaf.
 			// A claim's leaf names no landing of the wallet's.
 			leaf_as_asked(w, &record, receive.as_ref()).map_err(|why| Error::Refused(format!("the new leaf in round {}: {}", round_txid, why)))?;
 			// The supervised profile: a leaf of a supervised asset is asked
-			// for landing-1 at the wallet's own key, and lands where it was
-			// asked; its round keeps every output explicit. No other asset's
-			// leaf is landing-1, and a claim's leaf names no landing.
+			// for as a landing leaf at the wallet's own key, and lands where it
+			// was asked, at its own index where it asked for landing-2; its
+			// round keeps every output explicit. No other asset's leaf is a
+			// landing leaf, and a claim's leaf names no landing.
 			let asked = match w.get("landing").filter(|l| !l.is_null()) {
-				Some(l) => Some(arca_covenant::record_json::landing_from_json(l).map_err(|e| Error::Store(format!("a wanted landing: {}", e)))?),
+				Some(l) => Some(Landing { own_index: w["template"].as_str() == Some(arca_covenant::LANDING_2),
+					..arca_covenant::record_json::landing_from_json(l).map_err(|e| Error::Store(format!("a wanted landing: {}", e)))? }),
 				None => None,
 			};
 			let supervised = self.chain.supervised_assets()?.contains(&record.asset());
