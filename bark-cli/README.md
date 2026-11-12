@@ -385,8 +385,12 @@ and a board whose registration never reached the server, are not recovered.
   round of the wallet's own whose new coins it has not taken yet, or held
   under a forfeit for a round that went unbroadcast; given up by another
   device of the wallet in a round not final yet, which the operator refused
-  a spend of as spent already: such a coin is held out of every spend, and
-  every `sync` catches up until it is settled), or a part sale
+  a spend of as spent already: such a coin is held out of every spend, shown
+  apart in `balance` as `spent_elsewhere` and left out of what `coin-places`
+  counts as spendable, and every `sync` catches up while it is held; the
+  hold ends once the operator serves the coin live again, once a catch-up
+  settles it, and at the latest when the wait stated for it has passed, and
+  never bars its exit), or a part sale
   would shape a coin from one within three reassignments of that limit, the
   refusal is of kind `settle_first` and names those coins (`coins`), at the
   quote as at the spend, with how long they wait as `settle-first` reads it
