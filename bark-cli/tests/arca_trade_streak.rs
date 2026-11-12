@@ -6,6 +6,9 @@
 //! settings: depth limit 5, finality at anchor depth 0 with certification
 //! required, batches held for their forfeits (no sweep), no checkpoint exit.
 //!
+//! `ARCA_TEST_HARNESS_DEFAULTS=1` runs the same cases at the harness's
+//! defaults instead.
+//!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
 
@@ -154,7 +157,16 @@ fn trade(m: &Arca, a: &Arca, x: AssetId, y: AssetId, give: u64, get: u64) -> Res
 /// depth 0 with certification required, batches held for their forfeits,
 /// no checkpoint exit, a block every 60 s. The depth limit (5) is the
 /// server's own.
+///
+/// With `ARCA_TEST_HARNESS_DEFAULTS` set, the harness's own defaults instead
+/// (anchor depth 2, batches swept, the checkpoint exit offered), the round
+/// loop and the block clock as ever.
 fn testnet(cfg: &mut server::server::Config) {
+	if std::env::var_os("ARCA_TEST_HARNESS_DEFAULTS").is_some() {
+		cfg.watcher.enabled = false;
+		cfg.fills.block_seconds = 60;
+		return;
+	}
 	cfg.finality.anchor_depth = 0;
 	cfg.finality.certification = "required".into();
 	cfg.finality.poll_interval_ms = 1000;
