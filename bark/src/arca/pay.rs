@@ -73,11 +73,30 @@ impl Margins {
 	/// The margin the wallet leaves on a transaction of `vsize` vbytes: the
 	/// operator's least times [`MARGIN_HEADROOM`], within its most.
 	pub fn margin(&self, vsize: usize) -> u64 {
-		let least = match self.floor {
+		self.least(vsize).saturating_mul(self.headroom())
+	}
+
+	/// The least margin the operator takes on a transaction of `vsize`
+	/// vbytes at its floor now.
+	pub fn least(&self, vsize: usize) -> u64 {
+		match self.floor {
 			Some(f) => margin_for(vsize, f, self.multiple).max(1),
 			None => 1,
-		};
-		least.saturating_mul(MARGIN_HEADROOM.min(self.max_multiple))
+		}
+	}
+
+	/// The wallet's headroom over the operator's least, within its most.
+	fn headroom(&self) -> u64 {
+		MARGIN_HEADROOM.min(self.max_multiple).max(1)
+	}
+
+	/// The most a taker adds to a swap's margin in the asset the maker gives
+	/// ([`Wallet::swap_top_up`]): the wallet's headroom times what the
+	/// taker's coins beyond its first add to the operator's least, for a
+	/// reassignment of `vsize_all` vbytes with every coin and `vsize_one`
+	/// with the maker's coins and one of the taker's.
+	pub fn top_up_most(&self, vsize_all: usize, vsize_one: usize) -> u64 {
+		self.least(vsize_all).saturating_sub(self.least(vsize_one)).saturating_mul(self.headroom())
 	}
 }
 
@@ -677,18 +696,31 @@ impl Wallet {
 	}
 
 	fn reassignment_margin(&self, inputs: &[&ValidCoin], outputs: &[ExplicitOutput], m: &Margins) -> Result<u64, Error> {
-		let vis: Vec<ValidInput> = inputs.iter().map(|c| ValidInput {
-			coin: (*c).clone(), checkpoint: c.checkpoint(), checkpoint_value: c.value,
-			checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
-		}).collect();
-		// Sized with outputs of one atom each of the inputs' asset, so they
-		// fit any inputs: an explicit output's size does not depend on either.
+		Ok(m.margin(Self::reassignment_vsize(inputs, outputs)?))
+	}
+
+	/// The vbytes of a reassignment of `inputs` into `outputs`, sized as the
+	/// operator sizes it: every input and output in the first input's asset
+	/// (an explicit output's size does not depend on its asset or value).
+	fn reassignment_vsize(inputs: &[&ValidCoin], outputs: &[ExplicitOutput]) -> Result<usize, Error> {
+		// Every input, and every output of one atom, in the first input's
+		// asset: a swap's inputs are in two assets, whose margins one
+		// transaction cannot both leave, and an explicit input's or output's
+		// size depends on neither its asset nor its value.
 		let asset = inputs.first().map(|c| c.asset).ok_or_else(|| Error::Refused("a transfer with no input".into()))?;
+		let vis: Vec<ValidInput> = inputs.iter().map(|c| {
+			let mut coin = (*c).clone();
+			coin.asset = asset;
+			ValidInput {
+				checkpoint: coin.checkpoint(), checkpoint_value: coin.value, coin,
+				checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
+			}
+		}).collect();
 		let small: Vec<ExplicitOutput> = outputs.iter().map(|o| ExplicitOutput::new(asset, 1, o.script_pubkey.clone())).collect();
 		let cps: Vec<OutPoint> = (0..vis.len()).map(|i| OutPoint::new(elements::Txid::all_zeros(), i as u32)).collect();
 		let tx = arca_covenant::transfer::reassignment_tx(&vis, &small, &cps, &FeeSource::Reserve)
 			.map_err(|e| Error::Refused(e.to_string()))?.tx;
-		Ok(m.margin(tx.vsize()))
+		Ok(tx.vsize())
 	}
 
 	/// Refuses margins above the wallet's own bound: together, at most
@@ -2813,8 +2845,9 @@ impl Wallet {
 			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outputs,
 				arca_covenant::leaf::MAX_OUTPUTS)));
 		}
+		let top_up = self.swap_top_up(&info, &o, &mine, &others)?;
 		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
-		self.quoted(Ok(Self::swap_terms(&o, &mine, change, dates)))
+		self.quoted(Ok(Self::swap_terms(&o, &mine, top_up, change, dates)))
 	}
 
 	/// Refuses, before anything is signed, an offer that trades a
@@ -2873,13 +2906,77 @@ impl Wallet {
 		}
 	}
 
+	/// What the taker adds to the swap's margin, out of what it gets, in the
+	/// asset the maker gives, when it pays from coins `mine` into `outputs`
+	/// (web wallet #693). A reassignment carries one margin that pays its
+	/// fee whole, and the operator takes it only when one asset's margin
+	/// does. The maker sizes its margin, in the asset it gives, when it
+	/// offers, for its coins and one of the taker's; a taker paying from
+	/// more coins makes the transaction larger than that margin pays at the
+	/// operator's floor now. It then tops the margin up from the coin it
+	/// gets: by the wallet's headroom times what its coins beyond the first
+	/// add to the operator's least ([`Margins::top_up_most`]), so a margin
+	/// at least the maker's part plus that pays the whole. The top-up is
+	/// what the taker's own coins cost, whatever the maker offered: a maker
+	/// adding coins raises its own part and the whole alike. An offer whose
+	/// margin does not pay its own part (its coins and one of the taker's)
+	/// is refused before anything is signed, so a maker cannot leave its
+	/// part to the taker. Zero when the offer's margin pays the whole. A
+	/// margin pays the transaction's fee, never the maker.
+	fn swap_top_up(&self, info: &Value, o: &OfferChecked, mine: &[In], outputs: &[ExplicitOutput]) -> Result<u64, Error> {
+		let give = Margins::of(info, o.give_asset)?;
+		let coins = |n: usize| -> Vec<&ValidCoin> { o.theirs.iter().map(|i| &i.coin).chain(mine.iter().take(n).map(|i| &i.coin)).collect() };
+		let all = Self::reassignment_vsize(&coins(mine.len()), outputs)?;
+		if o.margin >= give.least(all) {
+			return Ok(0);
+		}
+		let one = Self::reassignment_vsize(&coins(1), outputs)?;
+		if o.margin < give.least(one) {
+			return Err(Error::Refused(format!("the offer leaves {} of asset {} as the swap's margin, less than its own part takes at the \
+				operator's floor now ({}): ask the maker for a new offer; nothing was signed", o.margin, o.give_asset, give.least(one))));
+		}
+		let top_up = give.top_up_most(all, one);
+		let min_give = Self::min_leaf(info, o.give_asset)?;
+		if o.give < top_up.saturating_add(min_give) {
+			return Err(Error::Refused(format!("paying this swap from {} coins takes {} of asset {} more in margin than the offer leaves, \
+				out of the {} it gives: pay from fewer coins (a round joins them), or trade more; nothing was signed", mine.len(), top_up,
+				o.give_asset, o.give)));
+		}
+		Ok(top_up)
+	}
+
+	/// Refuses, before the maker signs anything, an acceptance whose taker
+	/// adds `top_up` to the margin out of what the offer gives it, unless
+	/// that is at most what [`Self::swap_top_up`] adds for the taker's coins
+	/// beyond its first (`inputs`, the maker's first `n`) at the operator's
+	/// floor now: the maker's own part stays the margin it offered.
+	fn swap_top_up_within(&self, offer: &Value, inputs: &[In], n: usize, outs: &[Out], top_up: u64) -> Result<(), Error> {
+		let info = self.server_info()?;
+		let give_asset = asset_of(&offer["give"]["asset"], "give")?;
+		let give = Margins::of(&info, give_asset)?;
+		let explicit: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
+		let coins = |k: usize| -> Vec<&ValidCoin> { inputs.iter().take(k).map(|i| &i.coin).collect() };
+		if inputs.len() <= n + 1 {
+			return Err(Error::Refused(format!("the acceptance takes {} of asset {} out of what the offer gives into the margin, and pays from \
+				one coin, which the offer's margin covers", top_up, give_asset)));
+		}
+		let most = give.top_up_most(Self::reassignment_vsize(&coins(inputs.len()), &explicit)?, Self::reassignment_vsize(&coins(n + 1), &explicit)?);
+		if top_up > most {
+			return Err(Error::Refused(format!("the acceptance takes {} of asset {} out of what the offer gives into the margin; its coins \
+				beyond the first take at most {} at the operator's floor now", top_up, give_asset, most)));
+		}
+		Ok(())
+	}
+
 	/// What a taker is shown of a swap, by [`Wallet::swap_read`] and
-	/// [`Wallet::swap_accept`] alike.
-	fn swap_terms(o: &OfferChecked, mine: &[In], change: u64, dates: Value) -> Value {
+	/// [`Wallet::swap_accept`] alike. The wallet gets what the offer gives
+	/// less what it adds to the margin (`top_up`, [`Self::swap_top_up`]).
+	fn swap_terms(o: &OfferChecked, mine: &[In], top_up: u64, change: u64, dates: Value) -> Value {
 		let margins: u64 = mine.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
-		json!({"swap": o.id, "gets": {"asset": o.give_asset.to_string(), "value": o.give.to_string()},
+		json!({"swap": o.id, "gets": {"asset": o.give_asset.to_string(), "value": (o.give - top_up).to_string()},
 			"gives": {"asset": o.want_asset.to_string(), "value": o.want.to_string()},
 			"pays": {"asset": o.want_asset.to_string(), "margins": margins.to_string()},
+			"tops_up": {"asset": o.give_asset.to_string(), "margin": top_up.to_string()},
 			"maker_pays": {"asset": o.give_asset.to_string(), "margin": o.margin.to_string()},
 			"change": {"asset": o.want_asset.to_string(), "value": change.to_string()},
 			// The reassignments since a round of what the swap makes (the coin the taker gets, its
@@ -2904,13 +3001,19 @@ impl Wallet {
 		// The maker parses the leaves this acceptance makes: landing-2 only
 		// where it reads it.
 		let maker_reads = Reads::of(&o.offer);
-		outs.push(Out { asset: give_asset, value: give, leaf: self.own_leaf_traded("swap", &info, give_asset, give, maker_reads.landing_2)?,
-			mailbox, until: None });
+		// The wallet's leaf of what the swap gives it is made once its coins,
+		// and so what it adds to the margin, are known: a probe of its size
+		// prices the same margins until then.
 		let mut others: Vec<ExplicitOutput> = outs.iter().map(|o| o.explicit(self)).collect();
+		others.push(ExplicitOutput::new(give_asset, give, leaf_probe()));
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
 		self.swap_exit_required(&o, &info)?;
 		let (mine, _, change) = self.choose_for_trade(&info, want_asset, want, &others, false, min_want, 0, maker_reads)?;
 		Self::swap_depth(&info, &o, &mine)?;
+		let top_up = self.swap_top_up(&info, &o, &mine, &others)?;
+		let gets = give - top_up;
+		outs.push(Out { asset: give_asset, value: gets, leaf: self.own_leaf_traded("swap", &info, give_asset, gets, maker_reads.landing_2)?,
+			mailbox, until: None });
 		if change > 0 {
 			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf_traded("change", &info, want_asset, change,
 				maker_reads.landing_2)?, mailbox, until: None });
@@ -2922,7 +3025,7 @@ impl Wallet {
 		// The dates of the coins the wallet gets: the earliest of every coin
 		// spent, the maker's and its own.
 		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
-		let terms = Self::swap_terms(&o, &mine, change, dates.clone());
+		let terms = Self::swap_terms(&o, &mine, top_up, change, dates.clone());
 		if let Some(shown) = shown {
 			for k in ["swap", "gets", "gives", "pays"] {
 				if shown[k] != terms[k] {
@@ -2976,12 +3079,13 @@ impl Wallet {
 			}
 			Ok(())
 		})?;
-		let mut gets = vec![json!({"asset": give_asset.to_string(), "value": give.to_string(), "dates": dates})];
+		let mut coins = vec![json!({"asset": give_asset.to_string(), "value": gets.to_string(), "dates": dates})];
 		if change > 0 {
-			gets.push(json!({"asset": want_asset.to_string(), "value": change.to_string(), "change": true, "dates": dates}));
+			coins.push(json!({"asset": want_asset.to_string(), "value": change.to_string(), "change": true, "dates": dates}));
 		}
-		Ok(json!({"swap": id, "accept": encode(&self.spelling.accept, &accept), "gets": {"asset": give_asset.to_string(), "value": give.to_string()},
-			"gives": {"asset": want_asset.to_string(), "value": want.to_string()}, "pays": terms["pays"], "coins": gets, "dates": dates}))
+		Ok(json!({"swap": id, "accept": encode(&self.spelling.accept, &accept), "gets": terms["gets"],
+			"gives": {"asset": want_asset.to_string(), "value": want.to_string()}, "pays": terms["pays"], "tops_up": terms["tops_up"],
+			"coins": coins, "dates": dates}))
 	}
 
 	/// The dates of the coins a swap spending `inputs` gives the wallet, as
@@ -3037,8 +3141,18 @@ impl Wallet {
 		let give_asset = asset_of(&offer["give"]["asset"], "give")?;
 		let give = amount(&offer["give"]["value"], "give")?;
 		let outs: Vec<Out> = acc_out.iter().map(Out::from_json).collect::<Result<_, _>>()?;
-		if !outs.iter().skip(offered_out.len()).any(|o| o.asset == give_asset && o.value == give) {
+		// What the taker's outputs take of the asset the offer gives: the
+		// whole, or less what the taker adds to the margin when it pays from
+		// more coins than the offer's margin covers (checked below, once its
+		// coins are read); never more, which would come out of the maker's
+		// margin.
+		let taker_gets: u64 = outs.iter().skip(offered_out.len()).filter(|o| o.asset == give_asset).map(|o| o.value).sum();
+		if taker_gets == 0 {
 			return Err(Error::Refused("the acceptance has no leaf for the taker of what the offer gives".into()));
+		}
+		if taker_gets > give {
+			return Err(Error::Refused(format!("the acceptance pays the taker {} of asset {}, more than the {} the offer gives", taker_gets,
+				give_asset, give)));
 		}
 		let n = offered_in.len();
 		let mut inputs = vec![];
@@ -3055,6 +3169,9 @@ impl Wallet {
 		}
 		let taker = self.offer_inputs(&json!({"inputs": acc_in[n..]}))?;
 		inputs.extend(taker);
+		if taker_gets < give {
+			self.swap_top_up_within(&offer, &inputs, n, &outs, give - taker_gets)?;
+		}
 		// The dates of the coins the wallet gets: the earliest of every coin
 		// spent, its own and the taker's.
 		let dates = self.swap_dates(inputs.iter(), near_deadline)?;
