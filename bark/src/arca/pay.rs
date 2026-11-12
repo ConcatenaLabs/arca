@@ -3132,7 +3132,7 @@ impl Wallet {
 	/// says so; a later cancel asks again.
 	fn swap_cancel_spent(&mut self, id: &str, ids: &[String], message: &str) -> Result<Value, Error> {
 		let mailbox = self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()}));
-		if self.store.swap(id)?.is_some_and(|(_, _, _, st)| st == "done") {
+		if self.swap_paid(id)? {
 			return Ok(json!({"swap": id, "cancelled": false, "done": true, "error": message,
 				"note": "the maker completed the swap: what it pays the wallet has arrived"}));
 		}
@@ -3149,7 +3149,7 @@ impl Wallet {
 		let gone: Vec<String> = ids.iter().filter(|l| {
 			self.store.coin(l).ok().flatten().is_some_and(|c| !matches!(c.state.as_str(), "live" | "offered" | "sending"))
 		}).cloned().collect();
-		if self.store.swap(id)?.is_some_and(|(_, _, _, st)| st == "done") {
+		if self.swap_paid(id)? {
 			return Ok(json!({"swap": id, "cancelled": false, "done": true, "error": message,
 				"note": "the maker completed the swap: what it pays the wallet has arrived"}));
 		}
@@ -3177,6 +3177,32 @@ impl Wallet {
 		Ok(json!({"swap": id, "cancelled": false, "error": message, "mailbox": mailbox,
 			"note": "a coin signed into the acceptance is already spent, and neither the mailbox nor the wallet's other stores say by \
 			what yet: the coins stay held for the swap; cancel again shortly"}))
+	}
+
+	/// Whether swap `id`, which the wallet accepted, completed: it is done,
+	/// or the wallet holds a coin under the owner nonce of one of the outputs
+	/// its acceptance names (what the swap pays it, and its change), which
+	/// only the swap's own transfer makes. It is then recorded done, whatever
+	/// order the mailbox read and a catch-up ran in (a catch-up that saw the
+	/// coins spent first leaves no coin held for the swap for the mailbox to
+	/// mark it done by).
+	fn swap_paid(&mut self, id: &str) -> Result<bool, Error> {
+		let Some((_, _, accept, state)) = self.store.swap(id)? else { return Ok(false) };
+		if state == "done" {
+			return Ok(true);
+		}
+		let accept: Value = match accept.as_deref().map(serde_json::from_str) {
+			Some(Ok(v)) => v,
+			_ => return Ok(false),
+		};
+		for o in accept["outputs"].as_array().into_iter().flatten() {
+			let Ok(n) = unhex32(o["owner_nonce"].as_str().unwrap_or("")) else { continue };
+			if self.store.nonce(&n)?.and_then(|r| r.leaf_id).is_some() {
+				self.store.set_swap(id, "done", None)?;
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 
 	/// Spends `rows`, coins of one asset, to one fresh leaf of the wallet's

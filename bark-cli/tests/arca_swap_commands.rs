@@ -407,3 +407,50 @@ async fn a_refused_completion_withdraws_the_offer() {
 	assert_eq!(c["cancelled"], true, "{}", c);
 	assert!(c["respent"].as_array().is_some_and(|v| !v.is_empty()), "{}", c);
 }
+
+/// The maker completes the swap; the taker, which has not read its mailbox
+/// since, cancels (as a page does once it has waited for the maker): the
+/// respend is refused, and the swap reads done with what it pays the taker
+/// held, never "cancelled", whatever order the wallet's reads come in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_after_the_maker_completed_reads_done() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("DA");
+	let b = Arca::new("DB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &y, "500000", "--fee-asset", &x]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "400000"})).unwrap();
+	let id = offer["swap"].as_str().unwrap().to_string();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	let x_before = total(&b, "live", &x);
+	library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap();
+	let c = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	println!("TAKER CANCEL AFTER THE COMPLETION: {}", c);
+	assert_eq!(c["done"], true, "{}", c);
+	assert_ne!(c["cancelled"], true, "a completed swap is not cancelled: {}", c);
+	let state = library(&b, "swaps", json!({})).unwrap().as_array().unwrap().iter().find(|s| s["swap"] == id.as_str()).unwrap()["state"].clone();
+	assert_eq!(state, "done", "the taker's record says done");
+	assert_eq!(total(&b, "live", &x), x_before + 300_000, "what the swap pays the taker is held");
+	assert_eq!(total(&b, "offered", &y), 0, "nothing stays held");
+}
