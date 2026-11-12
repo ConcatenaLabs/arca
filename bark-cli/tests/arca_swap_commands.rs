@@ -454,3 +454,79 @@ async fn a_cancel_after_the_maker_completed_reads_done() {
 	assert_eq!(total(&b, "live", &x), x_before + 300_000, "what the swap pays the taker is held");
 	assert_eq!(total(&b, "offered", &y), 0, "nothing stays held");
 }
+
+/// The text `kind:hex(json)` of an offer or acceptance, read and written.
+fn unhex_text(t: &str) -> Value {
+	let h = t.split_once(':').unwrap().1;
+	serde_json::from_slice(&(0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect::<Vec<u8>>()).unwrap()
+}
+
+fn hex_text(kind: &str, v: &Value) -> String {
+	format!("{}:{}", kind, hex(v.to_string().as_bytes()))
+}
+
+/// A maker names in its own output of an offer the owner nonce of a coin
+/// the taker already holds (what an earlier trade with it paid the taker).
+/// The taker's acceptance meets coins its second device gave to rounds, and
+/// the maker never completes: the taker's cancel must not read done, since
+/// only the swap's own transfer, spending the taker's own inputs into the
+/// taker's own outputs, makes it so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_maker_chosen_nonce_does_not_make_a_swap_done() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("NA");
+	let b = Arca::new("NB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "3000000"]);
+	b.ok(&["board", &y, "3000000", "--fee-asset", &x]);
+	b.ok(&["board", &y, "500000", "--fee-asset", &x]);
+	r.fund_server(r.x, 50_000_000).await;
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let state = |w: &Arca, id: &str| library(w, "swaps", json!({})).unwrap().as_array().unwrap().iter().find(|s| s["swap"] == id).unwrap()["state"].clone();
+	// Trade 1, honest: it pays the taker under a nonce the maker sees.
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "1000000"})).unwrap();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap();
+	b.ok(&["sync"]);
+	assert_eq!(state(&b, offer["swap"].as_str().unwrap()), "done");
+	let n_off = offer["details"]["outputs"].as_array().unwrap().len();
+	let held_nonce = unhex_text(acc["accept"].as_str().unwrap())["outputs"][n_off]["owner_nonce"].as_str().unwrap().to_string();
+	// Every coin of y the taker holds, given to a round by its second device.
+	let b2 = second_device(&b, "NB2");
+	for l in coins(&b2, "live", &y).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect::<Vec<_>>() {
+		given_to_a_round(&r, &b2, &l).await;
+	}
+	// Trade 2: the maker's own output carries the taker's held nonce.
+	let offer2 = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "400000"})).unwrap();
+	let mut d = offer2["details"].clone();
+	d["outputs"][0]["owner_nonce"] = json!(held_nonce);
+	let tampered = hex_text(offer2["offer"].as_str().unwrap().split_once(':').unwrap().0, &d);
+	let read = library(&b, "swap_read", json!({"offer": tampered})).unwrap();
+	let acc2 = library(&b, "swap_accept", json!({"offer": tampered, "shown": read})).unwrap();
+	let id2 = acc2["swap"].as_str().unwrap().to_string();
+	// The maker never completes; the taker cancels.
+	let c = library(&b, "swap_cancel", json!({"swap": id2})).unwrap();
+	println!("TAKER CANCEL OF A SWAP NEVER COMPLETED: {}", c);
+	assert_ne!(c["done"], true, "nothing traded, yet the cancel reads done: {}", c);
+	assert_ne!(state(&b, &id2), "done", "nothing traded, yet the swap reads done");
+}

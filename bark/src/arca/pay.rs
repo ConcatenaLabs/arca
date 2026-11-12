@@ -3180,24 +3180,40 @@ impl Wallet {
 	}
 
 	/// Whether swap `id`, which the wallet accepted, completed: it is done,
-	/// or the wallet holds a coin under the owner nonce of one of the outputs
-	/// its acceptance names (what the swap pays it, and its change), which
-	/// only the swap's own transfer makes. It is then recorded done, whatever
-	/// order the mailbox read and a catch-up ran in (a catch-up that saw the
-	/// coins spent first leaves no coin held for the swap for the mailbox to
-	/// mark it done by).
+	/// or the wallet holds a coin under the owner nonce of one of its own
+	/// outputs in the acceptance (those past the offer's: what the swap pays
+	/// it, and its change, whose nonces it drew; the maker chooses its own
+	/// outputs' nonces) whose record spends one of the wallet's own inputs of
+	/// the acceptance, which only the swap's own transfer does. It is then
+	/// recorded done, whatever order the mailbox read and a catch-up ran in (a
+	/// catch-up that saw the coins spent first leaves no coin held for the
+	/// swap for the mailbox to mark it done by).
 	fn swap_paid(&mut self, id: &str) -> Result<bool, Error> {
-		let Some((_, _, accept, state)) = self.store.swap(id)? else { return Ok(false) };
+		let Some((_, offer, accept, state)) = self.store.swap(id)? else { return Ok(false) };
 		if state == "done" {
 			return Ok(true);
 		}
-		let accept: Value = match accept.as_deref().map(serde_json::from_str) {
-			Some(Ok(v)) => v,
-			_ => return Ok(false),
+		let (Ok(offer), Some(Ok(accept))) = (serde_json::from_str::<Value>(&offer), accept.as_deref().map(serde_json::from_str::<Value>)) else {
+			return Ok(false);
 		};
-		for o in accept["outputs"].as_array().into_iter().flatten() {
+		let n_out = offer["outputs"].as_array().map_or(0, |a| a.len());
+		let n_in = offer["inputs"].as_array().map_or(0, |a| a.len());
+		// The owner nonces of the wallet's own coins the acceptance spends.
+		let mut mine: Vec<[u8; 32]> = vec![];
+		for i in accept["inputs"].as_array().into_iter().flatten().skip(n_in) {
+			if let Some(c) = self.store.coin(i["leaf_id"].as_str().unwrap_or(""))? {
+				mine.push(c.owner_nonce);
+			}
+		}
+		for o in accept["outputs"].as_array().into_iter().flatten().skip(n_out) {
 			let Ok(n) = unhex32(o["owner_nonce"].as_str().unwrap_or("")) else { continue };
-			if self.store.nonce(&n)?.and_then(|r| r.leaf_id).is_some() {
+			let Some(leaf) = self.store.nonce(&n)?.and_then(|r| r.leaf_id) else { continue };
+			let Some(c) = self.store.coin(&leaf)? else { continue };
+			let spends_mine = match Self::record_of(&c) {
+				Ok(CoinRecord::Transfer(t)) => t.inputs.iter().any(|i| mine.contains(&owner_of(&i.coin).1)),
+				_ => false,
+			};
+			if spends_mine {
 				self.store.set_swap(id, "done", None)?;
 				return Ok(true);
 			}
