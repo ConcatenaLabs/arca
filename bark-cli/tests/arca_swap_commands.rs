@@ -1091,3 +1091,127 @@ async fn a_trade_that_shapes_its_coin_first_counts_what_shaping_costs() {
 	println!("THE TAKER'S X AFTER THE CHANGE'S REFRESH: {} (was {})", x_refreshed, x_after);
 	assert!(x_refreshed <= x_after, "nothing comes back at the refresh");
 }
+
+/// The operator at the testnet's published settings, as far as the harness
+/// takes them (`ARCA_TEST_TESTNET=1`): no checkpoint exit, batches without
+/// a sweep; with `ARCA_TEST_ANCHOR_DEPTH=0` its anchor depth (the
+/// harness's certification is `required`, as the testnet's is). Its depth
+/// limit and margin multiples are the harness's defaults, the testnet's too.
+async fn start_at_the_settings_asked() -> Running {
+	let testnet = std::env::var("ARCA_TEST_TESTNET").is_ok_and(|v| v == "1");
+	println!("SETTINGS: testnet {} anchor depth {:?}", testnet, std::env::var("ARCA_TEST_ANCHOR_DEPTH").ok());
+	Running::start_with(move |c, _, _| {
+		if testnet {
+			c.checkpoint_exit = false;
+			c.batches.no_sweep = true;
+			c.batches.holder_batches = Some(0);
+			c.batches.collect_after_seconds = Some(2_419_200);
+		}
+	}).await
+}
+
+/// The coins `w` holds of `asset` in every state but spent, by id.
+fn held_ids(w: &Arca, asset: &str) -> Vec<String> {
+	let mut ids: Vec<String> = w.ok(&["coins"]).as_array().unwrap().iter()
+		.filter(|c| c["asset"] == asset && !matches!(c["state"].as_str(), Some("spent" | "forfeited" | "exited" | "lost")))
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	ids.sort();
+	ids
+}
+
+/// A taker in default mode (an instant limit set, as the web wallet's
+/// default mode sets one) holding `boards` coins of Y, none of which holds
+/// the `want` of Y an offer of 20,000 X asks: the trade gives one coin of
+/// exactly what it takes, which the wallet pays itself first. The read
+/// prices that coin (one coin, so no top-up, its one checkpoint margin, and
+/// the payment's margins); an acceptance on other terms is refused with
+/// nothing moved; one on the terms shown completes, and the wallet's whole
+/// holding moves by exactly what it was shown.
+async fn a_default_mode_trade_from(r: &mut Running, a: &Arca, name: &str, boards: &[u64], want: u64) {
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let b = Arca::new(name);
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	b.ok(&create);
+	for (asset, v) in [(r.y, 10_000_000), (r.x, 2_000_000)] {
+		let s = script(&b.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	for v in boards {
+		b.ok(&["board", &y, &v.to_string(), "--fee-asset", &x]);
+		r.produce().await;
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the taker's boards credited", || b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")).await;
+	b.ok(&["sync"]);
+	a.ok(&["sync"]);
+	library(&b, "instant_limit", json!({"value": "1000000000000"})).unwrap();
+	let (x0, y0, ids0) = (held_all(&b, &x), held_all(&b, &y), held_ids(&b, &y));
+	let offer = library(a, "swap_offer", json!({"give_asset": x, "give": "20000", "want_asset": y, "want": want.to_string()})).unwrap();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	println!("[{}] READ: coins_spent {} gets {} pays {} tops_up {} change {}", name, read["coins_spent"], read["gets"], read["pays"],
+		read["tops_up"], read["change"]);
+
+	// Other terms than those the acceptance computes: refused, nothing moved.
+	let mut wrong = read.clone();
+	wrong["pays"]["margins"] = json!((num(&read["pays"]["margins"]) - 1).to_string());
+	let e = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": wrong})).unwrap_err();
+	println!("[{}] REFUSED (terms other than shown): {}", name, e);
+	assert_eq!((held_all(&b, &y), held_ids(&b, &y)), (y0, ids0.clone()), "a refused acceptance moved nothing: no coin was shaped");
+	assert!(e.contains("the swap's terms changed since they were shown") && e.contains("nothing moved"), "{}", e);
+
+	// The terms shown: accepted, completed, and the holding moves by them.
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read}))
+		.unwrap_or_else(|e| panic!("[{}] the acceptance on the terms shown: {}; Y {} -> {}", name, e, y0, held_all(&b, &y)));
+	assert_eq!(acc["pays"], read["pays"]);
+	assert_eq!(acc["gets"], read["gets"]);
+	library(a, "swap_complete", json!({"accept": acc["accept"]})).unwrap();
+	b.ok(&["sync"]);
+	let (x1, y1) = (held_all(&b, &x), held_all(&b, &y));
+	let shown_out = num(&read["gives"]["value"]) + num(&read["pays"]["margins"]);
+	println!("[{}] HOLDING: X {} -> {} (+{}, shown {}); Y {} -> {} (-{}, shown {})", name, x0, x1, x1 - x0, read["gets"]["value"], y0, y1, y0 - y1,
+		shown_out);
+	assert_eq!(x1 - x0, num(&read["gets"]["value"]), "the wallet got what it was shown");
+	assert_eq!(y0 - y1, shown_out, "what left the wallet is what it was shown");
+	// What the read showed: the one coin shaped first, its one checkpoint
+	// margin and the shaping payment's margins, no top-up, no change.
+	assert_eq!(read["coins_spent"], 1, "the trade gives one coin, the one shaped first: {}", read);
+	assert_eq!(read["change"]["value"], "0", "no change of the wallet's rides in the trade: {}", read);
+	assert_eq!(read["tops_up"]["margin"], "0", "one coin tops nothing up: {}", read);
+	let shapes = num(&read["pays"]["shapes"]);
+	assert!(shapes > 0 && num(&read["pays"]["margins"]) > shapes, "the margins count the shaping payment's and the coin's own: {}", read);
+}
+
+/// RV46's P1 (web wallet #693, #706): in default mode a trade paid from
+/// several coins is shown the terms its acceptance goes ahead on, and
+/// nothing is paid for it before they are final. Before, the read priced
+/// the coins held before shaping (each one's checkpoint margin, a top-up
+/// from all of them), the acceptance shaped first and priced the one coin
+/// made, and refused "terms changed" with the shaping payment's margins
+/// already gone: 792 atoms with two coins, 2,024 with six.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_mode_trade_from_several_coins_goes_on_the_terms_shown() {
+	let mut r = start_at_the_settings_asked().await;
+	// The instant limit values the coins it holds: Y needs a rate on the node.
+	common::node::list_fee_asset(&r.rt, r.y, 100_000_000);
+	post_bond(&mut r).await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("DMA");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, r.x, 10_000_000);
+	r.produce().await;
+	a.ok(&["board", &x, "1000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the maker's board credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	a_default_mode_trade_from(&mut r, &a, "DMB2", &[300_000, 300_000], 400_000).await;
+	a_default_mode_trade_from(&mut r, &a, "DMB6", &[100_000; 7], 550_000).await;
+}

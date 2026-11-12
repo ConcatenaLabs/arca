@@ -229,7 +229,10 @@ chain another made within three seconds when asked with `"shared_view": true`.
 An in-tree swap passes two texts between two wallets. The maker's `swap_offer`
 holds its coins and signs nothing, and answers what it gives, gets and pays (the
 reassignment's margin and its checkpoints' margins). The taker's `swap_read`
-checks the offer as `swap_accept` does and answers what it gives, gets and pays,
+checks the offer as `swap_accept` does and answers what it gives, gets and pays
+(with an instant limit set, from the coin of exactly what it gives that the
+wallet pays itself first, whose margins it counts, also apart as
+`pays.shapes`),
 and the `hops` of what the swap makes (reassignments since a round, against the
 operator's `depth_limit`), signing, holding and storing nothing; `swap_accept`
 with `shown` (that answer)
@@ -294,7 +297,10 @@ or comes less often than that runs it on a short timer of its own.
 
 A refusal is thrown as the JSON `arca` prints, `{"error": {"kind",
 "message"}}`, with the server's `code` and `status` when the server refused
-(and `swap`, `coin` and `whose` for a `swap_refused`).
+(and `swap`, `coin` and `whose` for a `swap_refused`; `asset` and `fee` for a
+`shaped` refusal: a trade refused after the wallet paid itself the coin it
+gives, which left that fee; the coin is kept, and the trade priced again
+trades from it).
 
 The page shows what the library says as it says it. With no command line,
 the library names the act rather than a command ("run sync", "an exit takes

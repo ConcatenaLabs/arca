@@ -299,6 +299,38 @@ struct OfferChecked {
 	maker_outs: Vec<Out>,
 }
 
+/// The coins a trade gives ([`Wallet::trade_coins`]): what they leave as
+/// the reassignment's margin, the wallet's change, and the payment of the
+/// wallet to itself that makes them first, when one does.
+struct TradeCoins {
+	mine: Vec<In>,
+	margin: u64,
+	change: u64,
+	shaping: Option<Shaping>,
+}
+
+impl TradeCoins {
+	/// What a payment to itself first costs the trade: its margins.
+	fn shaped(&self) -> u64 {
+		self.shaping.as_ref().map_or(0, |s| s.cost)
+	}
+
+	/// The coins of the wallet's that what the trade makes rests on: those
+	/// it gives, or those the coin it gives is made from.
+	fn rests_on(&self) -> &[In] {
+		self.shaping.as_ref().map_or(&self.mine, |s| &s.inputs)
+	}
+}
+
+/// A payment of the wallet to itself, out of round, of one coin of exactly
+/// `need` from `inputs` and `change` back, which leaves `cost` in margins.
+struct Shaping {
+	need: u64,
+	inputs: Vec<In>,
+	change: u64,
+	cost: u64,
+}
+
 /// The earliest first expiry among the batches `record` rests on, as its
 /// record names them; `None` for a coin resting on boards alone.
 pub(crate) fn first_expiry(record: &CoinRecord) -> Option<u32> {
@@ -472,6 +504,20 @@ impl Wallet {
 		-> Result<NewLeaf, Error>
 	{
 		let mut leaf = self.own_leaf_of(purpose, info, asset, value)?;
+		if !other_reads && !super::wallet::landing_2_only(info) {
+			leaf.landing = leaf.landing.map(|l| arca_covenant::LandingTerms { own_index: false, ..l });
+		}
+		Ok(leaf)
+	}
+
+	/// A leaf of the kind and size [`Self::own_leaf_traded`] makes, at no
+	/// key of the wallet's and with nothing stored: to price a coin before
+	/// it is made.
+	fn leaf_traded_probe(&self, info: &Value, asset: AssetId, value: u64, other_reads: bool) -> Result<NewLeaf, Error> {
+		let mut leaf = NewLeaf { owner: self.operator, owner_nonce: [0; 32], creator_nonce: [0; 32], exit_delay: self.exit_delay(), htlc: None,
+			landing: None, v2: self.asks_vtxo2() };
+		leaf.landing = self.landing_rule(info, asset)?.map(|l| l.terms(asset, value)).transpose().map_err(|e| Error::Refused(e.to_string()))?;
+		leaf.v2 &= leaf.landing.is_none();
 		if !other_reads && !super::wallet::landing_2_only(info) {
 			leaf.landing = leaf.landing.map(|l| arca_covenant::LandingTerms { own_index: false, ..l });
 		}
@@ -2448,11 +2494,15 @@ impl Wallet {
 		// no coin record of the newer format and refuses such an offer when
 		// it reads it, before signing anything: it never holds a coin it
 		// cannot read.
-		let (inputs, margin, change, _) = self.choose_for_trade(&info, give_asset, give, &others, true, min_give, 1, Reads::ALL)?;
-		// The wallet's own coins are what the switch protects first.
-		if let Some(i) = inputs.iter().find(|i| !i.coin.exit_allowed()) {
+		let priced = self.trade_coins(&info, give_asset, give, &others, true, min_give, 1, Reads::ALL)?;
+		// The wallet's own coins are what the switch protects first: checked
+		// before a coin is shaped for the offer.
+		if let Some(i) = priced.mine.iter().find(|i| !i.coin.exit_allowed()) {
 			self.exit_required(&format!("coin {} it would give cannot have it (its kind of leaf takes no checkpoint exit)", i.coin.id))?;
 		}
+		let made = self.shape_for_trade(&info, give_asset, priced, give, &others, true, min_give, 1, Reads::ALL)?;
+		let shaped = made.shaped();
+		let TradeCoins { mine: inputs, margin, change, .. } = made;
 		let mut outs = vec![wanted];
 		if change > 0 {
 			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_traded("change", &info, give_asset, change, false)?, mailbox,
@@ -2484,7 +2534,7 @@ impl Wallet {
 			Ok(())
 		})?;
 		Ok(json!({"swap": id, "offer": encode(&self.spelling.offer, &offer), "details": offer, "gives": offer["give"], "gets": offer["want"],
-			"pays": Self::maker_pays(give_asset, margin, &inputs)}))
+			"pays": Self::maker_pays(give_asset, margin, &inputs, shaped)}))
 	}
 
 	/// Whether the party whose offer, acceptance or receive request is `v`
@@ -2517,40 +2567,101 @@ impl Wallet {
 		info["checkpoint_exit"] == json!(true)
 	}
 
-	/// [`Self::choose`] for a trade. While the wallet sets an instant limit,
-	/// the coin it gives holds exactly what the trade takes, so no change of
-	/// the wallet's rides in the trade: when no coin does, the wallet first
-	/// pays itself, out of round, a coin of exactly that value and the rest
-	/// as change ([`Self::shape_coin`]); that change is of the coin's own
-	/// lineage, not the trade's.
+	/// The coins a trade gives, as its acceptance gives them, with nothing
+	/// moved: those [`Self::choose`] takes; or, while the wallet sets an
+	/// instant limit and they leave change, the one coin of exactly what the
+	/// trade gives that the wallet pays itself first, out of round, the rest
+	/// as change ([`Self::shape_for_trade`]), so no change of the wallet's
+	/// rides in the trade. That coin is priced before it is made, as the
+	/// payment makes it: its leaf, the sweep of the batch its first coin
+	/// descends from, its dates and its depth, so its checkpoint's margin
+	/// and every margin the trade leaves with it are those the acceptance
+	/// computes after shaping, to the atom; with the payment's own margins
+	/// (`cost`), which the trade's terms count (web wallet #706). A quote
+	/// shows this, and an acceptance checks what was shown against it before
+	/// anything moves. A coin the wallet cannot shape before a round answers
+	/// [`Error::SettleFirst`] here, as the trade itself would.
 	#[allow(clippy::too_many_arguments)]
-	fn choose_for_trade(&mut self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
-		other_inputs: usize, reads: Reads) -> Result<(Vec<In>, u64, u64, u64), Error>
+	fn trade_coins(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
+		other_inputs: usize, reads: Reads) -> Result<TradeCoins, Error>
 	{
-		let mut got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, reads, Spend::Trade)?;
-		if self.own_instant_limit()?.is_none() || got.2 == 0 {
-			return Ok((got.0, got.1, got.2, 0));
+		let (mine, margin, change) = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, reads, Spend::Trade)?;
+		if self.own_instant_limit()?.is_none() || change == 0 {
+			return Ok(TradeCoins { mine, margin, change, shaping: None });
 		}
-		// What shaping costs: the margins the wallet's payments to itself
-		// leave, which the trade's terms count (web wallet #706).
-		let mut shaped = 0u64;
-		// Twice at most: the coin the first payment makes may take another
-		// template than the coin it came from, and so other margins.
-		for _ in 0..2 {
-			let template = got.0.first().map(|i| i.coin.clone()).ok_or_else(|| Error::Refused("a trade with no coin".into()))?;
-			let margins = Margins::of(info, asset)?;
-			let m = self.checkpoint_margin(&template, &margins)?;
-			let all: Vec<&ValidCoin> = std::iter::repeat(&template).take(1 + other_inputs).collect();
+		let margins = Margins::of(info, asset)?;
+		let need_of = |coin: &ValidCoin| -> Result<(u64, u64, u64), Error> {
+			let m = self.checkpoint_margin(coin, &margins)?;
+			let all: Vec<&ValidCoin> = std::iter::repeat(coin).take(1 + other_inputs).collect();
 			let r = if pays_margin { self.reassignment_margin(&all, others, &margins)? } else { 0 };
 			let need = paid.checked_add(m).and_then(|v| v.checked_add(r)).ok_or_else(|| Error::Refused("a trade above 2^64 atoms".into()))?;
-			shaped = shaped.saturating_add(self.shape_coin(info, asset, need, reads)?);
-			got = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, reads, Spend::Trade)?;
-			if got.2 == 0 {
-				return Ok((got.0, got.1, got.2, shaped));
+			Ok((need, m, r))
+		};
+		// The first guess prices the coin as the first coin chosen is; the
+		// coin made may differ in its leaf (and so in its margins), and a
+		// landing leaf's size in its value: priced again until it holds.
+		let first = mine.first().map(|i| i.coin.clone()).ok_or_else(|| Error::Refused("a trade with no coin".into()))?;
+		let mut need = need_of(&first)?.0;
+		for _ in 0..4 {
+			let leaf = self.leaf_traded_probe(info, asset, need, reads.landing_2)?;
+			let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
+			let (inputs, left) = self.shape_inputs(info, asset, need, &probe, reads)?;
+			let coin = Self::shaped_coin(&inputs, &leaf, asset, need)?;
+			let (next, m, r) = need_of(&coin)?;
+			if next != need {
+				need = next;
+				continue;
 			}
+			let row = CoinRow { expiry: inputs.iter().map(|i| i.row.expiry).min().unwrap_or(u32::MAX), value: need, ..inputs[0].row.clone() };
+			let cost = Self::shaping_margins(&inputs, need, left);
+			let input = In { row, checkpoint_value: need - m.min(need - 1), coin };
+			return Ok(TradeCoins { mine: vec![input], margin: r, change: 0, shaping: Some(Shaping { need, inputs, change: left, cost }) });
 		}
-		Err(Error::Refused(format!("the wallet could not make a coin of asset {} holding exactly what this trade gives; it trades from \
-			coins a round has shaped, after the next round", asset)))
+		Err(Error::Refused(format!("the wallet could not price a coin of asset {} holding exactly what this trade gives; it trades from \
+			coins a round has shaped, after the next round; nothing moved", asset)))
+	}
+
+	/// The coin a payment of the wallet to itself from `inputs` makes at
+	/// `leaf` holding `need` of `asset`, as a receiver validates it: the
+	/// sweep of its first input's batch, the earliest expiry of its inputs,
+	/// one reassignment deeper than the deepest.
+	fn shaped_coin(inputs: &[In], leaf: &NewLeaf, asset: AssetId, need: u64) -> Result<ValidCoin, Error> {
+		let first = &inputs.first().ok_or_else(|| Error::Refused("a payment with no coin".into()))?.coin;
+		Ok(ValidCoin {
+			id: first.id, leaf: leaf.policy(first.leaf.operator, first.leaf.chain), asset, value: need, sweep: first.sweep.clone(),
+			expiry: inputs.iter().map(|i| i.coin.expiry).min_by_key(|e| e.to_consensus_u32()).unwrap_or(first.expiry),
+			hops: 1 + inputs.iter().map(|i| i.coin.hops).max().unwrap_or(0),
+			origin: first.origin.clone(),
+		})
+	}
+
+	/// What [`Self::trade_coins`] priced, made: when the trade gives a coin
+	/// shaped first, the wallet pays itself that coin now and chooses again,
+	/// and the coin chosen must be the one priced (exactly `need`, no
+	/// change, the same margins). Otherwise the payment has moved and the
+	/// trade cannot go on the terms shown: refused with
+	/// [`Error::Shaped`], which names what the payment cost (shown in those
+	/// terms), and the coin made is kept for the same trade, whose next
+	/// quote trades from it with nothing to shape. The only call that moves
+	/// anything before a trade is signed.
+	#[allow(clippy::too_many_arguments)]
+	fn shape_for_trade(&mut self, info: &Value, asset: AssetId, priced: TradeCoins, paid: u64, others: &[ExplicitOutput], pays_margin: bool,
+		min_leaf: u64, other_inputs: usize, reads: Reads) -> Result<TradeCoins, Error>
+	{
+		let Some(s) = priced.shaping else { return Ok(priced) };
+		self.shape_coin(info, asset, &s, reads)?;
+		let shaped = |why: String| Error::Shaped { asset: asset.to_string(), fee: s.cost, message: format!("the wallet paid itself a coin of \
+			exactly the {} of asset {} this trade gives first, which left {} in margins, counted in the terms shown; {}: ask for the terms \
+			again, which trade from that coin with nothing more to pay itself", s.need, asset, s.cost, why) };
+		let (mine, margin, change) = self.choose(info, asset, paid, others, pays_margin, min_leaf, other_inputs, true, reads, Spend::Trade)
+			.map_err(|e| shaped(format!("the coin made does not pay it now ({})", e)))?;
+		let same = change == 0 && margin == priced.margin && mine.len() == 1 && mine[0].coin.value == s.need
+			&& mine[0].checkpoint_value == priced.mine[0].checkpoint_value;
+		if !same {
+			return Err(shaped(format!("the coins it would give now are {} holding {} with {} of change, not the coin priced",
+				mine.len(), mine.iter().map(|i| i.coin.value).sum::<u64>(), change)));
+		}
+		Ok(TradeCoins { mine, margin, change, shaping: Some(s) })
 	}
 
 	/// The coins [`Self::shape_coin`] would pay itself a coin of exactly
@@ -2579,60 +2690,35 @@ impl Wallet {
 		Ok((inputs, change))
 	}
 
-	/// What shaping a coin first costs a trade giving `paid` of `asset` from
-	/// the coins [`Self::choose`] took (`got`), when it needs one
-	/// ([`Self::choose_for_trade`]): the margins of the wallet's payment to
-	/// itself, which the trade's terms count, so what the wallet is shown
-	/// is what leaves it (web wallet #706); zero when it needs none. A coin
-	/// the wallet cannot shape before a round answers [`Error::SettleFirst`],
-	/// as the trade itself would, for a quote, which moves nothing.
-	#[allow(clippy::too_many_arguments)]
-	fn shape_cost(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, other_inputs: usize,
-		reads: Reads, got: &(Vec<In>, u64, u64)) -> Result<u64, Error>
-	{
-		if self.own_instant_limit()?.is_none() || got.2 == 0 {
-			return Ok(0);
-		}
-		let template = got.0.first().map(|i| i.coin.clone()).ok_or_else(|| Error::Refused("a trade with no coin".into()))?;
-		let margins = Margins::of(info, asset)?;
-		let m = self.checkpoint_margin(&template, &margins)?;
-		let all: Vec<&ValidCoin> = std::iter::repeat(&template).take(1 + other_inputs).collect();
-		let r = if pays_margin { self.reassignment_margin(&all, others, &margins)? } else { 0 };
-		let need = paid.checked_add(m).and_then(|v| v.checked_add(r)).ok_or_else(|| Error::Refused("a trade above 2^64 atoms".into()))?;
-		let probe = ExplicitOutput::new(asset, need, leaf_probe());
-		let (inputs, change) = self.shape_inputs(info, asset, need, &probe, reads)?;
-		Ok(Self::shaping_margins(&inputs, need, change))
-	}
-
 	/// The margins a payment of the wallet to itself leaves: what its coins
 	/// `inputs` hold beyond the coin of `need` and the change it makes.
 	fn shaping_margins(inputs: &[In], need: u64, change: u64) -> u64 {
 		inputs.iter().map(|i| i.coin.value).sum::<u64>().saturating_sub(need).saturating_sub(change)
 	}
 
-	/// Pays the wallet itself, out of round, a coin of exactly `need` of
-	/// `asset`, and the rest as change, from coins a trade may give: the
-	/// margins it left ([`Self::shaping_margins`]).
-	fn shape_coin(&mut self, info: &Value, asset: AssetId, need: u64, reads: Reads) -> Result<u64, Error> {
+	/// Pays the wallet itself, out of round, the coin of exactly `s.need` of
+	/// `asset` that [`Self::trade_coins`] priced, and the rest as change,
+	/// from the coins it priced it from.
+	fn shape_coin(&mut self, info: &Value, asset: AssetId, s: &Shaping, reads: Reads) -> Result<(), Error> {
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		// The coin is given in the trade, so its leaf is one the other side
 		// reads.
-		let leaf = self.own_leaf_traded("shaped", info, asset, need, reads.landing_2)?;
-		let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
-		let (inputs, change) = self.shape_inputs(info, asset, need, &probe, reads)?;
-		let mut outs = vec![Out { asset, value: need, leaf, mailbox, until: None }];
-		if change > 0 {
-			outs.push(Out { asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });
+		let leaf = self.own_leaf_traded("shaped", info, asset, s.need, reads.landing_2)?;
+		let mut outs = vec![Out { asset, value: s.need, leaf, mailbox, until: None }];
+		if s.change > 0 {
+			outs.push(Out { asset, value: s.change, leaf: self.own_leaf_of("change", info, asset, s.change)?, mailbox, until: None });
 		}
-		self.transfer_back(&inputs, &outs)?;
-		Ok(Self::shaping_margins(&inputs, need, change))
+		self.transfer_back(&s.inputs, &outs)?;
+		Ok(())
 	}
 
 	/// What a maker's coins leave for a swap's fees, in the asset it gives:
-	/// the reassignment's margin and the margins of their checkpoints.
-	fn maker_pays(give_asset: AssetId, margin: u64, inputs: &[In]) -> Value {
-		let margins: u64 = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).sum();
-		json!({"asset": give_asset.to_string(), "margin": margin.to_string(), "margins": margins.to_string()})
+	/// the reassignment's margin, and the margins of their checkpoints and of
+	/// the wallet's payment to itself that shaped its coin first (`shaped`,
+	/// also apart as `shapes`).
+	fn maker_pays(give_asset: AssetId, margin: u64, inputs: &[In], shaped: u64) -> Value {
+		let margins: u64 = inputs.iter().map(|i| i.coin.value - i.checkpoint_value).sum::<u64>() + shaped;
+		json!({"asset": give_asset.to_string(), "margin": margin.to_string(), "margins": margins.to_string(), "shapes": shaped.to_string()})
 	}
 
 	/// Every swap the wallet offered or accepted: its id, the wallet's role
@@ -2847,20 +2933,32 @@ impl Wallet {
 		others.push(ExplicitOutput::new(o.want_asset, 1, leaf_probe()));
 		self.swap_exit_required(&o, &info)?;
 		let reads = Reads::of(&o.offer);
-		let got = self.choose(&info, o.want_asset, o.want, &others, false, min_want, 0, true, reads, Spend::Trade)?;
-		// A trade that would shape a coin first answers here, as it would at
-		// the acceptance, when the coin cannot be shaped before a round.
-		let shaped = self.shape_cost(&info, o.want_asset, o.want, &others, false, 0, reads, &got)?;
-		let (mine, _, change) = got;
-		Self::swap_depth(&info, &o, &mine)?;
-		let outputs = o.maker_outs.len() + 1 + usize::from(change > 0);
+		let trade = self.trade_coins(&info, o.want_asset, o.want, &others, false, min_want, 0, reads)?;
+		self.quoted(self.swap_priced(&info, &o, &others, &trade, near_deadline).map(|(terms, _)| terms))
+	}
+
+	/// What taking offer `o` from the coins `trade` gives
+	/// ([`Wallet::trade_coins`]) comes to, checked as the acceptance checks
+	/// it before anything is signed: the terms shown ([`Self::swap_terms`]),
+	/// and what the wallet adds to the margin. The quote and the acceptance
+	/// both price a trade here, from the coins it will give, the coin a
+	/// payment to itself makes first included, so what is shown is what is
+	/// accepted, to the atom.
+	fn swap_priced(&self, info: &Value, o: &OfferChecked, others: &[ExplicitOutput], trade: &TradeCoins, near_deadline: bool)
+		-> Result<(Value, u64), Error>
+	{
+		Self::swap_depth(info, o, &trade.mine)?;
+		let outputs = o.maker_outs.len() + 1 + usize::from(trade.change > 0);
 		if outputs > arca_covenant::leaf::MAX_OUTPUTS as usize {
 			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outputs,
 				arca_covenant::leaf::MAX_OUTPUTS)));
 		}
-		let top_up = self.swap_top_up(&info, &o, &mine, &others)?;
-		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
-		self.quoted(Ok(Self::swap_terms(&o, &mine, top_up, shaped, change, dates)))
+		let top_up = self.swap_top_up(info, o, &trade.mine, others)?;
+		// The dates of the coins the wallet gets: the earliest of every coin
+		// spent, the maker's and its own (a coin it shapes first carries the
+		// earliest of those it is made from).
+		let dates = self.swap_dates(o.theirs.iter().chain(trade.rests_on().iter()), near_deadline)?;
+		Ok((Self::swap_terms(o, &trade.mine, top_up, trade.shaped(), trade.change, dates), top_up))
 	}
 
 	/// Refuses, before anything is signed, an offer that trades a
@@ -2987,13 +3085,13 @@ impl Wallet {
 	/// and pays the margins of the coins it gives and of shaping one.
 	fn swap_terms(o: &OfferChecked, mine: &[In], top_up: u64, shaped: u64, change: u64, dates: Value) -> Value {
 		// The checkpoints' margins of the coins the wallet gives, and those
-		// of its payment to itself that shaped one of them first (`shaped`,
-		// [`Self::shape_cost`]): everything that leaves the wallet beyond
-		// what it gives.
+		// of its payment to itself that shaped the one it gives first
+		// (`shaped`, [`Wallet::trade_coins`], also apart as `shapes`):
+		// everything that leaves the wallet beyond what it gives.
 		let margins: u64 = mine.iter().map(|i| i.coin.value - i.checkpoint_value).sum::<u64>() + shaped;
 		json!({"swap": o.id, "gets": {"asset": o.give_asset.to_string(), "value": (o.give - top_up).to_string()},
 			"gives": {"asset": o.want_asset.to_string(), "value": o.want.to_string()},
-			"pays": {"asset": o.want_asset.to_string(), "margins": margins.to_string()},
+			"pays": {"asset": o.want_asset.to_string(), "margins": margins.to_string(), "shapes": shaped.to_string()},
 			"tops_up": {"asset": o.give_asset.to_string(), "margin": top_up.to_string()},
 			"maker_pays": {"asset": o.give_asset.to_string(), "margin": o.margin.to_string()},
 			"change": {"asset": o.want_asset.to_string(), "value": change.to_string()},
@@ -3026,9 +3124,37 @@ impl Wallet {
 		others.push(ExplicitOutput::new(give_asset, give, leaf_probe()));
 		others.push(ExplicitOutput::new(want_asset, 1, leaf_probe()));
 		self.swap_exit_required(&o, &info)?;
-		let (mine, _, change, shaped) = self.choose_for_trade(&info, want_asset, want, &others, false, min_want, 0, maker_reads)?;
-		Self::swap_depth(&info, &o, &mine)?;
-		let top_up = self.swap_top_up(&info, &o, &mine, &others)?;
+		// The terms are priced and checked against those shown before
+		// anything moves: from the coins the trade will give, the coin a
+		// payment to itself makes first included (web wallet #693, #706).
+		let priced = self.trade_coins(&info, want_asset, want, &others, false, min_want, 0, maker_reads)?;
+		let (terms, top_up) = self.swap_priced(&info, &o, &others, &priced, near_deadline)?;
+		let same = |a: &Value, b: &Value| ["swap", "gets", "gives", "pays"].iter().all(|k| a[*k] == b[*k]);
+		let now = |t: &Value| json!({"swap": t["swap"], "gets": t["gets"], "gives": t["gives"], "pays": t["pays"]});
+		if let Some(shown) = shown {
+			if !same(shown, &terms) {
+				return Err(Error::Refused(format!("the swap's terms changed since they were shown; they are now {}; nothing moved", now(&terms))));
+			}
+		}
+		let checkpoint_exit = o.offer["checkpoint_exit"] == json!(true) && Self::checkpoint_exit_offered(&info);
+		if checkpoint_exit {
+			if let Some(i) = o.theirs.iter().chain(priced.mine.iter()).find(|i| !i.coin.exit_allowed()) {
+				self.exit_required(&format!("coin {} of the swap cannot have it (its kind of leaf takes no checkpoint exit)", i.coin.id))?;
+			}
+		}
+		// The one step that moves anything before the acceptance is signed:
+		// the coin priced, made. Refused past it only as [`Error::Shaped`].
+		let made = self.shape_for_trade(&info, want_asset, priced, want, &others, false, min_want, 0, maker_reads)?;
+		let shaped = made.shaped();
+		let (made_terms, _) = self.swap_priced(&info, &o, &others, &made, near_deadline).map_err(|e| Error::Shaped { asset: want_asset.to_string(),
+			fee: shaped, message: format!("the wallet paid itself a coin of exactly what this trade gives first, which left {} of asset {} in \
+			margins, counted in the terms shown; the trade from it is now refused ({}): ask for the terms again", shaped, want_asset, e) })?;
+		if !same(&made_terms, &terms) {
+			return Err(Error::Shaped { asset: want_asset.to_string(), fee: shaped, message: format!("the wallet paid itself a coin of exactly \
+				what this trade gives first, which left {} of asset {} in margins, counted in the terms shown; the terms from that coin are \
+				now {}: ask for the terms again, which trade from it with nothing more to pay itself", shaped, want_asset, now(&made_terms)) });
+		}
+		let TradeCoins { mine, change, .. } = made;
 		let gets = give - top_up;
 		outs.push(Out { asset: give_asset, value: gets, leaf: self.own_leaf_traded("swap", &info, give_asset, gets, maker_reads.landing_2)?,
 			mailbox, until: None });
@@ -3040,22 +3166,11 @@ impl Wallet {
 			return Err(Error::Refused(format!("the swap would make {} outputs; a reassignment makes at most {}", outs.len(),
 				arca_covenant::leaf::MAX_OUTPUTS)));
 		}
-		// The dates of the coins the wallet gets: the earliest of every coin
-		// spent, the maker's and its own.
-		let dates = self.swap_dates(o.theirs.iter().chain(mine.iter()), near_deadline)?;
-		let terms = Self::swap_terms(&o, &mine, top_up, shaped, change, dates.clone());
-		if let Some(shown) = shown {
-			for k in ["swap", "gets", "gives", "pays"] {
-				if shown[k] != terms[k] {
-					return Err(Error::Refused(format!("the swap's terms changed since they were shown; they are now {}", json!({
-						"swap": terms["swap"], "gets": terms["gets"], "gives": terms["gives"], "pays": terms["pays"]}))));
-				}
-			}
-		}
+		let dates = made_terms["dates"].clone();
+		let terms = made_terms;
 		let OfferChecked { offer, theirs, .. } = o;
 		// Checkpoints with their owners' exit, where the maker asked for them
 		// and the operator co-signs them.
-		let checkpoint_exit = offer["checkpoint_exit"] == json!(true) && Self::checkpoint_exit_offered(&info);
 		let n = theirs.len();
 		let mut inputs = theirs;
 		inputs.extend(mine);
