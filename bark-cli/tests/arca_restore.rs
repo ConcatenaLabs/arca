@@ -163,10 +163,12 @@ async fn a_wallet_restored_from_its_mnemonic_ends_where_the_lost_one_was() {
 	p.rewrite(None);
 	println!("RS A's sync, the keeper down: participations {}", s["participations"]);
 	assert_eq!(coin_of(&a, &left[1])["state"], "forfeited");
-	// A board in a block, not final.
+	// A board in a block, not final; at anchor depth 0 its block, certified,
+	// is final at once.
 	let pending = a.ok(&["board", &xs, "1500000"])["leaf_id"].as_str().unwrap().to_string();
 	r.produce().await;
-	assert_eq!(coin_of(&a, &pending)["state"], "pending");
+	let board_state = if r.anchor_depth() > 0 { "pending" } else { "live" };
+	assert_eq!(coin_of(&a, &pending)["state"], board_state);
 	let still = left[2].clone();
 	println!("RS A before the loss: paid from {}, change {}, batch leaf {}, board {}, forfeited {}, pending {}", &paid_from[..16], &change[..16],
 		&leaf[..16], &still[..16], &left[1][..16], &pending[..16]);
@@ -194,7 +196,7 @@ async fn a_wallet_restored_from_its_mnemonic_ends_where_the_lost_one_was() {
 	println!("RS coins differing (A | A2): {:?}", diff);
 	assert_eq!(by_id(&ca).len(), by_id(&before).len() + 1, "A holds the payment it read besides what it held");
 	for (id, want) in [(&paid_from, "spent"), (&change, "live"), (&left[0], "spent"), (&leaf, "live"), (&still, "live"), (&left[1], "forfeited"),
-		(&pending, "pending"), (&unread, "live")]
+		(&pending, board_state), (&unread, "live")]
 	{
 		assert_eq!(coin_of(&a2, id)["state"], want, "A2's coin {}", id);
 	}

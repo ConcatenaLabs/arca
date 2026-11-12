@@ -192,6 +192,16 @@ impl Running {
 		format!("http://{}", self.server.addr)
 	}
 
+	/// The anchor depth the operator publishes in its `info`
+	/// (`finality.anchor_depth`): at 0 a certified block is final at once, so
+	/// a test asserting a state "in a block, not yet final" asserts the final
+	/// state there instead. Read while the operator runs.
+	pub fn anchor_depth(&self) -> u64 {
+		let info: serde_json::Value = serde_json::from_str(minreq::get(format!("{}/v1/info", self.url())).send().unwrap().as_str().unwrap())
+			.unwrap();
+		info["finality"]["anchor_depth"].as_u64().expect("the operator publishes its anchor depth")
+	}
+
 	/// Stops the server and starts a new one on the same database, at the
 	/// same address, so every wallet reaches it as before.
 	pub async fn restart_server(&mut self) {
