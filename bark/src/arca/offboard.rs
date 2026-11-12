@@ -163,7 +163,11 @@ impl Wallet {
 	/// date `expiry`, to `script` would pay out and cost, before the wallet
 	/// holds it (a coin a trade is about to bring): the same fee
 	/// [`OffboardOf::Coins`] takes of such a coin, from the operator's
-	/// published fees. Nothing is chosen, signed or asked.
+	/// published fees, and, when such a coin would arrive past the wallet's
+	/// instant limit, the refresh of the round it goes through first
+	/// (`fee.settle`, counted in `fee.amount`). `max_fee_ppm` bounds the
+	/// settle and the move each on its own, as each is bounded when it is
+	/// made, not their sum. Nothing is chosen, signed or asked.
 	pub fn offboard_whole_quote(&self, asset: AssetId, value: u64, expiry: u32, script: &Script, max_fee_ppm: Option<u64>)
 		-> Result<Value, Error>
 	{

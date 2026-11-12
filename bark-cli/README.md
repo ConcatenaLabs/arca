@@ -1179,7 +1179,10 @@ what moving a coin of `N` with exit date `T` whole would pay and cost, from
 the operator's published fees, so a program can price a coin a trade is about
 to bring: when such a coin would arrive past the wallet's instant limit (or
 after a received coin that is arriving), the round it goes through first is
-counted (`fee.settle`), each of the two within the fee bound on its own.
+counted (`fee.settle`). `fee.amount` is then the whole fee, the settle
+included, and `--max-fee-ppm` bounds each part on its own, as each is bounded
+when it is made: the settle against the coin's value, the move against what it
+pays out, never their sum against the amount.
 
 `sync` hands over the forfeits once the round is final, and the operator then
 unlocks the round's offboard output into the address: its output 0 pays exactly
