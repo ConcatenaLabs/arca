@@ -698,7 +698,9 @@ impl Wallet {
 			// And every coin of it the wallet's own rounds hold now (given up in a
 			// refresh, or not final yet), which a spend waits for as it is.
 			for c in self.store.coins_in_states(&["given", "pending"])? {
-				if c.asset == a.to_string() && !ids.contains(&c.leaf_id) {
+				// A board the operator holds lost waits for no round.
+				let lost_board = c.kind == "board" && c.note.contains(super::wallet::BOARD_LOST);
+				if c.asset == a.to_string() && !ids.contains(&c.leaf_id) && !lost_board {
 					ids.push(c.leaf_id);
 				}
 			}

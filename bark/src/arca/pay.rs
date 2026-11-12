@@ -613,6 +613,10 @@ impl Wallet {
 				continue;
 			}
 			let hops = Self::record_of(&row).map(|r| super::wallet::record_hops(&r)).unwrap_or(0);
+			// A board the operator holds lost settles in no round.
+			if row.kind == "board" && row.note.contains(super::wallet::BOARD_LOST) {
+				continue;
+			}
 			let why = if row.state == "pending" {
 				"not final yet"
 			} else if barred.contains(&row.leaf_id) {

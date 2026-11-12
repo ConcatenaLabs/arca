@@ -63,6 +63,13 @@ pub const REDOING: &str = "being redone after a Bitcoin reorganisation; ";
 /// How a board coin's note starts while the wallet reads its board final and
 /// the operator has not credited it yet ([`Wallet::recheck`]).
 pub const BOARD_NOT_CREDITED: &str = "waiting: the operator has not credited board ";
+/// How a board coin's note starts while the operator holds its board lost
+/// although the chain mined it: it never credits it, so the coin pays nothing
+/// in the tree and no round settles it; `exit` takes it home.
+pub const BOARD_LOST: &str = "the operator will not credit board ";
+/// The store's key prefix, with a board coin's leaf id, of the block the
+/// board was mined in when the operator last said it credited it.
+const BOARD_CREDITED_AT: &str = "board_credited_at.";
 
 /// The store's key for the anchor depth the operator last published, empty
 /// when it published none.
@@ -2531,14 +2538,54 @@ impl Wallet {
 		Ok(Some(tx))
 	}
 
-	/// The operator's state of board `b` when it has not credited it yet
-	/// (`pending`, or `lost`), from its `board_status`; `None` once it has, or
-	/// when it cannot be asked.
-	fn board_not_credited(&self, b: &arca_covenant::BoardRecord) -> Option<String> {
-		let v = self.server.post("board_status", &json!({"leaf_id": b.leaf_id().to_string()})).ok()?;
-		match v["state"].as_str() {
-			Some("credited") | None => None,
-			Some(other) => Some(other.to_string()),
+	/// The note a board coin the wallet reads final holds while it waits
+	/// for the operator, or `None` when it is live: once the operator's
+	/// `board_status` says credited. The operator co-signs nothing from a
+	/// board it has not credited (`not_live`), and it follows the chain on
+	/// its own clock, a block or a pass behind the wallet at times.
+	///
+	/// It is asked until it has credited the board as mined in the block
+	/// the chain holds it in now, which the wallet keeps: so a coin made live
+	/// by a restore or another device's catch-up, by a sync at which the
+	/// operator could not be asked, or before a rollback that mined the board
+	/// again in another block, is asked again before it pays. A board the
+	/// operator does not know (`unknown_board`) is not credited. One it holds
+	/// lost is never credited: its note says so ([`BOARD_LOST`]), and it is
+	/// not offered as settling ([`Wallet::round_first`]). When the operator
+	/// cannot be asked, a coin live before stays live (`was_live`), and any
+	/// other waits.
+	pub(crate) fn board_waits(&self, b: &arca_covenant::BoardRecord, base: Option<&str>, was_live: bool, note: &str)
+		-> Result<Option<String>, Error>
+	{
+		let leaf = b.leaf_id().to_string();
+		let block = match base.and_then(|t| Txid::from_str(t).ok()) {
+			Some(t) => self.chain.tx_block(&t)?.map(|(h, _)| h.to_string()),
+			None => None,
+		};
+		let key = format!("{}{}", BOARD_CREDITED_AT, leaf);
+		if block.is_some() && self.store.meta(&key)? == block {
+			return Ok(None);
+		}
+		let was = if note.starts_with(REDOING) { REDOING } else { "" };
+		let waiting = |state: &str| format!("{}{}{} yet (it reads it {}): the operator credits a board once its transaction is final as \
+			it reads the chain", was, BOARD_NOT_CREDITED, leaf, state);
+		match self.server.post("board_status", &json!({"leaf_id": leaf})) {
+			Ok(v) => match v["state"].as_str() {
+				Some("credited") => {
+					if let Some(h) = block {
+						self.store.set_meta(&key, &h)?;
+					}
+					Ok(None)
+				},
+				Some("lost") => Ok(Some(format!("{}{}{}: it holds it lost, its transaction having stayed out of every block for longer \
+					than it waits, and credits it no more although the chain holds it now; the coin pays nothing in the tree and no round \
+					settles it: exit takes it home", was, BOARD_LOST, leaf))),
+				Some(other) => Ok(Some(waiting(other))),
+				None => Ok(Some(waiting("unknown"))),
+			},
+			Err(Error::Server { code, .. }) if code == "unknown_board" => Ok(Some(waiting("unknown: it holds no such board"))),
+			Err(_) if was_live => Ok(None),
+			Err(e) => Ok(Some(waiting(&format!("unknown: it could not be asked ({})", e)))),
 		}
 	}
 
@@ -3242,20 +3289,12 @@ impl Wallet {
 	fn recheck_one(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy, now: MedianTime) -> Result<Checked, Error> {
 		let checked = self.recheck_one_at(c, record, policy, now)?;
 		// A board coin the wallet reads final is live only once the operator
-		// credits it: the operator co-signs nothing from a board it has not
-		// credited (`not_live`), and it follows the chain on its own clock, a
-		// block or a pass behind the wallet at times. Until it says so, the
-		// coin waits as any coin not final yet does (`settle_first` names it,
-		// with the time), so no payment is asked of the operator from it to
-		// be refused. An operator that cannot be asked leaves the wallet's own
-		// reading standing.
+		// credits it ([`Self::board_waits`]). Until it says so, the coin waits
+		// as any coin not final yet does (`settle_first` names it, with the
+		// time), so no payment is asked of the operator from it to be refused.
 		if let (Checked::Holds("live", _), CoinRecord::Board(b)) = (&checked, record) {
-			if c.state != "live" {
-				if let Some(state) = self.board_not_credited(b) {
-					let was = if c.note.starts_with(REDOING) { REDOING } else { "" };
-					return Ok(Checked::Holds("pending", format!("{}{}{} yet (it reads it {}): the operator credits a board once its \
-						transaction is final as it reads the chain", was, BOARD_NOT_CREDITED, b.leaf_id(), state)));
-				}
+			if let Some(note) = self.board_waits(b, c.bases.first().map(String::as_str), c.state == "live", &c.note)? {
+				return Ok(Checked::Holds("pending", note));
 			}
 		}
 		let (board_spent, note) = match checked {
