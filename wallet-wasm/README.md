@@ -47,7 +47,11 @@ operator that does not answer, and it keeps its state in SQLite. In a browser:
   about one a second, keeps the wallet working. The node runs one scan at a
   time for all its clients: a scan it refuses as busy with another's waits on
   the pause and is asked again, for two minutes at most, and the refusal is
-  never kept as the chain's answer.
+  never kept as the chain's answer. A block a search of the chain reads is
+  read once: a summary of what it pays and spends is kept in the wallet's
+  store, by its hash, checked against the active chain at every use, so a
+  page reloaded reads only the blocks it has not seen (at most 100,000 kept,
+  some 15 MB, the oldest dropped first).
 - **The pause** between two tries (a node or proxy that answers busy or "too
   many calls", an operator that does not answer) is the host's to give. A worker
   blocked in the library has nothing else to do, but a pause that watches the

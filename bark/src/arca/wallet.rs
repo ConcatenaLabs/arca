@@ -852,6 +852,9 @@ impl Wallet {
 		let coin_type = if get("chain_name")? == "sequentia" { 0 } else { 1 };
 		let keys = Keys::new(mnemonic, cfg.account, coin_type)?;
 		let chain = ChainSource::new(&cfg.node_url, cfg.node_user.as_deref(), cfg.node_password.as_deref(), cfg.node_cookie.as_deref());
+		// The blocks earlier sessions' searches read, so this one reads only
+		// those it has not seen ([`Wallet::keep_chain_seen`]).
+		chain.see_kept(&store.chain_seen()?);
 		// The operator's anchor depth as last read, until its `info` is read
 		// again ([`Self::server_info`]).
 		chain.follow_anchor_depth(opt(ANCHOR_DEPTH_META)?.and_then(|d| d.parse().ok()), &get("chain_name")?);
@@ -861,6 +864,16 @@ impl Wallet {
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
+	}
+
+	/// Keeps in the store the blocks the chain's searches read since it last
+	/// did, and drops those the bound leaves out
+	/// ([`super::chain::ChainSource::seen_to_keep`]): a new session of the
+	/// wallet (a page reloaded, a command run again) reads only the blocks
+	/// it has not seen. Run after each command.
+	pub fn keep_chain_seen(&self) -> Result<(), Error> {
+		let (rows, below) = self.chain.seen_to_keep();
+		self.store.keep_chain_seen(&rows, below)
 	}
 
 	/// Whether the wallet asks for `vtxo-2` leaves for itself: in a refresh,

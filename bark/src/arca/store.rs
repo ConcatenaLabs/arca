@@ -176,6 +176,8 @@ CREATE INDEX IF NOT EXISTS tower_deposit_owner ON tower_deposit(owner);
 CREATE INDEX IF NOT EXISTS forfeit_participation ON forfeit(participation);
 CREATE TABLE IF NOT EXISTS tower_sealed (id TEXT PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tower_hint (hint TEXT NOT NULL, id TEXT NOT NULL, k INTEGER NOT NULL, PRIMARY KEY (hint, id));
+CREATE TABLE IF NOT EXISTS chain_seen (hash BLOB PRIMARY KEY, height INTEGER NOT NULL, prev BLOB NOT NULL, pays BLOB NOT NULL, spends BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS chain_seen_height ON chain_seen(height);
 ";
 
 /// A deposit a watchtower holds ([`super::tower`]).
@@ -510,6 +512,42 @@ impl Store {
 				params![id, state, note, now()]),
 		}.map_err(db)?;
 		Ok(())
+	}
+
+	// --- the blocks the chain's searches have seen ([`super::chain::SeenRow`]) ---
+
+	/// Every block kept.
+	pub fn chain_seen(&self) -> Result<Vec<super::chain::SeenRow>, Error> {
+		use elements::hashes::Hash;
+		let mut st = self.conn.prepare("SELECT hash, height, prev, pays, spends FROM chain_seen").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, Vec<u8>>(3)?,
+			r.get::<_, Vec<u8>>(4)?))).map_err(db)?;
+		let mut out = vec![];
+		for row in rows {
+			let (hash, height, prev, pays, spends) = row.map_err(db)?;
+			// A row that does not read is left out: the block is read again.
+			let (Ok(hash), Ok(prev)) = (elements::BlockHash::from_slice(&hash), elements::BlockHash::from_slice(&prev)) else { continue };
+			out.push(super::chain::SeenRow { hash, height: height.max(0) as u64, prev, pays, spends });
+		}
+		Ok(out)
+	}
+
+	/// Keeps `rows`, and drops every block kept below height `below`, in one
+	/// transaction.
+	pub fn keep_chain_seen(&self, rows: &[super::chain::SeenRow], below: Option<u64>) -> Result<(), Error> {
+		use elements::hashes::Hash;
+		if rows.is_empty() && below.is_none() {
+			return Ok(());
+		}
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		if let Some(b) = below {
+			tx.execute("DELETE FROM chain_seen WHERE height < ?1", params![b as i64]).map_err(db)?;
+		}
+		for r in rows {
+			tx.execute("INSERT OR REPLACE INTO chain_seen (hash, height, prev, pays, spends) VALUES (?1, ?2, ?3, ?4, ?5)",
+				params![r.hash.to_byte_array().to_vec(), r.height as i64, r.prev.to_byte_array().to_vec(), r.pays, r.spends]).map_err(db)?;
+		}
+		tx.commit().map_err(db)
 	}
 
 	// --- meta ---
