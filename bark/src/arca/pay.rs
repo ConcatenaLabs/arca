@@ -1367,12 +1367,16 @@ impl Wallet {
 				}).cloned());
 				let held_note = self.spelling.say(FORFEIT_HELD_NOTE);
 				// A coin signed into an acceptance the wallet has not seen
-				// cancelled or done (a cancel's respend, refused) is held for
+				// cancelled or done (a cancel's respend, refused for a reason
+				// other than a spent coin) is held for
 				// that swap again, never live: the maker can complete the
 				// acceptance while it is unspent, so nothing else (a refresh, a
 				// payment) may take it, and the next cancel respends it.
+				// A double_spend says the coin is spent: it goes live, for the
+				// catch-up below and the cancel to find what spent it.
+				let spent_refusal = matches!(&e, Error::Server { code, .. } if code == "double_spend");
 				let mut for_swap: BTreeMap<String, String> = BTreeMap::new();
-				for (sid, role, _, state) in self.store.swaps()? {
+				for (sid, role, _, state) in self.store.swaps()?.into_iter().filter(|_| !spent_refusal) {
 					if role == "taker" && state == "accepted" {
 						for l in self.acceptance_coins(&sid)? {
 							if mine.contains(&l) {
