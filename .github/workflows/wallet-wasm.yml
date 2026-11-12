@@ -32,7 +32,14 @@ jobs:
           echo "3a4c1e5f2516c639d3079b1586e703fc7bcfa2136d58bda24d1d54f949c315e8  /tmp/protoc.zip" | sha256sum -c -
           sudo unzip -q -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
           protoc --version
+          cargo install --locked wasm-pack --version 0.13.1
 
       - name: Build
         working-directory: wallet-wasm
         run: cargo build --locked --release --target wasm32-unknown-unknown
+
+      - name: The pause costs no processor where the host gives a wait
+        working-directory: wallet-wasm
+        run: |
+          wasm-pack build --target web --release --out-name leaf_wallet
+          node tests/pause.mjs pkg
