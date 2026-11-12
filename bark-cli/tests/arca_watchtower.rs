@@ -653,6 +653,72 @@ async fn a_wallet_deposits_with_the_default_watchtowers_that_watch_for_its_opera
 	assert_eq!(t.deposits()[0]["state"], "sealed");
 }
 
+/// A restore does not wait for the watchtowers (#721): it notes its
+/// deposits as owed (`deposits.owed`), and `arca` makes them as soon as the
+/// restore's answer is out. A store whose program closed before they were
+/// made (the note standing, nothing sent) makes them first at its next
+/// `sync`, before it asks the operator anything, and the note goes once
+/// every watchtower holds every coin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_deposits_once_it_returns_and_first_at_the_next_sync_when_cut_short() {
+	let mut r = Running::start().await;
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("wt restore A");
+	a.ok(&create_args(&url, &node));
+	let t = Tower::new("wt restore T", &url, &node);
+	a.ok(&["watchtowers", &t.url]);
+	let l = board(&mut r, &a, "2000000").await;
+	a.ok(&["participate", "--leaf", &l, "--max-fee-ppm", "1000000"]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	a.ok(&["sync"]);
+	a.ok(&["sync"]);
+	let held = t.deposits().len();
+	assert!(held >= 1, "A's live coin is deposited: {}", held);
+
+	let a2 = Arca::new("wt restore A2");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	println!("A2's restore: deposits {} | sync deposits {}", made["restore"]["deposits"], made["restore"]["sync"]["deposits"]);
+	assert_eq!(made["restore"]["deposits"]["owed"], true, "{}", made["restore"]);
+	assert_eq!(made["restore"]["sync"]["deposits"]["note"], "left to the command deposits", "the restore's sync waits for no watchtower");
+	// Named the same watchtower, A2 restores again: the deposits follow the
+	// answer at once.
+	a2.ok(&["watchtowers", &t.url]);
+	let again = a2.ok(&["restore"]);
+	assert_eq!(again["deposits"]["owed"], true, "{}", again);
+	let meta = |w: &Arca, k: &str| -> Option<String> {
+		let db = rusqlite::Connection::open(w.dir.join("arca.sqlite")).unwrap();
+		db.query_row("SELECT value FROM meta WHERE key = ?1", [k], |r| r.get::<_, String>(0)).ok()
+	};
+	println!("after A2's restore: the watchtower holds {} deposits (A's {})", t.deposits().len(), held);
+	assert_eq!(t.deposits().len(), held * 2, "A2's coins deposited once the restore returned");
+	assert_eq!(meta(&a2, "deposits_owed"), None, "nothing owed once they are made");
+
+	// Cut short: the restore returned, the note stands, and the program
+	// closed before any deposit was made.
+	{
+		let db = rusqlite::Connection::open(a2.dir.join("arca.sqlite")).unwrap();
+		db.execute("DELETE FROM deposit_sent", []).unwrap();
+		db.execute("DELETE FROM deposit", []).unwrap();
+		db.execute("INSERT INTO meta (key, value) VALUES ('deposits_owed', '1') ON CONFLICT(key) DO UPDATE SET value = '1'", []).unwrap();
+	}
+	let s = a2.ok(&["sync"]);
+	println!("A2's sync with deposits owed: owed step {} | deposits {}", s["cost_by_step"]["owed deposits"], s["deposits"]);
+	assert!(s["cost_by_step"]["owed deposits"].is_object(), "the owed deposits are a step of their own: {}", s["cost_by_step"]);
+	let deps = s["deposits"].as_array().unwrap();
+	assert!(!deps.is_empty() && deps.iter().all(|d| d["watchtower"] == t.url.as_str() && d["deposited"].is_string()), "{}", s["deposits"]);
+	assert_eq!(t.deposits().len(), held * 3);
+	assert_eq!(meta(&a2, "deposits_owed"), None);
+	for w in [&a, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// The same answer when the earlier coin is a board: a sender pays out of
 /// round from the board it made, then converts that board into its leaf
 /// from a copy of its wallet made before it paid, while the receiver is

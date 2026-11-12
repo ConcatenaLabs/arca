@@ -331,6 +331,13 @@ fn txs_of(v: &Value) -> Result<Vec<Transaction>, Error> {
 	}).collect()
 }
 
+/// Where the wallet notes that a restore returned before its coins were
+/// deposited with the watchtowers: the deposits are made at once after it
+/// (the command `deposits`), and while the note stands, every `sync` makes
+/// them first, before it asks the operator anything, so a wallet closed
+/// before they were made makes them as soon as it is opened again.
+pub(crate) const DEPOSITS_OWED: &str = "deposits_owed";
+
 impl Wallet {
 	// -----------------------------------------------------------------------
 	// The holder's side
@@ -488,6 +495,12 @@ impl Wallet {
 		v
 	}
 
+	/// [`Self::progress_deposits`], for a program: what it did, a line a coin
+	/// and watchtower (the command `deposits`).
+	pub fn deposits(&mut self) -> Result<Value, Error> {
+		self.progress_deposits().map(Value::Array)
+	}
+
 	/// Every live coin resting on a batch deposited with each watchtower the
 	/// wallet names, once; every deposit of a coin no longer the wallet's
 	/// withdrawn. What it did, a line a coin and watchtower; a watchtower
@@ -621,6 +634,11 @@ impl Wallet {
 			if !left.contains_key(&leaf) {
 				self.store.delete_deposit(&leaf)?;
 			}
+		}
+		// A restore's deposits are made once a run reaches every watchtower
+		// with every coin ([`DEPOSITS_OWED`]).
+		if out.iter().all(|v| v["error"].is_null() && v["passed_over"].is_null()) {
+			self.store.delete_meta(DEPOSITS_OWED)?;
 		}
 		Ok(out)
 	}

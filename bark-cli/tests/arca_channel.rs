@@ -290,6 +290,87 @@ async fn a_channel_closed_by_someone_else_has_its_credit_claimed_by_sync() {
 	assert!(after >= before + home, "and in B's on-chain balance: {} -> {}", before, after);
 }
 
+/// A channel leaf restored (#721): A and B open channel leaves in one round,
+/// A pays B over them and B folds the credit; B then pays A out of its own
+/// leaf beside the channel is not possible, so the history is what opening
+/// the channel gave up. B's device is lost. B2, restored from B's mnemonic
+/// alone, holds B's channel leaf when the restore returns, its balance B's,
+/// the board B gave up to open it left to the history and counted nowhere;
+/// `channel sync` reads the states and the note, and B2's channel stands as
+/// B's. After the history's step, B2's coins are B's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_wallet_holds_its_channel_leaf_at_once() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.assets[0].channel_capacity = Some("2000000".into());
+	}).await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("restore channel A");
+	let b = Arca::new("restore channel B");
+	let b2 = Arca::new("restore channel B2");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1",
+		"--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for w in [&a, &b] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, r.x, 5_000_000);
+	}
+	r.produce().await;
+	let mut boards = vec![];
+	for w in [&a, &b] {
+		boards.push(w.ok(&["board", &x, &BOARD.to_string()])["leaf_id"].as_str().unwrap().to_string());
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit both boards", || {
+		a.ok(&["boards"])[0]["server"]["state"] == "credited" && b.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	for w in [&a, &b] {
+		w.ok(&["channel", "open", "--capacity", &CAPACITY.to_string()]);
+	}
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let (ca, cb) = (channel(&a), channel(&b));
+	let (la, lb) = (ca["leaf_id"].as_str().unwrap().to_string(), cb["leaf_id"].as_str().unwrap().to_string());
+	a.ok(&["channel", "pay", &la, &lb, "400000"]);
+	b.ok(&["channel", "sync", &lb]);
+	b.ok(&["channel", "fold", &lb]);
+	let before = channel(&b);
+	println!("B's channel before the loss: {}", before);
+
+	let mnemonic = std::fs::read_to_string(b.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create.to_vec();
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = b2.ok(&args);
+	let restore = &made["restore"];
+	println!("B2's restore: restored {} | history {} | not recovered {}", restore["restored"], restore["history"], restore["not_recovered"]);
+	assert!(restore["error"].is_null(), "{}", restore);
+	assert_eq!(restore["not_recovered"], serde_json::json!([]), "{}", restore);
+	assert!(restore["history"]["left"].as_u64().unwrap() >= 1, "the board B gave up is history: {}", restore["history"]);
+	let coin = b2.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == lb.as_str()).cloned().expect("B's channel leaf");
+	assert_eq!(coin["state"], "live", "{}", coin);
+	assert!(!b2.ok(&["coins"]).as_array().unwrap().iter().any(|c| c["leaf_id"] == boards[1].as_str()), "the board waits for its step");
+	let synced = b2.ok(&["channel", "sync", &lb]);
+	println!("B2's channel sync: {}", synced);
+	let after = channel(&b2);
+	for k in ["leaf_id", "value", "balance", "operator_side"] {
+		assert_eq!(after[k], before[k], "B2's channel {} is B's: {} | {}", k, after, before);
+	}
+	b.ok(&["sync"]);
+	b2.ok(&["sync"]);
+	assert_eq!(b2.ok(&["balance"])["arca"], b.ok(&["balance"])["arca"], "B2's balance is B's");
+	let board = b2.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == boards[1].as_str()).cloned().expect("the board, after its step");
+	assert_eq!(board["state"], "spent", "{}", board);
+}
+
 /// The operator's total on its side of all its channel leaves of an asset
 /// (`channel_capacity_total`): a channel past it is refused, saying why,
 /// and opens once another has closed.

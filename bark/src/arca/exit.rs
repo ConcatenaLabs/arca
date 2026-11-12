@@ -1950,6 +1950,13 @@ impl Wallet {
 	/// others from the wallet (a maker's firm offer) then finds the library
 	/// free between the two. The deposits answer nothing anyone waits on.
 	pub fn sync_parts(&mut self, catch_up: bool, deposits: bool) -> Result<Value, Error> {
+		self.sync_with(catch_up, deposits, true)
+	}
+
+	/// [`Self::sync_parts`]; with `history` false, without the step of a
+	/// restore's history ([`Self::restore_history`]): the sync that ends a
+	/// restore, which leaves the history to the syncs after it.
+	pub(crate) fn sync_with(&mut self, catch_up: bool, deposits: bool, history: bool) -> Result<Value, Error> {
 		// The schedule's relative times count from this sync.
 		let start = self.now()?.to_consensus_u32();
 		self.store.set_meta(super::wallet::LAST_SYNC, &start.to_string())?;
@@ -1960,7 +1967,7 @@ impl Wallet {
 		let (mut early_home, mut early_exits) = self.exit_steps();
 		*self.exit_watch.borrow_mut() = Some(start);
 		*self.exits_done.borrow_mut() = (vec![], vec![]);
-		let out = self.sync_asking(recheck, catch_up, deposits);
+		let out = self.sync_asking(recheck, catch_up, deposits, history);
 		*self.exit_watch.borrow_mut() = None;
 		let (h, e) = std::mem::take(&mut *self.exits_done.borrow_mut());
 		early_home.extend(h);
@@ -1985,10 +1992,20 @@ impl Wallet {
 
 	/// The part of [`Self::sync`] that asks the operator, with every exit step
 	/// whose date comes meanwhile taken at once ([`Self::exits_meanwhile`]).
-	fn sync_asking(&mut self, recheck: Value, catch_up: bool, with_deposits: bool) -> Result<Value, Error> {
+	fn sync_asking(&mut self, recheck: Value, catch_up: bool, with_deposits: bool, with_history: bool) -> Result<Value, Error> {
 		// What each step cost (milliseconds, and requests of the node and of
 		// the operator): `cost_by_step`, for a program that logs a slow sync.
 		let mut steps = Steps::start(self);
+		// Deposits a restore left owed, before anything else: the coins it
+		// took are safe with a watchtower only once they are made, and none
+		// of them waits on the operator ([`super::tower::DEPOSITS_OWED`]).
+		let owed = self.store.meta(super::tower::DEPOSITS_OWED)?.is_some();
+		let owed_deposits = if owed && with_deposits {
+			Some(self.progress_deposits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})))
+		} else { None };
+		if owed_deposits.is_some() {
+			steps.lap(self, "owed deposits");
+		}
 		// The witness first, patiently: after a rollback of the operator's
 		// signer's record the wallet does only what it does on the chain, and
 		// while no witness succeeds it takes no coin and signs no spend
@@ -2044,6 +2061,13 @@ impl Wallet {
 			self.catch_up().unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { Value::Null };
 		steps.lap(self, "catch up");
+		self.exits_meanwhile();
+		// The coins a restore left to be checked after it (the wallet's
+		// history): one bounded step of them ([`Self::restore_history`]).
+		let history = if talk && with_history {
+			self.restore_history().map(|v| v.unwrap_or(Value::Null)).unwrap_or_else(|e| json!({"error": e.to_string()}))
+		} else { Value::Null };
+		steps.lap(self, "history");
 		self.exits_meanwhile();
 		// Every coin kept before the wallet named its mailbox key is bound to
 		// it, so that a restore from the mnemonic finds it.
@@ -2105,7 +2129,9 @@ impl Wallet {
 		// every deposit of a coin no longer the wallet's withdrawn: none of
 		// it needs the operator.
 		self.exits_meanwhile();
-		let deposits = if with_deposits {
+		let deposits = if let Some(d) = owed_deposits {
+			d
+		} else if with_deposits {
 			self.progress_deposits().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { json!({"note": "left to the command deposits"}) };
 		steps.lap(self, "deposits");
@@ -2158,6 +2184,9 @@ impl Wallet {
 			"participations": participations, "forfeits": forfeits, "exits": exits, "schedule": schedule});
 		steps.lap(self, "schedule");
 		out["cost_by_step"] = steps.done();
+		if !history.is_null() {
+			out["history"] = history;
+		}
 		if refresh.as_array().is_none_or(|r| !r.is_empty()) {
 			out["refresh"] = refresh;
 		}
@@ -2237,7 +2266,7 @@ mod test {
 
 /// The cost of each step of a command, as [`super::command::run`] counts a
 /// command's: milliseconds, and requests of the node and of the operator.
-struct Steps {
+pub(crate) struct Steps {
 	at: web_time::Instant,
 	node: u64,
 	operator: u64,
@@ -2247,14 +2276,14 @@ struct Steps {
 }
 
 impl Steps {
-	fn start(w: &Wallet) -> Steps {
+	pub(crate) fn start(w: &Wallet) -> Steps {
 		Steps { at: web_time::Instant::now(), node: w.chain.calls().0, operator: super::chain::gaps(), by: w.chain.asked_by_method(),
 			op: super::chain::operator_calls(), out: serde_json::Map::new() }
 	}
 
 	/// The step `name` ends here; where it made many requests of the node one
 	/// read at a time, with their methods (`alone`).
-	fn lap(&mut self, w: &Wallet, name: &str) {
+	pub(crate) fn lap(&mut self, w: &Wallet, name: &str) {
 		let (node, operator, by) = (w.chain.calls().0, super::chain::gaps(), w.chain.asked_by_method());
 		let mut step = json!({"ms": self.at.elapsed().as_millis() as u64, "node": node - self.node, "operator": operator - self.operator});
 		let alone = super::command::cost_by_method(&self.by, &by);
@@ -2273,7 +2302,7 @@ impl Steps {
 		*self = Steps { at: web_time::Instant::now(), node, operator, by, op, out: std::mem::take(&mut self.out) };
 	}
 
-	fn done(self) -> Value {
+	pub(crate) fn done(self) -> Value {
 		Value::Object(self.out)
 	}
 }

@@ -602,6 +602,181 @@ fn held_in(w: &Arca, asset: &AssetId) -> u64 {
 	arca_held(w, asset)
 }
 
+/// D63 with the restore's history (#721): a server that withholds how one coin was
+/// given up. A receives over Lightning (claimed: leaf L, the claim's coin H),
+/// then pays three times out of round, each from the change before:
+/// L -> H -> H2 -> H3 -> H4 (live). A stepped restore takes L and H at once
+/// (H spends a received leaf) and leaves H2 to the history. The proxy serves
+/// H as live and given up nowhere (an old copy). A restore that checks
+/// everything at once still holds H spent, by H2's record; the stepped one
+/// must never count more than that, at any moment.
+#[tokio::test(flavor = "multi_thread")]
+async fn d63_a_withheld_give_up_of_a_claims_coin_is_never_counted() {
+	let Some(lnd) = lightningd("d63_a_withheld_give_up_of_a_claims_coin_is_never_counted") else { return };
+	let mut r = short_delays().await;
+	let x = r.x;
+	let xs = x.to_string();
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d63w").await;
+	let url = r.url();
+	let a = wallet_at("D63W", &url, &r);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &xs, "200000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let (hash, paying) = held(&r, &a, &px, 600_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	a.ok(&["sync"]);
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete");
+	assert_eq!(a.ok(&["lightning", "receives"])[&hash]["state"], "received");
+	a.ok(&["sync"]);
+	let claimed: Vec<String> = a.ok(&["coins"]).as_array().unwrap().iter()
+		.filter(|c| c["state"] == "live" && c["value"].as_str().is_some_and(|v| v.parse::<u64>().unwrap() > 300_000))
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	assert_eq!(claimed.len(), 1, "{:?}", claimed);
+	let h = claimed[0].clone();
+	let b = wallet_at("D63WB", &url, &r);
+	let mut from = h.clone();
+	let mut chain = vec![h.clone()];
+	for amount in ["300000", "15000", "10000"] {
+		let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		let sent = a.ok(&["send", &req, "--amount", amount, "--asset", &xs]);
+		println!("D63W A pays {} from {}", amount, sent["inputs"]);
+		assert!(sent["inputs"].as_array().unwrap().iter().any(|i| i == from.as_str()), "each payment spends the coin before: {}", sent);
+		from = sent["transfer"]["kept"][0]["leaf_id"].as_str().unwrap().to_string();
+		chain.push(from.clone());
+		b.ok(&["sync"]);
+		a.ok(&["sync"]);
+	}
+	println!("D63W chain H -> H2 -> H3 -> H4: {:?}", chain);
+	let bal_a = held_in(&a, &x);
+	let h_value: u64 = coin_of(&a, &h)["value"].as_str().unwrap().parse().unwrap();
+
+	// The lie: H served as live and given up nowhere.
+	let lie = common::proxy::Proxy::start(&r.url());
+	let hid = h.clone();
+	lie.rewrite(Some(std::sync::Arc::new(move |path: &str, _req: &Value, _status: u16, v: &mut Value| {
+		if path == "/v1/leaf_data" {
+			for l in v["leaves"].as_array_mut().into_iter().flatten() {
+				if l["leaf_id"] == hid.as_str() {
+					l["state"] = json!("live");
+					l["given"] = json!([]);
+				}
+			}
+		}
+		None
+	})));
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let node_url = r.node_url();
+	let create = |w: &Arca, server: &str, at_once: bool| {
+		let mut args = vec!["create", "--server", server, "--node-url", node_url.as_str(), "--node-user", "arca", "--exit-delay-units", "4",
+			"--min-exit-delay-units", "1", "--mnemonic", &mnemonic];
+		if at_once {
+			args.push("--restore-at-once");
+		}
+		w.ok(&args)
+	};
+	let a3 = Arca::new("D63W3");
+	let m3 = create(&a3, &lie.url, true);
+	let bal_3 = held_in(&a3, &x);
+	println!("D63W at once, against the lie: A3 holds {} (A {}) | H {} | history {}", bal_3, bal_a, coin_of(&a3, &h)["state"],
+		m3["restore"]["history"]);
+	let a2 = Arca::new("D63W2");
+	let m2 = create(&a2, &lie.url, false);
+	let bal_2 = held_in(&a2, &x);
+	println!("D63W stepped, against the lie, when the restore returns: A2 holds {} (A {}, at once {}) | H {} | H2 {} | history {}",
+		bal_2, bal_a, bal_3, coin_of(&a2, &h)["state"], coin_of(&a2, &chain[1])["state"], m2["restore"]["history"]);
+	let spendable = a2.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "live")
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+	println!("D63W A2's live coins when the restore returns: {:?} (H value {})", spendable, h_value);
+	let s = a2.ok(&["sync"]);
+	println!("D63W A2 after one sync: holds {} | H {} | history {}", held_in(&a2, &x), coin_of(&a2, &h)["state"], s["history"]);
+	assert_eq!(bal_3, bal_a, "the restore at once holds the lost wallet's balance against the lie");
+	assert_eq!(held_in(&a2, &x), bal_a, "after its step, the stepped one too");
+	assert!(bal_2 <= bal_3, "the stepped restore never counts more than the one at once: {} > {} (H is {})", bal_2, bal_3, h_value);
+	drop((ox, px));
+	for w in [&a, &a2, &a3, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// D63 with the restore's history (#721): a wallet receives over
+/// Lightning (claimed), then pays out of round from the coin its claim made
+/// and again from that payment's change, so the claim's coin is spent two
+/// transfers down, in the history a restore leaves to its steps. A wallet restored from the mnemonic is right
+/// when its restore returns, before any sync: the received leaf is spent by
+/// its claim (the coin the claim made is judged with it, at once), so the
+/// balance is the lost wallet's and nothing received is counted twice or
+/// held `receiving`.
+#[tokio::test(flavor = "multi_thread")]
+async fn d63_a_restore_counts_a_received_leaf_once_when_its_claims_coin_was_spent() {
+	let Some(lnd) = lightningd("d63_a_restore_counts_a_received_leaf_once_when_its_claims_coin_was_spent") else { return };
+	let mut r = short_delays().await;
+	let x = r.x;
+	let xs = x.to_string();
+	let (ox, px) = leg_in_x(&lnd, &mut r, "d63h").await;
+	let url = r.url();
+	let a = wallet_at("D63H", &url, &r);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &xs, "200000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let (hash, paying) = held(&r, &a, &px, 600_000).await;
+	a.ok(&["sync"]);
+	leaf_round(&r).await;
+	a.ok(&["sync"]);
+	assert_eq!(paying.join().unwrap().unwrap()["status"], "complete");
+	assert_eq!(a.ok(&["lightning", "receives"])[&hash]["state"], "received");
+	a.ok(&["sync"]);
+	// The claim's coin paid on: the board alone cannot make the payment.
+	let claimed: Vec<String> = a.ok(&["coins"]).as_array().unwrap().iter()
+		.filter(|c| c["state"] == "live" && c["value"].as_str().is_some_and(|v| v.parse::<u64>().unwrap() > 300_000))
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	assert_eq!(claimed.len(), 1, "the claim's coin alone holds more than the payment");
+	let b = wallet_at("D63HB", &url, &r);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req, "--amount", "300000", "--asset", &xs]);
+	println!("D63H A pays from {} (the claim's coin {:?})", sent["inputs"], claimed);
+	assert!(sent["inputs"].as_array().unwrap().iter().any(|i| i == claimed[0].as_str()), "the claim's coin is paid from: {}", sent["inputs"]);
+	b.ok(&["sync"]);
+	a.ok(&["sync"]);
+	// And once more from the change, so the claim's coin is two transfers
+	// below the coin A holds: deep in the history, not the parent of a
+	// live coin.
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req, "--amount", "15000", "--asset", &xs]);
+	println!("D63H A pays again from {}", sent["inputs"]);
+	b.ok(&["sync"]);
+	a.ok(&["sync"]);
+	let bal_a = held_in(&a, &x);
+
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let a2 = Arca::new("D63H2");
+	let made = a2.ok(&["create", "--server", &url, "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", mnemonic.trim()]);
+	println!("D63H restore: served {} | restored {} | history {}", made["restore"]["served"], made["restore"]["restored"],
+		made["restore"]["history"]["left"]);
+	let bal_b = held_in(&a2, &x);
+	let receiving: Vec<Value> = a2.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "receiving").cloned().collect();
+	println!("D63H when the restore returns: A2 holds {} in X (A {}) | receiving {:?}", bal_b, bal_a, receiving);
+	assert_eq!(bal_b, bal_a, "the balance is the lost wallet's when the restore returns, before any sync");
+	assert!(receiving.is_empty(), "no received leaf held receiving: {:?}", receiving);
+	drop((ox, px));
+	for w in [&a, &a2, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// R7j F3, turned around (D63). A wallet pays an invoice over Lightning
 /// (paid: its htlc-1 leaf the operator's), has one fail (its leaf returned),
 /// and receives one (claimed). Its device is lost and a wallet is restored

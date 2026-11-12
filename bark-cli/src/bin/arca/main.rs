@@ -122,6 +122,10 @@ enum Cmd {
 		/// The longest (default 48 hours).
 		#[arg(long)]
 		max_exit_delay_units: Option<u16>,
+		/// With a mnemonic, the restore checks every coin before it returns,
+		/// the wallet's history with the rest (`restore --at-once`).
+		#[arg(long)]
+		restore_at_once: bool,
 	},
 	/// The operators the registry lists, each record's signature checked
 	/// here; needs no wallet.
@@ -291,9 +295,19 @@ enum Cmd {
 	Lightning(LightningCmd),
 	/// Restores the wallet from its mnemonic: every leaf the server serves to
 	/// its mailbox key, each checked against the chain, the published tree
-	/// and its owner's own signatures, then the mailbox and a sync. Run
-	/// again, it takes only what the wallet does not hold.
-	Restore,
+	/// and its owner's own signatures, then the mailbox and a sync. The coins
+	/// the server serves as given up for good (the wallet's history) are left
+	/// to the syncs after it, a step at each. Run again, it takes only what
+	/// the wallet does not hold.
+	Restore {
+		/// Checks every coin served before it returns, the wallet's history
+		/// with the rest, and makes the watchtowers' deposits in its `sync`.
+		#[arg(long)]
+		at_once: bool,
+	},
+	/// One step of the history a restore left: at most 20 of its coins,
+	/// checked as the restore checks a coin. `sync` runs one step too.
+	RestoreHistory,
 	/// The refresh fee of each coin a participation would give up (every
 	/// live coin when none is named), priced by its asset's schedule, before
 	/// anything is signed: what `participate --shown` takes.
@@ -1350,7 +1364,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		return bark::arca::command::operators(registry, genesis.as_deref());
 	}
 	if let Cmd::Create { server, from_registry, registry, node_url, node_user, node_password_file, node_cookie, mnemonic, mnemonic_file,
-		account, exit_delay_units, min_exit_delay_units, max_exit_delay_units } = cli.command
+		account, exit_delay_units, min_exit_delay_units, max_exit_delay_units, restore_at_once } = cli.command
 	{
 		// `-` reads the standard input itself: a path such as /dev/stdin
 		// cannot be opened when the input is a socket, which is what
@@ -1416,7 +1430,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		// A mnemonic given may have held coins: they are restored from what
 		// the server serves to the wallet's mailbox key, every record checked.
 		if restoring {
-			info["restore"] = w.restore().unwrap_or_else(|e| json!({"error": {"kind": e.kind(), "message": e.to_string(),
+			info["restore"] = w.restore_with(restore_at_once).unwrap_or_else(|e| json!({"error": {"kind": e.kind(), "message": e.to_string(),
 				"note": "the restore stopped at this error: what it took before it is kept (`arca coins`, `arca participations`), and \
 				`arca restore` takes the rest once the cause is gone"}}));
 		}
@@ -1545,7 +1559,11 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Lightning(LightningCmd::PostPreimage { hash, preimage }) => w.lightning_post_preimage(&hash.to_lowercase(), &unhex32(&preimage)?),
 		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),
 		Cmd::Lightning(LightningCmd::Claim { .. }) => unreachable!("handled above"),
-		Cmd::Restore => w.restore(),
+		Cmd::Restore { at_once } => w.restore_with(at_once),
+		Cmd::RestoreHistory => match w.restore_history()? {
+			Some(v) => Ok(v),
+			None => Ok(json!({"left": 0})),
+		},
 		Cmd::Quote { leaves, max_fee_ppm, piece, pieces } => {
 			let mut quote = w.refresh_quote(&leaves, max_fee_ppm)?;
 			match piece {
@@ -1822,8 +1840,23 @@ fn read_order(arg: &str) -> Result<String, bark::arca::Error> {
 
 fn main() {
 	let cli = Cli::parse();
+	let datadir = cli.datadir.clone();
 	match run(cli) {
-		Ok(v) => println!("{}", serde_json::to_string_pretty(&v).expect("JSON")),
+		Ok(v) => {
+			println!("{}", serde_json::to_string_pretty(&v).expect("JSON"));
+			// A restore returns before its coins are deposited with the
+			// watchtowers: they are made now, once its answer is out, and by
+			// the next `sync` should this be cut short.
+			if v["deposits"]["owed"] == true || v["restore"]["deposits"]["owed"] == true {
+				use std::io::Write;
+				let _ = std::io::stdout().flush();
+				let made = Wallet::open(std::path::Path::new(&datadir)).and_then(|mut w| w.deposits());
+				match made {
+					Ok(d) => eprintln!("arca: watchtower deposits after the restore: {}", d.as_array().map_or(0, |a| a.len())),
+					Err(e) => eprintln!("arca: watchtower deposits after the restore: {} (the next sync makes them)", e),
+				}
+			}
+		},
 		Err(e) => {
 			let out = bark::arca::command::refusal(&e);
 			println!("{}", serde_json::to_string_pretty(&out).expect("JSON"));

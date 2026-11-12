@@ -3661,6 +3661,13 @@ impl Wallet {
 		let onchain: Value = onchain.into_iter().map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
 		let held: Value = held.into_iter().filter(|(_, v)| *v > 0).map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
 		let mut out = json!({"total": total, "held": held, "arca": arca, "sequentia_onchain": onchain});
+		// While a restore's history is still being checked, the wallet's past
+		// spends are not all listed yet: an activity view says so rather than
+		// read as complete. The balance itself is whole.
+		let left = self.history_left()?;
+		if left > 0 {
+			out["history"] = json!({"loading": true, "left": left});
+		}
 		if !frozen_onchain.is_empty() {
 			out["sequentia_onchain_frozen"] = frozen_onchain.into_iter().map(|(a, v)| (a, json!(v.to_string())))
 				.collect::<serde_json::Map<_, _>>().into();

@@ -1538,6 +1538,19 @@ impl ChainSource {
 		}
 	}
 
+	/// Which of `outpoints` are unspent on the active chain, read in as
+	/// few requests as the node takes, and answered from those reads at once.
+	pub fn unspent_of(&self, outpoints: &[OutPoint]) -> Result<std::collections::BTreeSet<OutPoint>, Error> {
+		self.read_ahead(outpoints.iter().map(|o| ("gettxout".to_string(), vec![json!(o.txid.to_string()), json!(o.vout), json!(true)])).collect());
+		let mut out = std::collections::BTreeSet::new();
+		for o in outpoints {
+			if self.unspent(o)? {
+				out.insert(*o);
+			}
+		}
+		Ok(out)
+	}
+
 	/// The lowest height of the active chain at which an output descending
 	/// from `roots` can be, `None` when none can: every root unspent, in the
 	/// chain and in the mempool, has nothing made from it anywhere. A spent
