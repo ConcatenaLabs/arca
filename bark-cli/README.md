@@ -383,7 +383,10 @@ and a board whose registration never reached the server, are not recovered.
   proceeds asked to pay a cross-chain leg; of the record format an older
   build on the other side does not read; not final yet; given up in a
   round of the wallet's own whose new coins it has not taken yet, or held
-  under a forfeit for a round that went unbroadcast), or a part sale
+  under a forfeit for a round that went unbroadcast; given up by another
+  device of the wallet in a round not final yet, which the operator refused
+  a spend of as spent already: such a coin is held out of every spend, and
+  every `sync` catches up until it is settled), or a part sale
   would shape a coin from one within three reassignments of that limit, the
   refusal is of kind `settle_first` and names those coins (`coins`), at the
   quote as at the spend, with how long they wait as `settle-first` reads it

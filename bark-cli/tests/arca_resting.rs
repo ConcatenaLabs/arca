@@ -454,3 +454,119 @@ async fn a_fill_refused_for_a_coin_spent_elsewhere_catches_up_at_once() {
 	println!("THE FILL ASKED AGAIN: {}", f["filled"]);
 	assert_eq!(f["filled"], "200000", "{}", f);
 }
+
+/// Builds the rounds waiting, has `wallets` hand over their forfeits, and
+/// broadcasts them, without making them final: the round ids.
+async fn rounds_broadcast(r: &mut Running, wallets: &[&Arca]) -> Vec<elements::Txid> {
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty() && !built.is_empty(), "{} built, {} failed", built.len(), failed.len());
+	for w in wallets {
+		w.ok(&["sync"]);
+	}
+	r.server.rounds.pass().await.unwrap();
+	built.iter().map(|b| b.tx.txid()).collect()
+}
+
+/// Makes the rounds `txids` final and syncs `wallets`.
+async fn rounds_final(r: &mut Running, txids: &[elements::Txid], wallets: &[&Arca]) {
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	for tx in txids {
+		r.round_state(tx, RoundState::Final).await;
+	}
+	for w in wallets {
+		w.ok(&["sync"]);
+	}
+}
+
+/// [`rest`] on an operator whose forfeits are handed over before its round
+/// is broadcast (batches without a sweep): the order's id.
+async fn rest_no_sweep(r: &mut Running, maker: &Arca, amount: u64, lot: u64) -> String {
+	let (x, y) = (r.x, r.y);
+	let args = |extra: &[&str]| -> Vec<String> {
+		let mut v: Vec<String> = ["order", "rest", "--sell", &x.to_string(), "--amount", &amount.to_string(), "--for", &y.to_string(),
+			"--rate-num", "2", "--rate-den", "1", "--min-lot", &lot.to_string(), "--expires-in-hours", "720"]
+			.iter().map(|s| s.to_string()).collect();
+		v.extend(extra.iter().map(|s| s.to_string()));
+		v
+	};
+	let q = maker.ok(&args(&["--quote"]).iter().map(|s| s.as_str()).collect::<Vec<_>>());
+	let shown = q.to_string();
+	let rested = maker.ok(&args(&["--shown", &shown]).iter().map(|s| s.as_str()).collect::<Vec<_>>());
+	assert_eq!(rested["state"], "pending", "{}", rested);
+	let txids = rounds_broadcast(r, &[maker]).await;
+	rounds_final(r, &txids, &[maker]).await;
+	maker.ok(&["sync"]);
+	let view = maker.ok(&["order", "resting"]);
+	let mine = view["orders"].as_array().unwrap().iter().find(|o| o["rested_by"] == rested["order"]).unwrap().clone();
+	assert_eq!(mine["state"], "published", "{}", view);
+	mine["order"].as_str().unwrap().to_string()
+}
+
+/// RV46's P6, on an operator like the testnet's (batches without a sweep,
+/// forfeits handed over before the round is broadcast, no checkpoint exit;
+/// `ARCA_TEST_ANCHOR_DEPTH=0` for its anchor depth): the second device's
+/// round that spends the coin is broadcast and not final, so its
+/// participation is not released and a catch-up finds nothing yet. The fill
+/// from the coin is refused `double_spend`; the coin is then held out of
+/// every spend until a catch-up settles it: the quote asked again at once
+/// does not give it, but waits for a round (`settle_first`, naming it), and
+/// `settle_first` waits for it, until the round is final. Then a sync
+/// catches up (not ten minutes later), the wallet holds the round's coin in
+/// its place, `settle_first` answers ready, and the fill goes from that
+/// coin. Before, the quote gave the dead coin again and again, and a page's
+/// re-prices, all within that window, ended the trade "Returned".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_spent_in_another_devices_round_not_final_is_held_out_until_caught_up() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.assets[0] = AssetSection::new(x, 1_000);
+		c.checkpoint_exit = false;
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+		c.batches.collect_after_seconds = Some(2_419_200);
+	}).await;
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let maker = holder(&mut r, "HM", x, 1_500_000, 0).await;
+	let order = rest_no_sweep(&mut r, &maker, 1_000_000, 100_000).await;
+	let t = holder(&mut r, "HT", y, 1_000_000, 0).await;
+	let coin = live_of(&t, y)[0]["leaf_id"].as_str().unwrap().to_string();
+	let t2 = second_device(&t, "HT2");
+	t2.ok(&["participate", "--leaf", &coin]);
+	let txids = rounds_broadcast(&mut r, &[&t2]).await;
+	let ids = |w: &Arca| -> Vec<String> { live_of(w, y).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect() };
+
+	// The fill from the coin, the other device's round broadcast, not final.
+	let q = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	let (ok, e) = t.run(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q.to_string()]);
+	println!("THE FILL, THE OTHER DEVICE'S ROUND NOT FINAL: ok {} {}", ok, e);
+	assert!(!ok && e.to_string().contains("double_spend"), "{}", e);
+	// The quote asked again at once: the dead coin is not given; the trade waits for that round.
+	let (ok, q2) = t.run(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	println!("THE QUOTE ASKED AGAIN AT ONCE: ok {} {}", ok, q2);
+	assert!(!ok, "the coin spent elsewhere is not given again: {}", q2);
+	assert_eq!(q2["error"]["kind"], "settle_first", "{}", q2);
+	assert_eq!(q2["error"]["coins"], json!([coin]), "{}", q2);
+	assert!(q2["error"]["message"].as_str().unwrap().contains("given up by another device of this wallet"), "{}", q2);
+	let (_, s1) = t.run(&["settle-first", "--coin", &coin]);
+	println!("SETTLE FIRST WHILE NOT FINAL: {}", s1);
+	assert_eq!(s1["ready"], false, "{}", s1);
+	assert_eq!(s1["waiting"], json!([coin]), "nothing given up for a coin another device spent: {}", s1);
+	assert_eq!(s1["settling"], json!([]), "{}", s1);
+
+	// The round final: a sync catches up at once, and the wallet holds the round's coin.
+	rounds_final(&mut r, &txids, &[&t2]).await;
+	t.ok(&["sync"]);
+	let fresh = ids(&t2);
+	println!("THE TAKER'S LIVE Y ONCE THE ROUND IS FINAL AND IT SYNCED: {:?} (the second device: {:?})", ids(&t), fresh);
+	assert!(!ids(&t).contains(&coin), "the coin given elsewhere is no longer counted");
+	assert!(!fresh.is_empty() && fresh.iter().all(|f| ids(&t).contains(f)), "the round's coin is held");
+	let (_, s2) = t.run(&["settle-first", "--coin", &coin]);
+	println!("SETTLE FIRST ONCE CAUGHT UP: {}", s2);
+	assert_eq!(s2["ready"], true, "{}", s2);
+	let q3 = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--quote"]);
+	let f = t.ok(&["order", "fill-resting", &order, "--amount", "200000", "--shown", &q3.to_string()]);
+	println!("THE FILL ASKED AGAIN: {}", f["filled"]);
+	assert_eq!(f["filled"], "200000", "{}", f);
+}

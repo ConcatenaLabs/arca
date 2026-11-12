@@ -2056,8 +2056,12 @@ impl Wallet {
 		self.exits_meanwhile();
 		// What other stores of the mnemonic did: coins they made taken, coins
 		// held here that they gave up given up here too. At most once every
-		// ten minutes ([`super::restore::CATCH_UP_EVERY`]).
-		let caught_up = if talk && catch_up && self.catch_up_due()? {
+		// ten minutes ([`super::restore::CATCH_UP_EVERY`]), and at every sync
+		// while a coin is held out as spent elsewhere, until a catch-up
+		// settles it ([`Self::spent_elsewhere`]).
+		let caught_up = if talk && catch_up && !self.spent_elsewhere()?.is_empty() {
+			self.settle_spent_elsewhere().map(|v| v.unwrap_or(Value::Null)).unwrap_or_else(|e| json!({"error": e.to_string()}))
+		} else if talk && catch_up && self.catch_up_due()? {
 			self.catch_up().unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { Value::Null };
 		steps.lap(self, "catch up");

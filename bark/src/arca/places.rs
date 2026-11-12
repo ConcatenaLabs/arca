@@ -626,16 +626,20 @@ impl Wallet {
 	/// while the wallet sets no instant limit. When the places cannot be
 	/// read, every coin of a lineage other than the wallet's own.
 	pub(crate) fn unspendable(&self, spend: Spend) -> Result<BTreeSet<String>, Error> {
+		// A coin another store of the mnemonic spent, which no catch-up has
+		// settled yet, is never taken ([`Wallet::spent_elsewhere`]).
+		let mut out = self.spent_elsewhere()?;
 		if self.own_instant_limit()?.is_none() {
-			return Ok(BTreeSet::new());
+			return Ok(out);
 		}
 		let barred = |p: Place| p == Place::Arriving || (spend == Spend::CrossChain && p == Place::Proceeds);
-		Ok(match self.places() {
-			Ok(p) => p.coins.into_iter().filter(|(_, _, p)| barred(*p)).map(|(c, ..)| c.leaf_id).collect(),
+		out.extend(match self.places() {
+			Ok(p) => p.coins.into_iter().filter(|(_, _, p)| barred(*p)).map(|(c, ..)| c.leaf_id).collect::<Vec<_>>(),
 			Err(_) => self.store.coins_in("live")?.into_iter()
 				.filter(|c| Self::record_of(c).map(|r| self.lineage(&r)).unwrap_or(Lineage::Received) != Lineage::Own)
 				.map(|c| c.leaf_id).collect(),
-		})
+		});
+		Ok(out)
 	}
 
 	/// Gives up in the next round every live coin of `asset` placed as trade
@@ -690,6 +694,11 @@ impl Wallet {
 	/// the refresh's fee per coin given up, within `max_fee_ppm` (by
 	/// default the wallet's bound).
 	pub fn settle_first(&mut self, coins: &[String], asset: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		// Coins another store of the mnemonic spent are settled by a catch-up,
+		// which this one runs while any is held out: one it settled is through.
+		if let Err(e) = self.settle_spent_elsewhere() {
+			self.store.refused("the catch-up for coins spent elsewhere", &e.to_string())?;
+		}
 		let info = self.server_info()?;
 		let ids: Vec<String> = if !coins.is_empty() {
 			coins.to_vec()
@@ -750,11 +759,20 @@ impl Wallet {
 	fn sorted(&self, ids: Vec<String>) -> Result<Sorted, Error> {
 		let (mut give, mut waiting, mut done) = (vec![], vec![], vec![]);
 		let mut rounds: Vec<Option<String>> = vec![];
+		let elsewhere = self.spent_elsewhere()?;
 		for id in ids {
 			let Some(c) = self.store.coin(&id)? else {
 				done.push(id);
 				continue;
 			};
+			// Another store's round spends it: never given up here; it waits
+			// for that round, which this store learns of only once a
+			// catch-up finds it released.
+			if elsewhere.contains(&id) {
+				rounds.push(None);
+				waiting.push(id);
+				continue;
+			}
 			match c.state.as_str() {
 				"live" => give.push(id),
 				"given" => {

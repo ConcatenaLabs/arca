@@ -162,7 +162,74 @@ pub(crate) const CAUGHT_UP: &str = "caught_up";
 /// How often `sync` catches up, at most (median-time seconds).
 pub(crate) const CATCH_UP_EVERY: u32 = 600;
 
+/// Where the wallet keeps the coins held out as spent elsewhere
+/// ([`Wallet::spent_elsewhere`]).
+const SPENT_ELSEWHERE: &str = "spent_elsewhere";
+
 impl Wallet {
+	/// After the operator refused a spend of this store's because coin
+	/// `leaf` of the wallet's own is spent already (`double_spend`), by
+	/// nothing this store did: another store of the mnemonic (a second
+	/// device) gave it to a round or paid with it. The wallet reads what the
+	/// other stores did at once, so it stops counting the coin and holds
+	/// what replaced it (arca #839). While that other store's round is not
+	/// final its participation is not released and the catch-up finds
+	/// nothing yet: the coin is then held out of every spend
+	/// ([`Self::spent_elsewhere`]) until a catch-up settles it, so no quote
+	/// or spend offers it again in the meantime.
+	pub(crate) fn caught_up_after_spent(&mut self, leaf: &str) -> Result<(), Error> {
+		if let Err(c) = self.catch_up() {
+			self.store.refused("the catch-up after a coin spent elsewhere", &c.to_string())?;
+		}
+		let mut held = self.spent_elsewhere_listed()?;
+		held.insert(leaf.to_string());
+		self.keep_spent_elsewhere(held)
+	}
+
+	/// The coins of the wallet's own that the operator refused to spend as
+	/// spent already, which a catch-up has not settled yet: still live or
+	/// pending here, while the other store's round that spends them is not
+	/// final. No spend takes them; a spend short without them waits for
+	/// them ([`Error::SettleFirst`]), and `sync` and `settle_first` catch up
+	/// until they are settled.
+	pub(crate) fn spent_elsewhere(&self) -> Result<BTreeSet<String>, Error> {
+		let mut out = BTreeSet::new();
+		for l in self.spent_elsewhere_listed()? {
+			if self.store.coin(&l)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				out.insert(l);
+			}
+		}
+		Ok(out)
+	}
+
+	fn spent_elsewhere_listed(&self) -> Result<BTreeSet<String>, Error> {
+		Ok(self.store.meta(SPENT_ELSEWHERE)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+	}
+
+	/// Keeps of `held` those a catch-up has not settled.
+	fn keep_spent_elsewhere(&mut self, held: BTreeSet<String>) -> Result<(), Error> {
+		let mut keep = BTreeSet::new();
+		for l in held {
+			if self.store.coin(&l)?.is_some_and(|c| matches!(c.state.as_str(), "live" | "pending")) {
+				keep.insert(l);
+			}
+		}
+		self.store.set_meta(SPENT_ELSEWHERE, &json!(keep).to_string())
+	}
+
+	/// A catch-up while a coin is held out as spent elsewhere
+	/// ([`Self::spent_elsewhere`]), whenever it is asked, not once every ten
+	/// minutes; what it found, or `None` when no coin is held out.
+	pub(crate) fn settle_spent_elsewhere(&mut self) -> Result<Option<Value>, Error> {
+		let held = self.spent_elsewhere()?;
+		if held.is_empty() {
+			return Ok(None);
+		}
+		let v = self.catch_up()?;
+		self.keep_spent_elsewhere(held)?;
+		Ok(Some(v))
+	}
+
 	/// Restores the wallet from what its mnemonic names: every leaf the server
 	/// serves to its mailbox key, each checked as the module documentation
 	/// says, then the mailbox, then a `sync`. Run on a wallet created from a

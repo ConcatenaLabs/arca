@@ -602,10 +602,15 @@ impl Wallet {
 			return Ok(vec![]);
 		}
 		let barred = self.unspendable(spend)?;
+		let elsewhere = self.spent_elsewhere()?;
 		let planned = self.planned_coins()?;
 		let now = self.now()?.to_consensus_u32() as u64;
 		let mut out = vec![];
 		for row in self.store.coins_in_states(&["live", "given", "pending"])?.into_iter().filter(|c| c.asset == asset.to_string()) {
+			if elsewhere.contains(&row.leaf_id) {
+				out.push((row.leaf_id.clone(), row.value, "given up by another device of this wallet, in a round that is not final yet"));
+				continue;
+			}
 			if row.expiry != u32::MAX && now + WalletPolicy::EXIT_DEADLINE as u64 >= row.expiry as u64 {
 				continue;
 			}
@@ -1432,11 +1437,10 @@ impl Wallet {
 				// the other stores did now, rather than at its next catch-up, so
 				// it stops counting and offering the coin and holds what replaced
 				// it.
+				// Held out of every spend until a catch-up settles it.
 				if let Error::Server { code, message, .. } = &e {
-					if code == "double_spend" && forfeited.is_none() && leaf_named(message).is_some_and(|l| mine.contains(&l)) {
-						if let Err(c) = self.catch_up() {
-							self.store.refused("the catch-up after a coin spent elsewhere", &c.to_string())?;
-						}
+					if let Some(l) = leaf_named(message).filter(|l| code == "double_spend" && forfeited.is_none() && mine.contains(l)) {
+						self.caught_up_after_spent(&l)?;
 					}
 				}
 				Err(e)
