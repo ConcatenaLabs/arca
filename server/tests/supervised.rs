@@ -399,8 +399,11 @@ async fn a_frozen_holder_cannot_move_or_escape() {
 	refused("distribution by the frozen holder", r.http.post("distribute", &json!({
 		"inputs": [{"leaf_id": alice2.held.id.to_string(), "attestation": att(&[0; 32])}], "asset": z.to_string(),
 		"exit_delay_units": exit_delay().units(), "claims": claims, "return_script": hex(op_true().as_bytes()), "fees": []})), "frozen");
+	// An operator whose batches have no sweep takes no plan at all
+	// (`server::plans::NO_SWEEP_PLANS`), frozen or not.
+	let plan_refusal = if r.config.batches.no_sweep { "out_of_bounds" } else { "frozen" };
 	refused("plan by the frozen holder", r.http.post("plan_quote", &json!({"coin": alice2.held.id.to_string(),
-		"owner_nonces": [hex(&random32())], "exit_delay_units": exit_delay().units(), "attestation": att(&[0; 32])})), "frozen");
+		"owner_nonces": [hex(&random32())], "exit_delay_units": exit_delay().units(), "attestation": att(&[0; 32])})), plan_refusal);
 	let htlc = arca_covenant::HtlcTerms {
 		direction: arca_covenant::HtlcDirection::Send, payment_hash: [9; 32],
 		timeout: arca_covenant::MedianTime::from_consensus(2_000_000_000).unwrap(), operator_delay: arca_covenant::RelativeTime::from_units(36).unwrap(),

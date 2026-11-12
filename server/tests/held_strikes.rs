@@ -289,7 +289,7 @@ async fn a_wallet_that_forfeits_after_broadcast_is_refused_in_words_and_loses_no
 	assert!(msg.contains("update the wallet") && msg.contains("Nothing was taken"), "{}", msg);
 	assert_eq!(r.server.store.leaf(&a.id.0).await.unwrap().unwrap().state, server::store::LeafState::Live);
 	// The same wallet, flag and all, is taken by an operator with a sweep.
-	let mut s = common::rounds::start().await;
+	let mut s = common::rounds::start_with_sweep().await;
 	let sx = s.x;
 	let (a2, _) = credited_board(&mut s, &keypair("A2 board"), sx).await;
 	let (w, _) = want_leaf(&keypair("A2 new"), s.x, VALUE);

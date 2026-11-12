@@ -121,6 +121,9 @@ async fn a_swept_coin_is_owed_withdrawn_by_a_reorg_and_repaid_once() {
 				.unwrap(),
 			AssetSection::new(y, MIN_LEAF),
 		];
+		// A batch with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: its sweep
+		// takes the coin that is then owed.
+		c.batches.no_sweep = false;
 	}).await;
 	let x = r.x;
 	r.fund_wallet_in(x, 50_000_000).await;

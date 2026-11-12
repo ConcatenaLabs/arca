@@ -769,6 +769,7 @@ impl Store {
 	/// ok), oldest first. One statement, which reads the recent blocks and
 	/// indexes only (`chain::unfinal_with`).
 	pub async fn rounds_final_not_final(&self, certification: bool, anchor_depth: u64) -> Result<Vec<RoundRow>, StoreError> {
+		self.prune_unblocked().await?;
 		let conn = self.conn().await?;
 		let rows = conn.query(
 			&format!("WITH {} SELECT {} FROM round r JOIN connector_output c ON c.round_id = r.round_id

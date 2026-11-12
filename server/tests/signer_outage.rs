@@ -21,7 +21,9 @@ const HOUR: u32 = 3_600;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_release_the_signer_cannot_sign_holds_no_coin_of_the_wallet() {
-	let mut r = Running::start().await;
+	// A batch with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: its token's
+	// release at the expiry is what the stopped signer cannot sign.
+	let mut r = Running::start_with(|c, _| c.batches.no_sweep = false).await;
 	let x = r.x;
 	for _ in 0..2 {
 		r.fund_wallet_in(x, 50_000_000).await;

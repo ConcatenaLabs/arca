@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use arca_covenant::{CoinRecord, Forfeit, LeafId, LeafRecord, RelativeTime, ValidCoin, ValidLeaf};
 use common::client::{auths_json, forfeit_sig, hex, participation_body, unhex, want_leaf, Answer, Held};
 use common::keys::{keypair, xonly};
-use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, status, validate_new_leaf, VALUE};
+use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, start_with_sweep, status, validate_new_leaf, VALUE};
 use common::running::{Running, MIN_LEAF};
 use server::params::{FeeSchedule, Params};
 use server::server::{AssetSection, FeesSection};
@@ -101,7 +101,7 @@ async fn complete(r: &Running, id: &[u8; 32], old: &Held, old_key: &Keypair, old
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_participation_whose_forfeits_never_come_expires() {
-	let mut r = start().await;
+	let mut r = start_with_sweep().await;
 	let x = r.x;
 	let (a, b) = (keypair("A"), keypair("B"));
 	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
@@ -247,7 +247,7 @@ async fn board_exit_deadline(r: &Running, id: &LeafId) -> u32 {
 /// and expires at the first pass after it, its board given back.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_forfeits_are_taken_until_the_coins_exit_deadline() {
-	let mut r = start().await;
+	let mut r = start_with_sweep().await;
 	let x = r.x;
 	let (a, b) = (keypair("A"), keypair("B"));
 	let (a_board, a_tx) = credited_board(&mut r, &a, x).await;
@@ -310,6 +310,9 @@ async fn start_charging() -> Running {
 	let mut r = Running::start_with(|c, y| {
 		c.assets.push(AssetSection::new(y, MIN_LEAF));
 		c.fees = FeesSection { refresh_ppm: 23_000, ..Default::default() };
+		// The fees below are those of batches with a sweep, priced by the
+		// service left before their expiry, whatever `ARCA_TEST_NO_SWEEP` says.
+		c.batches.no_sweep = false;
 	}).await;
 	let (x, y) = (r.x, r.y);
 	r.fund_wallet_in(x, 50_000_000).await;

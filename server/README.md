@@ -2157,7 +2157,14 @@ within a pass the rounds going out, the lost rounds, the rounds followed and
 the releases. At debug (`RUST_LOG=server::rounds=debug`) every such step is
 logged the same way, `rounds: took …`. The in-flight cap reads only the lowest nodes the coins of the
 participations at hand rest on, so a round's building does not grow with the
-operator's batches.
+operator's batches. Within one build of rounds it reads what is in flight
+once, and again only for an asset a round was built in since. The passes that
+find a final round, board or nursery transaction no longer final read the
+recent blocks and, of the transactions in no block, only those a block's
+disconnection took out of the chain or that were written final while no
+block held them (`tx_unblocked`, which triggers on `tx_block`, `nursery_tx`,
+`round` and `board` fill in the same transaction as the change, and the
+rounds pass empties of what a block holds again or nothing holds final).
 
 ## Issuer-operated assets
 
@@ -2634,6 +2641,34 @@ reads only what may still need it: an output a final transaction of the
 watcher's spends is not looked at again until a rollback takes that
 transaction out, a batch is not looked at for its expiry before its first
 one, nor for a reclaim before an owner under it has released.
+
+A whole pass reads a batch, for its expiry, its reclaims and its collection,
+only when something about it has changed. Triggers in the database log every
+such change against each batch it concerns, in the transaction that makes it,
+whichever code path writes it (`watch_touch`, schema version 49). A change is:
+- a release, a delegation, a forfeit or a reclaimed leaf of one of its coins;
+- a coin on it given up, paid on, spent or recorded;
+- its round, or a participation on it, changing state;
+- an output of it seen on the chain;
+- a transaction of the watcher's spending one of its outputs confirming, going
+  final, going back to the mempool or lost, a block's disconnection included.
+
+A coin paid on out of round touches every batch up its lineage. The pass reads
+the log from the oldest transaction still running at its last read, so a
+change committed late is never skipped, and forgets what it has acted on. It
+also reads:
+- the batches a date came due for since its last pass (the service horizon,
+  and `[batches] collect_owed_after_seconds` after the round);
+- the batches it acted on, or failed on, in its last pass;
+- the batches with a sweep its last sweep has not taken;
+- the next `[watcher] read_slice` batches in order (64 unless set), so every
+  batch is read again within a bounded number of passes whatever the log
+  says.
+
+A batch nothing touched is not read again: its steps would do as they did.
+So a pass costs what changed, not the operator's history. Each pass logs its
+steps' times at info past 2 s (`watcher: slow pass: …`), and
+`arca_watcher_last_pass_seconds` says how long the last one took.
 A transaction that needs the operator's signature takes the wallet coins
 that pay its fee before the signer is asked; when the signer gives no
 signature (it is stopped, say), those coins go back to the wallet, so a
@@ -2957,7 +2992,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep), and the most seconds from a participation's release to its offboard outputs' unlock being in a block (`offboards.unlock_within_seconds`, the block included; 0 when the watcher does not act on its own; see The watcher's Offboards) |
+| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes, and `round_pass_seconds`, the longest of the operator's latest passes over the rounds or builds of them plus a chain poll, which a release that comes due may wait on), how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep), and the most seconds from a participation's release to its offboard outputs' unlock being in a block (`offboards.unlock_within_seconds`, the block included; 0 when the watcher does not act on its own; see The watcher's Offboards) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -3851,8 +3886,13 @@ horizon (`lightning_pay.rs`); and a claim taken up out of round, landing
 under its holder's key while the claims nobody took up lapse
 (`distributions.rs`). `ARCA_TEST_NO_SWEEP=1` runs
 any suite against such an operator: the shared harness hands every held
-round's forfeits over for the tests' own participations before it goes out
-(a test of the sweep itself fails there by design).
+round's forfeits over for the tests' own participations before it goes out,
+and validates their leaves under the exit-delay bounds the test sets. A test
+of what only a batch with a sweep does (its token, release and sweep, a
+round broadcast before its forfeits, a plan) starts its operator with a
+sweep whatever the variable says (`common::rounds::start_with_sweep`), and
+the refusals of an operator without one are tested apart (`plans.rs`,
+`held_strikes.rs`, `supervised.rs`, `no_sweep.rs`).
 
 `tests/supervised.rs` issues an asset under the supervision descriptor,
 with the pause capability, and serves it supervised after a reload (a
@@ -4477,6 +4517,21 @@ the destination. Let go, the whole pass publishes no second unlock, and
 relay (on a node that requires standard transactions) beside a good one in
 that round: the good one is unlocked within milliseconds of the release, and
 the refused one is not tried again in 10 s without a block.
+
+`tests/pass_reads.rs` runs the watcher's whole pass with no slice read in
+order, so nothing but the change log brings a batch back:
+- A lowest node one of whose two owners released is read once and left; it is
+  not read again over three passes. When the other owner releases late, the
+  next pass reads it and reclaims the node.
+- The reclaim final, its batch is not read; once its block is disconnected,
+  the next pass reads the batch again. The nursery puts the same reclaim back
+  and no second one is built.
+- A transaction that touches a batch and stays open across a pass is not seen
+  by that pass, which does not forget the touch; the pass after its commit
+  reads the batch.
+
+`tests/history_passes.rs`, run by hand, times the passes over a history cloned
+to the public testnet's size and beyond (`HISTORY_SCALE`).
 
 `tests/expiry.rs` moves the chain's median time on. A participation whose
 forfeits have not come is still issued a day after its round was found final,

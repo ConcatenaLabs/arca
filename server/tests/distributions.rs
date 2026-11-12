@@ -123,7 +123,9 @@ fn refused(a: common::client::Answer, code: &str, what: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_distribution_pays_its_holders_and_what_nobody_takes_up_goes_back_to_its_payer() {
-	let mut r = common::rounds::start().await;
+	// Batches with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: the claim
+	// batch's expiry, release and sweep are what pays back what nobody took up.
+	let mut r = common::rounds::start_with_sweep().await;
 	let x = r.x;
 	let payer = keypair("D payer");
 	let (b1, tx1) = credited_board(&mut r, &payer, x).await;
@@ -428,7 +430,9 @@ async fn claims_nobody_takes_up_lapse_to_the_payer_after_the_deadline() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_distribution_is_refused_for_what_it_breaks() {
-	let mut r = common::rounds::start().await;
+	// Batches with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: a vesting
+	// distribution is refused there (and taken by [`start_no_sweep`]'s operator).
+	let mut r = common::rounds::start_with_sweep().await;
 	let (x, y) = (r.x, r.y);
 	let payer = keypair("DR payer");
 	let (b1, _) = credited_board(&mut r, &payer, x).await;

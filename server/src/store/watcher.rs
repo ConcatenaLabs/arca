@@ -58,7 +58,7 @@ pub struct TreeOutput {
 
 /// The outpoint `t.v` is spent by a transaction of the watcher's the nursery
 /// calls final: nothing more to do for it until a rollback takes that out.
-fn spent_final(t: &str, v: &str) -> String {
+pub(super) fn spent_final(t: &str, v: &str) -> String {
 	format!("EXISTS (SELECT 1 FROM watcher_input wi JOIN nursery_tx wn ON wn.txid = wi.txid
 		WHERE wi.prev_txid = {} AND wi.prev_vout = {} AND wn.state = 'final')", t, v)
 }
@@ -254,15 +254,10 @@ impl Store {
 	/// may still need answering. `(kind, the coin's leaf id, txid, vout)`,
 	/// oldest first.
 	pub async fn spent_coin_sightings(&self) -> Result<Vec<(ScriptKind, [u8; 32], [u8; 32], u32)>, StoreError> {
+		self.open_ready(super::open::Pass::Sighting).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			&format!("SELECT a.kind, a.leaf_id, s.txid, s.vout FROM script_sighting s
-			 JOIN arca_script a ON a.script_pubkey = s.script_pubkey
-			 JOIN leaf l ON l.leaf_id = a.leaf_id
-			 WHERE a.kind IN ('leaf', 'checkpoint') AND l.state = 'spent' AND NOT {}
-			 ORDER BY s.seen_at, s.txid, s.vout", spent_final("s.txid", "s.vout")),
-			&[],
-		).await?;
+		let (_, from) = super::open::Pass::Sighting.body(true);
+		let rows = conn.query(&format!("SELECT a.kind, a.leaf_id, s.txid, s.vout {} ORDER BY s.seen_at, s.txid, s.vout", from), &[]).await?;
 		rows.iter().map(|r| {
 			let kind = match r.get::<_, &str>(0) {
 				"leaf" => ScriptKind::Leaf,
@@ -348,18 +343,10 @@ impl Store {
 	/// subject is its round's connector asset, so the claim is found as the
 	/// spender of the forfeit's output.
 	pub async fn forfeited_transfer_coins(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, StoreError> {
+		self.open_ready(super::open::Pass::TransferForfeit).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			"SELECT DISTINCT l.leaf_id, l.record FROM leaf l JOIN forfeit f ON f.leaf_id = l.leaf_id
-			 WHERE l.kind = 'transfer' AND l.state = 'spent'
-			   AND NOT EXISTS (SELECT 1 FROM watcher_tx fw
-			                   JOIN watcher_input wi ON wi.prev_txid = fw.txid AND wi.prev_vout = 0
-			                   JOIN watcher_tx cw ON cw.txid = wi.txid AND cw.kind = 'claim'
-			                   JOIN nursery_tx n ON n.txid = cw.txid
-			                   WHERE fw.kind = 'forfeit' AND fw.subject = l.leaf_id AND n.state = 'final')
-			 ORDER BY l.leaf_id",
-			&[],
-		).await?;
+		let (_, from) = super::open::Pass::TransferForfeit.body(true);
+		let rows = conn.query(&format!("SELECT DISTINCT l.leaf_id, l.record {} ORDER BY l.leaf_id", from), &[]).await?;
 		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, r.get(1)))).collect()
 	}
 
@@ -367,13 +354,10 @@ impl Store {
 	/// transaction of the watcher's spends: what may still be claimed.
 	/// `(txid, the coin's leaf id)`, oldest first.
 	pub async fn unclaimed_forfeits(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, StoreError> {
+		self.open_ready(super::open::Pass::Forfeit).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			&format!("SELECT w.txid, w.subject FROM watcher_tx w JOIN nursery_tx n ON n.txid = w.txid
-			 WHERE w.kind = 'forfeit' AND n.state <> 'lost' AND NOT {}
-			 ORDER BY w.created_at, w.txid", spent_final("w.txid", "0")),
-			&[],
-		).await?;
+		let (_, from) = super::open::Pass::Forfeit.body(true);
+		let rows = conn.query(&format!("SELECT w.txid, w.subject {} ORDER BY w.created_at, w.txid", from), &[]).await?;
 		rows.iter().map(|r| Ok((array32(r.get(0), "txid")?, r.get(1)))).collect()
 	}
 
@@ -381,14 +365,10 @@ impl Store {
 	/// whose board output no final transaction of the watcher's spends: the
 	/// boards the operator may still have to recover. Their leaf ids.
 	pub async fn boards_to_recover(&self) -> Result<Vec<[u8; 32]>, StoreError> {
+		self.open_ready(super::open::Pass::Board).await?;
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			&format!("SELECT b.leaf_id FROM board b JOIN leaf l ON l.leaf_id = b.leaf_id
-			 WHERE b.state = 'credited' AND l.state = 'spent'
-			   AND EXISTS (SELECT 1 FROM forfeit f WHERE f.leaf_id = b.leaf_id) AND NOT {}
-			 ORDER BY b.created_at, b.leaf_id", spent_final("b.txid", "b.vout")),
-			&[],
-		).await?;
+		let (_, from) = super::open::Pass::Board.body(true);
+		let rows = conn.query(&format!("SELECT b.leaf_id {} ORDER BY b.created_at, b.leaf_id", from), &[]).await?;
 		rows.iter().map(|r| array32(r.get(0), "leaf id")).collect()
 	}
 
@@ -417,6 +397,86 @@ impl Store {
 			 WHERE NOT sr.retired AND r.state = 'final' ORDER BY bl.round_id, bl.vout",
 			&[],
 		).await?;
+		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
+	}
+
+	/// The batches something touched since `from` (a transaction id, 0 for
+	/// all the log holds), `(round id, output)`, and the transaction id to
+	/// read from next: the oldest transaction still running, whose changes
+	/// may yet come in under ids already passed ([`Self::forget_touches`]).
+	pub async fn touched_batches(&self, from: u64) -> Result<(Vec<(i64, u32)>, u64), StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"WITH s AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS x)
+			 SELECT s.x, t.round_id, t.vout FROM s LEFT JOIN (
+			   SELECT DISTINCT round_id, vout FROM watch_touch WHERE xid >= $1::text::xid8) t ON true",
+			&[&from.to_string()],
+		).await?;
+		let next = rows.first().map(|r| r.get::<_, String>(0)).unwrap_or_default().parse::<u64>()
+			.map_err(|e| StoreError::Corrupt(format!("a transaction id: {}", e)))?;
+		let batches = rows.iter().filter_map(|r| Some((r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i32>>(2)? as u32))).collect();
+		Ok((batches, next))
+	}
+
+	/// Forgets the touches logged by transactions older than `below`, which
+	/// a pass has read and acted on.
+	pub async fn forget_touches(&self, below: u64) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute("DELETE FROM watch_touch WHERE xid < $1::text::xid8", &[&below.to_string()]).await?;
+		Ok(())
+	}
+
+	/// A value the watcher keeps across restarts ([`Self::set_watch_cursor`]).
+	pub async fn watch_cursor(&self, name: &str) -> Result<Option<i64>, StoreError> {
+		let conn = self.conn().await?;
+		Ok(conn.query_opt("SELECT value FROM watch_cursor WHERE name = $1", &[&name]).await?.map(|r| r.get(0)))
+	}
+
+	pub async fn set_watch_cursor(&self, name: &str, value: i64) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute("INSERT INTO watch_cursor (name, value) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+			&[&name, &value]).await?;
+		Ok(())
+	}
+
+	/// The batches of final rounds a date of which falls after `from` and at
+	/// or before `to` (median times): their service horizon, or, with
+	/// `owed_after`, that long after their round.
+	pub async fn batches_due(&self, from: i64, to: i64, owed_after: Option<u32>) -> Result<Vec<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let mut rows = conn.query(
+			"SELECT b.round_id, b.vout FROM batch b JOIN round r ON r.round_id = b.round_id
+			 WHERE r.state = 'final' AND b.collect_mtp > $1 AND b.collect_mtp <= $2", &[&from, &to]).await?;
+		if let Some(a) = owed_after {
+			let a = a as i64;
+			rows.extend(conn.query(
+				"SELECT b.round_id, b.vout FROM round r JOIN batch b ON b.round_id = r.round_id
+				 WHERE r.state = 'final' AND r.created_mtp > $1 AND r.created_mtp <= $2", &[&(from - a), &(to - a)]).await?);
+		}
+		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
+	}
+
+	/// Up to `limit` batches of rounds not lost after `(round_id, vout)`, in
+	/// order: the watcher's round of every batch, a few each pass.
+	pub async fn batches_after(&self, at: (i64, i32), limit: i64) -> Result<Vec<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT b.round_id, b.vout FROM batch b JOIN round r ON r.round_id = b.round_id
+			 WHERE (b.round_id, b.vout) > ($1, $2) AND r.state <> 'lost' ORDER BY b.round_id, b.vout LIMIT $3",
+			&[&at.0, &at.1, &limit]).await?;
+		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
+	}
+
+	/// The batches with a sweep of rounds broadcast or final whose token no
+	/// final sweep has taken: those an expiry may still act on.
+	pub async fn batches_with_a_sweep(&self, no_sweep: &[u8; 32]) -> Result<Vec<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT b.round_id, b.vout FROM batch b JOIN round r ON r.round_id = b.round_id
+			 WHERE b.token <> $1 AND r.state IN ('broadcast', 'final')
+			   AND NOT EXISTS (SELECT 1 FROM watcher_tx w JOIN nursery_tx n USING (txid)
+			                   WHERE w.kind = 'sweep' AND w.subject = b.token AND n.state = 'final')
+			 ORDER BY 1, 2", &[&&no_sweep[..]]).await?;
 		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
 	}
 

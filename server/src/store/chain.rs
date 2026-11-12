@@ -105,15 +105,16 @@ fn i64_of(v: u64) -> i64 {
 ///   one's lowest block is then looked up over all its blocks, through
 ///   `tx_block`'s key: a transaction also held by a lower block that passes
 ///   is final.
-/// - A transaction in no block is found by an anti-join of `finals` with
-///   `tx_block`. `tx_block` names only stored blocks (its foreign key, which
-///   a rollback cascades), so a transaction without a row there is in no
-///   block. This term reads every row `finals` selects; with an index on the
-///   state it reads only indexes.
+/// - A transaction in no block is one of `tx_unblocked`: the triggers of
+///   schema step 49 write there, in the same transaction, every transaction
+///   a block's disconnection takes out of the chain (a rollback cascades to
+///   `tx_block`, whose foreign key names only stored blocks) and every one
+///   written final while no block holds it, whichever code path writes it.
+///   So the transactions of `finals` in no block are those of
+///   `tx_unblocked` that are in `finals` and in no block now, read through
+///   the indexes of the finals, rather than every final transaction there
+///   is ([`Store::prune_unblocked`] keeps it short).
 ///
-/// It assumes nothing about how the chain changed since the last pass: it is
-/// a function of the tables as one snapshot shows them, like the statement it
-/// replaced, which `tests/final_passes.rs` keeps as its oracle.
 pub(super) fn unfinal_with(finals: &str) -> String {
 	format!(
 		"tip AS (SELECT anchor_height AS a FROM block ORDER BY height DESC LIMIT 1),
@@ -127,7 +128,8 @@ pub(super) fn unfinal_with(finals: &str) -> String {
 		 unfinal AS (SELECT loc.txid FROM loc, tip, cert
 		             WHERE ((NOT $1 OR loc.height <= cert.h) AND GREATEST(tip.a - loc.anchor_height, 0) >= $2) IS NOT TRUE
 		             UNION ALL
-		             SELECT f.txid FROM ({}) f WHERE NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = f.txid))",
+		             SELECT u.txid FROM (SELECT DISTINCT txid FROM tx_unblocked) u
+		             WHERE u.txid IN ({}) AND NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = u.txid))",
 		finals,
 	)
 }
@@ -444,5 +446,24 @@ impl Store {
 		).await?;
 		rows.iter().map(|r| Ok((r.get(0), array32(r.get(1), "txid")?, r.get::<_, i32>(2) as u32, array32(r.get(3), "txid")?, r.get(4))))
 			.collect()
+	}
+}
+
+impl Store {
+	/// Removes from `tx_unblocked` the transactions a block holds again and
+	/// those nothing holds final (or credited) any more: what the passes of
+	/// [`unfinal_with`] need not read. A row it removes can matter again only
+	/// through a block's disconnection or a row written final, each of which
+	/// writes a new one in its own transaction, which this statement's
+	/// snapshot does not see and so does not remove.
+	pub async fn prune_unblocked(&self) -> Result<u64, StoreError> {
+		let conn = self.conn().await?;
+		Ok(conn.execute(
+			"DELETE FROM tx_unblocked u WHERE EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = u.txid)
+			 OR NOT (EXISTS (SELECT 1 FROM nursery_tx n WHERE n.txid = u.txid AND n.state = 'final')
+			      OR EXISTS (SELECT 1 FROM round r WHERE r.txid = u.txid AND r.state = 'final')
+			      OR EXISTS (SELECT 1 FROM board b WHERE b.txid = u.txid AND b.state = 'credited'))",
+			&[],
+		).await?)
 	}
 }
