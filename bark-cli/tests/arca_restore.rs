@@ -1551,3 +1551,142 @@ async fn an_anchor_reorganisation_while_a_restores_history_waits() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// Every wallet of `ws` asks for its refresh; the round is built and made
+/// final, and every wallet completes it. Its round's id.
+async fn rb_round(r: &Running, ws: &[&Arca]) -> elements::Txid {
+	for w in ws {
+		w.ok(&["participate"]);
+	}
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(built.len() == 1 && failed.is_empty(), "{} built, {} failed", built.len(), failed.len());
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	for w in ws {
+		w.ok(&["sync"]);
+	}
+	built[0].tx.txid()
+}
+
+/// A wallet with many coins resting on a batch output spent since, on a long
+/// chain, restores in time that grows with the chain, not with coins times
+/// the chain: the shape of a trading wallet's restore, whose every live coin
+/// rests on a batch that others' releases unrolled (web wallet #694). Five
+/// wallets share a batch; the two of one lowest node pay R eight times out of
+/// round, so R holds eight coins on the batch. The three of the other lowest
+/// node refresh and release, and the watcher unrolls the batch output to
+/// reclaim their node: every coin of R's now rests on an output spent. The
+/// chain grows by two hundred blocks. R restored from its mnemonic looks for
+/// each coin's own output on the chain from the batch's block up, as it must
+/// (a coin the lost wallet took home is never held live), and decodes each
+/// block of that stretch once for all its coins. Its coins are R's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_reads_each_block_once_whatever_the_coins_resting_on_a_spent_batch() {
+	use std::time::Duration;
+	use server::store::NurseryState;
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x;
+	let xs = x.to_string();
+	r.fund_server(x, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	let ws: Vec<Arca> = ["RB1", "RB2", "RB3", "RB4", "RB5"].iter().map(|n| Arca::new(n)).collect();
+	for w in &ws {
+		w.ok(&create_args(&url, &node));
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x, 5_000_000);
+	}
+	r.produce().await;
+	for w in &ws {
+		w.ok(&["board", &xs, "2000000"]);
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("every board credited", || ws.iter().all(|w| w.ok(&["boards"])[0]["server"]["state"] == "credited")).await;
+	let round1 = rb_round(&r, &ws.iter().collect::<Vec<_>>()).await;
+	let leaf_of = |w: &Arca| live(w).into_keys().next().unwrap();
+	let ids: Vec<String> = ws.iter().map(leaf_of).collect();
+	let (_, rtx, _, vouts) = r.server.store.rounds_page(0, 10).await.unwrap().into_iter().last().unwrap();
+	let (_, leaves) = r.server.store.batch(&rtx, vouts[0]).await.unwrap().expect("the batch");
+	let hexed = |b: &[u8; 32]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+	let order: Vec<usize> = leaves.iter().map(|l| ids.iter().position(|i| *i == hexed(&l.leaf_id)).expect("a wallet's leaf")).collect();
+	let first = order[..3].iter().map(|&i| &ws[i]).collect::<Vec<_>>();
+
+	// The two holders of the other lowest node, which never release, each
+	// pay R four times out of round (the operator's depth limit is five
+	// reassignments since a round): eight coins on the batch.
+	let (rw, rw2) = (Arca::new("RBR"), Arca::new("RBR2"));
+	rw.ok(&create_args(&url, &node));
+	const PAYMENTS: usize = 8;
+	for &i in &order[3..] {
+		for _ in 0..4 {
+			let req = rw.ok(&["receive"])["request"].as_str().unwrap().to_string();
+			ws[i].ok(&["send", &req, "--amount", "10000", "--asset", &xs]);
+		}
+	}
+	rw.ok(&["sync"]);
+	assert_eq!(live(&rw).len(), PAYMENTS, "R holds a coin a payment");
+
+	// Three of the batch's other holders refresh and release; the watcher
+	// unrolls the batch output to reclaim their lowest node.
+	rb_round(&r, &first).await;
+	for _ in 0..4 {
+		r.synced().await;
+		r.server.watcher.pass().await.unwrap();
+		let start = std::time::Instant::now();
+		while !r.server.store.nursery_in(NurseryState::Pending).await.unwrap().iter().all(|n| n.broadcasts > 0) {
+			assert!(start.elapsed() < Duration::from_secs(30));
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		r.produce().await;
+	}
+	r.bury().await;
+	let out: Value = r.rt.client().call("gettxout", &[json!(round1.to_string()), json!(vouts[0]), json!(true)]).unwrap();
+	assert!(out.is_null(), "the batch output R's coins rest on is spent");
+	// The chain grows.
+	const MORE: u64 = 200;
+	for _ in 0..MORE {
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	rw.ok(&["sync"]);
+	let tip = r.rt.client().block_count().unwrap() as u64;
+	let span = tip - block_height(&r, &round1.to_string()) + 1;
+
+	let mnemonic = std::fs::read_to_string(rw.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let started = std::time::Instant::now();
+	let made = rw2.ok(&args);
+	let took = started.elapsed();
+	let restore = &made["restore"];
+	let steps = &restore["cost_by_step"];
+	let decoded: u64 = steps.as_object().unwrap().values().map(|s| s["blocks"].as_u64().unwrap_or(0)).sum();
+	println!("RB R2's restore: {} coins on a spent batch, {} blocks from the batch to the tip: {} ms, blocks decoded {} (on_chain {}, \
+		sync {})", PAYMENTS, span, took.as_millis(), decoded, steps["on_chain"], steps["sync"]);
+	assert!(restore["error"].is_null(), "{}", restore);
+	assert_eq!(restore["not_recovered"], json!([]), "{}", restore);
+	// Each coin's own output is looked for from the batch's block up: every
+	// block of that stretch, once, for all eight.
+	assert!(steps["on_chain"]["blocks"].as_u64().is_some_and(|b| b >= span - 1), "the search crossed the stretch: {}", steps);
+	assert!(decoded <= span + 2 * 64, "{} blocks decoded for a stretch of {} with {} coins on it", decoded, span, PAYMENTS);
+	// The sync after it (a command of its own) decodes none either: what it
+	// asks of the chain needs no search back to the batch.
+	let bal = rw2.ok(&["balance"]);
+	let s = rw2.ok(&["sync"]);
+	let again: u64 = s["cost_by_step"].as_object().map(|o| o.values().map(|x| x["blocks"].as_u64().unwrap_or(0)).sum()).unwrap_or(0);
+	println!("RB R2's sync after it: blocks decoded {}", again);
+	assert!(again <= 2 * 64, "{} blocks decoded again by the sync after the restore", again);
+	let _ = bal;
+	assert_eq!(live(&rw2), live(&rw), "R2 holds R's coins");
+	assert_eq!(tree_balance(&rw2), tree_balance(&rw));
+	let diff = differences(&rw.ok(&["coins"]), &rw2.ok(&["coins"]));
+	assert!(diff.is_empty(), "R2's coins are R's: {:?}", diff);
+	for w in ws.iter().chain([&rw, &rw2]) {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
