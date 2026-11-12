@@ -1953,7 +1953,7 @@ impl Server {
 				no_sweep: params.no_sweep,
 				..RoundConfig::default()
 			}, participations.active());
-		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone());
+		let forfeits = Forfeits::new(store.clone(), finality.clone(), params.clone(), signer.clone(), cosigner.clone(), rounds.releases());
 		let watcher = Watcher::new(store.clone(), finality.clone(), params.clone(), wallet.clone(), nursery.clone(), signer,
 			rounds.clone(), WatcherConfig {
 				reclaim_early: config.watcher.reclaim_early,
@@ -2054,6 +2054,7 @@ impl Server {
 			receives.spawn()];
 		if config.watcher.enabled {
 			tasks.push(watcher.spawn());
+			tasks.push(watcher.spawn_unlocks());
 		}
 		tasks.push(finality.spawn());
 		// The supervised profile's watch on the node: after each pass over
@@ -2124,6 +2125,7 @@ impl Server {
 			trusted_proxies: config.limits.trusted_proxies.iter().map(|a| a.parse())
 				.collect::<Result<_, _>>().map_err(err("limits.trusted_proxies"))?,
 			info_parts: Default::default(),
+			watcher: config.watcher.enabled.then(|| watcher.clone()),
 			bond,
 			keepers: std::sync::Mutex::new(keepers),
 			replaced,

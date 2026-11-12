@@ -264,6 +264,12 @@ impl Wallet {
 			}
 		}
 		let Some(walked) = walked else {
+			// Coins a round must refresh or make final first: said so, naming
+			// them, as an order placed in a round says it.
+			let held = self.round_first(info, a, super::places::Spend::Pay, None, super::pay::Reads::ALL)?;
+			if let Some(e) = self.settle_first_of(a, total, ask.amount.saturating_add(fee), held) {
+				return Err(e);
+			}
 			return Err(self.short_of(a, ask.amount.saturating_add(fee).saturating_sub(total).max(1), format!("the wallet's live coins of \
 				asset {} hold {} and the order of {} and its refresh fees need {}, with any change at least the operator's smallest leaf of \
 				{}: board or receive more, or rest less", a, total, ask.amount, ask.amount.saturating_add(fee), min))?);
@@ -709,6 +715,13 @@ impl Wallet {
 				return Err(Error::Refused(format!("the order's maker runs an older build, which reads no coin whose past holds a checkpoint \
 					with its owner's exit, and the wallet's coins of asset {} that would pay this fill of {} are such coins: they pay it \
 					once a round refreshes them (refresh-received), or once the maker updates; nothing was signed", asset_b, filled)));
+			}
+			// Coins a round must refresh or make final first (the fill pays out
+			// of round, so the operator's depth limit counts too): said so,
+			// naming them, as a payment says it.
+			let held = self.round_first(info, asset_b, super::places::Spend::Pay, super::pay::depth_limit(info), super::pay::Reads::ALL)?;
+			if let Some(e) = self.settle_first_of(asset_b, kept, price.saturating_add(1), held) {
+				return Err(e);
 			}
 			return Err(self.short_of(asset_b, price.saturating_sub(kept).max(1), format!("the wallet's live coins of asset {} that expire \
 				no earlier than the order's coin (median time {}) keep {} past their checkpoints; the fill of {} costs {} and its fee, with \

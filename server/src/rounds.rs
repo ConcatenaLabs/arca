@@ -1132,6 +1132,8 @@ pub struct Rounds {
 	/// Rung when something a pass acts on has come in between the chain's
 	/// events and the round interval ([`Rounds::wake`]).
 	wake: tokio::sync::Notify,
+	/// Each participation released, for the watcher's unlock lane.
+	releases: Arc<crate::watcher::Releases>,
 }
 
 /// A batch a round builds: its asset, its leaves (each a participation's
@@ -1292,7 +1294,14 @@ impl Rounds {
 	{
 		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
 			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), in_flight_seen: Mutex::new(None), holders: Mutex::new(Default::default()),
-			active, wake: tokio::sync::Notify::new() })
+			active, wake: tokio::sync::Notify::new(), releases: crate::watcher::Releases::new() })
+	}
+
+	/// Where the participations released are told, for the watcher's unlock
+	/// lane ([`crate::watcher::Watcher::spawn_unlocks`]): the rounds and the
+	/// forfeits push each one they release.
+	pub fn releases(&self) -> Arc<crate::watcher::Releases> {
+		self.releases.clone()
 	}
 
 	/// Asks for a pass over the rounds now ([`Self::pass`]) rather than at
@@ -3823,6 +3832,7 @@ impl Rounds {
 			};
 			if self.store.release_participation(&id, p.attempt, round_id).await? {
 				log::info!("participation {} released by the server: {}; its new leaves are credited", crate::signer::hex(&id), why);
+				self.releases.push(id);
 				released.push(id);
 			}
 		}

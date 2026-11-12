@@ -43,7 +43,10 @@
 //!    from the round's connector output when the first board forfeit of the
 //!    round is published, so it is held by the time the forfeits confirm.
 //! 4. **Offboards.** A released participation's offboard output is unlocked
-//!    to its destination with the preimage, which the owner already holds. One
+//!    to its destination with the preimage, which the owner already holds,
+//!    by the unlock lane ([`Watcher::spawn_unlocks`]) within a chain poll of
+//!    its release, whatever the rest of the pass is doing; the whole pass
+//!    takes it too, under the same lock, should the lane miss it. One
 //!    whose participation expired or was voided (its preimage never went out)
 //!    is reclaimed once its reclaim delay has passed since it confirmed. An
 //!    offboard whose preimage went out is never reclaimed.
@@ -354,6 +357,45 @@ impl FeeStatus {
 	}
 }
 
+/// The participations released since the unlock lane last looked, each
+/// with when it was released ([`Watcher::spawn_unlocks`]): the rounds and the
+/// forfeits push each one they release, and the lane unlocks its offboard
+/// outputs within a chain poll, whatever the rest of the watcher is doing.
+#[derive(Default)]
+pub struct Releases {
+	ids: std::sync::Mutex<HashMap<[u8; 32], Instant>>,
+	notify: tokio::sync::Notify,
+}
+
+impl Releases {
+	pub fn new() -> Arc<Releases> {
+		Arc::new(Releases::default())
+	}
+
+	/// The participation `id` is released now.
+	pub fn push(&self, id: [u8; 32]) {
+		self.ids.lock().unwrap_or_else(|e| e.into_inner()).entry(id).or_insert_with(Instant::now);
+		self.notify.notify_one();
+	}
+
+	fn take(&self) -> HashMap<[u8; 32], Instant> {
+		std::mem::take(&mut *self.ids.lock().unwrap_or_else(|e| e.into_inner()))
+	}
+}
+
+/// How long the unlock lane keeps looking at a released participation whose
+/// offboard outputs it has not unlocked, before it leaves them to the whole
+/// pass: a day, longer than any round takes to be final.
+const LANE_KEEPS: Duration = Duration::from_secs(86_400);
+
+/// What the unlock lane allows itself, beyond a chain poll, from a release to
+/// the unlock's broadcast: building, the signer, the node.
+const LANE_SLACK: Duration = Duration::from_secs(10);
+
+/// How many of the latest releases' times to the unlock's broadcast the
+/// operator keeps, for the bound it publishes.
+const LANE_MEASURED: usize = 64;
+
 /// See the [module documentation](self).
 pub struct Watcher {
 	store: Store,
@@ -379,6 +421,18 @@ pub struct Watcher {
 	/// the median time it waits until ([`Self::recover_board_transfers`]):
 	/// not walked again, nor logged, before then.
 	lineage_waits: std::sync::Mutex<HashMap<[u8; 32], u32>>,
+	/// One offboard at a time, between the unlock lane and the whole pass.
+	offboarding: Mutex<()>,
+	/// The released participations whose offboard outputs the unlock lane
+	/// waits to unlock, each with when the lane learnt of it and whether that
+	/// was its release (one the lane took over at its start is not timed).
+	unlocking: std::sync::Mutex<HashMap<[u8; 32], (Instant, bool)>>,
+	/// The latest releases' times to their unlock's broadcast.
+	unlock_times: std::sync::Mutex<std::collections::VecDeque<Duration>>,
+	/// The offboard outputs whose unlock the node refused, `(round id,
+	/// output)`, each with the height of the tip it was refused at: the lane
+	/// tries it again on a new block, not at every chain poll.
+	refused: std::sync::Mutex<HashMap<(i64, u32), u64>>,
 }
 
 impl Watcher {
@@ -394,7 +448,22 @@ impl Watcher {
 				..FeeStatus::default()
 			}),
 			lineage_waits: std::sync::Mutex::new(HashMap::new()),
+			offboarding: Mutex::new(()),
+			unlocking: std::sync::Mutex::new(HashMap::new()),
+			unlock_times: std::sync::Mutex::new(std::collections::VecDeque::new()),
+			refused: std::sync::Mutex::new(HashMap::new()),
 		})
+	}
+
+	/// The most seconds from a participation's release to its offboard
+	/// unlock being in a block, as the operator keeps it: the unlock lane
+	/// answers a release within a chain poll and [`LANE_SLACK`], or within the
+	/// longest of the latest releases' measured times if that is longer, and
+	/// the unlock then waits for one block.
+	pub fn unlock_within_seconds(&self) -> u32 {
+		let kept = self.finality.config().poll_interval + LANE_SLACK;
+		let measured = self.unlock_times.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().max().unwrap_or_default();
+		(kept.max(measured) + self.config.block_interval).as_secs_f64().ceil().min(u32::MAX as f64) as u32
 	}
 
 	/// The fee pool and what waits on it, after the last pass.
@@ -443,6 +512,101 @@ impl Watcher {
 		self.answer_stale_exits().await?;
 		self.claim_paid_htlcs().await?;
 		self.claim_forfeits().await
+	}
+
+	/// The unlock lane: unlocks the offboard outputs of the participations
+	/// released since it last looked ([`Releases`]), and of those it waits
+	/// on (a round not final yet, a node that refused), each by the whole
+	/// pass's own rule ([`Self::offboard`]), so a released move to the chain
+	/// goes out within a chain poll of its release, however long the whole
+	/// pass takes. It reads only those participations' outputs: nothing when
+	/// none waits.
+	pub async fn unlocks(&self) -> Result<(), WatcherError> {
+		let fresh = self.rounds.releases().take();
+		let ids: Vec<[u8; 32]> = {
+			let mut u = self.unlocking.lock().unwrap_or_else(|e| e.into_inner());
+			for (id, at) in fresh {
+				u.entry(id).or_insert((at, true));
+			}
+			u.retain(|_, (at, _)| at.elapsed() < LANE_KEEPS);
+			u.keys().copied().collect()
+		};
+		if ids.is_empty() {
+			return Ok(());
+		}
+		let (now, later) = self.store.offboards_to_unlock(&ids).await?;
+		let mut open: HashSet<[u8; 32]> = later.keys().copied().collect();
+		// An unlock the node refused (a destination its relay policy will not
+		// take, say) is tried again on a new block, as the whole pass would,
+		// not at every poll: one such output never slows the lane for the
+		// others.
+		let tip = self.store.tip_block().await?.map_or(0, |b| b.height);
+		{
+			let keys: HashSet<(i64, u32)> = now.iter().map(|o| (o.round_id, o.vout)).collect();
+			self.refused.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| keys.contains(k));
+		}
+		for o in &now {
+			let key = (o.round_id, o.vout);
+			if self.refused.lock().unwrap_or_else(|e| e.into_inner()).get(&key) == Some(&tip) {
+				open.insert(o.participation_id);
+				continue;
+			}
+			let r = self.offboard_one(o).await;
+			match Self::item(&format!("the unlock of the offboard at output {} of round {}", o.vout, o.round_id), r)? {
+				Some(Some(true)) => {
+					let at = self.unlocking.lock().unwrap_or_else(|e| e.into_inner()).get(&o.participation_id).copied();
+					if let Some((at, true)) = at {
+						let mut t = self.unlock_times.lock().unwrap_or_else(|e| e.into_inner());
+						t.push_back(at.elapsed());
+						while t.len() > LANE_MEASURED {
+							t.pop_front();
+						}
+					}
+				},
+				// Spent already, by the watcher or by another: done.
+				Some(Some(false)) => {},
+				_ => {
+					self.refused.lock().unwrap_or_else(|e| e.into_inner()).insert(key, tip);
+					open.insert(o.participation_id);
+				},
+			}
+		}
+		self.unlocking.lock().unwrap_or_else(|e| e.into_inner()).retain(|id, _| open.contains(id));
+		Ok(())
+	}
+
+	/// Follows the chain and the releases with the unlock lane
+	/// ([`Self::unlocks`]): after each pass of the finality service, and at
+	/// each release, until the task is dropped. It takes over at its start
+	/// every participation released whose offboard outputs no final
+	/// transaction of the watcher's spends.
+	pub fn spawn_unlocks(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+		let me = self.clone();
+		let mut rx = self.finality.subscribe();
+		tokio::spawn(async move {
+			match me.store.released_with_offboards_open().await {
+				Ok(ids) => {
+					let mut u = me.unlocking.lock().unwrap_or_else(|e| e.into_inner());
+					for id in ids {
+						u.entry(id).or_insert((Instant::now(), false));
+					}
+				},
+				Err(e) => log::warn!("watcher: the unlock lane could not read what waits: {}", e),
+			}
+			let releases = me.rounds.releases();
+			loop {
+				let closed = tokio::select! {
+					d = crate::chain::drain(&mut rx) => d.closed,
+					_ = releases.notify.notified() => false,
+				};
+				if let Err(e) = me.unlocks().await {
+					log::warn!("watcher: the unlock lane: {}", e);
+				}
+				if closed {
+					return;
+				}
+			}
+		})
 	}
 
 	/// Follows the finality service: the urgent part after each of its
@@ -2208,19 +2372,29 @@ impl Watcher {
 	/// delay has passed.
 	async fn offboards(&self) -> Result<(), WatcherError> {
 		for o in self.store.offboards_pending().await? {
-			let r = self.offboard(&o).await;
+			let r = self.offboard_one(&o).await;
 			Self::item(&format!("the offboard at output {} of round {}", o.vout, o.round_id), r)?;
 		}
 		Ok(())
 	}
 
-	async fn offboard(&self, o: &crate::store::OffboardRow) -> Result<(), WatcherError> {
+	/// [`Self::offboard`] under the offboard lock, which the unlock lane and
+	/// the whole pass share, so one output is never answered twice at once.
+	/// `Some(true)` when it published an unlock, `Some(false)` when the output
+	/// is spent already (by a transaction of the watcher's not lost, or
+	/// another), `None` when it waits.
+	async fn offboard_one(&self, o: &crate::store::OffboardRow) -> Result<Option<bool>, WatcherError> {
+		let _one = self.offboarding.lock().await;
+		self.offboard(o).await
+	}
+
+	async fn offboard(&self, o: &crate::store::OffboardRow) -> Result<Option<bool>, WatcherError> {
 		let p = self.store.participation(&o.participation_id).await?
 			.ok_or_else(|| WatcherError::Build("an offboard of no participation".into()))?;
 		let round = self.store.round(o.round_id).await?.ok_or_else(|| WatcherError::Build("an offboard of no round".into()))?;
 		let op = OutPoint::new(txid_of(&round.txid), o.vout);
 		if self.spending(&op).await? || self.unspent(op).await?.is_none() {
-			return Ok(());
+			return Ok(Some(false));
 		}
 		let wanted = p.outputs.get(o.output_idx as usize).ok_or_else(|| WatcherError::Build("no such offboard output".into()))?;
 		let (script, units) = match &wanted.kind {
@@ -2249,12 +2423,13 @@ impl Watcher {
 					Ok((u, t))
 				}).await?;
 				let wallet = fee_coin.map(|c| (u.tx.input.len() - 1, c)).into_iter().collect();
-				self.publish(Ready { tx: u.tx, wallet, fee }, "unlock", subject,
+				let sent = self.publish(Ready { tx: u.tx, wallet, fee }, "unlock", subject,
 					format!("the offboard of participation {} unlocked to its destination", hex(&o.participation_id))).await?;
+				return Ok(sent.map(|_| true));
 			},
 			ParticipationState::Expired | ParticipationState::Void if current || p.state == ParticipationState::Void => {
 				if !self.waited(op.txid, policy.reclaim_delay).await? {
-					return Ok(());
+					return Ok(None);
 				}
 				let pay = self.payout(asset, o.value, &[], |outs, fee| {
 					let ks = policy.reclaim(op, o.value, outs, fee).map_err(|e| e.to_string())?;
@@ -2272,7 +2447,7 @@ impl Watcher {
 			},
 			_ => {},
 		}
-		Ok(())
+		Ok(None)
 	}
 
 	// -----------------------------------------------------------------------
