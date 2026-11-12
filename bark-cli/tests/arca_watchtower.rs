@@ -99,6 +99,15 @@ impl Tower {
 		all.iter().find(|d| d["leaf_id"] == leaf).or_else(|| all.iter().find(|d| id.as_deref().is_some_and(|i| d["deposit"] == i))).cloned()
 	}
 
+	/// What the tower's passes did to deposit `deposit` reaching `state`, as
+	/// its log records each pass that acted (`acted`): the first such entry.
+	fn passed(&self, deposit: &Value, state: &str) -> Option<Value> {
+		let log = std::fs::read_to_string(self.wallet.dir.join("serve.log")).ok()?;
+		log.lines().filter_map(|l| l.find('{').and_then(|i| serde_json::from_str::<Value>(&l[i..]).ok()))
+			.flat_map(|v| v["acted"].as_array().cloned().unwrap_or_default())
+			.find(|a| a["deposit"] == *deposit && a["state"] == state)
+	}
+
 	/// Notes the deposit ids a wallet's `sync` answer `s` names for this
 	/// watchtower.
 	fn learn(&self, s: &Value) {
@@ -511,12 +520,8 @@ async fn a_watchtower_answers_a_sender_who_takes_an_earlier_coin_home() {
 	r.rt.client().call::<Value>("setfeeexchangerates", &[Value::Object(rates)]).unwrap();
 	t.start();
 	let start = Instant::now();
-	let mut brought = Value::Null;
 	loop {
 		let d = t.deposit_of(&coin).unwrap();
-		if d["state"] == "brought" {
-			brought = d.clone();
-		}
 		if d["state"] == "on_chain" {
 			break;
 		}
@@ -525,6 +530,10 @@ async fn a_watchtower_answers_a_sender_who_takes_an_earlier_coin_home() {
 		tokio::time::sleep(Duration::from_secs(2)).await;
 	}
 	let d = t.deposit_of(&coin).unwrap();
+	// The step that brought the coin, as the tower recorded it: its pass's
+	// answer in its log (the deposit's own note moves on to "on the chain"
+	// at the next pass, often before a poll reads it).
+	let brought = t.passed(&d["deposit"], "brought").unwrap_or(Value::Null);
 	println!("T answered: {} | then {}", brought["note"], d["note"]);
 	assert!(brought["note"].as_str().unwrap_or("").contains("a sender up its lineage took an earlier coin on the chain"), "{}", brought);
 	let steps = d["broadcast"].as_array().unwrap();

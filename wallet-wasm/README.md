@@ -224,7 +224,10 @@ stands. A spend the operator refuses because a coin of the wallet's is spent
 already, by another store of the same mnemonic (a second device), has the
 wallet read what its other stores did at once, so it stops counting that coin
 and holds what replaced it; a `swap_cancel` that meets such a coin cancels the
-acceptance without a respend.
+acceptance without a respend. A `swap_cancel` whose respend went unanswered
+never calls the acceptance cancelled until the operator has answered it: the
+next one posts the respend again and answers `cancelled`, `done`, or, while
+the operator cannot be reached, `cancelled: false` with `unknown: true`.
 
 `quote` is the refresh fee, coin by coin, that `participate` would pay; the page
 shows it, and `participate` goes ahead only when `shown` equals the fees it

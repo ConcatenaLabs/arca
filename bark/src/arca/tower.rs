@@ -1039,7 +1039,7 @@ impl Wallet {
 			format!("a sender up its lineage took an earlier coin on the chain ({}): its path broadcast, its leaf at {}", seen.join("; "), at)
 		};
 		self.store.tower_set(&row.id, "brought", &note, Some(&Value::Array(all).to_string()))?;
-		Ok(Some(json!({"deposit": row.id, "leaf_id": row.leaf_id, "state": "brought", "leaf": at.to_string(), "broadcast": steps})))
+		Ok(Some(json!({"deposit": row.id, "leaf_id": row.leaf_id, "state": "brought", "leaf": at.to_string(), "broadcast": steps, "note": note})))
 	}
 
 	/// Whether an output `record` descends from (a batch output or a board,
