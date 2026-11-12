@@ -735,11 +735,27 @@ impl Store {
 		Ok(rows)
 	}
 
-	/// The ids of the coins the store took at `since` (seconds) or later.
+	/// The ids of the coins the store took (or wrote again) after the one of
+	/// row `since` ([`Self::coin_row_last`]): an order the store keeps, not a
+	/// clock that can step back.
 	pub fn coin_ids_since(&self, since: i64) -> Result<BTreeSet<String>, Error> {
-		let mut st = self.conn.prepare("SELECT leaf_id FROM coin WHERE created_at >= ?1").map_err(db)?;
+		let mut st = self.conn.prepare("SELECT leaf_id FROM coin WHERE rowid > ?1").map_err(db)?;
 		let rows = st.query_map(params![since], |r| r.get::<_, String>(0)).map_err(db)?.collect::<Result<BTreeSet<_>, _>>().map_err(db)?;
 		Ok(rows)
+	}
+
+	/// The row of the coin the store took (or wrote again) last; 0 for none.
+	pub fn coin_row_last(&self) -> Result<i64, Error> {
+		self.conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM coin", [], |r| r.get(0)).map_err(db)
+	}
+
+	/// Deletes every key of `keys` in one transaction: all of them or none.
+	pub fn delete_metas(&self, keys: &[&str]) -> Result<(), Error> {
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		for k in keys {
+			tx.execute("DELETE FROM meta WHERE key = ?1", params![k]).map_err(db)?;
+		}
+		tx.commit().map_err(db)
 	}
 
 	pub fn coin_by_salt(&self, salt: &[u8; 32]) -> Result<Option<CoinRow>, Error> {

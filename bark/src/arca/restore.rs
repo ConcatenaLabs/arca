@@ -164,9 +164,10 @@ pub const SYNC_HISTORY_MS: u64 = 1_000;
 /// check, in milliseconds: how many coins a slice takes together.
 pub(crate) const HISTORY_PACE: &str = "restore_history_pace";
 
-/// Where the wallet keeps when (seconds) the last step of a restore's
-/// history looked at the coins held: the next looks at those taken since.
-pub(crate) const HISTORY_LOOKED: &str = "restore_history_looked";
+/// Where the wallet keeps the last coin row the last step of a restore's
+/// history looked at: the next looks at the coins taken since.
+/// (A key of its own: one a store kept as a time names no row.)
+pub(crate) const HISTORY_LOOKED: &str = "restore_history_looked_row";
 
 /// Where the wallet keeps the median time it last caught up with what the
 /// server serves to its mailbox key ([`Wallet::catch_up`]).
@@ -977,8 +978,9 @@ impl Wallet {
 		let ids = self.store.coin_ids()?;
 		let left: Vec<Value> = history.iter().filter(|e| !ids.contains(e["leaf_id"].as_str().unwrap_or(""))).cloned().collect();
 		if left.is_empty() {
-			self.store.delete_meta(RESTORE_HISTORY)?;
-			self.store.delete_meta(RESTORE_HISTORY_IDS)
+			// The list and its ids together, so a program stopped between the
+			// two never leaves ids with no list.
+			self.store.delete_metas(&[RESTORE_HISTORY, RESTORE_HISTORY_IDS])
 		} else {
 			let ids: Vec<Value> = left.iter().map(|e| e["leaf_id"].clone()).collect();
 			self.store.set_metas(&[(RESTORE_HISTORY, Value::Array(left).to_string()), (RESTORE_HISTORY_IDS, Value::Array(ids).to_string())])
@@ -1032,9 +1034,10 @@ impl Wallet {
 		let info = self.server_info()?;
 		// The coins taken since the last step looked (a participation completed,
 		// a catch-up, the mailbox, or a step cut short): what this step looks
-		// at beside its own.
+		// at beside its own. Told by the store's own order of its rows, which
+		// never steps back as a clock can.
 		let since = self.store.meta(HISTORY_LOOKED)?.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
-		let looked = store_now();
+		let looked = self.store.coin_row_last()?;
 		// A step cut short (the program closed, the link lost) may have taken
 		// a coin and not yet applied how it was given up, and a participation
 		// completed or a catch-up may have taken one of the list since: each
@@ -1067,7 +1070,10 @@ impl Wallet {
 				None => room,
 				Some(budget) => {
 					let spent = started.elapsed().as_millis() as u64;
-					if checked > 0 && spent >= budget {
+					// Past the budget, or so close that one more coin at the
+					// pace would overrun it by more than half a coin: the slice
+					// ends. Only a coin dearer than the pace overruns it.
+					if checked > 0 && (spent >= budget || spent + pace / 2 >= budget) {
 						break;
 					}
 					if pace == 0 { 1 } else { ((budget.saturating_sub(spent) / pace) as usize).clamp(1, room.min(2 * last)) }
@@ -2024,9 +2030,4 @@ impl Wallet {
 		}
 		Ok(notes)
 	}
-}
-
-/// Now, in the seconds a coin's `created_at` counts.
-fn store_now() -> i64 {
-	web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
