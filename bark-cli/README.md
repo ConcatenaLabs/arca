@@ -261,9 +261,14 @@ and a board whose registration never reached the server, are not recovered.
   completed a day or two after its round, as the operator allows until the
   coin's exit date, takes the same leaf), the exit delay within the wallet's
   bounds, the depth,
-  and reserves on every node (an accumulator batch: on the slot's exit) and on
-  the entry of at least four times the node's relay floor in the leaf's
-  asset, so the leaf pays its own way out. The wallet hands the operator its
+  and the reserves on every node (an accumulator batch: on the slot's exit)
+  and on the entry: built by the rule the batch publishes (`reserve`, a
+  floor and a multiple, which the rebuild checks every reserve against), a
+  multiple of at least four, and each reserve paying its own spend at the
+  wallet's node's relay floor in the leaf's asset now, so the leaf pays its
+  own way out. The floor moves, and the operator read it earlier and often at
+  another node: what has risen since the build uses up part of the fourfold
+  cover, and the leaf is taken while what is left pays its way. The wallet hands the operator its
   authorisations to take the leaf out, signed when it takes the leaf: one per
   node of a tree's branch, or one exit from an accumulator batch, which names
   no state of the batch and so stays good whoever leaves before it.
@@ -283,6 +288,17 @@ and a board whose registration never reached the server, are not recovered.
   The forfeit of each coin given up is built from the validated leaf of the
   coin's own asset and its round, and its refund delay must end before the new
   leaves' exit deadline.
+  A refusal of a new leaf's reserves is one its round cannot cure. Where the
+  operator takes declines (`participations.decline`) and the wallet signed no
+  forfeit for that round, the wallet declines the round at once
+  (`decline_participation`, each coin's key signing for that round alone),
+  says so in its refusals, and has its coins back in the same sync; the round
+  goes on for everyone else. Any other refusal is asked again at the next
+  sync, where an honest answer completes the round. A participation the
+  operator already released, as a wallet restored from its phrase can find
+  one, holds its forfeits whole: its new leaves are taken with the reserves
+  of a coin the wallet holds (one atom), since refusing them could only lose
+  them.
 - **An issuer-operated asset's batch.** An operator may serve an asset
   issuer-operated: each round of it mints the refresh liquidity for its new
   batch through the asset's mint limiter, and every sweep of such a batch only

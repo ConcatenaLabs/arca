@@ -1,0 +1,53 @@
+{
+ "asset": "c8eccacf0953e1931cd31e434d8319101cc36e6c38b0e2104d8687552fae3e40",
+ "batch_vout": 0,
+ "burn": false,
+ "connector_vout": 2,
+ "delegated_reclaim": true,
+ "genesis_hash": "ddd11d54c87a2bd94400fd31ce05d8e1110bb4b78e7103f738342086fc4ea92e",
+ "kind": "tree",
+ "leaves": [
+  {
+   "exit_delay_units": 254,
+   "leaf_id": "37cd8302812f6823a0a4086860838bdb8035a73871fed5930e461297c3aa86cc",
+   "operator_nonce": "1cdf8f0232eb52febdd623cfde58bc0a831ce7baed8260583a80613186d0dbdc",
+   "owner": "67e6d136d55c74687ab470ed7dccb7e34df5a4f4753cef6a296aae05abb688bf",
+   "owner_nonce": "a02ee14d338593dbf23ed23e11875338f80359cd9392e52606bebd3c51bf46a0",
+   "preimage": "9f1413df3f142fc37afd1517fdc0393edf180d46aa61053b932962611495ec17",
+   "script_pubkey": "5120241648575993df532cc7a4304a2c0d5e48c574135f6b28eb1565b81063c9b62d",
+   "template": "vtxo-1",
+   "unlock_hash": "a35aa90ef2a7c45d1026ece71c797e96b3a302809cc52fe0702fe0cb065dcffb",
+   "value": "4261757870"
+  }
+ ],
+ "min_leaf": "2700301",
+ "nodes": [
+  [
+   {
+    "children": [
+     0,
+     1
+    ],
+    "reserve": "592",
+    "script_pubkey": "5120b8ffb0bd4c8c1340ae0934bb376ed997520407caffffbdc4e71883ce6fd24296",
+    "value": "4261758982"
+   }
+  ]
+ ],
+ "radix": 4,
+ "reserve": {
+  "fee_rate": {
+   "floor_per_kvb": "571",
+   "multiple": "4"
+  }
+ },
+ "round_state": "final",
+ "round_txid": "58140a076af6723e1a9967459c035f655c71c0e011973ea6671540c9a56eef5d",
+ "schedule": "01f69bd5c2240b32ea12609b16d05d2fcf53894f2e6b60eda0d229647f4feccf13b6f4c5924ad81947658cf85bb93d9267efc54c7fcb2e4577e8c954c68fa087bb010001ffffffff",
+ "signer_record": {
+  "entry": 98108,
+  "hash": "c5ce10271ae0c64b81bada9395d45001ba5683b361369e95f5db1e7c584cf2ce",
+  "signature": "bd38c7c00d9f3bc49fc9c61d6e26defc4f45b5c07ca75bf6a1c18efa1174f878ae33f8ca45a1cc29b601ce592c01028120229bc307cc5e03e8fab11a126d0a3f"
+ },
+ "token_vout": 0
+}

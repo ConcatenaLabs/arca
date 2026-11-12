@@ -182,6 +182,95 @@ async fn wallets_sign_before_broadcast_and_a_silent_one_is_left_out() {
 	assert_eq!(k.state, NurseryState::Final);
 }
 
+/// A round held for its forfeits, refreshing A's coin and D's in X. D's
+/// wallet reaches the operator through a proxy that publishes the round's
+/// tree with its reserves at three times the floor, below the four every
+/// operator builds at: D's wallet refuses its leaf for its reserves, which
+/// the round cannot cure, and declines the round. The operator drops it
+/// unbroadcast there and then (no window waited out), D's participation void
+/// and its coin live again in the same sync; A's refresh runs again in the
+/// next round and completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_that_refuses_its_leaf_declines_and_the_round_goes_on_without_it() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x;
+	r.fund_server(x, 100_000_000).await;
+	let proxy = common::proxy::Proxy::start(&r.url());
+	proxy.rewrite(Some(std::sync::Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/tree" && status == 200 && v["reserve"].get("fee_rate").is_some() {
+			v["reserve"]["fee_rate"]["multiple"] = serde_json::json!("3");
+			v.as_object_mut().unwrap().remove("nodes");
+			for l in v["leaves"].as_array_mut().into_iter().flatten() {
+				l.as_object_mut().unwrap().remove("leaf_id");
+			}
+		}
+		None
+	})));
+	let (url, purl, node) = (r.url(), proxy.url.clone(), r.node_url());
+	let create = |server: &str| vec!["create".to_string(), "--server".into(), server.into(), "--node-url".into(), node.clone(), "--node-user".into(),
+		"arca".into(), "--exit-delay-units".into(), "1".into(), "--min-exit-delay-units".into(), "1".into()];
+	let (a, d) = (Arca::new("RA"), Arca::new("RD"));
+	a.ok(&create(&url).iter().map(String::as_str).collect::<Vec<_>>());
+	d.ok(&create(&purl).iter().map(String::as_str).collect::<Vec<_>>());
+	for w in [&a, &d] {
+		r.pay_to(script(&w.ok(&["address"])), x, 5_000_000);
+	}
+	r.produce().await;
+	a.ok(&["board", &x.to_string(), "2000000"]);
+	let board = d.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the boards credited", || [&a, &d].iter().all(|w| w.ok(&["boards"])[0]["server"]["state"] == "credited")).await;
+	for w in [&a, &d] {
+		w.ok(&["sync"]);
+		let p = w.ok(&["participate"]);
+		assert!(p["participations"].as_array().unwrap().iter().all(|x| x["state"] == "pending"), "{}", p);
+	}
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	let held = built[0].tx.clone();
+	assert_eq!(built[0].participations, 2);
+	println!("round {} built, held for its forfeits", held.txid());
+	let sa = a.ok(&["sync"]);
+	assert!(common::cli::handed_over(&sa), "{}", sa);
+	let sd = d.ok(&["sync"]);
+	// A round held for its forfeits is answered under `held`.
+	let p = sd["held"].as_array().unwrap().iter().find(|p| !p["refused"].is_null()).cloned()
+		.unwrap_or_else(|| panic!("not refused: {}", sd));
+	println!("D refused and declined: {}", p);
+	assert!(p["refused"].as_str().unwrap().contains("fails the wallet's checks: the batch's reserves are built at 3 times"), "{}", p);
+	assert_eq!(p["declined"], serde_json::json!(held.txid().to_string()), "{}", p);
+	assert_eq!(p["state"], "void", "{}", p);
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "D signed no forfeit");
+	let coin = d.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == board.as_str()).cloned().unwrap();
+	assert_eq!(coin["state"], "live", "D's coin is D's again in the same sync");
+	let row = r.server.store.round_by_txid(&held.txid().to_byte_array()).await.unwrap().unwrap();
+	assert_eq!(row.state, RoundState::Lost, "the held round is dropped unbroadcast at once");
+	// A runs again once the spend that kills the dropped round is final.
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let (again, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(!again.is_empty(), "A's round runs again: {:?}", failed.iter().map(|f| f.1.to_string()).collect::<Vec<_>>());
+	assert_eq!(again[0].participations, 1);
+	let sa = a.ok(&["sync"]);
+	assert!(common::cli::handed_over(&sa), "{}", sa);
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&again[0].tx.txid(), RoundState::Final).await;
+	let sa = a.ok(&["sync"]);
+	assert!(sa["participations"].as_array().unwrap().iter().any(|p| p["state"] == "released"), "{}", sa);
+	println!("A completed round {}, without D", again[0].tx.txid());
+	for w in [&a, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// Boards `amount` of `asset` for each of `ws`, credited.
 async fn boarded(r: &mut Running, ws: &[&Arca], asset: elements::AssetId, amount: u64) {
 	for w in ws {

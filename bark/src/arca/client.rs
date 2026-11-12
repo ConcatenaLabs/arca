@@ -70,6 +70,27 @@ pub fn withdraw_digest(chain: &Chain, operator: &XOnlyPublicKey, id: &[u8; 32]) 
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of the digest the owner of each coin a participation gives up
+/// signs to take it out of the round it is in
+/// (`server::participations::DECLINE_TAG`).
+pub const DECLINE_TAG: &[u8] = b"Arca/participation-decline";
+
+/// What the owner key of each coin given up signs to take participation `id`
+/// out of round `round` (`server::participations::decline_digest`):
+/// `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ id ‖ round)`, the round's txid in its
+/// internal byte order, so that it declines that round alone.
+pub fn decline_digest(chain: &Chain, operator: &XOnlyPublicKey, id: &[u8; 32], round: &elements::Txid) -> [u8; 32] {
+	let tag = sha256::Hash::hash(DECLINE_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(id);
+	e.input(&round.to_byte_array());
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// The tag of a signed head of the operator's signer's record.
 pub const RECORD_HEAD_TAG: &[u8] = b"Arca/record-head";
 
@@ -352,7 +373,7 @@ pub const REFUSALS: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
 	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
 	"key_reused", "lapsed", "leaf_set", "malformed", "margin", "merge", "no_lightning", "no_lowest_node", "nonce_unknown", "nonce_used", "not_accepted",
-	"not_an_order", "not_in_round", "not_live", "not_on_node", "not_participating", "not_withdrawable", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
+	"not_an_order", "not_declined", "not_in_round", "not_live", "not_on_node", "not_participating", "not_withdrawable", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
 	"order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed", "owed_withdrawn", "planned",
 	"receive_cap", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt", "script_reused", "template",
 	"unauthenticated", "unbalanced",
