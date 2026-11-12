@@ -113,6 +113,12 @@ impl Pass {
 		}
 	}
 
+	/// The keys of every row of the whole statement: what the recount and
+	/// the first fill read (`tests/history_passes.rs` times it).
+	pub fn whole_keys(self) -> String {
+		format!("{} SELECT k, v FROM keys", self.keys_with(false))
+	}
+
 	/// The keys of the whole statement's rows (`logged`: of those logged), as
 	/// `keys (k, v)` after `WITH`, or after the statement's own expressions.
 	fn keys_with(self, logged: bool) -> String {
@@ -212,6 +218,9 @@ impl Store {
 	pub async fn recount_open(&self, pass: Pass) -> Result<(u64, u64), StoreError> {
 		let mut conn = self.conn().await?;
 		let tx = conn.build_transaction().isolation_level(tokio_postgres::IsolationLevel::RepeatableRead).start().await?;
+		// The whole statement hashes every coin given up: in memory, not in
+		// batches on the disk.
+		tx.execute("SET LOCAL work_mem = '256MB'", &[]).await?;
 		let read = |logged: bool| format!("{} SELECT k, v FROM keys", pass.keys_with(logged));
 		let whole: BTreeSet<(Vec<u8>, i32)> = tx.query(&read(false), &[]).await?.iter().map(|r| (r.get(0), r.get(1))).collect();
 		let logged: BTreeSet<(Vec<u8>, i32)> = tx.query(&read(true), &[]).await?.iter().map(|r| (r.get(0), r.get(1))).collect();

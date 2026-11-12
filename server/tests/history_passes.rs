@@ -190,6 +190,15 @@ async fn passes_with_a_history_behind_them() {
 		ORDER BY n_live_tup DESC LIMIT 14", &[]).await.unwrap().iter().map(|r| r.get(0)).collect();
 	let finals: i64 = c.query_one("SELECT count(*) FROM round WHERE state = 'final'", &[]).await.unwrap().get(0);
 	println!("history ×{}: {} final rounds; {}", scale, finals, sizes.join(", "));
+	// The plans of the whole statements the logs of open items are filled
+	// from, when asked (`HISTORY_EXPLAIN=1`).
+	if env("HISTORY_EXPLAIN", 0) == 1 {
+		for pass in server::store::open::WATCHER_PASSES.iter().chain([server::store::open::Pass::Flight].iter()) {
+			let plan: Vec<String> = c.query(&format!("EXPLAIN (ANALYZE, BUFFERS) {}", pass.whole_keys()), &[]).await.unwrap()
+				.iter().map(|r| r.get(0)).collect();
+			println!("PLAN {}:\n{}", pass.name(), plan.join("\n"));
+		}
+	}
 	// The logs of open items start again, as after the schema step: the
 	// restarted server's first passes fill them from the whole history.
 	c.batch_execute("DELETE FROM pass_open; DELETE FROM watch_cursor WHERE name LIKE 'open:%'").await.unwrap();

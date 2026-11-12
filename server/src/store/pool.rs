@@ -52,15 +52,21 @@ pub struct PoolFlow {
 /// forfeit window are judged together by the cap), its lineage up through
 /// reassignments, and what has come back. `given` limits the coins given up
 /// (`pi`, a condition beginning with `AND`): the passes read those logged as
-/// they may have opened ([`super::open::Pass::Flight`]). What has come back
-/// is read for the batch leaves of those coins' lineages only, which is all
-/// `held` asks of it.
+/// they may have opened ([`super::open::Pass::Flight`]), and then what has
+/// come back is read for the batch leaves of those coins' lineages only,
+/// which is all `held` asks of it. Over every coin (`given` empty) it is
+/// read whole, by table, which reads the disk in order rather than by an
+/// index lookup a leaf.
 pub(super) fn in_flight_with(given: &str) -> String {
+	let only = |e: &str| if given.is_empty() { String::new() } else { format!(" AND {} IN (SELECT leaf_id FROM lineage)", e) };
+	let batches = if given.is_empty() { String::new() } else {
+		" AND (b.round_id, b.vout) IN (SELECT bl.round_id, bl.vout FROM lineage x JOIN batch_leaf bl ON bl.leaf_id = x.leaf_id)".into()
+	};
 	format!("
 	WITH RECURSIVE given AS MATERIALIZED (
 	   SELECT pi.leaf_id, pi.asset, pi.value FROM participation_input pi
 	   JOIN participation p USING (participation_id) JOIN round r ON r.round_id = p.round_id
-	   WHERE pi.active AND p.state IN ('issued', 'released') AND r.state IN ('built', 'broadcast', 'final'){}),
+	   WHERE pi.active AND p.state IN ('issued', 'released') AND r.state IN ('built', 'broadcast', 'final'){given}),
 	 up (root, asset, leaf_id, depth) AS (
 	   SELECT leaf_id, asset, leaf_id, 0 FROM given
 	   UNION
@@ -72,20 +78,18 @@ pub(super) fn in_flight_with(given: &str) -> String {
 	 lineage AS MATERIALIZED (SELECT DISTINCT leaf_id FROM up),
 	 swept AS MATERIALIZED (
 	   SELECT DISTINCT b.round_id, b.vout FROM batch b JOIN watcher_tx w ON w.subject = b.token JOIN nursery_tx n USING (txid)
-	   WHERE w.kind = 'sweep' AND n.state = 'final'
-	     AND (b.round_id, b.vout) IN (SELECT bl.round_id, bl.vout FROM lineage x JOIN batch_leaf bl ON bl.leaf_id = x.leaf_id)),
+	   WHERE w.kind = 'sweep' AND n.state = 'final'{batches}),
 	 back AS MATERIALIZED (
-	   SELECT rl.leaf_id FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid) WHERE n.state <> 'lost'
-	     AND rl.leaf_id IN (SELECT leaf_id FROM lineage)
+	   SELECT rl.leaf_id FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid) WHERE n.state <> 'lost'{rl}
 	   UNION
 	   SELECT nr.leaf_id FROM node_release nr JOIN watcher_tx w ON w.kind = 'reclaim' AND w.subject = nr.node_hash
-	   JOIN nursery_tx n ON n.txid = w.txid WHERE n.state <> 'lost' AND nr.leaf_id IN (SELECT leaf_id FROM lineage)
+	   JOIN nursery_tx n ON n.txid = w.txid WHERE n.state <> 'lost'{nr}
 	   UNION
 	   -- A leaf of a batch without a sweep, collected: brought down to its
 	   -- leaf and forfeited on the chain, the forfeit final.
 	   SELECT bl.leaf_id FROM batch_leaf bl JOIN batch b ON b.round_id = bl.round_id AND b.vout = bl.vout
 	   JOIN watcher_tx w ON w.kind = 'forfeit' AND w.subject = bl.leaf_id JOIN nursery_tx n ON n.txid = w.txid
-	   WHERE b.collect_mtp IS NOT NULL AND n.state = 'final' AND bl.leaf_id IN (SELECT leaf_id FROM lineage)),
+	   WHERE b.collect_mtp IS NOT NULL AND n.state = 'final'{bl}),
 	 -- A coin given up whose own forfeit is final on the chain: the
 	 -- collection brought it down to its leaf, through its lineage's
 	 -- reassignments when it was paid on out of round, and forfeited it.
@@ -99,7 +103,8 @@ pub(super) fn in_flight_with(given: &str) -> String {
 	   WHERE b.asset = u.asset AND r.state IN ('broadcast', 'final')
 	     AND NOT EXISTS (SELECT 1 FROM swept s WHERE s.round_id = bl.round_id AND s.vout = bl.vout)
 	     AND NOT EXISTS (SELECT 1 FROM back k WHERE k.leaf_id = bl.leaf_id)
-	     AND NOT EXISTS (SELECT 1 FROM forfeited f WHERE f.leaf_id = u.root))", given)
+	     AND NOT EXISTS (SELECT 1 FROM forfeited f WHERE f.leaf_id = u.root))",
+		given = given, batches = batches, rl = only("rl.leaf_id"), nr = only("nr.leaf_id"), bl = only("bl.leaf_id"))
 }
 
 /// The value in flight, by asset: each coin given up counted once, however
