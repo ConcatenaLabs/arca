@@ -321,8 +321,14 @@ enum Cmd {
 		at_once: bool,
 	},
 	/// One step of the history a restore left: at most 20 of its coins,
-	/// checked as the restore checks a coin. `sync` runs one step too.
-	RestoreHistory,
+	/// checked as the restore checks a coin. `sync` runs a slice of about a
+	/// second.
+	RestoreHistory {
+		/// A slice of about this many milliseconds, past the coin it is
+		/// checking when they run out, rather than a whole step.
+		#[arg(long = "budget-ms")]
+		budget_ms: Option<u64>,
+	},
 	/// The refresh fee of each coin a participation would give up (every
 	/// live coin when none is named), priced by its asset's schedule, before
 	/// anything is signed: what `participate --shown` takes.
@@ -1588,7 +1594,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),
 		Cmd::Lightning(LightningCmd::Claim { .. }) => unreachable!("handled above"),
 		Cmd::Restore { at_once } => w.restore_with(at_once),
-		Cmd::RestoreHistory => match w.restore_history()? {
+		Cmd::RestoreHistory { budget_ms } => match w.restore_history_within(budget_ms)? {
 			Some(v) => Ok(v),
 			None => Ok(json!({"left": 0})),
 		},

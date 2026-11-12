@@ -84,9 +84,14 @@ data cleared, another browser) is created again from its mnemonic with
 the server and the chain hold of it, every record checked, as `arca create
 --mnemonic` does (`bark-cli/README.md`, Restoring from the mnemonic). It
 returns once the coins that make the balance are checked; the coins given up
-for good, the wallet's history, are checked a step at each `sync` after it.
-While they are, `balance` carries `history: {"loading": true, "left": N}`: a
-page shows its activity as still loading until it is gone. The restore leaves
+for good, the wallet's history, are checked after it, in slices:
+`run('restore_history', {budget_ms})` checks coins for about that long (past
+it only by the coin it was checking, at least one) and answers how many are
+`left` and how long it ran (`ms`); each `sync` runs a slice of about a second.
+A page runs slices while nobody asks the wallet for anything, one after the
+other, so a person's ask waits for one slice at most, never for the whole
+history. While they are left, `balance` carries `history: {"loading": true,
+"left": N}`: a page shows its activity as still loading until it is gone. The restore leaves
 the watchtowers' deposits owed (`deposits.owed`): the page runs `deposits` as
 soon as `restore` returns, and a `sync` makes them first while they are owed.
 `restore {at_once: true}` checks everything before it returns instead.
@@ -137,7 +142,7 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 `balance`, `coins {held?, brief?}`, `record {leaf_id}`, `board_quote {asset, amount, fee_asset?}`,
 `board {asset, amount, fee_asset?, shown?}`, `boards`, `receive {asset?,
 amount?, channels?}` (`channels: false` names none of the wallet's channels), `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
-`mailbox`, `restore {at_once?}`, `restore_history`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
+`mailbox`, `restore {at_once?}`, `restore_history {budget_ms?}`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_quote {asset,
 value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,

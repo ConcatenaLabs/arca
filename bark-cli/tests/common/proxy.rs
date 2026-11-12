@@ -40,6 +40,8 @@ pub struct Proxy {
 	/// gateway with the server gone answers (a 502): the call lost on its
 	/// way, the server never seeing it.
 	lose: Arc<Mutex<Vec<String>>>,
+	/// How long each call waits before it is forwarded: a far link.
+	delay: Arc<Mutex<Duration>>,
 }
 
 fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
@@ -87,6 +89,10 @@ fn serve(mut s: TcpStream, target: &str, p: &Proxy) -> std::io::Result<()> {
 		let text = v.to_string();
 		write!(s, "HTTP/1.1 502 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", text.len(), text)?;
 		return s.flush();
+	}
+	let wait = *p.delay.lock().unwrap();
+	if !wait.is_zero() {
+		std::thread::sleep(wait);
 	}
 	let url = format!("{}{}", target, path);
 	let resp = if method == "GET" { minreq::get(url).send() } else {
@@ -151,6 +157,7 @@ impl Proxy {
 			log: Arc::new(Mutex::new(vec![])),
 			hold: Arc::new(Mutex::new(vec![])),
 			lose: Arc::new(Mutex::new(vec![])),
+			delay: Arc::new(Mutex::new(Duration::ZERO)),
 		};
 		let (q, target) = (p.clone(), target.to_string());
 		std::thread::spawn(move || {
@@ -184,6 +191,11 @@ impl Proxy {
 	/// Rewrites requests with `f` before they reach the server, or nothing.
 	pub fn rewrite_request(&self, f: Option<RewriteRequest>) {
 		*self.rewrite_request.lock().unwrap() = f;
+	}
+
+	/// Makes every call wait `d` before it is forwarded, as over a far link.
+	pub fn delay(&self, d: Duration) {
+		*self.delay.lock().unwrap() = d;
 	}
 
 	/// Holds every call to `path` unanswered from now on.
