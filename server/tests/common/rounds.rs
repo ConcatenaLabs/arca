@@ -36,6 +36,11 @@ async fn start_tuned(unroll_at_release: bool) -> Running {
 	let mut r = Running::start_with(|c, y| {
 		c.assets.push(AssetSection::new(y, MIN_LEAF));
 		c.watcher.unroll_at_release = unroll_at_release;
+		// A test that follows a sweep needs batches with one, whatever
+		// `ARCA_TEST_NO_SWEEP` says.
+		if !unroll_at_release {
+			c.batches.no_sweep = false;
+		}
 	}).await;
 	let (x, y) = (r.x, r.y);
 	r.fund_wallet_in(x, 50_000_000).await;

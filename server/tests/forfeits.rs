@@ -129,8 +129,11 @@ async fn a_refresh_end_to_end_and_every_refusal() {
 	let built = r.server.rounds.run_round().await.unwrap().unwrap();
 	let round_txid = built.tx.txid();
 	println!("round {}: {} vB", round_txid, built.tx.vsize());
-	// Before the round is final.
-	refused(r.http.post("forfeit_leaves", &forfeit_body(&pa, &[(a_board.id, hex(&[1; 64]))], &[])), 422, "round_not_final");
+	// Before the round is final. A round of batches without a sweep is held
+	// for its forfeits before it goes out, so there the forfeit is taken now
+	// and its bad signature is what refuses it.
+	let early = if r.config.batches.no_sweep { "bad_forfeit" } else { "round_not_final" };
+	refused(r.http.post("forfeit_leaves", &forfeit_body(&pa, &[(a_board.id, hex(&[1; 64]))], &[])), 422, early);
 	r.produce().await;
 	r.bury().await;
 	round_final(&r, &round_txid).await;

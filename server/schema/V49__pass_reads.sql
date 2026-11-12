@@ -172,30 +172,38 @@ BEGIN
 	-- Rows only ever inserted, or updated in place.
 	FOREACH t IN ARRAY ARRAY['node_release', 'slot_release', 'delegation', 'forfeit', 'participation_input', 'tree_sighting', 'script_sighting']
 	LOOP
+		EXECUTE format('DROP TRIGGER IF EXISTS watch_touch_ins ON %I', t);
 		EXECUTE format('CREATE TRIGGER watch_touch_ins AFTER INSERT ON %I REFERENCING NEW TABLE AS touched
 			FOR EACH STATEMENT EXECUTE FUNCTION watch_touch_rows()', t);
+		EXECUTE format('DROP TRIGGER IF EXISTS watch_touch_upd ON %I', t);
 		EXECUTE format('CREATE TRIGGER watch_touch_upd AFTER UPDATE ON %I REFERENCING NEW TABLE AS touched
 			FOR EACH STATEMENT EXECUTE FUNCTION watch_touch_rows()', t);
 	END LOOP;
 	FOREACH t IN ARRAY ARRAY['reclaimed_leaf', 'transfer_output', 'order_fill', 'batch', 'tx_block']
 	LOOP
+		EXECUTE format('DROP TRIGGER IF EXISTS watch_touch_ins ON %I', t);
 		EXECUTE format('CREATE TRIGGER watch_touch_ins AFTER INSERT ON %I REFERENCING NEW TABLE AS touched
 			FOR EACH STATEMENT EXECUTE FUNCTION watch_touch_rows()', t);
 	END LOOP;
+	DROP TRIGGER IF EXISTS watch_touch_upd ON order_fill;
 	CREATE TRIGGER watch_touch_upd AFTER UPDATE ON order_fill REFERENCING NEW TABLE AS touched
 		FOR EACH STATEMENT EXECUTE FUNCTION watch_touch_rows();
 	-- Rows whose change of state matters: the old row beside the new.
 	FOREACH t IN ARRAY ARRAY['leaf', 'participation', 'round', 'nursery_tx', 'transfer', 'lightning_send']
 	LOOP
+		EXECUTE format('DROP TRIGGER IF EXISTS watch_touch_upd ON %I', t);
 		EXECUTE format('CREATE TRIGGER watch_touch_upd AFTER UPDATE ON %I REFERENCING OLD TABLE AS untouched NEW TABLE AS touched
 			FOR EACH STATEMENT EXECUTE FUNCTION watch_touch_rows()', t);
 	END LOOP;
+	DROP TRIGGER IF EXISTS watch_unblocked ON tx_block;
 	CREATE TRIGGER watch_unblocked AFTER DELETE ON tx_block REFERENCING OLD TABLE AS touched
 		FOR EACH STATEMENT EXECUTE FUNCTION watch_unblocked();
 	FOREACH t IN ARRAY ARRAY['nursery_tx:final', 'round:final', 'board:credited']
 	LOOP
+		EXECUTE format('DROP TRIGGER IF EXISTS final_unblocked_ins ON %I', split_part(t, ':', 1));
 		EXECUTE format('CREATE TRIGGER final_unblocked_ins AFTER INSERT ON %I REFERENCING NEW TABLE AS touched
 			FOR EACH STATEMENT EXECUTE FUNCTION final_unblocked(%L)', split_part(t, ':', 1), split_part(t, ':', 2));
+		EXECUTE format('DROP TRIGGER IF EXISTS final_unblocked_upd ON %I', split_part(t, ':', 1));
 		EXECUTE format('CREATE TRIGGER final_unblocked_upd AFTER UPDATE ON %I REFERENCING NEW TABLE AS touched
 			FOR EACH STATEMENT EXECUTE FUNCTION final_unblocked(%L)', split_part(t, ':', 1), split_part(t, ':', 2));
 	END LOOP;
@@ -361,11 +369,13 @@ BEGIN
 	FOREACH t IN ARRAY ARRAY['nursery_tx', 'watcher_tx', 'script_sighting', 'arca_script', 'leaf', 'forfeit', 'board', 'participation_input',
 		'batch_leaf', 'round', 'transfer_input', 'transfer_output', 'order_fill']
 	LOOP
+		EXECUTE format('DROP TRIGGER IF EXISTS pass_open_ins ON %I', t);
 		EXECUTE format('CREATE TRIGGER pass_open_ins AFTER INSERT ON %I REFERENCING NEW TABLE AS touched
 			FOR EACH STATEMENT EXECUTE FUNCTION pass_open_rows()', t);
 	END LOOP;
 	FOREACH t IN ARRAY ARRAY['nursery_tx', 'leaf', 'board', 'participation_input', 'participation', 'round', 'batch']
 	LOOP
+		EXECUTE format('DROP TRIGGER IF EXISTS pass_open_upd ON %I', t);
 		EXECUTE format('CREATE TRIGGER pass_open_upd AFTER UPDATE ON %I REFERENCING OLD TABLE AS untouched NEW TABLE AS touched
 			FOR EACH STATEMENT EXECUTE FUNCTION pass_open_rows()', t);
 	END LOOP;
