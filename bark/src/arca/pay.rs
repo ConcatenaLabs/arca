@@ -988,6 +988,11 @@ impl Wallet {
 		let mut chosen: Vec<In> = vec![];
 		// The reassignment's margin with every coin chosen so far.
 		let mut margin = 0;
+		// The wallet's bound refusing the coins chosen so far, which pay:
+		// more coins can bring their margins within it (a small coin taken
+		// first, beside a large one), so it is the refusal only when no
+		// prefix that pays is within it (#869).
+		let mut bound: Option<Error> = None;
 		for c in candidates {
 			if chosen.len() >= cap {
 				break;
@@ -1013,10 +1018,19 @@ impl Wallet {
 						continue;
 					}
 				} else {
-					self.margins_within_bound(&chosen, margin, asset)?;
-					return Ok((chosen, margin, change));
+					match self.margins_within_bound(&chosen, margin, asset) {
+						Ok(()) => return Ok((chosen, margin, change)),
+						Err(e) if chosen.len() < cap => {
+							bound = Some(e);
+							continue;
+						}
+						Err(e) => return Err(e),
+					}
 				}
 			}
+		}
+		if let Some(e) = bound {
+			return Err(e);
 		}
 		let kept: u64 = chosen.iter().map(|i| i.checkpoint_value).sum();
 		if kept >= paid + margin {
