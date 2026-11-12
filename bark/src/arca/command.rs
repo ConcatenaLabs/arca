@@ -61,9 +61,14 @@ pub fn refusal(e: &Error) -> Value {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["release"] = json!(release);
 	}
-	if let Error::SettleFirst { asset, coins, .. } = e {
+	if let Error::SettleFirst { asset, coins, wait, .. } = e {
 		out["error"]["asset"] = json!(asset);
 		out["error"]["coins"] = json!(coins);
+		if let Some((most, usual, step)) = wait {
+			out["error"]["final_in_seconds"] = json!(most);
+			out["error"]["usual_in_seconds"] = json!(usual);
+			out["error"]["waiting_for"] = json!(step);
+		}
 	}
 	if let Error::InChannel { asset, close, side, most, fee, .. } = e {
 		out["error"]["asset"] = json!(asset);

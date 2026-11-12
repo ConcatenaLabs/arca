@@ -647,10 +647,13 @@ impl Wallet {
 		if held.is_empty() || live.saturating_add(more) < need {
 			return None;
 		}
-		Some(Error::SettleFirst { asset: asset.to_string(), coins: held.into_iter().map(|(l, ..)| l).collect(),
+		let coins: Vec<String> = held.into_iter().map(|(l, ..)| l).collect();
+		let wait = self.settle_wait(&coins);
+		let when = wait.map(|(most, usual, _)| format!(", usually within {} s and at most {} s", usual, most)).unwrap_or_default();
+		Some(Error::SettleFirst { asset: asset.to_string(), coins, wait,
 			message: format!("the wallet's coins of asset {} that pay this now hold {}, short of the {} it takes; {} more are {}, and pay it once \
-				the operator's next round has refreshed them: settle them first (settle_first), then ask again; nothing was signed", asset,
-				live, need, more, why) })
+				a round has made them coins the wallet can spend{}: settle them first (settle_first), which puts through a round those that \
+				need one and waits for the rest, then ask again; nothing was signed", asset, live, need, more, why, when) })
 	}
 
 	/// The checkpoint margin of `coin`, and the reassignment's of `inputs`
@@ -2487,7 +2490,9 @@ impl Wallet {
 			let deep: Vec<(String, u64)> = inputs.iter().filter(|i| i.coin.hops + 3 > limit).map(|i| (i.row.leaf_id.clone(), i.coin.value)).collect();
 			if !deep.is_empty() {
 				let held: u64 = deep.iter().map(|(_, v)| *v).sum();
-				return Err(Error::SettleFirst { asset: asset.to_string(), coins: deep.into_iter().map(|(l, _)| l).collect(),
+				let coins: Vec<String> = deep.into_iter().map(|(l, _)| l).collect();
+				let wait = self.settle_wait(&coins);
+				return Err(Error::SettleFirst { asset: asset.to_string(), coins, wait,
 					message: format!("the wallet's coins of asset {} that would make a coin of exactly the {} this trade gives hold {} too \
 						near the operator's depth limit of reassignments since a round, so the coin made could not be traded: settle them \
 						first (settle_first), then ask again; nothing moved", asset, need, held) });

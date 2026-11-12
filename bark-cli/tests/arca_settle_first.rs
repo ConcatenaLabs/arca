@@ -605,6 +605,9 @@ async fn window_case(depth: u32) {
 		assert!(w["settle"]["waiting_for"].as_str().is_some(), "{}: it says what for: {}", tag, w["settle"]);
 		for k in ["send", "offboard", "swap_read"] {
 			assert_eq!(w[k]["error"]["kind"], "settle_first", "{}: {} waits for the round, never a plain shortfall: {}", tag, k, w[k]);
+			// The refusal says how long itself, and never that a next round is needed.
+			assert!(w[k]["error"]["final_in_seconds"].as_u64().is_some() && w[k]["error"]["waiting_for"].as_str().is_some(), "{}: {}", tag, w[k]);
+			assert!(!w[k]["error"]["message"].as_str().unwrap_or("").contains("next round"), "{}: {}", tag, w[k]);
 		}
 	}
 	// Final: ready, and every spend goes.

@@ -94,6 +94,14 @@ const BLOCK_SECONDS: u64 = 60;
 const FORFEIT_WINDOW_SECONDS: u64 = 600;
 const BITCOIN_BLOCK_SECONDS: u64 = 600;
 
+/// `settle_first`'s sorting of the coins it is asked for ([`Wallet::sorted`]).
+struct Sorted {
+	give: Vec<String>,
+	waiting: Vec<String>,
+	done: Vec<String>,
+	rounds: Vec<Option<String>>,
+}
+
 /// What [`Wallet::final_within`] answers: the most seconds a round still
 /// takes, what it usually takes, and the step it waits for.
 pub(crate) struct Within {
@@ -618,36 +626,7 @@ impl Wallet {
 		} else {
 			return Err(Error::Parse("name the coins to settle, or the asset".into()));
 		};
-		let (mut give, mut waiting, mut done) = (vec![], vec![], vec![]);
-		// The rounds waited for: `None` for one not built yet.
-		let mut rounds: Vec<Option<String>> = vec![];
-		for id in ids {
-			let Some(c) = self.store.coin(&id)? else {
-				done.push(id);
-				continue;
-			};
-			match c.state.as_str() {
-				"live" => give.push(id),
-				"given" => {
-					// The round the operator built for it, once the wallet has
-					// read it (a held round, before its forfeits); else none yet.
-					rounds.push(Self::participation_of(&c).and_then(|p| self.store.participation(&p).ok().flatten()).and_then(|p| p.6));
-					waiting.push(id);
-				},
-				"pending" => {
-					rounds.push(c.bases.last().cloned());
-					waiting.push(id);
-				},
-				"forfeited" | "spent" => match self.made_by_round_waits(&c)? {
-					Some(round) => {
-						rounds.push(Some(round));
-						waiting.push(id);
-					},
-					None => done.push(id),
-				},
-				_ => done.push(id),
-			}
-		}
+		let Sorted { give, waiting, done, mut rounds } = self.sorted(ids)?;
 		let mut left = vec![];
 		let mut settling = vec![];
 		if !give.is_empty() {
@@ -676,20 +655,80 @@ impl Wallet {
 		let ready = settling.is_empty() && waiting.is_empty();
 		let mut v = json!({"settling": settling, "waiting": waiting, "done": done, "left": left, "ready": ready});
 		if !ready {
-			// The round furthest from done names the step waited for, the most it
-			// takes and what it usually takes.
-			let (mut most, mut usual, mut step) = (0u64, 0u64, Wait::Release);
-			for r in &rounds {
-				let w = self.final_within(&info, r.as_deref())?;
-				most = most.max(w.most);
-				usual = usual.max(w.usual);
-				step = step.min(w.step);
-			}
-			v["final_in_seconds"] = json!(most);
-			v["usual_in_seconds"] = json!(usual);
-			v["waiting_for"] = json!(step.name());
+			let w = self.wait_of(&info, &rounds)?;
+			v["final_in_seconds"] = json!(w.most);
+			v["usual_in_seconds"] = json!(w.usual);
+			v["waiting_for"] = json!(w.step.name());
 		}
 		Ok(v)
+	}
+
+	/// `ids` as `settle_first` sorts them: the live ones it gives up, the
+	/// ones that wait for a round as they are, the ones that are through,
+	/// and the round each waiting one waits for (`None` or empty for one not
+	/// built yet; a live one, once given up, waits for one not built yet).
+	fn sorted(&self, ids: Vec<String>) -> Result<Sorted, Error> {
+		let (mut give, mut waiting, mut done) = (vec![], vec![], vec![]);
+		let mut rounds: Vec<Option<String>> = vec![];
+		for id in ids {
+			let Some(c) = self.store.coin(&id)? else {
+				done.push(id);
+				continue;
+			};
+			match c.state.as_str() {
+				"live" => give.push(id),
+				"given" => {
+					// The round the operator built for it, once the wallet has
+					// read it (a held round, before its forfeits); else none yet.
+					rounds.push(Self::participation_of(&c).and_then(|p| self.store.participation(&p).ok().flatten()).and_then(|p| p.6));
+					waiting.push(id);
+				},
+				"pending" => {
+					rounds.push(c.bases.last().cloned());
+					waiting.push(id);
+				},
+				"forfeited" | "spent" => match self.made_by_round_waits(&c)? {
+					Some(round) => {
+						rounds.push(Some(round));
+						waiting.push(id);
+					},
+					None => done.push(id),
+				},
+				_ => done.push(id),
+			}
+		}
+		Ok(Sorted { give, waiting, done, rounds })
+	}
+
+	/// The wait of `rounds` together: the round furthest from done names the
+	/// step waited for, the most it takes and what it usually takes.
+	fn wait_of(&self, info: &Value, rounds: &[Option<String>]) -> Result<Within, Error> {
+		let mut out = Within { most: 0, usual: 0, step: Wait::Release };
+		for r in rounds {
+			let w = self.final_within(info, r.as_deref())?;
+			out.most = out.most.max(w.most);
+			out.usual = out.usual.max(w.usual);
+			out.step = out.step.min(w.step);
+		}
+		Ok(out)
+	}
+
+	/// How long the coins a [`Error::SettleFirst`] names wait, as
+	/// `settle_first` would answer once asked for them: `(final_in_seconds,
+	/// usual_in_seconds, waiting_for)`, the refusal's own reading of when the
+	/// spend can be asked again. `None` when it cannot be read now.
+	pub(crate) fn settle_wait(&self, coins: &[String]) -> Option<(u64, u64, &'static str)> {
+		let info = self.server_info().ok()?;
+		let Sorted { give, rounds, .. } = self.sorted(coins.to_vec()).ok()?;
+		let mut rounds = rounds;
+		if !give.is_empty() {
+			rounds.push(None);
+		}
+		if rounds.is_empty() {
+			return None;
+		}
+		let w = self.wait_of(&info, &rounds).ok()?;
+		Some((w.most, w.usual, w.step.name()))
 	}
 
 	/// For a coin given up (`forfeited`) or spent (`spent`) by a
@@ -772,7 +811,9 @@ impl Wallet {
 		let round_s = info["fills"]["round_interval_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(ROUND_SECONDS);
 		let block_s = info["fills"]["block_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(BLOCK_SECONDS);
 		let forfeits_s = info["fills"]["forfeit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(FORFEIT_WINDOW_SECONDS);
-		let release = round_s;
+		// The operator releases in its pass over the rounds, which runs at
+		// its round interval and on each block: a pass under way and one more.
+		let release = round_s + block_s;
 		let depth = self.chain.anchor_depth();
 		let bury = |have: u64| depth.saturating_sub(have).saturating_mul(BITCOIN_BLOCK_SECONDS);
 		let txid = round.and_then(|t| elements::Txid::from_str(t).ok());
