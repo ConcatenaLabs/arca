@@ -182,13 +182,16 @@ impl Wallet {
 		let (amount, fee) = whole_amount(&schedule, held, refresh, margin).ok_or_else(|| Error::Refused(format!("a coin of {} of asset {} \
 			holds no more than the fee of moving it on the chain (settle {}, refresh {}, offboard {}, unlock margin {})", value, asset, settle,
 			refresh, offboard_fee(&schedule, 0), margin)))?;
+		// Each of the two is held to the wallet's bound on its own, as each
+		// is when it is made: the settle of the coin's value, the move of
+		// what it pays.
+		let bound = max_fee_ppm.unwrap_or(DEFAULT_MAX_FEE_PPM);
+		if !fee_within(settle, value, bound) || !fee_within(fee, amount, bound) {
+			return Err(Error::Refused(format!("moving a coin of {} of asset {} on the chain costs {} (settle {}), above the wallet's bound \
+				of {} ppm (raise it with max_fee_ppm)", value, asset, fee.saturating_add(settle), settle, bound)));
+		}
 		let fee = fee.saturating_add(settle);
 		Self::at_least_min(&info, asset, amount, fee)?;
-		let bound = max_fee_ppm.unwrap_or(DEFAULT_MAX_FEE_PPM);
-		if !fee_within(fee, amount, bound) {
-			return Err(Error::Refused(format!("moving a coin of {} of asset {} on the chain costs {}, above the wallet's bound of {} ppm of \
-				the {} it pays (raise it with max_fee_ppm)", value, asset, fee, bound, amount)));
-		}
 		Ok(json!({"asset": asset.to_string(), "value": value.to_string(), "expiry": expiry, "amount": amount.to_string(),
 			"script": hex(script.as_bytes()), "address": self.chain.address(script)?,
 			"fee": {"asset": asset.to_string(), "amount": fee.to_string(), "settle": settle.to_string(), "refresh": refresh.to_string(),
@@ -203,6 +206,11 @@ impl Wallet {
 	fn would_arrive(&self, asset: AssetId, value: u64) -> Result<bool, Error> {
 		let places = self.places()?;
 		let Some(limit) = places.limit else { return Ok(false) };
+		// Once a received coin is arriving, every coin received after it
+		// arrives too, whatever room the limit has ([`Self::places`]).
+		if places.coins.iter().any(|(_, l, p)| *l == super::places::Lineage::Received && *p == super::places::Place::Arriving) {
+			return Ok(true);
+		}
 		let rates = self.chain.fee_rates()?;
 		Ok(match rates.get(&asset) {
 			None => true,
@@ -225,10 +233,14 @@ impl Wallet {
 
 	/// The coin the wallet holds now in place of `id`: `id` itself, or, when
 	/// a refresh of the wallet's own gave `id` up alone and is released, the
-	/// coin that refresh made, followed through each such refresh. A coin
-	/// settled first (`settle_first`) is so named by its old id. `None` when
-	/// the wallet holds neither; a refresh that gave up other coins with it
-	/// made a coin that is not `id`'s alone, and is refused, named.
+	/// coin that refresh made, followed through each such refresh. A refresh
+	/// is a participation that gave up that one coin and wants one plain leaf
+	/// of the wallet's own and nothing else (no order, channel or offboard):
+	/// a payment, an order or a take that made change is not one, and its
+	/// change is never named for the coin it spent. A coin settled first
+	/// (`settle_first`) is so named by its old id. `None` when the wallet
+	/// holds neither; a refresh that gave up other coins with it made a coin
+	/// that is not `id`'s alone, and is refused, named.
 	fn successor(&self, id: &str) -> Result<Option<String>, Error> {
 		let mut at = id.to_string();
 		for _ in 0..8 {
@@ -237,8 +249,16 @@ impl Wallet {
 				return Ok(Some(at));
 			}
 			let Some(pid) = c.spent_by.as_deref().and_then(|s| s.strip_prefix("participation ")) else { return Ok(Some(at)) };
-			let Some((_, _, given, wanted, state, _, _)) = self.store.participation(pid)? else { return Ok(Some(at)) };
+			let Some((_, body, given, wanted, state, _, _)) = self.store.participation(pid)? else { return Ok(Some(at)) };
 			if state != "released" {
+				return Ok(Some(at));
+			}
+			// A refresh, and nothing else: one output, a plain leaf.
+			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+			let outs = body["outputs"].as_array().cloned().unwrap_or_default();
+			let plain = outs.len() == 1 && outs[0]["leaf"].is_object() && outs[0]["leaf"]["order"].is_null()
+				&& outs[0]["leaf"]["channel"].is_null() && outs[0]["leaf"]["asset"].as_str() == Some(c.asset.as_str());
+			if !plain {
 				return Ok(Some(at));
 			}
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;

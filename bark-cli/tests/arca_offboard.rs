@@ -452,8 +452,10 @@ async fn an_offboard_of_named_coins_moves_them_whole_and_touches_no_other() {
 		let fee: u64 = whole["fee"]["amount"].as_str().unwrap().parse().unwrap();
 		assert_eq!(amount.parse::<u64>().unwrap() + fee, value.parse::<u64>().unwrap(), "the amount and the fee are the whole coin");
 		assert_eq!(whole["change"], "0");
-		let free = a.ok(&["offboard", "--asset", &xs, "--amount", &amount, "--address", &address, "--quote"]);
-		println!("the wallet's own choice for {}: {}", amount, free["gives"]);
+		// The wallet's own choice may also be refused (its fee above the
+		// bound): either way it is not this coin alone.
+		let (_, free) = a.run(&["offboard", "--asset", &xs, "--amount", &amount, "--address", &address, "--quote"]);
+		println!("the wallet's own choice for {}: {}", amount, free);
 		if free["gives"] != json!([c["leaf_id"]]) {
 			pick = Some((c.clone(), whole, amount));
 			break;

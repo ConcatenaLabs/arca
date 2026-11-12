@@ -11,6 +11,11 @@
 //! 2. A coin whose value after the fee is below the operator's smallest
 //!    output: both quotes refuse, naming the smallest amount that goes, and
 //!    nothing is asked of the operator.
+//! 3. A coin spent on a payment out of the tree that made change: its name
+//!    never moves the change (only a refresh of that coin alone is
+//!    followed).
+//! 4. A coin received while an earlier received coin is arriving arrives
+//!    too: the value quote counts its settle.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -48,6 +53,12 @@ fn library(a: &Arca, cmd: &str, args: Value) -> Result<Value, Value> {
 
 fn names(v: &Value) -> Vec<String> {
 	v.as_array().unwrap_or_else(|| panic!("no list: {}", v)).iter().map(|c| c.as_str().unwrap().to_string()).collect()
+}
+
+fn quote_ok(a: &Arca, args: &[&str]) -> (bool, Value) {
+	let (ok, v) = a.run(args);
+	println!("{} {:?} -> ok={} {}", a.name, &args[..args.len().min(5)], ok, v);
+	(ok, v)
 }
 
 async fn leaves_only(r: &mut Running, w: &Arca, asset: AssetId, paid: u64) {
@@ -236,6 +247,82 @@ async fn a_move_below_the_smallest_output_is_refused_at_the_quote() {
 	}
 	assert!(a.ok(&["offboards"]).as_array().unwrap().is_empty(), "nothing asked of the operator");
 	assert_eq!(live_of(&a, x).len(), 1);
+	for w in [&s, &a] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 3. A coin spent on a payment that made change.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_spent_on_a_payment_is_never_named_by_its_change() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.finality.anchor_depth = 0;
+		c.assets[0] = AssetSection { offboard_ppm: Some(3_333), offboard_base: Some("7".into()), ..AssetSection::new(x, 1_000) };
+	}).await;
+	let x = r.x;
+	let a = Arca::new("NAMED N1 A");
+	create(&r, &a);
+	leaves_only(&mut r, &a, x, 600_000).await;
+	let b = Arca::new("NAMED N1 B");
+	create(&r, &b);
+	let address = b.ok(&["address"])["address"].as_str().unwrap().to_string();
+	let xs = x.to_string();
+	let named = live_of(&a, x)[0]["leaf_id"].as_str().unwrap().to_string();
+	// The person pays 100,000 X out to someone else's address from that coin.
+	let paid = a.ok(&["offboard", "--asset", &xs, "--amount", "100000", "--address", &address]);
+	assert_eq!(paid["gives"], json!([named]), "{}", paid);
+	rounds_final(&r).await;
+	a.ok(&["sync"]);
+	let left = live_of(&a, x);
+	println!("N1: live after the payment: {:?}", left.iter().map(|c| (c["leaf_id"].clone(), c["value"].clone())).collect::<Vec<_>>());
+	// The named move of the coin that was spent on that payment.
+	let mine = a.ok(&["address"])["address"].as_str().unwrap().to_string();
+	let (ok, v) = quote_ok(&a, &["offboard", "--asset", &xs, "--coins", &named, "--address", &mine, "--quote"]);
+	assert!(!ok, "the coin spent on a payment is named, and the payment's change ({}) is quoted in its place: {}",
+		v["gives"], v);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 4. A coin received after an arriving one.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_value_quote_counts_the_settle_when_an_earlier_coin_is_arriving() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.finality.anchor_depth = 0;
+		c.watcher.enabled = false;
+		c.assets[0] = AssetSection { refresh_ppm: Some(3_000), refresh_base: Some("200".into()), offboard_ppm: Some(3_333),
+			offboard_base: Some("7".into()), ..AssetSection::new(x, 1_000) };
+	}).await;
+	let x = r.x;
+	post_bond(&mut r).await;
+	let (s, a) = (Arca::new("NAMED N4 S"), Arca::new("NAMED N4 A"));
+	create(&r, &s);
+	leaves_only(&mut r, &s, x, 4_100_000).await;
+	create(&r, &a);
+	library(&a, "instant_limit", json!({"value": worth(&r, x, 1_000_000).to_string()})).unwrap();
+	let address = a.ok(&["address"])["address"].as_str().unwrap().to_string();
+	let xs = x.to_string();
+	let big = pay(&s, &a, x, 2_000_000);
+	println!("N4: places: {}", library(&a, "coin_places", json!({})).unwrap()["coins"]);
+	let line = a.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == big.as_str()).cloned().unwrap();
+	let expiry = line["expiry"].as_u64().unwrap().to_string();
+	let ticket = a.ok(&["offboard", "--asset", &xs, "--value", "500000", "--expiry", &expiry, "--address", &address, "--quote"]);
+	println!("N4: ticket for a coin of 500,000: {}", ticket);
+	let small = pay(&s, &a, x, 500_000);
+	let place = library(&a, "coin_places", json!({})).unwrap()["coins"].as_array().unwrap().iter()
+		.find(|c| c["leaf_id"] == small.as_str()).cloned().unwrap();
+	println!("N4: the 500,000 coin is placed {}", place["place"]);
+	let (ok, v) = quote_ok(&a, &["offboard", "--asset", &xs, "--coins", &small, "--address", &address]);
+	let needs_settle = !ok && v["error"]["kind"] == "settle_first";
+	assert!(!(needs_settle && ticket["fee"]["settle"] == "0"), "the ticket counted no settle ({}), and the named move must \
+		settle first: {}", ticket["fee"], v);
 	for w in [&s, &a] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
