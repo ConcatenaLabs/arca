@@ -1797,6 +1797,19 @@ back, less the late-refresh fee, at its next sync (see Swept coins).
 Planning every leaf of a round closes it, at the price that a payment the
 unplanned coins cannot cover waits for one round (`plan-release`).
 
+A payment the wallet's live coins cannot make as asked, with nothing more of
+the asset on its way, is refused with kind `refused` and, in its JSON, what it
+can pay now: `most`, the ceiling below which every amount pays (what the coins
+it can give hold, less the margins and the operator's smallest leaf, so the
+change is never too small); `all`, when given, the exact amount that pays with
+no change at all, a little more than `most` (an amount between the two would
+leave change below the smallest leaf and is refused); and `live`, what it holds
+in live coins when the margins are what it falls short by. A payment gives at
+most sixteen coins, the largest; a payment over Lightning gives both as invoice
+amounts, the operator's fee on top. A program offers "up to `most`", or "all of
+it" as `all`, and asking for either goes. A take of an order and a
+distribution refuse with the words only.
+
 A coin a plan names carries refund halves that stay valid while its script is
 unspent, so the operator alone could void a payment of it out of round: no
 wallet pays it out of round. `arca plan-release COIN…` gives it up in the next
