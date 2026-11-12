@@ -1575,8 +1575,7 @@ async fn rb_round(r: &Running, ws: &[&Arca]) -> elements::Txid {
 /// chain grows by two hundred blocks. R restored from its mnemonic looks for
 /// each coin's own output on the chain from the batch's block up, as it must
 /// (a coin the lost wallet took home is never held live), and decodes each
-/// block of that stretch once for all its coins, in the restore and in the
-/// commands after it. Its coins are R's.
+/// block of that stretch once for all its coins. Its coins are R's.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restore_reads_each_block_once_whatever_the_coins_resting_on_a_spent_batch() {
 	use std::time::Duration;
@@ -1670,7 +1669,8 @@ async fn a_restore_reads_each_block_once_whatever_the_coins_resting_on_a_spent_b
 	// block of that stretch, once, for all eight.
 	assert!(steps["on_chain"]["blocks"].as_u64().is_some_and(|b| b >= span - 1), "the search crossed the stretch: {}", steps);
 	assert!(decoded <= span + 2 * 64, "{} blocks decoded for a stretch of {} with {} coins on it", decoded, span, PAYMENTS);
-	// And the commands after it read none of them again.
+	// The sync after it (a command of its own) decodes none either: what it
+	// asks of the chain needs no search back to the batch.
 	let bal = rw2.ok(&["balance"]);
 	let s = rw2.ok(&["sync"]);
 	let again: u64 = s["cost_by_step"].as_object().map(|o| o.values().map(|x| x["blocks"].as_u64().unwrap_or(0)).sum()).unwrap_or(0);
