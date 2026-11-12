@@ -652,6 +652,9 @@ pub(crate) fn rests_on_board(record: &CoinRecord) -> bool {
 enum Checked {
 	/// It holds, in this state, with this note.
 	Holds(&'static str, String),
+	/// It waits (`pending`), with this note: a board it is, or rests on, is
+	/// spent on the chain ([`arca_covenant::transfer::TransferError::BoardSpent`]).
+	BoardSpent(String),
 	/// A base the chain holds fails the wallet's checks, for this reason.
 	Fails(String),
 	/// A base is out of the chain while an input of it is spent by another
@@ -2924,6 +2927,12 @@ impl Wallet {
 			let policy = self.followed_policy(c.expiry, now);
 			let (state, note) = match self.recheck_one(&c, &record, &policy, now)? {
 				Checked::Holds(state, note) => (state, note),
+				Checked::BoardSpent(note) => {
+					if c.state == "live" && matches!(record, CoinRecord::Board(_)) {
+						board_spent.push(c.leaf_id.clone());
+					}
+					("pending", note)
+				},
 				Checked::Lost(base) => {
 					let why = format!("rests on {}, which is out of the chain while a coin it spends is spent by another transaction that is \
 						final: the coin is worth nothing while that stands, and the wallet follows it should the parent chain bring {} back", base, base);
@@ -2946,9 +2955,6 @@ impl Wallet {
 			if state != c.state || note != c.note {
 				if state != c.state {
 					changes.push(json!({"leaf_id": c.leaf_id, "from": c.state, "to": state, "why": note}));
-				}
-				if c.state == "live" && state == "pending" && matches!(record, CoinRecord::Board(_)) && is_board_spent(&note) {
-					board_spent.push(c.leaf_id.clone());
 				}
 				self.store.set_coin_state(&c.leaf_id, state, &note)?;
 			}
@@ -3234,7 +3240,11 @@ impl Wallet {
 	/// and `coins` says so (`redoing`).
 	fn recheck_one(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy, now: MedianTime) -> Result<Checked, Error> {
 		let checked = self.recheck_one_at(c, record, policy, now)?;
-		let Checked::Holds("pending", note) = checked else { return Ok(checked) };
+		let (board_spent, note) = match checked {
+			Checked::Holds("pending", note) => (false, note),
+			Checked::BoardSpent(note) => (true, note),
+			_ => return Ok(checked),
+		};
 		let note = note.strip_prefix(REDOING).map(str::to_string).unwrap_or(note);
 		let was = c.state == "live" || (c.state == "pending" && c.note.starts_with(REDOING));
 		let out = was && match self.base_txs(record) {
@@ -3247,7 +3257,8 @@ impl Wallet {
 			},
 			Err(_) => false,
 		};
-		Ok(Checked::Holds("pending", if out { format!("{}{}", REDOING, note) } else { note }))
+		let note = if out { format!("{}{}", REDOING, note) } else { note };
+		Ok(if board_spent { Checked::BoardSpent(note) } else { Checked::Holds("pending", note) })
 	}
 
 	fn recheck_one_at(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy, now: MedianTime) -> Result<Checked, Error> {
@@ -3332,7 +3343,11 @@ impl Wallet {
 			});
 		}
 		Ok(if let Err(e) = a.valid.check_boards(|op| self.chain.unspent(op).unwrap_or(false)) {
-			Checked::Holds("pending", format!("{}{}", e, extra))
+			let note = format!("{}{}", e, extra);
+			match e {
+				arca_covenant::transfer::TransferError::BoardSpent(_) => Checked::BoardSpent(note),
+				_ => Checked::Holds("pending", note),
+			}
 		} else if a.all_final() {
 			Checked::Holds("live", extra.trim_start_matches("; ").to_string())
 		} else {
@@ -4751,10 +4766,4 @@ mod tests {
 		let not_accepted = WalletPolicy { min_reserve: reserve_floor(None), ..policy };
 		assert!(not_accepted.check(&record).is_ok());
 	}
-}
-
-/// Whether a re-check's note says the board a coin is, or rests on, is
-/// spent on the chain ([`arca_covenant::transfer::TransferError::BoardSpent`]).
-fn is_board_spent(note: &str) -> bool {
-	note.starts_with("the board at ") && note.contains(" is spent")
 }

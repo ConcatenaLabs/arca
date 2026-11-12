@@ -2063,9 +2063,12 @@ impl Wallet {
 		steps.lap(self, "catch up");
 		self.exits_meanwhile();
 		// The coins a restore left to be checked after it (the wallet's
-		// history): one bounded step of them ([`Self::restore_history`]).
+		// history): one slice of them, of about a second
+		// ([`super::restore::SYNC_HISTORY_MS`]); a program that runs slices
+		// of its own while nobody asks it anything finishes it sooner.
 		let history = if talk && with_history {
-			self.restore_history().map(|v| v.unwrap_or(Value::Null)).unwrap_or_else(|e| json!({"error": e.to_string()}))
+			self.restore_history_within(Some(super::restore::SYNC_HISTORY_MS)).map(|v| v.unwrap_or(Value::Null))
+				.unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { Value::Null };
 		steps.lap(self, "history");
 		self.exits_meanwhile();

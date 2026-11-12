@@ -4668,6 +4668,11 @@ async fn d57_past_its_expiry_a_coin_goes_on_until_the_chain_says_it_is_gone() {
 	let batch = record.branch().unwrap().batch_output();
 	let bvout = rb.output.iter().position(|o| arca_covenant::ExplicitOutput::from_txout(o).as_ref() == Some(&batch)).unwrap() as u32;
 	let batch_at = elements::OutPoint::new(rb.txid(), bvout);
+	// The watcher publishes the batch's token once the batch is past its
+	// expiry, and sweeps it once the token has waited the notice, in median
+	// time from the token's block: the chain's median time is moved on with
+	// each pass, not only blocks produced, so the sweep never depends on how
+	// far A's coming home happened to move it (arca #511).
 	for _ in 0..30 {
 		let _ = r.server.watcher.pass().await;
 		r.produce().await;
@@ -4675,7 +4680,8 @@ async fn d57_past_its_expiry_a_coin_goes_on_until_the_chain_says_it_is_gone() {
 		if spender_of(&r, &batch_at).is_some() {
 			break;
 		}
-		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, notice / 4 + 1));
+		r.synced().await;
 	}
 	let sweep = spender_of(&r, &batch_at).expect("the operator sweeps B's batch");
 	println!("D57 B's batch output {} swept by {}", batch_at, sweep.txid());
