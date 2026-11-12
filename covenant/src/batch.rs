@@ -13,7 +13,7 @@ use elements::Script;
 use crate::accumulator::{prefer_accumulator, Accumulator, AccumulatorParams, SLOTS};
 use crate::record::Template;
 use crate::script::ExplicitOutput;
-use crate::tree::{LeafSpec, Tree, TreeError, TreeLeaf, TreeParams};
+use crate::tree::{LeafSpec, ReserveRule, Tree, TreeError, TreeLeaf, TreeParams};
 
 /// Which kind a batch is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -172,6 +172,15 @@ impl Batch {
 		match self {
 			Batch::Tree(t) => t.leaves(),
 			Batch::Accumulator(a) => a.leaves(),
+		}
+	}
+
+	/// The rule its reserves were built by, as its parameters name it: what a
+	/// wallet reads the floor and multiple a round was built at from.
+	pub fn reserve(&self) -> ReserveRule {
+		match self {
+			Batch::Tree(t) => t.params().reserve,
+			Batch::Accumulator(a) => a.params().reserve,
 		}
 	}
 

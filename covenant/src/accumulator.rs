@@ -1586,11 +1586,9 @@ impl AccumulatorRecord {
 			ReserveFloor::FeeRate { floor_per_kvb, multiple } => {
 				let (state, _) = self.batch()?;
 				let entry = self.entry();
-				let tap = entry.taproot();
-				let w = tap.witness(&entry.unlock_script(), vec![vec![0; 32]]);
 				let leaf_out = ExplicitOutput::new(self.asset, self.value, self.leaf().script_pubkey()).txout();
-				(exit_fee_rate_reserve(&state, self.asset, tap.script_pubkey().len(), floor_per_kvb, multiple),
-					fee_rate_reserve(floor_per_kvb, multiple, w, vec![leaf_out], self.asset))
+				(exit_fee_rate_reserve(&state, self.asset, entry.taproot().script_pubkey().len(), floor_per_kvb, multiple),
+					crate::tree::entry_reserve(ReserveRule::FeeRate { floor_per_kvb, multiple }, &entry, leaf_out))
 			},
 		};
 		if self.exit_reserve < exit_min {

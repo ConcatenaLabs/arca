@@ -53,7 +53,7 @@ use elements::secp256k1_zkp::XOnlyPublicKey;
 use elements::{AssetId, LockTime, OutPoint, Script, Sequence, Transaction, TxIn, TxOut};
 
 use crate::clock::ClockSchedule;
-use crate::gate::{Members, MAX_OWNERS};
+use crate::gate::{MemberProof, Members, MAX_OWNERS};
 use crate::htlc::HtlcTerms;
 use crate::landing::Landing;
 use crate::order::OrderLeafTerms;
@@ -62,6 +62,7 @@ use crate::message::Chain;
 use crate::node::MAX_CHILDREN;
 use crate::record::{LeafRecord, LowestLevel, Sibling, Template, UpperLevel, MAX_LEVELS, MAX_VALUE};
 use crate::script::{Child, ExplicitOutput};
+use crate::taptree::TapOutput;
 use crate::time::RelativeTime;
 use crate::{EntryPolicy, LeafPolicy, NodePolicy};
 
@@ -282,6 +283,41 @@ pub(crate) fn fee_rate_reserve(floor_per_kvb: u64, multiple: u64, witness: Vec<V
 	vsize.saturating_mul(floor_per_kvb).div_ceil(1000).saturating_mul(multiple)
 }
 
+/// What `rule` reserves on a node for its unroll with the reserve as the fee:
+/// the node's own amount under [`ReserveRule::Fixed`], and under
+/// [`ReserveRule::FeeRate`] `multiple` times `floor_per_kvb` for the unroll's
+/// size, its witness at its full length (a signature, the authorisation's
+/// time at five bytes, and a member proof of `depth` levels for `operator`).
+/// The one function the tree builder sizes a node by and a wallet checks a
+/// node's reserve by, so that both read the same size for the same node.
+pub fn node_reserve(rule: ReserveRule, taproot: &TapOutput, unroll: &Script, operator: &XOnlyPublicKey, depth: usize,
+	outputs: Vec<TxOut>, asset: AssetId) -> u64
+{
+	match rule {
+		ReserveRule::Fixed { node, .. } => node,
+		ReserveRule::FeeRate { floor_per_kvb, multiple } => {
+			let widest = MemberProof { index: 0, siblings: vec![[0; 32]; depth] };
+			let mut below = vec![vec![0; 64], vec![0; 5]];
+			below.extend(widest.witness_items(operator));
+			fee_rate_reserve(floor_per_kvb, multiple, taproot.witness(unroll, below), outputs, asset)
+		},
+	}
+}
+
+/// What `rule` reserves on an entry for its unlock into `leaf_out` with the
+/// reserve as the fee: [`node_reserve`]'s counterpart for an entry, used by
+/// every builder of entries (a tree's and an accumulator batch's) and by a
+/// wallet's check of one.
+pub fn entry_reserve(rule: ReserveRule, entry: &EntryPolicy, leaf_out: TxOut) -> u64 {
+	match rule {
+		ReserveRule::Fixed { entry, .. } => entry,
+		ReserveRule::FeeRate { floor_per_kvb, multiple } => {
+			let w = entry.taproot().witness(&entry.unlock_script(), vec![vec![0; 32]]);
+			fee_rate_reserve(floor_per_kvb, multiple, w, vec![leaf_out], entry.asset)
+		},
+	}
+}
+
 /// The vest time of a batch of `vest-1` leaves; `None` for a batch with
 /// none. Refuses a batch that mixes them with other leaves or vest times, or
 /// has a sweep ([`TreeError::VestBatch`]).
@@ -374,14 +410,8 @@ pub(crate) fn build_leaves(params: &TreeParams, leaves: &[LeafSpec]) -> Result<V
 			sweep: entry_sweep,
 		};
 		let entry_tap = entry.taproot();
-		let entry_reserve = match params.reserve {
-			ReserveRule::Fixed { entry, .. } => entry,
-			ReserveRule::FeeRate { floor_per_kvb, multiple } => {
-				let w = entry_tap.witness(&entry.unlock_script(), vec![vec![0; 32]]);
-				let leaf_out = ExplicitOutput::new(params.asset, spec.value, leaf.script_pubkey()).txout();
-				fee_rate_reserve(floor_per_kvb, multiple, w, vec![leaf_out], params.asset)
-			},
-		};
+		let entry_reserve = entry_reserve(params.reserve, &entry,
+			ExplicitOutput::new(params.asset, spec.value, leaf.script_pubkey()).txout());
 		let entry_value = sum(spec.value, entry_reserve)?;
 		tree_leaves.push(TreeLeaf {
 			spec: spec.clone(), leaf, entry, entry_value, entry_reserve, entry_program: entry_tap.program(),
@@ -447,15 +477,8 @@ impl Tree {
 				}
 				let taproot = policy.taproot();
 				let members = policy.members();
-				let reserve = match params.reserve {
-					ReserveRule::Fixed { node, .. } => node,
-					ReserveRule::FeeRate { floor_per_kvb, multiple } => {
-						let mut below = vec![vec![0; 64], vec![0; 5]];
-						below.extend(members.proof(0).witness_items(&operator));
-						let w = taproot.witness(&policy.unroll_script(), below);
-						fee_rate_reserve(floor_per_kvb, multiple, w, policy.child_outputs(), params.asset)
-					},
-				};
+				let reserve = node_reserve(params.reserve, &taproot, &policy.unroll_script(), &operator, members.depth(),
+					policy.child_outputs(), params.asset);
 				let value = policy.children().iter().try_fold(reserve, |acc, c| sum(acc, c.value))?;
 				nodes.push(TreeNode {
 					program: taproot.program(), policy, value, reserve, leaves: leaf_range, children: range, members,
