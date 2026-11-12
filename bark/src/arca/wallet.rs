@@ -60,6 +60,9 @@ struct Pins {
 /// round or board it rests on left the chain, as a Bitcoin reorganisation of
 /// the block its block anchors to does ([`Wallet::recheck`]).
 pub const REDOING: &str = "being redone after a Bitcoin reorganisation; ";
+/// How a board coin's note starts while the wallet reads its board final and
+/// the operator has not credited it yet ([`Wallet::recheck`]).
+pub const BOARD_NOT_CREDITED: &str = "waiting: the operator has not credited board ";
 
 /// The store's key for the anchor depth the operator last published, empty
 /// when it published none.
@@ -2528,6 +2531,17 @@ impl Wallet {
 		Ok(Some(tx))
 	}
 
+	/// The operator's state of board `b` when it has not credited it yet
+	/// (`pending`, or `lost`), from its `board_status`; `None` once it has, or
+	/// when it cannot be asked.
+	fn board_not_credited(&self, b: &arca_covenant::BoardRecord) -> Option<String> {
+		let v = self.server.post("board_status", &json!({"leaf_id": b.leaf_id().to_string()})).ok()?;
+		match v["state"].as_str() {
+			Some("credited") | None => None,
+			Some(other) => Some(other.to_string()),
+		}
+	}
+
 	/// The most rounds [`Self::batch_base`] reads of one `batch_status`
 	/// answer.
 	const BATCH_ROUNDS_READ: usize = 3;
@@ -3227,6 +3241,23 @@ impl Wallet {
 	/// and `coins` says so (`redoing`).
 	fn recheck_one(&self, c: &CoinRow, record: &CoinRecord, policy: &WalletPolicy, now: MedianTime) -> Result<Checked, Error> {
 		let checked = self.recheck_one_at(c, record, policy, now)?;
+		// A board coin the wallet reads final is live only once the operator
+		// credits it: the operator co-signs nothing from a board it has not
+		// credited (`not_live`), and it follows the chain on its own clock, a
+		// block or a pass behind the wallet at times. Until it says so, the
+		// coin waits as any coin not final yet does (`settle_first` names it,
+		// with the time), so no payment is asked of the operator from it to
+		// be refused. An operator that cannot be asked leaves the wallet's own
+		// reading standing.
+		if let (Checked::Holds("live", _), CoinRecord::Board(b)) = (&checked, record) {
+			if c.state != "live" {
+				if let Some(state) = self.board_not_credited(b) {
+					let was = if c.note.starts_with(REDOING) { REDOING } else { "" };
+					return Ok(Checked::Holds("pending", format!("{}{}{} yet (it reads it {}): the operator credits a board once its \
+						transaction is final as it reads the chain", was, BOARD_NOT_CREDITED, b.leaf_id(), state)));
+				}
+			}
+		}
 		let (board_spent, note) = match checked {
 			Checked::Holds("pending", note) => (false, note),
 			Checked::BoardSpent(note) => (true, note),
