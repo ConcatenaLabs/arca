@@ -3470,9 +3470,20 @@ impl Wallet {
 	/// records: an exit fee of a board reads every on-chain script the
 	/// wallet ever drew.
 	pub fn coins_listed(&self, held: bool, brief: bool) -> Result<Value, Error> {
+		// A coin held out as spent elsewhere ([`Self::spent_elsewhere`]): the
+		// wallet's, and not spendable now, whatever its state reads. Marked
+		// so, with when its hold ends, so a program counts what can be spent
+		// now as coin_places does.
+		let elsewhere = self.spent_elsewhere_until()?;
+		let mark = |v: &mut Value, id: &str| {
+			if let Some(until) = elsewhere.get(id) {
+				v["spent_elsewhere_until"] = json!(until);
+				v["standing"] = json!("spent_elsewhere");
+			}
+		};
 		if brief {
 			let rows = if held { self.store.coins_not_in(&GONE)? } else { self.store.coins()? };
-			return Ok(Value::Array(rows.iter().map(Self::coin_brief).collect()));
+			return Ok(Value::Array(rows.iter().map(|c| { let mut v = Self::coin_brief(c); mark(&mut v, &c.leaf_id); v }).collect()));
 		}
 		let alone = self.keepers()?.0.is_empty();
 		let stopped = self.rolled_back()?.is_some();
@@ -3486,6 +3497,7 @@ impl Wallet {
 		let mut out = vec![];
 		for c in if held { self.store.coins_not_in(&GONE)? } else { self.store.coins()? } {
 			let mut v = Self::coin_json(&c);
+			mark(&mut v, &c.leaf_id);
 			// Given up in a refresh the operator has not put in a round (as
 			// the wallet last knew): a payment or a trade that needs it takes
 			// that refresh back first, and its quote counts it.

@@ -248,8 +248,10 @@ operator serves the coin live again (the other store's participation withdrawn
 or voided, its round dropped), once a catch-up settles it, and at the latest when
 the wait `settle_first` stated for it has passed, so a false refusal costs at most
 that one wait. While held, the coin counts in `balance` (as `spent_elsewhere`)
-and not in what `coin_places` calls spendable (`spent_elsewhere_until` on its
-line), and its exit is never barred; a `swap_cancel` that meets such a coin cancels the
+and not in what `coin_places` calls spendable; `coin_places` and `coins` (full
+and `brief`) mark it with `spent_elsewhere_until` and the standing
+`spent_elsewhere`, so a program counts what it can spend now as the library does;
+and its exit is never barred; a `swap_cancel` that meets such a coin cancels the
 acceptance without a respend. A `swap_cancel` whose respend went unanswered
 never calls the acceptance cancelled until the operator has answered it: the
 next one posts the respend again and answers `cancelled`, `done`, or, while
