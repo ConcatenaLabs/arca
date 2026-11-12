@@ -315,6 +315,17 @@ struct Memo {
 	/// chain is (whether the block is in it is read in each view, by its
 	/// transaction's confirmations), so each is read once.
 	headers: HashMap<BlockHash, (u32, Option<BlockHash>)>,
+	/// What each block read by a search of the chain pays and spends, by its
+	/// hash ([`BlockSeen`]). Neither changes for a hash, whatever the active
+	/// chain is; which blocks are in it is read in each view, from the hash
+	/// at the top of a search down through each block's parent
+	/// ([`ChainSource::seen_range`]). So a block is read and decoded once for
+	/// every search that crosses it, in every later command too: a wallet with
+	/// hundreds of coins resting on outputs spent long ago searched the same
+	/// blocks once for each coin, in each command.
+	seen: HashMap<BlockHash, Arc<BlockSeen>>,
+	/// Blocks decoded from the node's bytes ([`ChainSource::blocks_decoded`]).
+	decoded: u64,
 	/// What each script scanned for in this view's set of unspent outputs
 	/// pays there (outpoint and height), whether found or not. A scan reads
 	/// the set at the tip, so its answer for a script stands until the tip
@@ -325,6 +336,35 @@ struct Memo {
 	/// Counts each drop of the view's answers: what tells a scan answered in
 	/// one view from one answered in the next.
 	view_drops: u64,
+}
+
+/// What a block pays and spends, as a search of the chain needs it: each
+/// output's script and each input's outpoint, with the place of its
+/// transaction in the block; and the block's parent, which links the blocks
+/// of a search to the hash at its top.
+#[derive(Debug)]
+pub(crate) struct BlockSeen {
+	prev: BlockHash,
+	/// Each output's script, with its transaction's place and its index.
+	pays: Vec<(Script, u32, u32)>,
+	/// Each input's outpoint, with its transaction's place.
+	spends: Vec<(OutPoint, u32)>,
+}
+
+impl BlockSeen {
+	fn of(block: &Block) -> BlockSeen {
+		let mut pays = vec![];
+		let mut spends = vec![];
+		for (t, tx) in block.txdata.iter().enumerate() {
+			for (v, o) in tx.output.iter().enumerate() {
+				pays.push((o.script_pubkey.clone(), t as u32, v as u32));
+			}
+			for i in &tx.input {
+				spends.push((i.previous_output, t as u32));
+			}
+		}
+		BlockSeen { prev: block.header.prev_blockhash, pays, spends }
+	}
 }
 
 /// The reads a look at the view makes.
@@ -974,7 +1014,14 @@ impl ChainSource {
 
 	fn raw_block(&self, hash: &BlockHash) -> Result<Block, RpcError> {
 		let hex: String = self.call("getblock", &[json!(hash.to_string()), json!(0)])?;
+		self.memo.lock().expect("the chain memo").decoded += 1;
 		decode("block", &hex)
+	}
+
+	/// How many blocks this source has decoded from the node's bytes: what a
+	/// search of the chain costs in processor time, the requests apart.
+	pub fn blocks_decoded(&self) -> u64 {
+		self.memo.lock().expect("the chain memo").decoded
 	}
 
 	pub fn genesis(&self) -> Result<BlockHash, Error> {
@@ -1581,19 +1628,20 @@ impl ChainSource {
 		if scripts.is_empty() {
 			return Ok(seen);
 		}
-		let mut look = |tx: &Transaction| {
+		let tip = self.tip()?.height;
+		for (_, _, b) in self.seen_range(from_height, tip)? {
+			for (script, _, _) in &b.pays {
+				if scripts.contains(script) {
+					seen.insert(script.clone());
+				}
+			}
+		}
+		for tx in self.mempool_txs()? {
 			for o in &tx.output {
 				if scripts.contains(&o.script_pubkey) {
 					seen.insert(o.script_pubkey.clone());
 				}
 			}
-		};
-		self.each_block(from_height, |_, block| {
-			block.txdata.iter().for_each(&mut look);
-			Ok(false)
-		})?;
-		for tx in self.mempool_txs()? {
-			look(&tx);
 		}
 		Ok(seen)
 	}
@@ -1602,11 +1650,46 @@ impl ChainSource {
 	/// pays `output` (asset, value and script), if any: what a wallet re-checks
 	/// a leaf against when its round is gone.
 	pub fn find_payment(&self, output: &TxOut, from_height: u64) -> Result<Option<(Transaction, u64)>, Error> {
-		let mut found = None;
-		self.each_block(from_height, |h, block| {
-			found = block.txdata.into_iter().find(|tx| tx.output.iter().any(|o| o == output)).map(|tx| (tx, h));
-			Ok(found.is_some())
-		})?;
+		Ok(self.find_payments(&[(output.clone(), from_height)])?.pop().flatten())
+	}
+
+	/// [`Self::find_payment`] of each of `wanted` (an output, and the height
+	/// it is looked for from), in one pass over the blocks: from the lowest
+	/// of those heights to the tip, each block read and decoded once for all
+	/// of them, ending as soon as every one is found. Each answer is the one
+	/// [`Self::find_payment`] gives for it alone: the first transaction from
+	/// its own height up that pays it.
+	pub fn find_payments(&self, wanted: &[(TxOut, u64)]) -> Result<Vec<Option<(Transaction, u64)>>, Error> {
+		let mut found: Vec<Option<(Transaction, u64)>> = vec![None; wanted.len()];
+		let Some(from) = wanted.iter().map(|(_, h)| *h).min() else { return Ok(found) };
+		let mut by_script: HashMap<&Script, Vec<usize>> = HashMap::new();
+		for (i, (o, _)) in wanted.iter().enumerate() {
+			by_script.entry(&o.script_pubkey).or_default().push(i);
+		}
+		let tip = self.tip()?.height;
+		let mut left = wanted.len();
+		for (h, hash, b) in self.seen_range(from, tip)? {
+			// A script that one of them pays is in this block: the block is
+			// decoded and its outputs compared in full, in order.
+			if !b.pays.iter().any(|(script, _, _)| by_script.get(script).is_some_and(|ix| ix.iter().any(|&i| found[i].is_none() && h >= wanted[i].1))) {
+				continue;
+			}
+			let block = self.raw_block(&hash).map_err(node)?;
+			for tx in &block.txdata {
+				for o in &tx.output {
+					let Some(ix) = by_script.get(&o.script_pubkey) else { continue };
+					for &i in ix {
+						if found[i].is_none() && h >= wanted[i].1 && *o == wanted[i].0 {
+							found[i] = Some((tx.clone(), h));
+							left -= 1;
+						}
+					}
+				}
+			}
+			if left == 0 {
+				break;
+			}
+		}
 		Ok(found)
 	}
 
@@ -1627,25 +1710,94 @@ impl ChainSource {
 			Some((_, h)) => from_height.max(h),
 			None => from_height,
 		};
-		let mut found = None;
-		self.each_block(from, |h, block| {
-			found = block.txdata.into_iter().find(|tx| spends(tx)).map(|tx| (tx, Some(h)));
-			Ok(found.is_some())
-		})?;
-		Ok(found)
-	}
-
-	/// Every block of the active chain from `from_height` to the tip, in
-	/// order, handed to `f` until it answers `true`. Read [`BATCH_MOST`] at a
-	/// time, where the node takes a batch: a node behind a proxy answers each
-	/// request after a round trip, and one read per block made a scan of an
-	/// hour of blocks take minutes.
-	fn each_block(&self, from_height: u64, f: impl FnMut(u64, Block) -> Result<bool, Error>) -> Result<(), Error> {
 		let tip = self.tip()?.height;
-		self.each_block_to(from_height, tip, f)
+		for (h, hash, b) in self.seen_range(from, tip)? {
+			let Some((_, t)) = b.spends.iter().find(|(o, _)| o == outpoint) else { continue };
+			let block = self.raw_block(&hash).map_err(node)?;
+			let tx = block.txdata.into_iter().nth(*t as usize).filter(|tx| spends(tx))
+				.ok_or_else(|| Error::Node(format!("block {} does not hold the spend of {} it held", hash, outpoint)))?;
+			return Ok(Some((tx, Some(h))));
+		}
+		Ok(None)
 	}
 
-	/// [`Self::each_block`], from `from_height` to `to_height` at most.
+	/// The blocks of the active chain from `from` to `to` (the tip at most),
+	/// lowest first, each with its hash and what it pays and spends
+	/// ([`BlockSeen`]). Only the hash at the top is read in this view: every
+	/// block below it is its parent's child, so each is reached from the one
+	/// above through its parent's hash, and a block seen in any earlier search
+	/// is not read again. One not seen yet is read with the blocks below it,
+	/// [`BATCH_MOST`] at a time, where the node takes a batch.
+	pub(crate) fn seen_range(&self, from: u64, to: u64) -> Result<Vec<(u64, BlockHash, Arc<BlockSeen>)>, Error> {
+		let mut out = vec![];
+		let to = to.min(self.tip()?.height);
+		if from > to {
+			return Ok(out);
+		}
+		let Some(mut hash) = self.block_hash(to)? else { return Ok(out) };
+		let mut h = to;
+		loop {
+			let known = self.memo.lock().expect("the chain memo").seen.get(&hash).cloned();
+			let b = match known {
+				Some(b) => b,
+				None => {
+					self.see_blocks(from.max(h.saturating_sub(BATCH_MOST as u64 - 1)), h, &hash)?;
+					self.memo.lock().expect("the chain memo").seen.get(&hash).cloned()
+						.ok_or_else(|| Error::Node(format!("block {} at height {} could not be read", hash, h)))?
+				},
+			};
+			let prev = b.prev;
+			out.push((h, hash, b));
+			if h == from {
+				break;
+			}
+			hash = prev;
+			h -= 1;
+		}
+		out.reverse();
+		Ok(out)
+	}
+
+	/// Reads the blocks at heights `lo` to `hi` not seen yet, in one batch of
+	/// hashes and one of blocks, and keeps what each pays and spends; and the
+	/// block `top` (the one a search reached at `hi` through its child) by
+	/// its hash, should the chain have moved since and the height name
+	/// another.
+	fn see_blocks(&self, lo: u64, hi: u64, top: &BlockHash) -> Result<(), Error> {
+		self.read_ahead((lo..=hi).map(|x| ("getblockhash".to_string(), vec![json!(x)])).collect());
+		let mut wanted: Vec<BlockHash> = vec![*top];
+		for x in lo..=hi {
+			if let Some(hash) = self.block_hash(x)? {
+				if hash != *top {
+					wanted.push(hash);
+				}
+			}
+		}
+		{
+			let m = self.memo.lock().expect("the chain memo");
+			wanted.retain(|hash| !m.seen.contains_key(hash));
+		}
+		self.read_ahead(wanted.iter().map(|hash| ("getblock".to_string(), vec![json!(hash.to_string()), json!(0)])).collect());
+		for hash in wanted {
+			let block = self.raw_block(&hash).map_err(node)?;
+			let b = Arc::new(BlockSeen::of(&block));
+			// What a search needs of the block is kept; its bytes are not, so a
+			// long search holds a few bytes a transaction rather than every
+			// block it crossed. A search that finds what it looks for in it
+			// reads the block again.
+			let mut m = self.memo.lock().expect("the chain memo");
+			m.named.remove(&Self::read_key("getblock", &[json!(hash.to_string()), json!(0)]));
+			m.seen.insert(hash, b);
+		}
+		Ok(())
+	}
+
+	/// Every block of the active chain from `from_height` to `to_height` (the
+	/// tip at most), in order, handed to `f` until it answers `true`. Read
+	/// [`BATCH_MOST`] at a time, where the node takes a batch: a node behind a
+	/// proxy answers each request after a round trip, and one read per block
+	/// made a scan of an hour of blocks take minutes. A search for what blocks
+	/// pay or spend uses [`Self::seen_range`], which reads each block once.
 	pub fn each_block_to(&self, from_height: u64, to_height: u64, mut f: impl FnMut(u64, Block) -> Result<bool, Error>) -> Result<(), Error> {
 		let tip = Tip { height: to_height.min(self.tip()?.height), ..self.tip()? };
 		let mut h = from_height;
@@ -1803,7 +1955,10 @@ pub fn unhex(s: &str) -> Result<Vec<u8>, Error> {
 	if s.len() % 2 != 0 || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
 		return Err(Error::Parse(format!("not hex: {}", s)));
 	}
-	Ok((0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("checked")).collect())
+	// A block is hundreds of kilobytes of hex: each pair is read by value,
+	// not parsed as a string.
+	let nibble = |c: u8| match c { b'0'..=b'9' => c - b'0', b'a'..=b'f' => c - b'a' + 10, _ => c - b'A' + 10 };
+	Ok(s.as_bytes().chunks_exact(2).map(|p| nibble(p[0]) << 4 | nibble(p[1])).collect())
 }
 
 /// 32 bytes from hex.
