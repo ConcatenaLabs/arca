@@ -377,6 +377,114 @@ async fn a_frozen_holder_lands_its_coin_in_its_own_key() {
 	}
 }
 
+/// A holder takes part of its supervised balance out to an address on the
+/// chain (`arca offboard`): the change stays in the tree as a landing leaf at
+/// its own landing, of the template the operator makes, since the operator
+/// makes no other leaf of a supervised asset. Before, the change was asked as
+/// `vtxo-1` and the operator refused the offboard ("every leaf of it is a
+/// landing leaf"). With `landing_2_only` on, the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_holder_takes_part_of_a_supervised_balance_out_and_keeps_the_rest_landing() {
+	let mut r = Running::start().await;
+	let iss = serve_z(&mut r).await;
+	let z = iss.z.to_string();
+	let (url, node_url) = (r.url(), r.node_url());
+	let a = Arca::new("OBA");
+	a.ok(&create_args(&url, &node_url));
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, iss.z, 4_000_000);
+	r.produce().await;
+	for _ in 0..2 {
+		a.ok(&["board", &z, "1500000"]);
+		r.produce().await;
+	}
+	r.bury().await;
+	r.synced().await;
+	r.wait("the boards credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let info = a.ok(&["info"]);
+	let landing = info["landing_address"].clone();
+	for (n, on) in [(1usize, false), (2, true)] {
+		if on {
+			r.config.landing_2_only = true;
+			r.restart_server().await;
+			a.ok(&["sync"]);
+		}
+		let addr = a.ok(&["address"])["address"].as_str().unwrap().to_string();
+		let before: Vec<String> = live_in(&a, &z).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+		let asked = a.ok(&["offboard", "--asset", &z, "--amount", "200000", "--address", &addr]);
+		println!("OFFBOARD {} (switch {}): {}", n, if on { "on" } else { "off" }, asked);
+		let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+		assert_eq!(built.iter().map(|b| b.offboards).sum::<usize>(), 1, "the round pays the offboard");
+		r.produce().await;
+		r.bury().await;
+		r.synced().await;
+		r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+		let id = asked["offboard"].as_str().unwrap().to_string();
+		let mut paid = false;
+		for _ in 0..30 {
+			r.produce().await;
+			r.synced().await;
+			a.ok(&["sync"]);
+			let o = a.ok(&["offboards"]).as_array().unwrap().iter().find(|o| o["offboard"] == id.as_str()).cloned().unwrap_or(Value::Null);
+			if o["state"] == "paid" {
+				let txid: elements::Txid = o["txid"].as_str().unwrap().parse().unwrap();
+				let tx = r.rt.client().raw_transaction(&txid).unwrap();
+				let spk = script_of(&r, &addr);
+				paid = tx.output.iter().any(|t| t.script_pubkey == spk && t.asset.explicit() == Some(iss.z) && t.value.explicit() == Some(200_000));
+				println!("OFFBOARD {}: paid by {}", n, txid);
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+		}
+		let mut change = vec![];
+		for _ in 0..10 {
+			a.ok(&["sync"]);
+			change = live_in(&a, &z).into_iter().filter(|c| !before.contains(&c["leaf_id"].as_str().unwrap().to_string())).collect();
+			if !change.is_empty() {
+				break;
+			}
+			r.produce().await;
+			r.synced().await;
+		}
+		println!("OFFBOARD {}: 200000 of Z paid to the address: {}; change {:?}", n, paid,
+			change.iter().map(|c| format!("{} {} {}", c["template"], c["value"], c["landing"])).collect::<Vec<_>>());
+		assert!(paid, "the round pays 200000 of Z out");
+		assert_eq!(change.len(), 1, "one change leaf: {:?}", change);
+		assert_eq!(change[0]["template"], json!("landing-2"), "{}", change[0]);
+		assert_eq!(change[0]["landing"], landing, "the change lands at the holder's own landing: {}", change[0]);
+		assert_eq!(change[0]["value"], asked["change"], "the change is what the offboard said: {}", change[0]);
+	}
+	// An order on the chain selling part of the balance (an offboard into
+	// the order's script): its change is a landing leaf too.
+	let before: Vec<String> = live_in(&a, &z).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	let x = r.x.to_string();
+	let placed = a.ok(&["order", "place", "--sell", &z, "--amount", "200000", "--for", &x, "--rate-num", "1", "--rate-den", "1",
+		"--expires-in-hours", "48", "--wait", "0"]);
+	println!("ORDER placed: {}", placed);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.iter().map(|b| b.offboards).sum::<usize>(), 1, "the round pays the order's output");
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.round_state(&built[0].tx.txid(), RoundState::Final).await;
+	let mut change = vec![];
+	for _ in 0..10 {
+		a.ok(&["sync"]);
+		change = live_in(&a, &z).into_iter().filter(|c| !before.contains(&c["leaf_id"].as_str().unwrap().to_string())).collect();
+		if !change.is_empty() {
+			break;
+		}
+		r.produce().await;
+		r.synced().await;
+	}
+	println!("ORDER change {:?}", change.iter().map(|c| format!("{} {} {}", c["template"], c["value"], c["landing"])).collect::<Vec<_>>());
+	assert_eq!(change.len(), 1, "one change leaf: {:?}", change);
+	assert_eq!(change[0]["template"], json!("landing-2"), "{}", change[0]);
+	assert_eq!(change[0]["landing"], landing, "{}", change[0]);
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
 /// Serves a new supervised asset Z, its signer reading freezes from a node
 /// of its own, as [`a_frozen_holder_lands_its_coin_in_its_own_key`] does.
 async fn serve_z(r: &mut Running) -> Issuer {
