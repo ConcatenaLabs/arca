@@ -40,8 +40,11 @@
 //! issues the round's connector asset, then change per asset and the one fee
 //! output. A round of refreshes spends the operator's own coins and nothing
 //! else: it takes no input of a third party, which could be spent elsewhere
-//! and keep the round from returning after a rollback. Only a round of its
-//! own that fills on-chain orders (below) spends one. A round has
+//! and keep the round from returning after a rollback. Two kinds of round
+//! spend one: a round of its own that fills on-chain orders (below), and a
+//! round that mints an issuer-operated asset, whose input 0 is the asset's
+//! mint limiter coin, which the limiter's `arm` path spends with the cold
+//! key's signature alone. A round has
 //! `nLockTime` 0 and final inputs, and is kept byte for byte, so the nursery
 //! broadcasts it again unchanged after a rollback and it returns with its
 //! txid, every forfeit signed for it still good.
@@ -1134,8 +1137,8 @@ pub struct Rounds {
 	wake: tokio::sync::Notify,
 	/// Each participation released, for the watcher's unlock lane.
 	releases: Arc<crate::watcher::Releases>,
-	/// Rung when a round held for its forfeits, and filling no order, is
-	/// handed to the node: the operator's half of those forfeits is signed
+	/// Rung when a round held for its forfeits that spends only the operator
+	/// wallet's own coins ([`Store::round_wakes_fill`]) is handed to the node: the operator's half of those forfeits is signed
 	/// only once the node holds the round
 	/// ([`crate::forfeits::Forfeits::fill_unsigned`]), and every release of
 	/// the round waits for it.
@@ -1304,8 +1307,8 @@ impl Rounds {
 			fill_due: Arc::new(tokio::sync::Notify::new()) })
 	}
 
-	/// Rung each time a round held for its forfeits, and filling no order,
-	/// goes to the node, so the forfeits' operator halves are filled in then
+	/// Rung each time a round held for its forfeits that spends only the
+	/// operator wallet's own coins goes to the node, so the forfeits' operator halves are filled in then
 	/// ([`crate::forfeits::Forfeits::fill_unsigned`]), not at the next minute.
 	pub fn fill_due(&self) -> Arc<tokio::sync::Notify> {
 		self.fill_due.clone()
@@ -3451,9 +3454,10 @@ impl Rounds {
 			let tx: Transaction = deserialize(&r.tx).map_err(|e| RoundError::Internal(e.to_string()))?;
 			let fee = AssetAmount::new(AssetId::from_byte_array(r.fee_asset), r.fee);
 			let answer = self.submit(r.round_id, &tx, fee).await?;
-			// Not for a round that fills orders: its takes run again if an
-			// order is taken before it confirms, but not a take whose
-			// forfeit the signer has co-signed ([`Store::round_wakes_fill`]).
+			// Not for a round with an input someone else can spend (an
+			// order, a mint limiter's coin): its participations run again if
+			// it is lost that way, but not one whose forfeit the signer has
+			// co-signed ([`Store::round_wakes_fill`]).
 			if self.store.round_wakes_fill(r.round_id).await? {
 				self.fill_due.notify_one();
 			}

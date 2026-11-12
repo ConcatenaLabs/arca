@@ -2081,8 +2081,8 @@ impl Server {
 		});
 		tasks.push(housekeeping(store.clone(), Duration::from_secs(config.limits.nonce_ttl_seconds),
 			Duration::from_secs(config.limits.cleanup_interval_seconds.max(1))));
-		// Once a minute, and at once when a round held for its forfeits, and
-		// filling no order, goes to the node (handed to it by the rounds pass,
+		// Once a minute, and at once when a round held for its forfeits that
+		// spends only the operator wallet's own coins goes to the node (handed to it by the rounds pass,
 		// or taken by it at a later broadcast of the nursery's, after a
 		// refusal): the forfeits without the operator's half, the fills of
 		// resting orders left unsigned, and the keepers the signer names,
