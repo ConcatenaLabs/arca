@@ -504,8 +504,15 @@ impl Wallet {
 	pub fn refresh_needed(&self, idle_seconds: Option<u64>) -> Result<Value, Error> {
 		let info = self.server_info()?;
 		let now = self.now()?.to_consensus_u32();
+		// The coins the upkeep may reason about: the wallet's live coins, less
+		// those held out as spent by another device of the wallet until a
+		// catch-up settles them ([`Self::spent_elsewhere`]). Such a coin is
+		// not the wallet's to move, so it neither counts toward any rule nor is
+		// given up by one; every rule below reads this list alone.
+		let elsewhere = self.spent_elsewhere()?;
+		let live: Vec<super::store::CoinRow> = self.store.coins_in("live")?.into_iter().filter(|c| !elsewhere.contains(&c.leaf_id)).collect();
 		let mut received = vec![];
-		for c in self.store.coins_in("live")? {
+		for c in live.iter().cloned() {
 			if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) {
 				continue;
 			}
@@ -517,7 +524,8 @@ impl Wallet {
 		let mut reasons = vec![];
 		let places = if self.own_instant_limit()?.is_some() { Some(self.places()?) } else { None };
 		if let Some(p) = &places {
-			let arriving: Vec<String> = p.coins.iter().filter(|(c, _, pl)| *pl == super::places::Place::Arriving && c.state == "live")
+			let arriving: Vec<String> = p.coins.iter()
+				.filter(|(c, _, pl)| *pl == super::places::Place::Arriving && c.state == "live" && !elsewhere.contains(&c.leaf_id))
 				.map(|(c, ..)| c.leaf_id.clone()).collect();
 			if !arriving.is_empty() {
 				reasons.push(json!({"rule": "arriving", "coins": arriving,
@@ -533,14 +541,25 @@ impl Wallet {
 						"why": format!("a received coin is one reassignment short of the operator's depth limit, {}", limit)}));
 				}
 			}
-			if let Some(l) = places.as_ref().and_then(|p| p.limit.as_ref().map(|l| (l, p.counted))) {
+			// What a held coin counts is not the wallet's exposure here.
+			let held_counts = |p: &super::places::Places| -> u128 {
+				elsewhere.iter().filter_map(|l| p.counted_of.get(l)).sum()
+			};
+			if let Some(l) = places.as_ref().and_then(|p| p.limit.as_ref().map(|l| (l, p.counted.saturating_sub(held_counts(p))))) {
 				let (limit, counted) = l;
 				if counted.saturating_mul(2) > limit.value {
 					reasons.push(json!({"rule": "exposure", "held": counted.to_string(), "limit": limit.value.to_string(),
 						"why": format!("the wallet counts {} of its instant limit of {} (reference atoms at its node's rates), past half", counted,
 						limit.value)}));
 				}
-			} else if let Some(e) = self.exposure()? {
+			} else if let Some(mut e) = self.exposure()? {
+				if !elsewhere.is_empty() {
+					let rates = self.chain.fee_rates()?;
+					let held: u128 = self.store.coins_in("live")?.iter().filter(|c| elsewhere.contains(&c.leaf_id))
+						.filter_map(|c| AssetId::from_str(&c.asset).ok().and_then(|a| rates.get(&a)).map(|r| c.value as u128 * *r as u128 / 100_000_000))
+						.sum();
+					e.held = e.held.saturating_sub(held);
+				}
 				if !e.unpriced.is_empty() {
 					reasons.push(json!({"rule": "exposure", "unpriced": e.unpriced, "why": format!("the wallet's node does not price {}: what it holds \
 						out of round cannot be weighed against what it may hold, so it is refreshed", e.unpriced.join(", "))}));
@@ -564,18 +583,12 @@ impl Wallet {
 		}
 		if let (Some(limit), true) = (super::pay::depth_limit(&info), places.is_some()) {
 			let idle = idle_seconds.is_some_and(|i| i >= REFRESH_IDLE);
-			// A coin another device of the wallet spent is held out of every
-			// spend until a catch-up settles it ([`Self::spent_elsewhere`]):
-			// never given up here either.
-			let elsewhere = self.spent_elsewhere()?;
 			let mut by_asset: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-			for c in self.store.coins_in("live")? {
-				if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(&c) || self.channel_worth(&c)?.is_some()
-					|| elsewhere.contains(&c.leaf_id)
-				{
+			for c in &live {
+				if !matches!(c.kind.as_str(), "transfer" | "fill") || super::resting::is_order_coin(c) || self.channel_worth(c)?.is_some() {
 					continue;
 				}
-				if Self::record_of(&c).is_ok_and(|r| super::wallet::record_hops(&r) + 3 > limit) {
+				if Self::record_of(c).is_ok_and(|r| super::wallet::record_hops(&r) + 3 > limit) {
 					by_asset.entry(c.asset.clone()).or_default().push(c.leaf_id.clone());
 				}
 			}
@@ -629,9 +642,6 @@ impl Wallet {
 		};
 		give.sort();
 		give.dedup();
-		// Never a coin held out as spent by another device of the wallet.
-		let elsewhere = self.spent_elsewhere()?;
-		give.retain(|l| !elsewhere.contains(l));
 		let shaped: Vec<String> = reasons.iter().filter(|r| r["rule"] == "shape")
 			.flat_map(|r| r["coins"].as_array().cloned().unwrap_or_default()).filter_map(|c| c.as_str().map(String::from)).collect();
 		// A coin inside its refresh window goes whatever else does.

@@ -359,6 +359,10 @@ pub struct Places {
 	pub coins: Vec<(CoinRow, Lineage, Place)>,
 	/// What the counted coins are worth, in atoms of the reference unit.
 	pub counted: u128,
+	/// What each counted coin counts of `counted`, by leaf id (a coin
+	/// waiting on a reserve for coins it was made from is in `counted` only
+	/// through that reserve, and not here).
+	pub counted_of: BTreeMap<String, u128>,
 	/// The assets of received coins the node gives no rate for.
 	pub unvalued: Vec<String>,
 	/// The channel coins, by leaf id, each counted at the wallet's side.
@@ -514,7 +518,7 @@ impl Wallet {
 			coins.push((c, lineage, place));
 		}
 		let Some(limit) = limit else {
-			return Ok(Places { limit: None, coins, counted: 0, unvalued: vec![], channels });
+			return Ok(Places { limit: None, coins, counted: 0, counted_of: BTreeMap::new(), unvalued: vec![], channels });
 		};
 		received.sort();
 		let held: BTreeSet<String> = received.iter().map(|(_, i)| coins[*i].0.leaf_id.clone()).collect();
@@ -625,11 +629,14 @@ impl Wallet {
 			caps.get(&c.leaf_id).map_or(w, |cap| w.min(*cap))
 		};
 		let mut counted = reserved;
+		let mut counted_of: BTreeMap<String, u128> = BTreeMap::new();
 		let mut unvalued: BTreeSet<String> = BTreeSet::new();
 		for (_, i) in &received {
 			let c = &coins[*i].0;
 			if sticky.contains(&c.leaf_id) {
-				counted += counts(c);
+				let n = counts(c);
+				counted += n;
+				counted_of.insert(c.leaf_id.clone(), n);
 			}
 		}
 		let mut grew = false;
@@ -653,6 +660,7 @@ impl Wallet {
 				},
 				Some(v) if open && counted + v <= limit.value => {
 					counted += v;
+					counted_of.insert(c.leaf_id.clone(), v);
 					sticky.insert(c.leaf_id.clone());
 					grew = true;
 					Place::Counted
@@ -671,7 +679,7 @@ impl Wallet {
 			self.store.set_metas(&[(INSTANT_COUNTED, serde_json::to_string(&sticky).expect("a set")),
 				(INSTANT_COUNTED_CAPS, serde_json::to_string(&caps).expect("a map"))])?;
 		}
-		Ok(Places { limit: Some(limit), coins, counted, unvalued: unvalued.into_iter().collect(), channels })
+		Ok(Places { limit: Some(limit), coins, counted, counted_of, unvalued: unvalued.into_iter().collect(), channels })
 	}
 
 	/// The coins a selection for `spend` may not take, by leaf id: none

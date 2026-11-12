@@ -794,3 +794,74 @@ async fn a_coin_held_as_spent_elsewhere_is_never_the_upkeeps_to_give() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// What `refresh_needed`'s answer `v` plans for coins of `asset`, by value:
+/// whether needed, what it gives up and keeps back (values sorted), and the
+/// rules that fire.
+fn plan_of(w: &Arca, v: &Value) -> Value {
+	let values: std::collections::BTreeMap<String, String> = library(w, "coin_places", json!({})).unwrap()["coins"].as_array().unwrap().iter()
+		.map(|c| (c["leaf_id"].as_str().unwrap().to_string(), c["value"].as_str().unwrap().to_string())).collect();
+	let by_value = |k: &str| { let mut x: Vec<String> = names(&v[k]).iter().map(|l| values.get(l).cloned().unwrap_or_default()).collect(); x.sort(); x };
+	let mut rules: Vec<String> = v["reasons"].as_array().unwrap().iter().map(|r| r["rule"].as_str().unwrap().to_string()).collect();
+	rules.sort();
+	json!({"needed": v["needed"], "give_up": by_value("give_up"), "kept_back": by_value("kept_back"), "rules": rules})
+}
+
+/// A coin held as spent elsewhere counts toward no rule of the upkeep (review
+/// RV55's S5): a wallet holding received coins of X and such a coin H plans
+/// for its other coins exactly as a wallet holding the same other coins and
+/// no H, the person active or away, and its upkeep never gives up its last
+/// coin of X it can spend. Before, H counted toward the exposure rule, and the
+/// upkeep gave up the other coins one after the other while the person used
+/// the wallet, the last one included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_coin_counts_toward_no_rule_and_the_last_free_coin_stays() {
+	let tag = "SF7 held counts";
+	let (mut r, a, m) = streak_setup(tag, &[]).await;
+	let x = r.x;
+	let b = Arca::new(&format!("{} B", tag));
+	create(&r, &b);
+	let (sa, sb) = (Arca::new(&format!("{} SA", tag)), Arca::new(&format!("{} SB", tag)));
+	boarded(&mut r, &sa, &[(x, 8_000_000)]).await;
+	boarded(&mut r, &sb, &[(x, 8_000_000)]).await;
+	for w in [&a, &b] {
+		library(w, "instant_limit", json!({"value": worth(&r, x, 8_000_000).to_string()})).unwrap();
+	}
+	let send = |s: &Arca, to: &Arca, v: u64| {
+		let req = to.ok(&["receive"])["request"].as_str().unwrap().to_string();
+		s.ok(&["send", &req, "--amount", &v.to_string(), "--asset", &x.to_string()]);
+		to.ok(&["mailbox"]);
+	};
+	for v in [1_500_000u64, 1_200_000] {
+		send(&sa, &a, v);
+		send(&sb, &b, v);
+	}
+	send(&sa, &a, 3_000_000);
+	let h = coins_of(&a, x).iter().find(|c| c.1 == 3_000_000).unwrap().0.clone();
+	let a2 = second_device(&a, &format!("{} A2", tag));
+	a2.ok(&["participate", "--leaf", &h]);
+	let req = sa.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let (ok, e) = a.run(&["send", &req, "--amount", "2800000", "--asset", &x.to_string()]);
+	assert!(!ok && e.to_string().contains("double_spend"), "{}", e);
+	println!("{}: A holds X {} with H held | B holds X {}", tag, depths(&a, x), depths(&b, x));
+	for idle in [0u64, 130] {
+		let (va, vb) = (library(&a, "refresh_needed", json!({"idle_seconds": idle})).unwrap(), library(&b, "refresh_needed", json!({"idle_seconds": idle})).unwrap());
+		let (pa, pb) = (plan_of(&a, &va), plan_of(&b, &vb));
+		println!("{}: idle {}: A {} | B {}", tag, idle, pa, pb);
+		assert_eq!(pa, pb, "idle {}: the plan for the other coins is B's", idle);
+		assert!(!names(&va["give_up"]).contains(&h) && !names(&va["kept_back"]).contains(&h), "{}", va);
+	}
+	// The upkeep twice with the person active: the last coin of X A can spend stays.
+	for k in 0..2 {
+		page_upkeep(&a);
+		page_upkeep(&b);
+		let spendable = |w: &Arca| library(w, "coin_places", json!({})).unwrap()["spendable"][x.to_string()].as_str().unwrap_or("0").parse::<u64>().unwrap();
+		println!("{}: after upkeep {}: A X live {} spendable {} | B X live {} spendable {}", tag, k + 1, depths(&a, x), spendable(&a),
+			depths(&b, x), spendable(&b));
+		assert!(spendable(&a) > 0, "A keeps a coin of X it can spend");
+		assert_eq!(spendable(&a), spendable(&b), "A can spend what B can");
+	}
+	for w in [&a, &a2, &b, &m, &sa, &sb] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
