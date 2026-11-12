@@ -217,7 +217,14 @@ and the `hops` of what the swap makes (reassignments since a round, against the
 operator's `depth_limit`), signing, holding and storing nothing; `swap_accept`
 with `shown` (that answer)
 signs only on those terms. The maker's `swap_complete` signs its side and has the
-operator co-sign; `swaps` lists each swap with where it stands.
+operator co-sign; one the operator refuses withdraws the offer and is refused
+with kind `swap_refused`, naming the `swap`, the `coin` the operator named and
+`whose` it is (`maker` or `taker`). `swaps` lists each swap with where it
+stands. A spend the operator refuses because a coin of the wallet's is spent
+already, by another store of the same mnemonic (a second device), has the
+wallet read what its other stores did at once, so it stops counting that coin
+and holds what replaced it; a `swap_cancel` that meets such a coin cancels the
+acceptance without a respend.
 
 `quote` is the refresh fee, coin by coin, that `participate` would pay; the page
 shows it, and `participate` goes ahead only when `shown` equals the fees it
@@ -266,7 +273,8 @@ participation voided, when they have not come within the operator's window
 or comes less often than that runs it on a short timer of its own.
 
 A refusal is thrown as the JSON `arca` prints, `{"error": {"kind",
-"message"}}`, with the server's `code` and `status` when the server refused.
+"message"}}`, with the server's `code` and `status` when the server refused
+(and `swap`, `coin` and `whose` for a `swap_refused`).
 
 The page shows what the library says as it says it. With no command line,
 the library names the act rather than a command ("run sync", "an exit takes

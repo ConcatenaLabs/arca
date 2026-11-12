@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use bark::arca::{command, Wallet};
 use common::cli::Arca;
 use common::running::Running;
+use server::store::RoundState;
 
 fn script(v: &Value) -> Script {
 	let h = v["script_pubkey"].as_str().unwrap();
@@ -244,4 +245,288 @@ async fn a_swap_pays_from_the_smallest_coin_that_holds_it() {
 	assert_eq!(big["details"]["inputs"].as_array().unwrap().len(), 1);
 	assert_eq!(total(&a, "offered", &x), 2_000_000, "the large coin pays what the small one cannot");
 	library(&a, "swap_cancel", json!({"swap": big["swap"]})).unwrap();
+}
+
+/// A copy of the wallet in `from`'s directory, as a second device holding
+/// the same mnemonic and the same store holds it.
+fn second_device(from: &Arca, name: &str) -> Arca {
+	fn copy(a: &std::path::Path, b: &std::path::Path) {
+		std::fs::create_dir_all(b).unwrap();
+		for e in std::fs::read_dir(a).unwrap() {
+			let e = e.unwrap();
+			if e.file_type().unwrap().is_dir() { copy(&e.path(), &b.join(e.file_name())) } else { std::fs::copy(e.path(), b.join(e.file_name())).unwrap(); }
+		}
+	}
+	let d = Arca::new(name);
+	copy(&from.dir, &d.dir);
+	d
+}
+
+/// A coin given to a round by `w` (a wallet's second device), the round
+/// built, made final and completed by `w`: what replaced it.
+async fn given_to_a_round(r: &Running, w: &Arca, leaf: &str) -> Value {
+	let before: Vec<Value> = w.ok(&["coins"]).as_array().unwrap().iter().map(|c| c["leaf_id"].clone()).collect();
+	let p = w.ok(&["participate", "--leaf", leaf]);
+	assert_eq!(p["participations"][0]["state"], "pending", "{}", p);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(!built.is_empty() && failed.is_empty(), "{} built, {} failed", built.len(), failed.len());
+	r.produce().await;
+	r.bury().await;
+	for b in &built {
+		r.round_state(&b.tx.txid(), RoundState::Final).await;
+	}
+	let s = w.ok(&["sync"]);
+	assert!(s["participations"].as_array().unwrap().iter().any(|p| p["state"] == "released"), "{}", s);
+	let new = w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["kind"] == "batch" && c["state"] == "live" && !before.contains(&c["leaf_id"]))
+		.cloned().unwrap_or_else(|| panic!("no coin replaced {}: {}", leaf, w.ok(&["coins"])));
+	println!("SECOND DEVICE GAVE {} TO A ROUND, HOLDS {} OF {}", &leaf[..12], &new["leaf_id"].as_str().unwrap()[..12], new["value"]);
+	new
+}
+
+/// The coins of `w` of `asset` that are live, by id.
+fn live_ids(w: &Arca, asset: &str) -> Vec<String> {
+	coins(w, "live", asset).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect()
+}
+
+/// A completion the operator refuses withdraws the offer: the swap does not
+/// stand open on coins the maker no longer holds for it. The refusal names
+/// the swap, the coin the operator named and whose it is, and an acceptance
+/// handed over again is answered at once that the offer is cancelled. Then
+/// the taker, whose coin a second device of its own gave to a round before
+/// its acceptance named it (as on the testnet, 2026-11-12), cancels: the
+/// operator refuses the respend of that coin, the wallet catches up with its
+/// other store at once, and ends holding the truth (the dead coin not
+/// counted, the round's coin held) with nothing respent. A payment from a
+/// coin given elsewhere ends the same way. Last, the maker's own coin given
+/// to a round by its second device.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_completion_withdraws_the_offer() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("RA");
+	let b = Arca::new("RB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &y, "3000000", "--fee-asset", &x]);
+	b.ok(&["board", &y, "500000", "--fee-asset", &x]);
+	r.fund_server(r.x, 50_000_000).await;
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let b2 = second_device(&b, "RB2");
+	let a2 = second_device(&a, "RA2");
+
+	// --- The taker's coin, given to a round on its second device ---
+	let small = coins(&b2, "live", &y).into_iter().find(|c| value(c) == 500_000).expect("the taker's small coin");
+	let small_id = small["leaf_id"].as_str().unwrap().to_string();
+	let new = given_to_a_round(&r, &b2, &small_id).await;
+	assert!(live_ids(&b, &y).contains(&small_id), "the first device still counts the coin given elsewhere");
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "400000"})).unwrap();
+	let id = offer["swap"].as_str().unwrap().to_string();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	assert_eq!(total(&b, "offered", &y), 500_000, "the acceptance names the coin given elsewhere");
+	let e = tokio::task::block_in_place(|| {
+		let mut w = Wallet::open(&a.dir).expect("open the wallet");
+		command::run_answer(&mut w, "swap_complete", &json!({"accept": acc["accept"]}))
+	}).unwrap_err();
+	println!("REFUSED (completion, the taker's coin given elsewhere): {}", e["error"]);
+	assert_eq!(e["error"]["kind"], "swap_refused", "{}", e);
+	assert_eq!(e["error"]["code"], "double_spend", "{}", e);
+	assert_eq!(e["error"]["swap"], id.as_str());
+	assert_eq!(e["error"]["coin"], small_id.as_str(), "{}", e);
+	assert_eq!(e["error"]["whose"], "taker", "{}", e);
+	assert_eq!(library(&a, "swaps", json!({})).unwrap()[0]["state"], "cancelled", "the offer is withdrawn");
+	assert_eq!(total(&a, "offered", &x), 0, "nothing stays held for it");
+	assert_eq!(total(&a, "live", &x), 2_000_000, "the maker's coin is spendable again");
+	let again = library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap_err();
+	println!("REFUSED (the same acceptance again): {}", again);
+	assert!(again.contains("is not an open offer") && again.contains("cancelled"), "{}", again);
+	// The taker cancels: the respend is refused, the wallet catches up at once.
+	let c = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	println!("TAKER CANCEL: {}", c);
+	assert_eq!(c["cancelled"], true, "{}", c);
+	assert_eq!(c["spent_elsewhere"], json!([small_id]), "{}", c);
+	assert!(c.get("respent").is_none(), "nothing respent for an acceptance that can never complete: {}", c);
+	let live = live_ids(&b, &y);
+	assert!(!live.contains(&small_id), "the coin given elsewhere is no longer counted: {:?}", live);
+	assert!(live.contains(&new["leaf_id"].as_str().unwrap().to_string()), "the round's coin is held: {:?}", live);
+	assert_eq!(total(&b, "live", &y), 3_000_000 + value(&new), "the balance is the truth");
+	assert_eq!(library(&b, "swaps", json!({})).unwrap()[0]["state"], "cancelled");
+
+	// --- A payment from a coin given to a round on the second device ---
+	let new2 = given_to_a_round(&r, &b2, coins(&b2, "live", &y).iter().find(|c| value(c) == 3_000_000).unwrap()["leaf_id"].as_str().unwrap()).await;
+	let big_id = coins(&b, "live", &y).iter().find(|c| value(c) == 3_000_000).expect("the first device still counts it")["leaf_id"]
+		.as_str().unwrap().to_string();
+	let req = library(&a, "receive", json!({"asset": y, "amount": "1000000"})).unwrap();
+	let e = library(&b, "send", json!({"request": req["request"]})).unwrap_err();
+	println!("REFUSED (a payment from a coin given elsewhere): {}", e);
+	assert!(e.contains("double_spend") && e.contains(&big_id), "{}", e);
+	let live = live_ids(&b, &y);
+	assert!(!live.contains(&big_id), "the coin given elsewhere is no longer counted: {:?}", live);
+	assert!(live.contains(&new2["leaf_id"].as_str().unwrap().to_string()), "the round's coin is held: {:?}", live);
+	assert_eq!(total(&b, "live", &y), value(&new) + value(&new2), "the balance is the truth");
+	let req = library(&a, "receive", json!({"asset": y, "amount": "300000"})).unwrap();
+	let paid = library(&b, "send", json!({"request": req["request"]})).unwrap();
+	println!("PAID FROM THE ROUND'S COINS: {}", paid);
+
+	// --- The maker's own coin, given to a round on its second device ---
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "100000"})).unwrap();
+	let mine = offer["details"]["inputs"][0]["leaf_id"].as_str().unwrap().to_string();
+	given_to_a_round(&r, &a2, &mine).await;
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	let e = tokio::task::block_in_place(|| {
+		let mut w = Wallet::open(&a.dir).expect("open the wallet");
+		command::run_answer(&mut w, "swap_complete", &json!({"accept": acc["accept"]}))
+	}).unwrap_err();
+	println!("REFUSED (completion, the maker's coin given elsewhere): {}", e["error"]);
+	assert_eq!(e["error"]["kind"], "swap_refused", "{}", e);
+	assert_eq!(e["error"]["coin"], mine.as_str(), "{}", e);
+	assert_eq!(e["error"]["whose"], "maker", "{}", e);
+	assert_eq!(library(&a, "swaps", json!({})).unwrap()[1]["state"], "cancelled");
+	// The taker's coins are its own: its cancel respends them, so the
+	// acceptance it signed can never complete.
+	let c = library(&b, "swap_cancel", json!({"swap": acc["swap"]})).unwrap();
+	assert_eq!(c["cancelled"], true, "{}", c);
+	assert!(c["respent"].as_array().is_some_and(|v| !v.is_empty()), "{}", c);
+}
+
+/// The maker completes the swap; the taker, which has not read its mailbox
+/// since, cancels (as a page does once it has waited for the maker): the
+/// respend is refused, and the swap reads done with what it pays the taker
+/// held, never "cancelled", whatever order the wallet's reads come in.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_after_the_maker_completed_reads_done() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("DA");
+	let b = Arca::new("DB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &y, "500000", "--fee-asset", &x]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "400000"})).unwrap();
+	let id = offer["swap"].as_str().unwrap().to_string();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	let x_before = total(&b, "live", &x);
+	library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap();
+	let c = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	println!("TAKER CANCEL AFTER THE COMPLETION: {}", c);
+	assert_eq!(c["done"], true, "{}", c);
+	assert_ne!(c["cancelled"], true, "a completed swap is not cancelled: {}", c);
+	let state = library(&b, "swaps", json!({})).unwrap().as_array().unwrap().iter().find(|s| s["swap"] == id.as_str()).unwrap()["state"].clone();
+	assert_eq!(state, "done", "the taker's record says done");
+	assert_eq!(total(&b, "live", &x), x_before + 300_000, "what the swap pays the taker is held");
+	assert_eq!(total(&b, "offered", &y), 0, "nothing stays held");
+}
+
+/// The text `kind:hex(json)` of an offer or acceptance, read and written.
+fn unhex_text(t: &str) -> Value {
+	let h = t.split_once(':').unwrap().1;
+	serde_json::from_slice(&(0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect::<Vec<u8>>()).unwrap()
+}
+
+fn hex_text(kind: &str, v: &Value) -> String {
+	format!("{}:{}", kind, hex(v.to_string().as_bytes()))
+}
+
+/// A maker names in its own output of an offer the owner nonce of a coin
+/// the taker already holds (what an earlier trade with it paid the taker).
+/// The taker's acceptance meets coins its second device gave to rounds, and
+/// the maker never completes: the taker's cancel must not read done, since
+/// only the swap's own transfer, spending the taker's own inputs into the
+/// taker's own outputs, makes it so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_maker_chosen_nonce_does_not_make_a_swap_done() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("NA");
+	let b = Arca::new("NB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca",
+		"--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "3000000"]);
+	b.ok(&["board", &y, "3000000", "--fee-asset", &x]);
+	b.ok(&["board", &y, "500000", "--fee-asset", &x]);
+	r.fund_server(r.x, 50_000_000).await;
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let state = |w: &Arca, id: &str| library(w, "swaps", json!({})).unwrap().as_array().unwrap().iter().find(|s| s["swap"] == id).unwrap()["state"].clone();
+	// Trade 1, honest: it pays the taker under a nonce the maker sees.
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "1000000"})).unwrap();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap();
+	b.ok(&["sync"]);
+	assert_eq!(state(&b, offer["swap"].as_str().unwrap()), "done");
+	let n_off = offer["details"]["outputs"].as_array().unwrap().len();
+	let held_nonce = unhex_text(acc["accept"].as_str().unwrap())["outputs"][n_off]["owner_nonce"].as_str().unwrap().to_string();
+	// Every coin of y the taker holds, given to a round by its second device.
+	let b2 = second_device(&b, "NB2");
+	for l in coins(&b2, "live", &y).iter().map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect::<Vec<_>>() {
+		given_to_a_round(&r, &b2, &l).await;
+	}
+	// Trade 2: the maker's own output carries the taker's held nonce.
+	let offer2 = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "400000"})).unwrap();
+	let mut d = offer2["details"].clone();
+	d["outputs"][0]["owner_nonce"] = json!(held_nonce);
+	let tampered = hex_text(offer2["offer"].as_str().unwrap().split_once(':').unwrap().0, &d);
+	let read = library(&b, "swap_read", json!({"offer": tampered})).unwrap();
+	let acc2 = library(&b, "swap_accept", json!({"offer": tampered, "shown": read})).unwrap();
+	let id2 = acc2["swap"].as_str().unwrap().to_string();
+	// The maker never completes; the taker cancels.
+	let c = library(&b, "swap_cancel", json!({"swap": id2})).unwrap();
+	println!("TAKER CANCEL OF A SWAP NEVER COMPLETED: {}", c);
+	assert_ne!(c["done"], true, "nothing traded, yet the cancel reads done: {}", c);
+	assert_ne!(state(&b, &id2), "done", "nothing traded, yet the swap reads done");
 }
