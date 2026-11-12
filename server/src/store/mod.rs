@@ -152,6 +152,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(45, include_str!("../../schema/V45__final_pass_indexes.sql")),
 	(46, include_str!("../../schema/V46__resting_order_reads.sql")),
 	(47, include_str!("../../schema/V47__participation_arriving.sql")),
+	(48, include_str!("../../schema/V48__offboard_by_participation.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

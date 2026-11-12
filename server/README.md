@@ -2719,7 +2719,8 @@ meanwhile.
   forfeit step tell the watcher each participation they release, and it
   unlocks that participation's offboard outputs at once, or at the first chain
   poll after its round is final, however long the rest of the watcher's pass
-  takes; it reads only what was released, never the history. `info` publishes
+  takes; it reads only what was released, never the history. An unlock the
+  node refuses is tried again on a new block, not at every poll. `info` publishes
   the bound it keeps (`offboards.unlock_within_seconds`): a chain poll and
   10 s, or the longest of its latest releases' measured times when that is
   longer, plus a block (`[watcher] block_interval_seconds`). One whose
@@ -4472,6 +4473,10 @@ once the round is final and the participation released, the unlock is in the
 nursery within seconds while the whole pass has not ended once, and it pays
 the destination. Let go, the whole pass publishes no second unlock, and
 `info.offboards.unlock_within_seconds` is the chain poll, 10 s and a block.
+`tests/unlock_lane_refused.rs` puts an offboard to a script the node will not
+relay (on a node that requires standard transactions) beside a good one in
+that round: the good one is unlocked within milliseconds of the release, and
+the refused one is not tried again in 10 s without a block.
 
 `tests/expiry.rs` moves the chain's median time on. A participation whose
 forfeits have not come is still issued a day after its round was found final,

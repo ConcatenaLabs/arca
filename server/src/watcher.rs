@@ -429,6 +429,10 @@ pub struct Watcher {
 	unlocking: std::sync::Mutex<HashMap<[u8; 32], (Instant, bool)>>,
 	/// The latest releases' times to their unlock's broadcast.
 	unlock_times: std::sync::Mutex<std::collections::VecDeque<Duration>>,
+	/// The offboard outputs whose unlock the node refused, `(round id,
+	/// output)`, each with the height of the tip it was refused at: the lane
+	/// tries it again on a new block, not at every chain poll.
+	refused: std::sync::Mutex<HashMap<(i64, u32), u64>>,
 }
 
 impl Watcher {
@@ -447,6 +451,7 @@ impl Watcher {
 			offboarding: Mutex::new(()),
 			unlocking: std::sync::Mutex::new(HashMap::new()),
 			unlock_times: std::sync::Mutex::new(std::collections::VecDeque::new()),
+			refused: std::sync::Mutex::new(HashMap::new()),
 		})
 	}
 
@@ -531,7 +536,21 @@ impl Watcher {
 		}
 		let (now, later) = self.store.offboards_to_unlock(&ids).await?;
 		let mut open: HashSet<[u8; 32]> = later.keys().copied().collect();
+		// An unlock the node refused (a destination its relay policy will not
+		// take, say) is tried again on a new block, as the whole pass would,
+		// not at every poll: one such output never slows the lane for the
+		// others.
+		let tip = self.store.tip_block().await?.map_or(0, |b| b.height);
+		{
+			let keys: HashSet<(i64, u32)> = now.iter().map(|o| (o.round_id, o.vout)).collect();
+			self.refused.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| keys.contains(k));
+		}
 		for o in &now {
+			let key = (o.round_id, o.vout);
+			if self.refused.lock().unwrap_or_else(|e| e.into_inner()).get(&key) == Some(&tip) {
+				open.insert(o.participation_id);
+				continue;
+			}
 			let r = self.offboard_one(o).await;
 			match Self::item(&format!("the unlock of the offboard at output {} of round {}", o.vout, o.round_id), r)? {
 				Some(Some(true)) => {
@@ -547,6 +566,7 @@ impl Watcher {
 				// Spent already, by the watcher or by another: done.
 				Some(Some(false)) => {},
 				_ => {
+					self.refused.lock().unwrap_or_else(|e| e.into_inner()).insert(key, tip);
 					open.insert(o.participation_id);
 				},
 			}

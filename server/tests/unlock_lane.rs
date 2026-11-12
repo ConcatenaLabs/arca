@@ -140,4 +140,14 @@ async fn a_released_offboard_is_unlocked_while_the_whole_pass_is_held_up() {
 	let unlocks: Vec<_> = of_kind(&r, "unlock").await.into_iter().filter(|w| w.subject == subject).collect();
 	assert_eq!(unlocks.len(), 1, "one unlock of the output, whichever lane published it");
 	println!("the whole pass ended once the lock was let go; still one unlock of {}", op);
+
+	// The lane reads a participation's offboard outputs through an index,
+	// not a scan of every offboard the operator ever made.
+	let plan: Vec<String> = db.query("EXPLAIN SELECT * FROM round_offboard WHERE participation_id = ANY($1)",
+		&[&vec![id.to_vec()]]).await.unwrap().iter().map(|r| r.get(0)).collect();
+	println!("the lane's read of round_offboard: {}", plan.join(" | "));
+	assert!(db.execute("SET enable_seqscan = off", &[]).await.is_ok());
+	let plan: Vec<String> = db.query("EXPLAIN SELECT * FROM round_offboard WHERE participation_id = ANY($1)",
+		&[&vec![id.to_vec()]]).await.unwrap().iter().map(|r| r.get(0)).collect();
+	assert!(plan.iter().any(|l| l.contains("round_offboard_by_participation")), "no index by participation: {}", plan.join(" | "));
 }
