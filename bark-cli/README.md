@@ -3022,3 +3022,12 @@ protobuf-compiler`).
     ARCA_TEST_POSTGRES=postgres://arca@127.0.0.1:55432/postgres \
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-cli --test arca_scenarios --test arca_adversity -- --nocapture
     cargo test -p arca-wallet --features arca --lib arca::
+
+The test operator runs at the server's defaults. Two settings follow the
+environment, so a proof of anything that waits runs at an operator's
+published settings too (`/v1/info`): `ARCA_TEST_ANCHOR_DEPTH` is the anchor
+depth it calls a block final at, and `ARCA_TEST_CHECKPOINT_EXIT=0` runs it
+without checkpoints that carry their owners' exit. The testnet's operator
+publishes anchor depth 0 and no checkpoint exit:
+
+    ARCA_TEST_ANCHOR_DEPTH=0 ARCA_TEST_CHECKPOINT_EXIT=0 cargo test -p arca-cli --test arca_swap_commands
