@@ -2105,6 +2105,8 @@ async fn a_refund_replaced_by_the_operators_claim_leaves_the_wallet_its_new_leaf
 	let mut r = Running::start().await;
 	let proxy = Proxy::start(&r.url());
 	let c = Arca::new("P2claim");
+	// Read while the operator answers: the test stops it.
+	let depth = r.anchor_depth();
 	let (board, pid, forfeit_txid, atom_txid, preimage) = forfeit_left_unclaimed(&mut r, &proxy, &c).await;
 	let (units, cvout, margin, unlock) = stored_status(&r, &pid);
 
@@ -2149,19 +2151,25 @@ async fn a_refund_replaced_by_the_operators_claim_leaves_the_wallet_its_new_leaf
 	println!("P2 the operator's claim {} replaced the refund and confirmed", claim.txid());
 
 	// The wallet reads the preimage from the claim at once, and holds the
-	// new leaf; the forfeit is followed until the claim is final.
+	// new leaf; the forfeit is followed until the claim is final. At anchor
+	// depth 0 the claim's block, certified, is final at once.
 	let s = c.ok(&["sync"]);
 	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned()
 		.unwrap_or_else(|| panic!("the forfeit is followed: {}", s));
-	println!("P2 the claim in a block, not yet final: {}", f);
-	assert_eq!(f["state"], "claiming", "{}", f);
 	let leaf = f["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
-	r.bury().await;
-	let s = c.ok(&["sync"]);
-	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned()
-		.unwrap_or_else(|| panic!("the forfeit is followed until final: {}", s));
-	println!("P2 the claim final: {}", f);
-	assert_eq!(f["state"], "claimed", "{}", f);
+	if depth > 0 {
+		println!("P2 the claim in a block, not yet final: {}", f);
+		assert_eq!(f["state"], "claiming", "{}", f);
+		r.bury().await;
+		let s = c.ok(&["sync"]);
+		let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned()
+			.unwrap_or_else(|| panic!("the forfeit is followed until final: {}", s));
+		println!("P2 the claim final: {}", f);
+		assert_eq!(f["state"], "claimed", "{}", f);
+	} else {
+		println!("P2 the claim in a block, final at anchor depth 0: {}", f);
+		assert_eq!(f["state"], "claimed", "{}", f);
+	}
 	c.ok(&["sync"]);
 	println!("P2 RESULT: the coin given up is {}, the new leaf {} is {}", coin_of(&c, &board)["state"], leaf, coin_of(&c, &leaf)["state"]);
 	assert_eq!(coin_of(&c, &board)["state"], "spent", "the coin given up is the operator's: {}", coin_of(&c, &board));
@@ -2177,6 +2185,8 @@ async fn a_refund_decides_the_coin_only_once_it_is_final() {
 	let mut r = Running::start().await;
 	let proxy = Proxy::start(&r.url());
 	let c = Arca::new("P2refund");
+	// Read while the operator answers: the test stops it.
+	let depth = r.anchor_depth();
 	let (board, _, _, _, _) = forfeit_left_unclaimed(&mut r, &proxy, &c).await;
 	let s = c.ok(&["sync"]);
 	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
@@ -2185,13 +2195,16 @@ async fn a_refund_decides_the_coin_only_once_it_is_final() {
 	r.produce().await;
 	assert!(confirmations(&r, &refund) >= 1);
 	let s = c.ok(&["sync"]);
-	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
-	println!("P2 the refund in a block, not yet final: {} (coin {})", f["state"], coin_of(&c, &board)["state"]);
-	assert_eq!(f["state"], "refunding", "{}", f);
-	assert_eq!(coin_of(&c, &board)["state"], "forfeited");
-	r.bury().await;
-	let s = c.ok(&["sync"]);
-	let f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
+	let mut f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
+	// At anchor depth 0 the refund's block, certified, is final at once.
+	if depth > 0 {
+		println!("P2 the refund in a block, not yet final: {} (coin {})", f["state"], coin_of(&c, &board)["state"]);
+		assert_eq!(f["state"], "refunding", "{}", f);
+		assert_eq!(coin_of(&c, &board)["state"], "forfeited");
+		r.bury().await;
+		let s = c.ok(&["sync"]);
+		f = s["forfeits"].as_array().unwrap().iter().find(|f| f["leaf_id"] == board.as_str()).cloned().unwrap();
+	}
 	println!("P2 the refund final: {} (coin {})", f["state"], coin_of(&c, &board)["state"]);
 	assert_eq!(f["state"], "refunded", "{}", f);
 	assert_eq!(coin_of(&c, &board)["state"], "exited");
@@ -3051,8 +3064,11 @@ async fn a_second_spend_before_any_witness_is_answered_by_the_receivers_next_syn
 	let (ok, v) = m.run(&["exit", &got_m]);
 	println!("W2 M's exit again: ok={} {}", ok, v);
 	assert!(!(ok && v["state"] == "waiting"), "the second spend's coin does not reach the chain: {}", v);
-	assert!(v["error"]["message"].as_str().unwrap_or("").contains(&format!("co-signed another spend of coin {}", c_a)),
-		"the refusal names the coin paid twice: {}", v);
+	// While P2's leaf on the chain is not yet final, the refusal names the
+	// coin paid twice; at anchor depth 0 it is final at once, and M's coin is
+	// lost already.
+	let why = if r.anchor_depth() > 0 { format!("co-signed another spend of coin {}", c_a) } else { format!("coin {} is lost", got_m) };
+	assert!(v["error"]["message"].as_str().unwrap_or("").contains(&why), "the refusal says {}: {}", why, v);
 	let _ = (&a, &mut r);
 	for w in [&a, &a_old, &b, &m, &d] {
 		let _ = std::fs::remove_dir_all(&w.dir);
@@ -6094,7 +6110,8 @@ async fn d58_a_coin_read_after_its_batch_was_swept_is_refused_once_the_sweep_is_
 		let bal = b.ok(&["balance"]);
 		println!("{}: B's coin of 600000: {:?} | B's balance: arca {}", tag, got.iter().map(|c| format!("{} {}", c["state"], c["note"])).collect::<Vec<_>>(),
 			bal["arca"]);
-		if final_first {
+		// At anchor depth 0 the sweep's block, certified, is final at once.
+		if final_first || r.anchor_depth() == 0 {
 			let refused = s["mailbox"]["refused"].to_string();
 			assert!(s["mailbox"]["accepted"].as_array().is_none_or(|a| a.is_empty()), "the coin is refused: {}", s["mailbox"]);
 			assert!(refused.contains("its path is gone") && refused.contains(&sweep.to_string()), "naming the sweep: {}", refused);
