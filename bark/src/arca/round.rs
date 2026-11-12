@@ -1521,10 +1521,42 @@ impl Wallet {
 					s.set_participation(pid, "refused", None, None)?;
 					s.refused(&format!("participation {}", pid), &e.to_string())
 				})?;
+				// The operator refused it as giving up a coin of the wallet's
+				// own that is spent or given up already (`in_use`), by nothing
+				// this store did: another store of the mnemonic (a second
+				// device) gave it to a round or paid with it. Held out of every
+				// spend until a catch-up settles it, exactly as a spend refused
+				// `double_spend` ([`Self::caught_up_after_spent`]): the
+				// operator's word with an end time, lifted when a catch-up
+				// finds the coin served live or settles it, never barring its
+				// exit.
+				if let Error::Server { code, message, .. } = &e {
+					if let Some(l) = super::pay::leaf_named(message).filter(|l| code == "in_use" && given.contains(l)) {
+						if !self.given_in_open_participation(&l)? {
+							if let Err(c) = self.caught_up_after_spent(&l) {
+								self.store.refused("the catch-up after a coin spent elsewhere", &c.to_string())?;
+							}
+						}
+					}
+				}
 				Err(e)
 			},
 			Err(e) => Err(e),
 		}
+	}
+
+	/// Whether coin `leaf` is given up in a participation of this store's
+	/// own that is still open (pending, in a round, or handing over its
+	/// forfeits): the operator's `in_use` for it then names this store's own
+	/// participation, not another device's.
+	fn given_in_open_participation(&self, leaf: &str) -> Result<bool, Error> {
+		for (_, _, given, ..) in self.store.participations_in(&["pending", "issued", "forfeiting"])? {
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			if given.iter().any(|g| g == leaf) {
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 
 	/// Hands over the forfeits of each of the wallet's participations whose
