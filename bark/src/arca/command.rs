@@ -27,7 +27,7 @@ use super::{Config, Error, Wallet};
 /// Every command [`run`] takes, with its arguments.
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, brief?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?, channels?}, forget_request {owner}, send {request, amount?, route?, \
-	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
+	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore {at_once?}, restore_history, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?}, deposits, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
 	refresh_received {max_fee_ppm?, leaves?}, refresh_needed {idle_seconds?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
@@ -351,7 +351,13 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 			opt_asset(&a["asset"])?, a["route"].as_str()),
 		"channel_code" => w.channel_code(a["address"].as_str()),
 		"mailbox" => w.mailbox(),
-		"restore" => w.restore(),
+		// `at_once`: every coin checked before it returns, the history with
+		// them. Otherwise the program runs `deposits` as soon as it returns
+		// (`deposits.owed`), and `sync` steps through the history.
+		"restore" => w.restore_with(a["at_once"].as_bool() == Some(true)),
+		// One step of the coins a restore left to be checked after it; `sync`
+		// runs one too. `{"left": 0}` once none is left.
+		"restore_history" => w.restore_history().and_then(|v| Ok(v.unwrap_or(json!({"left": w.history_left()?})))),
 		"quote" => {
 			let mut quote = w.refresh_quote(&leaves(a)?, opt_u64(&a["max_fee_ppm"], "the fee bound")?)?;
 			match in_pieces(&mut quote, a)? {

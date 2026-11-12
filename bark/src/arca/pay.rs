@@ -240,7 +240,7 @@ impl Out {
 		Ok(Out {
 			asset,
 			value,
-			leaf: NewLeaf { enclave: None,
+			leaf: NewLeaf {
 				owner: XOnlyPublicKey::from_slice(&unhex(v["owner"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
 				owner_nonce: unhex32(v["owner_nonce"].as_str().unwrap_or(""))?,
 				creator_nonce: unhex32(v["creator_nonce"].as_str().unwrap_or(""))?,
@@ -421,7 +421,7 @@ impl Wallet {
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
 		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None,
-			enclave: None, v2: self.asks_vtxo2() })
+			v2: self.asks_vtxo2() })
 	}
 
 	/// [`Self::own_leaf`] of `value` of `asset`: for a supervised asset a
@@ -1131,7 +1131,7 @@ impl Wallet {
 		};
 		let to = Out {
 			asset, value,
-			leaf: NewLeaf { enclave: None,
+			leaf: NewLeaf {
 				owner: xonly(req["owner"].as_str().unwrap_or(""))?,
 				owner_nonce: unhex32(req["owner_nonce"].as_str().unwrap_or(""))?,
 				// Drawn fresh for this leaf: two payments to one request make
@@ -1446,6 +1446,25 @@ impl Wallet {
 	}
 
 	fn accept_coin_as(&mut self, bytes: &[u8], claimed: &str, source: &str, home: bool) -> Result<Value, Error> {
+		// The very record of a coin the store holds under the id the server
+		// names was checked when that coin was taken, and every re-check
+		// since reads it against the chain again: it is answered as held
+		// without reading the chain once more. A restore reads the mailbox
+		// from its start, where nearly every message is such a coin. The
+		// store's id was computed from these same bytes when the coin was
+		// taken, so the server's word for it decides nothing; any other
+		// record goes through every check below.
+		if let Some(c) = if claimed.is_empty() { None } else { self.store.coin(claimed)? } {
+			let canonical = CoinRecord::from_bytes(&c.record).ok().and_then(|r| r.to_bytes().ok());
+			if !c.record.is_empty() && (c.record == bytes || canonical.as_deref() == Some(bytes)) {
+				return Ok(json!({"leaf_id": c.leaf_id, "already_held": c.state}));
+			}
+		}
+		// The coins a restore left to its history (below, by the coin's own id).
+		let history = self.history_ids()?;
+		if history.contains(claimed) {
+			return Ok(json!({"leaf_id": claimed, "already_held": "history", "note": "left to the restore's history"}));
+		}
 		let record = CoinRecord::from_bytes(bytes).map_err(|e| if e.is_unknown_format() {
 			Error::Unread(e.to_string())
 		} else {
@@ -1514,6 +1533,13 @@ impl Wallet {
 		}
 		if let Some(v) = self.held_again(&id, &record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?)? {
 			return Ok(v);
+		}
+		// A coin a restore left to its history's steps is theirs: it may have
+		// been spent off the chain, which only those steps can tell (by its
+		// owner's signatures and the records that spend it), so a mailbox
+		// read, which knows nothing of that, never takes it.
+		if history.contains(&id) {
+			return Ok(json!({"leaf_id": id, "already_held": "history", "note": "left to the restore's history"}));
 		}
 		// A resting order, resting again after a fill, is under its order's
 		// own key and nonce: every coin of its lineage is.
@@ -3078,7 +3104,7 @@ impl Wallet {
 	/// its fee, before anything is signed: `(asset, value, fee)`.
 	pub(crate) fn respend_quote(&mut self, rows: Vec<CoinRow>) -> Result<(AssetId, u64, u64), Error> {
 		let n = random32();
-		let leaf = NewLeaf { enclave: None, v2: false, owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None };
+		let leaf = NewLeaf { v2: false, owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None };
 		let held: u64 = rows.iter().map(|r| r.value).sum();
 		let (asset, _, value) = self.respend_plan(rows, &leaf)?;
 		Ok((asset, value, held.saturating_sub(value)))
@@ -3262,7 +3288,7 @@ mod tests {
 	fn a_landing_2_leaf_written_for_another_wallet_is_malformed_to_an_older_library() {
 		let key = xonly("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap();
 		let asset = AssetId::from_str(&"07".repeat(32)).unwrap();
-		let out = |own_index: bool| Out { asset, value: 100_000, mailbox: key, until: None, leaf: NewLeaf { enclave: None, owner: key,
+		let out = |own_index: bool| Out { asset, value: 100_000, mailbox: key, until: None, leaf: NewLeaf { owner: key,
 			owner_nonce: [1; 32], creator_nonce: [2; 32], exit_delay: RelativeTime::from_units(1).unwrap(), htlc: None, v2: false,
 			landing: Some(arca_covenant::Landing { program: [3; 20], allowance: 1_000, own_index }.terms(asset, 100_000).unwrap()) } };
 		let older = |v: &Value| arca_covenant::record_json::landing_from_json(&v["landing"]);

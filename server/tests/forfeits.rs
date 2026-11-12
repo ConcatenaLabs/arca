@@ -66,8 +66,8 @@ fn participate(r: &Running, old: &Held, new_key: &Keypair) -> ([u8; 32], [u8; 32
 
 /// A forfeit the signer declines for what it asks is refused for good, 422
 /// `declined`, and it records nothing: the participation is not released and
-/// no preimage goes out. The signer here holds the coin's asset restricted,
-/// which the server serves open, so it signs no forfeit of it. Once the
+/// no preimage goes out. The signer here gets every owner's signature with
+/// one character changed (a tap in front of it), so none verifies. Once the
 /// signer signs again, the same forfeit releases the participation. A signer
 /// that cannot be reached is answered `signer_unavailable` (503), the
 /// forfeit recorded with its owner's half, and the same request completes it.
@@ -91,13 +91,14 @@ async fn a_forfeit_the_signer_declines_is_refused_for_good() {
 	let entries = r.signer_entries().await.len();
 	let genesis = r.chain.genesis_hash();
 	let key = r.s;
-	tokio::task::block_in_place(|| r.signer.restart_with(genesis, &["--restricted".to_string(),
-		format!("{}={}", x, hex(&xonly(&keypair("P")).serialize()))]));
+	let tap = common::signer::SignerTap::on(&r.signer);
+	tap.garble(true);
 	for _ in 0..2 {
 		refused(r.http.post("forfeit_leaves", &good), 422, "declined");
 	}
 	assert_eq!(status(&r, &pa)["state"], "issued", "not released");
 	assert_eq!(r.signer_entries().await.len(), entries, "the signer recorded nothing");
+	drop(tap);
 	r.signer.kill();
 	refused(r.http.post("forfeit_leaves", &good), 503, "signer_unavailable");
 	tokio::task::block_in_place(|| r.signer.restart(&key, genesis));

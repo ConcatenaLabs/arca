@@ -60,7 +60,7 @@ fn leaf(net: &Net, owner: &elements::secp256k1_zkp::Keypair, s: &elements::secp2
 	LeafPolicy {
 		claim: None,
 		owner: xonly(owner), operator: xonly(s), salt: label32(salt), chain: net.chain, exit_delay: delay(), htlc: None, order: None,
-		landing: None, channel: None, enclave: None, v2,
+		landing: None, channel: None, v2,
 	}
 }
 

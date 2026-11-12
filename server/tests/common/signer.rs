@@ -104,7 +104,13 @@ impl SignerProcess {
 	pub fn kill(&mut self) {
 		let _ = self.child.kill();
 		let _ = self.child.wait();
-		let _ = std::fs::remove_file(&self.socket);
+		let _ = std::fs::remove_file(self.listens_at());
+	}
+
+	/// Where the signer listens: its socket, or, while a [`SignerTap`] is on
+	/// it, the socket behind the tap, so a restart keeps the tap in front.
+	fn listens_at(&self) -> PathBuf {
+		if self.dir.join("tap.on").exists() { self.dir.join("signer.real.sock") } else { self.socket.clone() }
 	}
 
 	/// Starts it again on the same key, record and socket, with `extra`
@@ -115,13 +121,13 @@ impl SignerProcess {
 		let file = self.dir.join("operator.key");
 		let log = std::fs::File::create(self.dir.join("signer.log")).unwrap();
 		self.child = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
-			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.socket.to_str().unwrap(),
+			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.listens_at().to_str().unwrap(),
 				"--record", self.record().to_str().unwrap()])
 			.args(extra)
 			.stdout(Stdio::null()).stderr(log)
 			.spawn().unwrap();
 		let start = Instant::now();
-		while !self.socket.exists() {
+		while !self.listens_at().exists() {
 			assert!(start.elapsed() < Duration::from_secs(20), "the signer did not open its socket: {}",
 				std::fs::read_to_string(self.dir.join("signer.log")).unwrap_or_default());
 			std::thread::sleep(Duration::from_millis(50));
@@ -139,12 +145,12 @@ impl SignerProcess {
 		let file = self.dir.join("operator.key");
 		let _ = key;
 		self.child = Command::new(env!("CARGO_BIN_EXE_arca-signer"))
-			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.socket.to_str().unwrap(),
+			.args(["--key-file", file.to_str().unwrap(), "--genesis", &genesis.to_string(), "--socket", self.listens_at().to_str().unwrap(),
 				"--record", self.record().to_str().unwrap()])
 			.stdout(Stdio::null()).stderr(Stdio::null())
 			.spawn().unwrap();
 		let start = Instant::now();
-		while !self.socket.exists() {
+		while !self.listens_at().exists() {
 			assert!(start.elapsed() < Duration::from_secs(20), "the signer did not open its socket");
 			std::thread::sleep(Duration::from_millis(50));
 		}
@@ -164,11 +170,16 @@ impl Drop for SignerProcess {
 /// [`SignerTap::cut`] names an operation, a request of it is dropped
 /// unanswered, as when the signer goes away in the middle of a call; the
 /// requests before it in the same piece of work have been signed and
-/// recorded. Dropping the tap puts the signer's own socket back.
+/// recorded. While [`SignerTap::garble`] is on, every owner's signature a
+/// request carries reaches the signer with one character changed, so the
+/// signer declines the request (`declined`), on its own key, chain and
+/// record, as it declines any request whose owner did not sign it.
+/// Dropping the tap puts the signer's own socket back.
 pub struct SignerTap {
 	at: PathBuf,
 	real: PathBuf,
 	cut: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+	garble: std::sync::Arc<std::sync::atomic::AtomicBool>,
 	stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 	thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -180,11 +191,13 @@ impl SignerTap {
 		let at = signer.socket.clone();
 		let real = signer.dir.join("signer.real.sock");
 		std::fs::rename(&at, &real).unwrap();
+		std::fs::write(signer.dir.join("tap.on"), b"").unwrap();
 		let listener = UnixListener::bind(&at).unwrap();
 		listener.set_nonblocking(true).unwrap();
 		let cut = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+		let garble = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 		let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-		let (c, s, r) = (cut.clone(), stop.clone(), real.clone());
+		let (c, g, s, r) = (cut.clone(), garble.clone(), stop.clone(), real.clone());
 		let thread = std::thread::spawn(move || {
 			while !s.load(Ordering::SeqCst) {
 				let (client, _) = match listener.accept() {
@@ -194,7 +207,7 @@ impl SignerTap {
 						continue;
 					},
 				};
-				let (c, r) = (c.clone(), r.clone());
+				let (c, g, r) = (c.clone(), g.clone(), r.clone());
 				std::thread::spawn(move || {
 					client.set_nonblocking(false).unwrap();
 					let mut reader = BufReader::new(client.try_clone().unwrap());
@@ -211,6 +224,13 @@ impl SignerTap {
 						println!("signer tap: request {} dropped unanswered", op);
 						return;
 					}
+					if g.load(Ordering::SeqCst) {
+						let mut v = v.clone();
+						if garble_owner_sigs(&mut v) {
+							println!("signer tap: request {} carries an owner's signature changed", op);
+							line = format!("{}\n", v);
+						}
+					}
 					let Ok(mut up) = UnixStream::connect(&r) else { return };
 					if up.write_all(line.as_bytes()).is_err() {
 						return;
@@ -222,7 +242,13 @@ impl SignerTap {
 				});
 			}
 		});
-		SignerTap { at, real, cut, stop, thread: Some(thread) }
+		SignerTap { at, real, cut, garble, stop, thread: Some(thread) }
+	}
+
+	/// Changes one character of every owner's signature in the requests
+	/// from now, checks included; `false` passes them as they are again.
+	pub fn garble(&self, on: bool) {
+		self.garble.store(on, Ordering::SeqCst);
 	}
 
 	/// Drops every request of operation `op` unanswered from now, but a
@@ -240,5 +266,30 @@ impl Drop for SignerTap {
 		}
 		let _ = std::fs::remove_file(&self.at);
 		let _ = std::fs::rename(&self.real, &self.at);
+		let _ = std::fs::remove_file(self.real.with_file_name("tap.on"));
+	}
+}
+
+/// Changes the first hex digit of every `owner_sig` in a request, wherever it
+/// sits; true when there was one.
+fn garble_owner_sigs(v: &mut serde_json::Value) -> bool {
+	match v {
+		serde_json::Value::Object(m) => {
+			let mut any = false;
+			for (k, x) in m.iter_mut() {
+				if k == "owner_sig" {
+					if let Some(sig) = x.as_str().filter(|s| !s.is_empty()) {
+						let first = if sig.starts_with('0') { '1' } else { '0' };
+						*x = serde_json::Value::String(format!("{}{}", first, &sig[1..]));
+						any = true;
+					}
+				} else {
+					any |= garble_owner_sigs(x);
+				}
+			}
+			any
+		},
+		serde_json::Value::Array(a) => a.iter_mut().fold(false, |any, x| garble_owner_sigs(x) | any),
+		_ => false,
 	}
 }

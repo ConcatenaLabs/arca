@@ -96,16 +96,12 @@ pub enum SpendError {
 	Channel(crate::channel::ChannelError),
 	#[error("a landing pays its fee from the coin, naming the amount (a split), or from a coin attached")]
 	LandingFee,
-	#[error("the enclave-1 terms: {0}")]
-	Enclave(crate::EnclaveError),
 	#[error(transparent)]
 	Lapse(crate::LapseError),
 	#[error("the leaf is no claim-1 leaf: it has no lapse")]
 	NoLapse,
 	#[error("a lapse pays its fee from its allowance, or from a coin attached that pays it; it burns nothing")]
 	LapseFee,
-	#[error("an enclave-1 exit pays its fee from a coin attached in another asset: the leaf's whole value goes to the enclave")]
-	EnclaveFee,
 	#[error("the schedule has no clock {step}; it has {steps}")]
 	ClockStep { step: usize, steps: usize },
 	#[error("clock {0} is the last: it has no roll")]
@@ -550,10 +546,6 @@ impl LeafPolicy {
 		if let Some(l) = &self.landing {
 			l.check_outputs(0, outputs).map_err(SpendError::Landing)?;
 		}
-		if let Some(e) = &self.enclave {
-			let first = outputs.first().ok_or(SpendError::Enclave(crate::EnclaveError::Output { value: e.value }))?;
-			e.check_output(first).map_err(SpendError::Enclave)?;
-		}
 		let spent = explicit_txout(asset, value, self.script_pubkey());
 		KeySpend::build_at(self.lock_time(), self.taproot(), self.exit_script(), vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))],
 			outputs, fee)
@@ -603,30 +595,6 @@ impl LeafPolicy {
 		let k = KeySpend::build_at(lock, self.taproot(), lapse, vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))],
 			&[out], &fee)?;
 		Ok(k.finish(vec![]))
-	}
-
-	/// The exit of `coin`, this `enclave-1` leaf on-chain: output 0 pays the
-	/// holder's enclave the leaf's whole value, and a coin of the
-	/// broadcaster's in another asset pays the fee ([`FeeSource::Coin`]); no
-	/// part of a restricted asset pays a fee. The owner signs
-	/// [`KeySpend::sighash`] and finishes it with its signature.
-	pub fn enclave_exit_tx(&self, coin: OutPoint, fee: &FeeSource) -> Result<KeySpend, SpendError> {
-		let e = self.enclave.ok_or(SpendError::Enclave(crate::EnclaveError::Output { value: 0 }))?;
-		if !matches!(fee, FeeSource::Coin { .. }) {
-			return Err(SpendError::EnclaveFee);
-		}
-		self.exit_tx(coin, e.asset, e.value, &[e.output()], fee)
-	}
-
-	/// The clawback of `coin`, this `enclave-1` leaf on-chain, by its claw
-	/// leaf, into `outputs`, where the asset elected clawback. The issuer and
-	/// the policy key each sign [`KeySpend::sighash`]; it is finished with
-	/// `[policy_sig, issuer_sig]`.
-	pub fn claw_tx(&self, coin: OutPoint, outputs: &[ExplicitOutput], fee: &FeeSource) -> Result<KeySpend, SpendError> {
-		let e = self.enclave.ok_or(SpendError::Enclave(crate::EnclaveError::NoClawback))?;
-		let claw = self.claw_script().map_err(SpendError::Enclave)?;
-		let spent = explicit_txout(e.asset, e.value, self.script_pubkey());
-		KeySpend::build(self.taproot(), claw, vec![(coin, spent, FINAL)], outputs, fee)
 	}
 
 	/// The claim of `coin`, this `htlc-1` leaf on-chain holding `value` of

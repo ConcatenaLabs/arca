@@ -425,8 +425,6 @@ pub enum ParticipationError {
 	SignedAlready(String),
 	#[error(transparent)]
 	Supervision(#[from] crate::supervision::SupervisionError),
-	#[error(transparent)]
-	Restricted(#[from] crate::restricted::RestrictedError),
 	#[error("the signer: {0}")]
 	Signer(SignerError),
 	/// The operator's rate for the participation's asset is stale, or
@@ -499,7 +497,6 @@ impl ParticipationError {
 			Signer(SignerError::Declined(_)) => "declined",
 			Signer(_) => "signer_unavailable",
 			Supervision(e) => e.code(),
-			Restricted(e) => e.code(),
 			Rate(_) => "rate_stale",
 			Order(_) => "order",
 			OrderSpent(_) => "order_spent",
@@ -721,7 +718,7 @@ impl Participations {
 		let paid_in = o.landed.terms.asset_b;
 		if p.supervised(&paid_in).is_some() {
 			return Err(ParticipationError::OutOfBounds(format!("output {}: an order paid in asset {}, which is supervised: each credit \
-				is a vtxo-1 leaf, out of a freeze's reach", j, paid_in)));
+				is a vtxo-1 leaf, out of a freeze's reach. {}", j, paid_in, crate::params::SUPERVISED_INSTEAD)));
 		}
 		if !p.assets.contains(&paid_in) {
 			return Err(ParticipationError::Assets(format!("output {}: an order paid in asset {}, which is not served by this operator: \
@@ -773,10 +770,6 @@ impl Participations {
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		crate::supervision::gate(&self.store, &self.finality, p, &given).await?;
-		crate::restricted::gate(&self.store, p, &given, "a refresh or an offboard").await?;
-		if let Some(a) = req.outputs.iter().map(|o| o.asset()).find(|a| p.restricted(a).is_some()) {
-			return Err(crate::restricted::RestrictedError::NotServed { asset: a, coin: None, what: "a round".into() }.into());
-		}
 		let now = self.now().await?;
 		if let Some(t) = req.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {
@@ -1129,7 +1122,6 @@ impl Participations {
 		// A coin whose holder is frozen is refused before anything else.
 		let given: Vec<LeafId> = req.inputs.iter().map(|i| i.leaf_id).collect();
 		crate::supervision::gate(&self.store, &self.finality, p, &given).await?;
-		crate::restricted::gate(&self.store, p, &given, "a take of an order").await?;
 		let now = self.now().await?;
 		if let Some(t) = req.not_before {
 			if t.to_consensus_u32() > now.to_consensus_u32().saturating_add(MAX_DEFER) {
@@ -1158,7 +1150,7 @@ impl Participations {
 			// pays its maker by a script path a freeze cannot follow.
 			if p.supervised(&a).is_some() {
 				return Err(ParticipationError::OutOfBounds(format!("asset {} is supervised: a take of an on-chain order is not served in \
-					it, as its leaf would be vtxo-1, out of a freeze's reach", a)));
+					it, as its leaf would be vtxo-1, out of a freeze's reach. {}", a, crate::params::SUPERVISED_INSTEAD)));
 			}
 		}
 

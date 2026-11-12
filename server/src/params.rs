@@ -94,10 +94,6 @@ pub struct AssetParams {
 	/// leaves of the asset together, open or being opened: a participation
 	/// that would open past it is refused. No total when `None`.
 	pub channel_total: Option<Amount>,
-	/// Set when the operator serves the asset as a restricted asset in its
-	/// issuer's tree: its leaves are `enclave-1`, and its policy server
-	/// co-signs beside the operator ([`crate::restricted`]).
-	pub restricted: Option<crate::restricted::Restricted>,
 	/// The most of the asset the operator fronts for refreshes whose old
 	/// coins have not come back yet (`in_flight`, [`crate::store::PoolFlow`]):
 	/// a refresh that would take it past the cap waits for a later round.
@@ -368,6 +364,15 @@ pub const ORDER_BLOCK_SECONDS: u32 = 60;
 /// The default cap on a transfer's margins, as a multiple of the least.
 pub const MAX_MARGIN_MULTIPLE: u64 = 25;
 
+/// What a holder of a supervised asset can do with it when the operator
+/// refuses something it does not serve in it: words a page shows as they
+/// are. The wallet that meets this refusal is an older one (an up-to-date
+/// wallet refuses such things itself first), so they say what updating
+/// gives, and the exit, which every build has, until then.
+pub const SUPERVISED_INSTEAD: &str = "An up-to-date wallet can pay the asset to another wallet, swap it by a swap offer, withdraw \
+	it to an address on the chain, or sell it by an order on the chain. Until the wallet is updated, its coins of the asset can be \
+	taken home to its own key by their exit. Nothing was co-signed.";
+
 impl Params {
 	/// The specification's parameters: an exit delay of 36 to 48 hours and a
 	/// depth limit of 5.
@@ -482,34 +487,6 @@ impl Params {
 		self.assets.get(asset).and_then(|p| p.supervised)
 	}
 
-	/// The restricted profile of `asset`, when the operator serves it so.
-	pub fn restricted(&self, asset: &AssetId) -> Option<crate::restricted::Restricted> {
-		self.assets.get(asset).and_then(|p| p.restricted)
-	}
-
-	/// Why a new leaf of `asset`, owned by `owner` under `owner_nonce`, with
-	/// `enclave` breaks the restricted profile, if it does: a leaf of a
-	/// restricted asset is `enclave-1` for the asset's policy key and
-	/// clawback key, its owner key the holder's enclave key for its nonce, and
-	/// no other asset's leaf is ([`crate::restricted`]).
-	pub fn check_enclave(&self, asset: AssetId, owner: &XOnlyPublicKey, owner_nonce: &[u8; 32], enclave: Option<&arca_covenant::Enclave>)
-		-> Result<(), String>
-	{
-		match (self.restricted(&asset), enclave) {
-			(None, None) => Ok(()),
-			(None, Some(_)) => Err(format!("asset {} is not served restricted: its leaves are not enclave-1", asset)),
-			(Some(_), None) => Err(format!("asset {} is restricted: every leaf of it is enclave-1, whose exit pays only its holder's \
-				enclave", asset)),
-			(Some(r), Some(e)) => {
-				if e.policy != r.policy || e.clawback != r.clawback {
-					return Err(format!("an enclave-1 leaf of asset {} carries the asset's policy key {} and clawback {}", asset,
-						crate::signer::hex(&r.policy.serialize()), r.clawback.map_or("none".into(), |k| crate::signer::hex(&k.serialize()))));
-				}
-				e.check_owner(owner, owner_nonce).map_err(|e| e.to_string())
-			},
-		}
-	}
-
 	/// Why a new leaf of `asset` and `value` with `landing` breaks the
 	/// supervised profile, if it does: a leaf of a supervised asset is a
 	/// landing leaf with the published allowance, `landing-2` once the
@@ -520,7 +497,8 @@ impl Params {
 			(None, None) => Ok(()),
 			(None, Some(_)) => Err(format!("asset {} is not supervised: its leaves are not landing leaves", asset)),
 			(Some(_), None) => Err(format!("asset {} is supervised: every leaf of it is a landing leaf, naming the landing its owner's \
-				exit pays, where a freeze of the asset binds", asset)),
+				exit pays, where a freeze of the asset binds. {}", asset,
+				SUPERVISED_INSTEAD)),
 			(Some(s), Some(l)) => {
 				if self.landing_2_only && !l.own_index {
 					return Err(format!("this operator makes landing-2 leaves only (info.landing_2_only): a leaf of asset {} lands at its \

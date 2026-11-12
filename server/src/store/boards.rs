@@ -65,6 +65,32 @@ fn board_row(r: &tokio_postgres::Row) -> Result<BoardRow, StoreError> {
 }
 
 impl Store {
+	/// The coins the retired `enclave-1` left in the database, each as its
+	/// leaf id and what it is: every board of record version 4 (whatever its
+	/// state, since the watcher defends a board paid away as long as its
+	/// holder can convert it), and every coin not spent or expired whose
+	/// record is the retired transfer output (coin record tag 7) or such a
+	/// board (tag 2, its board record version 4). This build reads none of
+	/// them, so its watcher could not defend them and its holder's own
+	/// conversion would stop a later start ([`crate::server`]).
+	pub async fn retired_enclave_coins(&self) -> Result<Vec<([u8; 32], String)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT b.leaf_id, 'an enclave-1 board, ' || b.state::text || ', its coin ' || l.state::text
+			 FROM board b JOIN leaf l ON l.leaf_id = b.leaf_id
+			 WHERE length(b.record) >= 1 AND get_byte(b.record, 0) = 4
+			 UNION ALL
+			 SELECT l.leaf_id, 'an enclave-1 coin, ' || l.state::text
+			 FROM leaf l
+			 WHERE l.state NOT IN ('spent', 'expired') AND length(l.record) >= 2
+			   AND (get_byte(l.record, 1) = 7 OR (get_byte(l.record, 1) = 2 AND length(l.record) >= 5 AND get_byte(l.record, 4) = 4))
+			   AND NOT EXISTS (SELECT 1 FROM board b WHERE b.leaf_id = l.leaf_id AND length(b.record) >= 1 AND get_byte(b.record, 0) = 4)
+			 ORDER BY 1",
+			&[],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, r.get(1)))).collect()
+	}
+
 	/// Registers a board: its coin (taking its operator nonce and recording
 	/// its scripts), the board with its transaction, and its output watched
 	/// for a spend. All or nothing.

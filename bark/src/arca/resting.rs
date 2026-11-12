@@ -199,6 +199,14 @@ impl Wallet {
 
 	fn rest_plan(&mut self, info: &Value, ask: &RestAsk, max_fee_ppm: Option<u64>) -> Result<(Value, RestPlan), Error> {
 		let (a, b) = (ask.sell, ask.want);
+		// The operator holds no resting order in a supervised asset: the
+		// order's leaf, and the credits its fills make, pay keys a freeze
+		// cannot follow. Refused here, before anything moves.
+		for x in [a, b] {
+			if self.landing_rule(info, x)?.is_some() {
+				return Err(Self::supervised_refusal(x, "the operator holds no resting order in the Arca that sells it or is paid in it"));
+			}
+		}
 		let terms = OrderTerms { asset_a: a, asset_b: b, rate_num: ask.rate_num, rate_den: ask.rate_den, min_lot: ask.min_lot };
 		terms.check().map_err(|e| Error::Refused(e.to_string()))?;
 		if ask.amount < ask.min_lot {
@@ -334,12 +342,9 @@ impl Wallet {
 		let mut wanted_json = vec![json!({"nonce": hex(&nonce), "asset": ask.sell.to_string(), "value": ask.amount.to_string(),
 			"order": terms_json})];
 		if plan.change > 0 {
-			let n = random32();
-			let o = self.keys.leaf_xonly(&n)?;
-			self.store.put_nonce(&n, &o.serialize(), "order change")?;
-			wanted.push(Wanted::Leaf { asset: ask.sell, value: plan.change, template: Template::Vtxo1, owner: o, owner_nonce: n,
-				exit_delay: self.exit_delay(), order: None, landing: None, channel: None });
-			wanted_json.push(json!({"nonce": hex(&n), "asset": ask.sell.to_string(), "value": plan.change.to_string()}));
+			let (w, entry) = self.change_wanted(&info, ask.sell, plan.change, "order change")?;
+			wanted.push(w);
+			wanted_json.push(entry);
 		}
 		let fees = vec![(ask.sell, plan.fee)];
 		let ids: Vec<LeafId> = plan.coins.iter().map(|c| c.coin.id).collect();
@@ -479,7 +484,7 @@ impl Wallet {
 		let mut takers = vec![];
 		for l in t["takers"].as_array().into_iter().flatten() {
 			takers.push(NewLeaf {
-				enclave: None, v2: false, htlc: None, landing: None,
+				v2: false, htlc: None, landing: None,
 				owner: parse_key(&l["owner"], "a taker's leaf")?,
 				owner_nonce: unhex32(l["owner_nonce"].as_str().unwrap_or(""))?,
 				creator_nonce: unhex32(l["creator_nonce"].as_str().unwrap_or(""))?,
@@ -593,7 +598,7 @@ impl Wallet {
 		self.resting_exit(&info, &o)?;
 		let leaf = |w: &Wallet| -> Result<NewLeaf, Error> {
 			let n = random32();
-			Ok(NewLeaf { enclave: None, v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
+			Ok(NewLeaf { v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
 		};
 		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
 		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;

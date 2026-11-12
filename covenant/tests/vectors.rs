@@ -140,7 +140,7 @@ impl Ctx {
 
 	fn leaf(&self) -> LeafPolicy {
 		let p = &self.output("leaf")["params"];
-		let leaf = LeafPolicy { enclave: None, claim: None,
+		let leaf = LeafPolicy { claim: None,
 			owner: key(&p["owner"]),
 			operator: key(&p["operator"]),
 			salt: h32(&p["salt"]),
@@ -157,7 +157,7 @@ impl Ctx {
 
 	fn board(&self) -> BoardPolicy {
 		let p = &self.output("board")["params"];
-		let leaf = LeafPolicy { enclave: None, claim: None,
+		let leaf = LeafPolicy { claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]),
 			htlc: None,
@@ -251,7 +251,7 @@ impl Ctx {
 			timeout: time(&p["timeout"]),
 			operator_delay: rel(&p["operator_delay"]),
 		};
-		let h = LeafPolicy { enclave: None, claim: None,
+		let h = LeafPolicy { claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, exit_delay,
 			htlc: Some(terms),
 			order: None,
@@ -277,7 +277,7 @@ impl Ctx {
 		let landing = arca_covenant::Landing { program, allowance: p["allowance"].as_u64().unwrap(), own_index };
 		let terms = landing.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
 		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
-		let l = LeafPolicy { enclave: None, claim: None,
+		let l = LeafPolicy { claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]), htlc: None, order: None, landing: Some(terms),
 			channel: None, v2: false,
@@ -299,7 +299,7 @@ impl Ctx {
 		};
 		let terms = lapse.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
 		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
-		let l = LeafPolicy { enclave: None, claim: Some(terms),
+		let l = LeafPolicy { claim: Some(terms),
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]), htlc: None, order: None, landing: None,
 			channel: None, v2: false,

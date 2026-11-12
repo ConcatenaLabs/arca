@@ -46,7 +46,7 @@ use serde_json::{json, Value};
 use arca_covenant::fill::FillOrder;
 use arca_covenant::script::witness_program;
 use arca_covenant::spend::FeeSource;
-use arca_covenant::{ExplicitOutput, LeafId, OffboardPolicy, RelativeTime, Template};
+use arca_covenant::{ExplicitOutput, LeafId, OffboardPolicy, RelativeTime};
 
 use super::chain::{hex, unhex, unhex32};
 use super::client::{key_proof_digest, participation_id, Wanted};
@@ -318,12 +318,9 @@ impl Wallet {
 		let mut wanted_json = vec![json!({"offboard": {"asset": ask.sell.to_string(), "value": ask.amount.to_string(),
 			"script": hex(destination.as_bytes()), "margin": plan.margin.to_string()}})];
 		if plan.change > 0 {
-			let nonce = random32();
-			let owner = self.keys.leaf_xonly(&nonce)?;
-			self.store.put_nonce(&nonce, &owner.serialize(), "order change")?;
-			wanted.push(Wanted::Leaf { asset: ask.sell, value: plan.change, template: Template::Vtxo1, owner, owner_nonce: nonce,
-				exit_delay: self.exit_delay(), order: None, landing: None, channel: None });
-			wanted_json.push(json!({"nonce": hex(&nonce), "asset": ask.sell.to_string(), "value": plan.change.to_string()}));
+			let (w, entry) = self.change_wanted(&info, ask.sell, plan.change, "order change")?;
+			wanted.push(w);
+			wanted_json.push(entry);
 		}
 		let fees = vec![(ask.sell, plan.fee)];
 		let ids: Vec<LeafId> = plan.coins.iter().map(|c| c.coin.id).collect();

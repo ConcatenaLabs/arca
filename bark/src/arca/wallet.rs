@@ -120,12 +120,11 @@ pub(crate) fn reads_landing_2(v: &Value) -> bool {
 /// The template of the leaf a coin record names: what `coins` shows of it.
 fn template_of(r: &CoinRecord) -> Option<Template> {
 	// A leaf made by a transfer or a fill, by its terms.
-	let new_leaf = |l: &arca_covenant::NewLeaf| match (&l.htlc, &l.landing, &l.enclave, l.v2) {
+	let new_leaf = |l: &arca_covenant::NewLeaf| match (&l.htlc, &l.landing, l.v2) {
 		(Some(_), ..) => Template::Htlc1,
-		(None, Some(l), ..) => if l.own_index { Template::Landing2 } else { Template::Landing1 },
-		(None, None, Some(_), _) => Template::Enclave1,
-		(None, None, None, true) => Template::Vtxo2,
-		(None, None, None, false) => Template::Vtxo1,
+		(None, Some(l), _) => if l.own_index { Template::Landing2 } else { Template::Landing1 },
+		(None, None, true) => Template::Vtxo2,
+		(None, None, false) => Template::Vtxo1,
 	};
 	Some(match r {
 		CoinRecord::Leaf { record, .. } => record.template,
@@ -2307,6 +2306,16 @@ impl Wallet {
 		amount(&a["min_leaf"], "min_leaf")
 	}
 
+	/// The refusal of something the operator does not serve in supervised
+	/// `asset` (`what` it is), saying what its holder can do with the asset
+	/// instead: words a page shows as they are, so they name no command.
+	pub(crate) fn supervised_refusal(asset: AssetId, what: &str) -> Error {
+		Error::Refused(format!("asset {} is supervised (its issuer can freeze it): {}, as the coin it would make would be out of \
+			the freeze's reach. The asset can still be paid to another wallet, swapped with another wallet by a swap offer, \
+			withdrawn to an address on the chain, or sold by an order on the chain that this wallet places. Nothing was signed.",
+			asset, what))
+	}
+
 	/// The landing a new leaf of `asset` the wallet asks for or takes must
 	/// carry: `Some` for a supervised asset, at the wallet's landing key with
 	/// the allowance the operator publishes, `landing-2` (landing at its own
@@ -3658,6 +3667,13 @@ impl Wallet {
 		let onchain: Value = onchain.into_iter().map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
 		let held: Value = held.into_iter().filter(|(_, v)| *v > 0).map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>().into();
 		let mut out = json!({"total": total, "held": held, "arca": arca, "sequentia_onchain": onchain});
+		// While a restore's history is still being checked, the wallet's past
+		// spends are not all listed yet: an activity view says so rather than
+		// read as complete. The balance itself is whole.
+		let left = self.history_left()?;
+		if left > 0 {
+			out["history"] = json!({"loading": true, "left": left});
+		}
 		if !frozen_onchain.is_empty() {
 			out["sequentia_onchain_frozen"] = frozen_onchain.into_iter().map(|(a, v)| (a, json!(v.to_string())))
 				.collect::<serde_json::Map<_, _>>().into();
@@ -4043,7 +4059,7 @@ impl Wallet {
 		// are those of the board itself, every key being 32 bytes.
 		let dummy = self.keys.onchain(CHANGE, 0)?;
 		let change = p2wpkh(&dummy);
-		let record = BoardRecord { enclave: None,
+		let record = BoardRecord {
 			template: Template::Board1, owner: dummy.x_only_public_key().0, owner_nonce: [1; 32], operator_nonce: [2; 32],
 			exit_delay: self.exit_delay(), asset, value, chain: self.genesis, operator: self.operator,
 			landing: None,
@@ -4084,7 +4100,7 @@ impl Wallet {
 		// A board of a supervised asset converts into a landing leaf at the
 		// wallet's landing key.
 		let landing = self.landing_rule(&info, asset)?;
-		let record = BoardRecord { enclave: None,
+		let record = BoardRecord {
 			template: Template::Board1, owner, owner_nonce, operator_nonce, exit_delay: self.exit_delay(),
 			asset, value, chain: self.genesis, operator: self.operator,
 			landing,
