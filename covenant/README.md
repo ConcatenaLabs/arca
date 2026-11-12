@@ -232,11 +232,14 @@ sorted and no whitespace, asset ids, the token and the genesis hash are in
 display order, and amounts are decimal strings. Its reader also refuses a
 repeated key, which two readers could otherwise resolve differently.
 
-Restricted assets (OpenAMP assets, whose every move needs the issuer's policy
-key) stay on the chain and have no leaf here. The numbers reserved for their
-leaf, `enclave-1`, are never taken by another form and read as the refusal
+Restricted assets, of either kind (OpenAMP, whose every move the issuer's
+policy server co-signs, and OpenDAMP, whose rules covenants enforce), stay on
+the chain and have no leaf here. The numbers reserved for their former leaf,
+`enclave-1`, are never taken by another form and read as the refusal
 `ENCLAVE_RETIRED`, "enclave-1 was retired: restricted assets stay on the
-chain": template id 6 (`enclave-<n>` in the JSON form), policy type 11 of the
+chain", followed by the way home of a coin made under it: its exit to its
+holder's enclave, built by a build from before the retirement (see
+`server/README.md`, "Restricted assets"): template id 6 (`enclave-<n>` in the JSON form), policy type 11 of the
 `encode` module, tag 7 of the coin record (an output of a reassignment), and
 version 4 of the board record.
 

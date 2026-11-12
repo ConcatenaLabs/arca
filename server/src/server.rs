@@ -1396,8 +1396,10 @@ fn housekeeping(store: Store, nonce_ttl: Duration, every: Duration) -> JoinHandl
 /// a transaction paying the operator's connector script that is no round of
 /// the database's, and a board output spent by its collaborative path, which
 /// needs `S`, by a transaction the server neither built nor co-signed (the
-/// checkpoint of the board's transfer). Each is named.
-async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>, operator: elements::secp256k1_zkp::XOnlyPublicKey)
+/// checkpoint of the board's transfer). Each is named. A board of the
+/// retired `enclave-1` is skipped, with a log line. Public for its tests;
+/// [`Server::start`] runs it after its first pass over the chain.
+pub async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>, operator: elements::secp256k1_zkp::XOnlyPublicKey)
 	-> Result<Vec<String>, StartError>
 {
 	use elements::hashes::Hash;
@@ -1408,6 +1410,15 @@ async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>,
 			elements::Txid::from_byte_array(t)));
 	}
 	for (record, txid, vout, by, checkpoint) in store.board_spends_unbuilt().await.map_err(err("the database"))? {
+		// A board of the retired enclave-1 (record version 4): the start
+		// refuses such a database before this point, and were it reached, the
+		// spend is its holder's own conversion as far as this build can tell,
+		// so it is skipped rather than stopping the start.
+		if record.first() == Some(&arca_covenant::board::BOARD_ENCLAVE_RECORD_VERSION) {
+			log::warn!("board output {}:{}, spent by {}: an enclave-1 board ({}), skipped",
+				elements::Txid::from_byte_array(txid), vout, elements::Txid::from_byte_array(by), arca_covenant::ENCLAVE_RETIRED);
+			continue;
+		}
 		let record = BoardRecord::from_bytes(&record).map_err(err("a board's record"))?;
 		let by = elements::Txid::from_byte_array(by);
 		let spender = match finality.call(move |c| c.transaction(&by)).await.map_err(err("the node"))? {
@@ -1428,6 +1439,26 @@ async fn unknown_to_the_database(store: &Store, finality: &Arc<FinalityService>,
 			by, record.leaf_id()));
 	}
 	Ok(found)
+}
+
+/// Refuses to start while the database holds a coin of the retired
+/// `enclave-1` ([`Store::retired_enclave_coins`]), naming each. This build
+/// reads none of their records, so its watcher could not answer a sender who
+/// converts a board it paid away, and a holder's own conversion would stop a
+/// later start; the previous release still reads them, defends them, and
+/// builds each holder's way home. Checked before anything else, so a refused
+/// start changes nothing.
+async fn retired_enclave_coins(store: &Store) -> Result<(), StartError> {
+	let found = store.retired_enclave_coins().await.map_err(err("the database"))?;
+	if found.is_empty() {
+		return Ok(());
+	}
+	Err(StartError(format!(
+		"the database holds {} coin(s) of the retired enclave-1, which this build can neither read nor defend: {}. Bring them \
+		 home with the previous release first: run a build from before the retirement on this database, under which each holder \
+		 takes its coin home by its exit to its enclave and the watcher defends every one until then (the server's README, \
+		 \"Restricted assets\")",
+		found.len(), found.iter().map(|(id, what)| format!("{} ({})", crate::signer::hex(id), what)).collect::<Vec<_>>().join(", "))))
 }
 
 /// Refuses to start when the signer's record is not the one the database
@@ -1748,6 +1779,7 @@ impl Server {
 	/// HTTP listener.
 	pub async fn start(config: &Config) -> Result<Server, StartError> {
 		let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+		retired_enclave_coins(&store).await?;
 		let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(node_client(config)?));
 		let certification = match config.finality.certification.as_str() {
 			"required" => Certification::Required,

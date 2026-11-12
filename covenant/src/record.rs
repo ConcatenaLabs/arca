@@ -194,7 +194,8 @@ pub const MAX_LEVELS: usize = 16;
 /// 4. Those numbers are reserved and never reused, so a record or message
 /// written for the retired template meets this sentence, not another
 /// template's reading of the same bytes.
-pub const ENCLAVE_RETIRED: &str = "enclave-1 was retired: restricted assets stay on the chain";
+pub const ENCLAVE_RETIRED: &str = "enclave-1 was retired: restricted assets stay on the chain; a coin made under it goes home by \
+	its exit to its holder's enclave, which a build from before the retirement makes (arca's server README, \"Restricted assets\")";
 
 /// The largest amount any Sequentia chain allows in one output or one
 /// transaction: 400,000,000 coins of 10^8 atoms (the node's `MAX_MONEY` on the

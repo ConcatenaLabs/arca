@@ -2369,20 +2369,44 @@ coin, so an operator serving a supervised asset runs its signer with one.
 
 ## Restricted assets
 
-A restricted asset (an OpenAMP asset, whose every move needs its issuer's
-policy key) is not served in the tree. It stays on the chain, in its
-holders' enclaves, where its policy server (`openampd`, in the openamp
-repository) applies the asset's rules to every move.
+A restricted asset, of either kind, is not served in the tree: an OpenAMP
+asset, whose every move its policy server (`openampd`, in the openamp
+repository) co-signs under the issuer's rules, and an OpenDAMP asset, whose
+rules covenants enforce on the chain. Both stay on the chain, between the
+addresses their rules allow. The operator serves the assets its
+configuration lists; what keeps a restricted asset out of the tree is the
+asset's own rules (the policy server's co-signature, the covenants), which a
+board or a round cannot meet, not the operator.
 
 An asset entry with a `restricted` section stops the server at start and at
-a reload, with an error naming the asset and the sentence "enclave-1 was
-retired: restricted assets stay on the chain"; the server never serves such
-an asset as an open one. A transfer output that carries `enclave` is
-refused as malformed with the same sentence. The wire numbers reserved for
-`enclave-1` read as that refusal (see `covenant/README.md`). The signer
-refuses a request carrying `enclave` or `policy_sig` (`declined`, with the
-sentence), and `arca-signer --restricted <value>` is accepted and ignored,
-with one log line saying so, so a unit that still passes it starts.
+a reload, with an error naming the asset and the sentence of
+`ENCLAVE_RETIRED` ("enclave-1 was retired: restricted assets stay on the
+chain; …"). A transfer output that carries `enclave` is refused as
+malformed with the same sentence. The wire numbers reserved for `enclave-1`
+read as that refusal (see `covenant/README.md`). The signer refuses a
+request carrying `enclave` or `policy_sig` (`declined`, with the sentence),
+and `arca-signer --restricted <value>` is accepted and ignored, with one log
+line saying so, so a unit that still passes it starts.
+
+### A database that holds an `enclave-1` coin
+
+This build reads no `enclave-1` record, so it could neither defend such a
+coin (answer a sender who converts a board it has paid away) nor tell a
+holder's conversion of one from a spend it never co-signed. So before
+anything else, `arcad` counts the coins the template left in its database:
+every board of record version 4, whatever its state, and every coin not
+spent or expired whose record is coin record tag 7 or such a board. If there
+is one, it refuses to start, naming each by its leaf id, and changes
+nothing. A database without them starts as before.
+
+Such a database stays with a build that still serves `enclave-1`: commit
+7a6d2befa, or any commit of this repository before the template was
+retired. Under it, each holder brings its coin home by its exit to its own
+enclave on the chain (`enclave_exit_tx` in that build's `arca-covenant`;
+for a coin received out of round, its checkpoint and reassignment first),
+and the watcher keeps defending every coin until then. A wallet built from
+this repository cannot build that exit either: it reads the record as the
+same refusal, which names the way home.
 
 ## Channel leaves
 

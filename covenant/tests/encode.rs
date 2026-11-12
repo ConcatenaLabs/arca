@@ -302,5 +302,6 @@ fn the_retired_enclave_numbers_read_as_its_refusal() {
 	assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED));
 	let e = BoardRecord::from_json(&serde_json::json!({"version": 4, "template": "board-1"})).unwrap_err();
 	assert_eq!(e, RecordError::Retired(ENCLAVE_RETIRED));
-	assert_eq!(ENCLAVE_RETIRED, "enclave-1 was retired: restricted assets stay on the chain");
+	assert!(ENCLAVE_RETIRED.starts_with("enclave-1 was retired: restricted assets stay on the chain; "));
+	assert!(ENCLAVE_RETIRED.contains("goes home by its exit to its holder's enclave"), "the refusal names the way home");
 }
