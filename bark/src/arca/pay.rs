@@ -586,7 +586,10 @@ impl Wallet {
 	/// can make; less for a coin a trade would shape first), or because
 	/// their record is of the format with its owner's exit, which the other
 	/// side does not read (`reads`). A round gives each of them back as a
-	/// coin of the wallet's own that pays anything at once. Coins an
+	/// coin of the wallet's own that pays anything at once. And the coins
+	/// given up in a round of the wallet's own whose forfeits it signed but
+	/// whose new leaves it has not taken yet ([`Self::owed_by_own_rounds`]):
+	/// the next sync takes them once the operator releases them. Coins an
 	/// offline-refresh plan keeps, a resting order's coin, a channel's and
 	/// one past its exit deadline are not among them: each has its own way.
 	/// None is named for a side that reads no `landing-2` when `asset` is
@@ -623,6 +626,20 @@ impl Wallet {
 			};
 			out.push((row.leaf_id.clone(), row.value, why));
 		}
+		// And the coins given up in a round of the wallet's own whose new
+		// leaves it has not taken yet: final in its view, its forfeits
+		// signed, the operator's preimage still to come. They are named so
+		// a spend waits for them, never refused as a shortfall; what comes
+		// back is counted once, with the first.
+		for (_, given, back) in self.owed_by_own_rounds(asset)? {
+			let mut value = back;
+			for l in given {
+				if !out.iter().any(|(o, ..)| *o == l) {
+					out.push((l, value, "in a round of the wallet's own whose new coins it has not taken yet"));
+					value = 0;
+				}
+			}
+		}
 		Ok(out)
 	}
 
@@ -639,10 +656,13 @@ impl Wallet {
 		if held.is_empty() || live.saturating_add(more) < need {
 			return None;
 		}
-		Some(Error::SettleFirst { asset: asset.to_string(), coins: held.into_iter().map(|(l, ..)| l).collect(),
+		let coins: Vec<String> = held.into_iter().map(|(l, ..)| l).collect();
+		let wait = self.settle_wait(&coins);
+		let when = wait.map(|(most, usual, _)| format!(", usually within {} s and at most {} s", usual, most)).unwrap_or_default();
+		Some(Error::SettleFirst { asset: asset.to_string(), coins, wait,
 			message: format!("the wallet's coins of asset {} that pay this now hold {}, short of the {} it takes; {} more are {}, and pay it once \
-				the operator's next round has refreshed them: settle them first (settle_first), then ask again; nothing was signed", asset,
-				live, need, more, why) })
+				a round has made them coins the wallet can spend{}: settle them first (settle_first), which puts through a round those that \
+				need one and waits for the rest, then ask again; nothing was signed", asset, live, need, more, why, when) })
 	}
 
 	/// The checkpoint margin of `coin`, and the reassignment's of `inputs`
@@ -2513,7 +2533,9 @@ impl Wallet {
 			let deep: Vec<(String, u64)> = inputs.iter().filter(|i| i.coin.hops + 3 > limit).map(|i| (i.row.leaf_id.clone(), i.coin.value)).collect();
 			if !deep.is_empty() {
 				let held: u64 = deep.iter().map(|(_, v)| *v).sum();
-				return Err(Error::SettleFirst { asset: asset.to_string(), coins: deep.into_iter().map(|(l, _)| l).collect(),
+				let coins: Vec<String> = deep.into_iter().map(|(l, _)| l).collect();
+				let wait = self.settle_wait(&coins);
+				return Err(Error::SettleFirst { asset: asset.to_string(), coins, wait,
 					message: format!("the wallet's coins of asset {} that would make a coin of exactly the {} this trade gives hold {} too \
 						near the operator's depth limit of reassignments since a round, so the coin made could not be traded: settle them \
 						first (settle_first), then ask again; nothing moved", asset, need, held) });
