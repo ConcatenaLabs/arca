@@ -3151,18 +3151,19 @@ impl Wallet {
 		}
 		if accepted {
 			// Nothing signed into the acceptance is held, live or sending. Only
-			// a coin spent (by the wallet's own respend, or by the swap) or
-			// whose forfeit the operator holds can no longer be co-signed into
-			// it; one in any other state (given to a refresh not done yet, on
-			// its way home) can still be taken back, and the maker can then
+			// a coin that can never come back stops the maker completing it
+			// ([`Self::acceptance_coin_gone`]); one in any other state (given
+			// to a refresh not done yet, forfeited in a round not final, on its
+			// way home) can still be live again, and the maker can then
 			// complete the acceptance. So the swap is not called cancelled.
+			let given_up = self.given_up_set()?;
 			let open: Vec<Value> = self.acceptance_coins(id)?.into_iter().filter_map(|l| self.store.coin(&l).ok().flatten())
-				.filter(|c| !matches!(c.state.as_str(), "spent" | "forfeited"))
+				.filter(|c| !Self::acceptance_coin_gone(c, &given_up))
 				.map(|c| json!({"leaf_id": c.leaf_id, "state": c.state})).collect();
 			if !open.is_empty() {
 				return Ok(json!({"swap": id, "cancelled": false, "acceptance_stands": true, "coins": open,
-					"note": "a coin signed into the acceptance is not spent (it is given to a refresh not done yet, or on its way home): \
-					until it is spent the maker can complete the acceptance; run swap cancel again once it is"}));
+					"note": "a coin signed into the acceptance is not spent (it is given to a refresh, in a round not final yet, or on its \
+					way home): until it is spent the maker can complete the acceptance; run swap cancel again once it is"}));
 			}
 			// Each coin in it is spent, by the wallet's own respend or by the
 			// swap. What the swap pays the wallet says which; without a read
@@ -3184,6 +3185,16 @@ impl Wallet {
 		}
 		self.store.set_swap(id, "cancelled", None)?;
 		Ok(json!({"swap": id, "cancelled": true, "freed": freed}))
+	}
+
+	/// Whether coin `c`, signed into an acceptance, can never be co-signed
+	/// into it again: it is spent, or it is forfeited in a refresh whose
+	/// round is final and whose new coins the wallet holds (`given_up`,
+	/// [`Self::given_up_set`]). A coin forfeited in a round not final yet
+	/// comes back if that round is dropped (another participant never hands
+	/// over its forfeits), and the maker can then complete the acceptance.
+	fn acceptance_coin_gone(c: &CoinRow, given_up: &std::collections::HashSet<String>) -> bool {
+		c.state == "spent" || (c.state == "forfeited" && given_up.contains(&c.leaf_id))
 	}
 
 	/// The wallet's own coins signed into swap `id`, which it accepted: the
@@ -3292,8 +3303,12 @@ impl Wallet {
 			Some(_) => mailbox,
 		};
 		let named = leaf_named(message);
+		// Only a coin that can never come back ([`Self::acceptance_coin_gone`]):
+		// one given to a refresh, or forfeited in a round not final, is live
+		// again if that round is dropped, and the maker can then complete.
+		let given_up = self.given_up_set()?;
 		let gone: Vec<String> = ids.iter().filter(|l| {
-			self.store.coin(l).ok().flatten().is_some_and(|c| !matches!(c.state.as_str(), "live" | "offered" | "sending"))
+			self.store.coin(l).ok().flatten().is_some_and(|c| Self::acceptance_coin_gone(&c, &given_up))
 		}).cloned().collect();
 		if self.swap_paid(id)? {
 			return Ok(json!({"swap": id, "cancelled": false, "done": true, "error": message,
