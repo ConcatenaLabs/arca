@@ -13,6 +13,7 @@
 mod common;
 
 use elements::Script;
+use elements::hashes::Hash as _;
 use serde_json::{json, Value};
 
 use bark::arca::{command, Wallet};
@@ -702,4 +703,198 @@ async fn a_board_another_device_gave_to_a_round_is_followed_at_once() {
 	println!("THE BOARD AND THE ROUND'S COIN ON THE FIRST DEVICE: {:?}", states);
 	assert!(coins(&b, "pending", &y).is_empty(), "nothing left pending: {}", b.ok(&["coins"]));
 	assert!(!live_ids(&b, &y).contains(&board_id), "the board given up is not counted");
+}
+
+/// The answer to a cancel's respend is lost; a sync posts it again and the
+/// operator refuses it for a reason other than a spent coin (a signature the
+/// proxy spoils, standing for a margin or fee the operator no longer takes).
+/// The coin is held for the swap again, not live: the wallet's refresh cannot
+/// give it to a round, where a cancel could miss it and a withdrawal of the
+/// refresh would hand it back to a maker still holding the acceptance. The
+/// next cancel respends it, and the maker's completion is then refused.
+/// (RV41's probe P10.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_respend_keeps_the_coin_held_for_the_swap() {
+	use std::sync::Arc;
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let proxy = common::proxy::Proxy::start(&url);
+	let a = Arca::new("HA");
+	let b = Arca::new("HB");
+	a.ok(&["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	b.ok(&["create", "--server", &proxy.url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &y, "900000", "--fee-asset", &x]);
+	r.fund_server(r.x, 50_000_000).await;
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let state = |w: &Arca, id: &str| library(w, "swaps", json!({})).unwrap().as_array().unwrap().iter().find(|s| s["swap"] == id).unwrap()["state"].clone();
+	let st = |w: &Arca, l: &str| w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == l).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "400000"})).unwrap();
+	let id = offer["swap"].as_str().unwrap().to_string();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	let coin = coins(&b, "offered", &y)[0]["leaf_id"].as_str().unwrap().to_string();
+	proxy.lose("/v1/cosign_transfer", true);
+	let c1 = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	proxy.lose("/v1/cosign_transfer", false);
+	assert_eq!(c1["cancelled"], false, "{}", c1);
+	proxy.rewrite_request(Some(Arc::new(|path: &str, body: &mut Value| {
+		if path == "/v1/cosign_transfer" {
+			body["inputs"][0]["checkpoint_sig"] = json!("11".repeat(64));
+		}
+	})));
+	let s = b.ok(&["sync"]);
+	proxy.rewrite_request(None);
+	println!("SYNC POSTS THE RESPEND AGAIN, REFUSED: {}", s["transfers"]);
+	println!("THE COIN AFTER THE REFUSAL: {}", st(&b, &coin));
+	assert_eq!(st(&b, &coin), "offered", "the coin is held for the swap again");
+	let (ok, p) = b.run(&["participate", "--leaf", &coin]);
+	println!("A REFRESH OF THE COIN: ok {} {}", ok, p);
+	// Whatever the refresh did, take it back, as a person or the wallet may.
+	if let Some(pid) = b.ok(&["participations"]).as_array().and_then(|a| a.iter().find(|p| p["state"] == "pending")).and_then(|p| p["participation"].as_str()).map(String::from) {
+		b.run(&["withdraw-participation", &pid]);
+	}
+	let c2 = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	println!("CANCEL AFTER THE REFUSED RESPEND: {}", c2);
+	let done = library(&a, "swap_complete", json!({"accept": acc["accept"]}));
+	println!("THE MAKER'S COMPLETION AFTER IT: {:?}", done.as_ref().map(|d| d["swap"].clone()));
+	assert!(!(c2["cancelled"] == true && done.is_ok()), "the cancel said cancelled, and the maker completed the acceptance after it: {}", c2);
+	assert_eq!(c2["cancelled"], true, "{}", c2);
+	assert!(c2["respent"].as_array().is_some_and(|v| !v.is_empty()), "{}", c2);
+	assert!(done.unwrap_err().contains("double_spend"));
+	assert_eq!(state(&b, &id), "cancelled");
+}
+
+/// A coin signed into an acceptance is forfeited in a round not final yet.
+/// A forfeited coin comes back when its round is dropped (another
+/// participant never hands over its forfeits, arca #823), and the maker can
+/// then complete the acceptance with it: so until the round is final, a
+/// cancel answers that the acceptance stands. Once the round is final and
+/// the wallet holds its new coin, the cancel reads the mailbox and answers
+/// cancelled, and the maker's completion is refused.
+///
+/// The coin gets there as it does when another device's refresh holds it in
+/// a round that is then dropped: the cancel's respend is lost; a sync posts
+/// it again and is answered that the coin is spent (`double_spend`, here by
+/// the proxy, the operator refusing the spoiled request), so the coin goes
+/// live for the catch-up; it is not spent, and the wallet's own refresh gives
+/// it to a round. The operator is the testnet's: batches without a sweep,
+/// whose forfeits are taken before the round is broadcast (on a batch with a
+/// sweep the wallet signs no forfeit before the round is final).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_forfeited_in_a_round_not_final_keeps_the_acceptance_standing() {
+	use std::sync::Arc;
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let proxy = common::proxy::Proxy::start(&url);
+	let a = Arca::new("KA");
+	let b = Arca::new("KB");
+	a.ok(&["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	b.ok(&["create", "--server", &proxy.url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 1_000_000), (&b, r.x, 1_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	b.ok(&["board", &y, "600000", "--fee-asset", &x]);
+	r.fund_server(r.x, 50_000_000).await;
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	let st = |w: &Arca, l: &str| w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == l).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+	let state = |w: &Arca, id: &str| library(w, "swaps", json!({})).unwrap().as_array().unwrap().iter().find(|s| s["swap"] == id).unwrap()["state"].clone();
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "300000", "want_asset": y, "want": "400000"})).unwrap();
+	let id = offer["swap"].as_str().unwrap().to_string();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	let coin = coins(&b, "offered", &y)[0]["leaf_id"].as_str().unwrap().to_string();
+	// The cancel's respend is lost.
+	proxy.lose("/v1/cosign_transfer", true);
+	let c1 = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	proxy.lose("/v1/cosign_transfer", false);
+	assert_eq!(c1["cancelled"], false, "{}", c1);
+	// A sync posts it again: the operator refuses the spoiled request, and the
+	// answer the wallet reads says the coin is spent.
+	let named = coin.clone();
+	proxy.rewrite_request(Some(Arc::new(|path: &str, body: &mut Value| {
+		if path == "/v1/cosign_transfer" {
+			body["inputs"][0]["checkpoint_sig"] = json!("11".repeat(64));
+		}
+	})));
+	proxy.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/cosign_transfer" && status != 200 {
+			*v = json!({"error": {"code": "double_spend", "message": format!("leaf {} is already spent: the server co-signs one spend of a leaf", named)}});
+			return Some(409);
+		}
+		None
+	})));
+	let s = b.ok(&["sync"]);
+	proxy.rewrite_request(None);
+	proxy.rewrite(None);
+	println!("SYNC POSTS THE RESPEND AGAIN, ANSWERED SPENT: {}", s["transfers"]);
+	println!("THE COIN AFTER IT: {}", st(&b, &coin));
+	assert_eq!(st(&b, &coin), "live", "a double_spend leaves the coin live, for the catch-up");
+	// The wallet's own refresh gives it to a round, and hands over its
+	// forfeit; the round is broadcast and not final.
+	let p = b.ok(&["participate", "--leaf", &coin]);
+	assert_eq!(p["participations"][0]["state"], "pending", "{}", p);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(!built.is_empty() && failed.is_empty(), "{} built, {} failed", built.len(), failed.len());
+	let s = b.ok(&["sync"]);
+	println!("THE TAKER'S SYNC AFTER THE ROUND: {}", s["participations"]);
+	r.server.rounds.pass().await.unwrap();
+	for t in &built {
+		let round = r.server.store.round_by_txid(&t.tx.txid().to_byte_array()).await.unwrap().map(|x| x.state);
+		println!("ROUND {}: {:?}", t.tx.txid(), round);
+		assert_ne!(round, Some(RoundState::Final), "the round is not final yet");
+	}
+	println!("THE COIN: {}", st(&b, &coin));
+	assert_eq!(st(&b, &coin), "forfeited", "the coin is given up under its forfeit");
+	let c2 = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	println!("CANCEL, THE COIN FORFEITED, THE ROUND NOT FINAL: {}", c2);
+	assert_ne!(c2["cancelled"], true, "a coin forfeited in a round not final can come back: the acceptance stands: {}", c2);
+	assert_eq!(c2["acceptance_stands"], true, "{}", c2);
+	assert_eq!(state(&b, &id), "accepted");
+	// The round final, the wallet holding its new coin: the cancel goes on.
+	r.produce().await;
+	r.bury().await;
+	for t in &built {
+		r.round_state(&t.tx.txid(), RoundState::Final).await;
+	}
+	let s = b.ok(&["sync"]);
+	println!("THE TAKER'S SYNC AFTER THE ROUND IS FINAL: {}", s["participations"]);
+	let c3 = library(&b, "swap_cancel", json!({"swap": id})).unwrap();
+	println!("CANCEL, THE ROUND FINAL: {}", c3);
+	assert_eq!(c3["cancelled"], true, "{}", c3);
+	assert_eq!(state(&b, &id), "cancelled");
+	let done = library(&a, "swap_complete", json!({"accept": acc["accept"]}));
+	println!("THE MAKER'S COMPLETION AFTER IT: {:?}", done);
+	assert!(done.is_err(), "the maker cannot complete an acceptance whose coin is given up in a final round");
 }
