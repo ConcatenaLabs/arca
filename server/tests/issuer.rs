@@ -181,7 +181,9 @@ fn destination(key: &Keypair) -> Script {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_issuer_operated_asset_mints_its_refresh_liquidity_and_burns_it_at_expiry() {
-	let mut r = Running::start_on(&["-evbparams=simplicity:-1:::"], |_, _| {}).await;
+	// A batch with a sweep, whatever `ARCA_TEST_NO_SWEEP` says: the liquidity
+	// it mints is burnt at its expiry.
+	let mut r = Running::start_on(&["-evbparams=simplicity:-1:::"], |c, _| c.batches.no_sweep = false).await;
 	let x = r.x;
 	for _ in 0..10 {
 		r.fund_wallet_in(x, 20_000_000).await;

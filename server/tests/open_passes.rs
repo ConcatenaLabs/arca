@@ -134,12 +134,17 @@ async fn logs_hold_every_open_item() {
 	let kinds: Vec<String> = c.query("SELECT kind || ' ' || count(*) FROM watcher_tx GROUP BY kind ORDER BY 1", &[]).await.unwrap()
 		.iter().map(|r| r.get(0)).collect();
 	println!("flows: watcher transactions {}; open rows now {:?}", kinds.join(", "), check(&r, "the flows").await);
+	// The named writes below are the test's own, and each count expects only
+	// them: the server's tasks stop until they are done, or its nursery would
+	// set a spender the test takes out of the final state final again, the
+	// node holding it in a block, between two counts.
+	r.server.stop();
 
 	// Two shapes these flows do not make, made here: an output on the chain
 	// paying the leaf of a coin given up (an exit), recorded as the chain's
 	// scan records one, some spent by a transaction of the watcher's; and a
 	// coin of a transfer given up with a forfeit, the forfeit published and
-	// claimed (four forfeited coins taken as transfer coins, a change no
+	// claimed (every forfeited coin taken as a transfer coin, a change no
 	// write of the server's makes, so the log takes them in by a count, as
 	// at its first count after the schema step).
 	c.batch_execute("
@@ -152,7 +157,7 @@ async fn logs_hold_every_open_item() {
 		JOIN (SELECT txid, row_number() OVER (ORDER BY txid) AS k FROM watcher_tx) w ON w.k = s.k WHERE s.k % 2 = 0
 		ON CONFLICT DO NOTHING;
 		SET session_replication_role = replica;
-		UPDATE leaf SET kind = 'transfer' WHERE leaf_id IN (SELECT subject FROM watcher_tx WHERE kind = 'forfeit' ORDER BY txid LIMIT 4);
+		UPDATE leaf SET kind = 'transfer' WHERE leaf_id IN (SELECT subject FROM watcher_tx WHERE kind = 'forfeit');
 		SET session_replication_role = origin;").await.unwrap();
 	for pass in PASSES {
 		r.db.store.recount_open(pass).await.unwrap();
@@ -186,7 +191,9 @@ async fn logs_hold_every_open_item() {
 	c.execute("UPDATE nursery_tx SET state = 'final' WHERE txid = $1", &[&spender]).await.unwrap();
 	assert_eq!(check(&r, "the spender final again").await[3], before);
 
-	// 2. Random writes.
+	// 2. Random writes, the server running again: its tasks answer them as
+	// they answer the chain, which makes more of the states the passes read.
+	r.restart_server().await;
 	let seed: u64 = std::env::var("OPEN_PASSES_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x09e4_5eed);
 	println!("seed {}", seed);
 	let mut rng = rand::rngs::StdRng::seed_from_u64(seed);

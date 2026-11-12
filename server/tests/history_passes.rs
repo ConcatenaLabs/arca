@@ -23,6 +23,11 @@
 //! HISTORY_SCALE=10 cargo test -p arca-server --test history_passes -- --ignored --nocapture
 //! ```
 //!
+//! `HISTORY_V49=1` also times schema step V49 on the cloned history, run
+//! again whole after what it made is taken away: what the operator's move
+//! across it spends with the service down. `HISTORY_EXPLAIN=1` prints the
+//! plans of the whole-history statements.
+//!
 //! Needs `SEQUENTIAD_EXEC` and `ARCA_TEST_POSTGRES`.
 
 mod common;
@@ -198,6 +203,19 @@ async fn passes_with_a_history_behind_them() {
 				.iter().map(|r| r.get(0)).collect();
 			println!("PLAN {}:\n{}", pass.name(), plan.join("\n"));
 		}
+	}
+	// Schema step V49 itself on this history, when asked (`HISTORY_V49=1`):
+	// what it made taken away (its tables, and its indexes on the tables
+	// before it), then the step run again whole, as the move runs it with the
+	// service down. Its seed of the change log reads every live batch.
+	if env("HISTORY_V49", 0) == 1 {
+		c.batch_execute("DROP TABLE IF EXISTS watch_touch, tx_unblocked, watch_cursor, pass_open;
+			DROP INDEX IF EXISTS watcher_input_by_txid, tree_sighting_by_outpoint, script_sighting_by_outpoint,
+				batch_leaf_by_participation, participation_by_round, nursery_tx_not_final, round_by_created_mtp, batch_by_collect_mtp,
+				arca_script_by_leaf, batch_by_token, board_by_outpoint").await.unwrap();
+		let t = Instant::now();
+		c.batch_execute(&format!("BEGIN; {} COMMIT;", include_str!("../schema/V49__pass_reads.sql"))).await.unwrap();
+		println!("V49 ×{}: the schema step on {} final rounds took {:.0} ms", scale, finals, t.elapsed().as_secs_f64() * 1000.0);
 	}
 	// The logs of open items start again, as after the schema step: the
 	// restarted server's first passes fill them from the whole history.

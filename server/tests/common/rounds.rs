@@ -222,14 +222,15 @@ pub fn accept_policy(r: &Running) -> WalletPolicy {
 	with_test_delays(r, WalletPolicy::new(r.chain, xonly(&r.s), mtp(r)))
 }
 
-/// `policy` with the exit-delay bounds the test set for its operator, where
-/// it set them: a wallet reading them from `info` accepts the leaves they
-/// make.
+/// `policy` widened to the exit-delay bounds the test set for its
+/// operator, where it set them: a wallet reading them from `info` accepts the
+/// leaves they make, and still those made before under `policy`'s (a test
+/// that changes the bounds on a running operator holds both).
 pub fn with_test_delays(r: &Running, policy: WalletPolicy) -> WalletPolicy {
 	match r.config.exit_delay_units {
 		Some((min, max)) => WalletPolicy {
-			min_exit_delay: RelativeTime::from_units(min).unwrap(),
-			max_exit_delay: RelativeTime::from_units(max).unwrap(),
+			min_exit_delay: RelativeTime::from_units(min).unwrap().min(policy.min_exit_delay),
+			max_exit_delay: RelativeTime::from_units(max).unwrap().max(policy.max_exit_delay),
 			..policy
 		},
 		None => policy,
