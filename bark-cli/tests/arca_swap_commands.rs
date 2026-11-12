@@ -983,3 +983,111 @@ async fn a_taker_paying_from_many_coins_tops_up_the_margin() {
 	println!("AN OFFER THAT LEAVES ITS PART TO THE TAKER: {}", e);
 	assert!(e.contains("less than its own part"), "{}", e);
 }
+
+/// The operator's bond, posted from the test's coins: a wallet with an
+/// instant limit takes coins out of round only against one.
+async fn post_bond(r: &mut Running) {
+	use arca_covenant::bond::BondPolicy;
+	let w = common::running::keypair("mk3 bond W");
+	let s_key = common::running::keypair("operator");
+	let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
+	let notice = server::bond::min_notice_seconds(server::bond::LIFETIME, arca_covenant::RelativeTime::from_units(338).unwrap()).div_ceil(512) as u16;
+	let policy = BondPolicy::new(chain, s_key.x_only_public_key().0, w.x_only_public_key().0,
+		arca_covenant::RelativeTime::from_units(notice).unwrap()).unwrap();
+	let x = r.x;
+	let tx = r.pay_to(policy.script_pubkey(), x, 50_000_000);
+	r.produce().await;
+	r.bury().await;
+	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
+	r.config.bond = Some(server::bond::BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice,
+		outpoint: Some(format!("{}:{}", tx.txid(), vout)), notice: None, instant_budget_fraction: None, instant_limit_value: None });
+	r.restart_server().await;
+	r.synced().await;
+}
+
+/// What `w` holds of `asset` in every state but spent (and its coins given
+/// up: a coin forfeited for a new one is not counted twice).
+fn held_all(w: &Arca, asset: &str) -> u64 {
+	w.ok(&["coins"]).as_array().unwrap().iter()
+		.filter(|c| c["asset"] == asset && !matches!(c["state"].as_str(), Some("spent" | "forfeited" | "exited" | "lost")))
+		.map(value).sum()
+}
+
+/// A taker with an instant limit (the web wallet's default mode sets one)
+/// trades from a coin larger than the trade: the wallet first pays itself a
+/// coin of exactly what the trade gives, and that payment leaves margins of
+/// its own (web wallet #706: 480 atoms on the testnet). The swap's terms
+/// count them in what it pays, so what leaves the wallet is what it was
+/// shown; the change is then refreshed in a round, and nothing of those
+/// margins comes back there: they are the fee of a transaction, paid.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trade_that_shapes_its_coin_first_counts_what_shaping_costs() {
+	let mut r = Running::start().await;
+	post_bond(&mut r).await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("PA");
+	let b = Arca::new("PB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.x, 10_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	b.ok(&["board", &x, "3000000"]);
+	r.produce().await;
+	r.fund_server(r.x, 50_000_000).await;
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	// The maker sells Y for X: it needs Y first, from a swap the other way.
+	let pay_y = a.ok(&["address"]);
+	r.pay_to(script(&pay_y), r.y, 2_000_000);
+	r.produce().await;
+	a.ok(&["board", &y, "1000000", "--fee-asset", &x]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the maker's board of Y credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	library(&b, "instant_limit", json!({"value": "1000000000000"})).unwrap();
+	let x_before = held_all(&b, &x);
+	let offer = library(&a, "swap_offer", json!({"give_asset": y, "give": "300000", "want_asset": x, "want": "400000"})).unwrap();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	println!("SWAP READ, A COIN SHAPED FIRST: gives {} pays {}", read["gives"], read["pays"]);
+	let shown = num(&read["gives"]["value"]) + num(&read["pays"]["margins"]);
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap();
+	b.ok(&["sync"]);
+	let x_after = held_all(&b, &x);
+	println!("THE TAKER'S X: {} -> {}, fell by {}; shown {}", x_before, x_after, x_before - x_after, shown);
+	assert_eq!(x_before - x_after, shown, "what left the wallet is what the swap's terms showed");
+	// The change, out of round, refreshed in the next round: what it holds
+	// after is what it held less the refresh's fee; the shaping's margins
+	// do not come back.
+	let out: Vec<Value> = b.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["asset"] == x.as_str() && c["state"] == "live" && c["kind"] == "transfer").cloned().collect();
+	println!("THE CHANGE, OUT OF ROUND: {}", out[0]);
+	b.ok(&["participate", "--leaf", out[0]["leaf_id"].as_str().unwrap()]);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(!built.is_empty() && failed.is_empty());
+	r.produce().await;
+	r.bury().await;
+	for t in &built {
+		r.round_state(&t.tx.txid(), RoundState::Final).await;
+	}
+	b.ok(&["sync"]);
+	let x_refreshed = held_all(&b, &x);
+	println!("THE TAKER'S X AFTER THE CHANGE'S REFRESH: {} (was {})", x_refreshed, x_after);
+	assert!(x_refreshed <= x_after, "nothing comes back at the refresh");
+}
