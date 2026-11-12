@@ -329,6 +329,7 @@ impl Store {
 		store.add_column("signer_seen", "signature", "TEXT")?;
 		store.add_column("mailbox_retry", "head", "TEXT")?;
 		store.add_column("coin", "bound", "INTEGER")?;
+		store.add_column("forfeit", "searched", "TEXT")?;
 		store.follow_lost_participations()?;
 		Ok(store)
 	}
@@ -1094,6 +1095,25 @@ impl Store {
 			state, note FROM forfeit WHERE state = ?1 ORDER BY created_at").map_err(db)?;
 		let rows = st.query_map(params![state], Self::forfeit_row).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
 		Ok(rows)
+	}
+
+	/// How far the chain was searched for the forfeit's output and found
+	/// none: the height and hash of the block the search reached.
+	pub fn forfeit_searched(&self, leaf_id: &str, round: &str) -> Result<Option<(u64, String)>, Error> {
+		let v: Option<Option<String>> = self.conn.query_row("SELECT searched FROM forfeit WHERE leaf_id = ?1 AND round = ?2",
+			params![leaf_id, round], |r| r.get(0)).optional().map_err(db)?;
+		Ok(v.flatten().and_then(|s| {
+			let (h, hash) = s.split_once(' ')?;
+			Some((h.parse().ok()?, hash.to_string()))
+		}))
+	}
+
+	/// Keeps how far the chain was searched for the forfeit's output
+	/// ([`Self::forfeit_searched`]).
+	pub fn set_forfeit_searched(&self, leaf_id: &str, round: &str, height: u64, hash: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE forfeit SET searched = ?3 WHERE leaf_id = ?1 AND round = ?2",
+			params![leaf_id, round, format!("{} {}", height, hash)]).map_err(db)?;
+		Ok(())
 	}
 
 	pub fn set_forfeit_state(&self, leaf_id: &str, round: &str, state: &str, note: &str) -> Result<(), Error> {
