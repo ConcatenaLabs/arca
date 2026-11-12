@@ -898,3 +898,88 @@ async fn a_coin_forfeited_in_a_round_not_final_keeps_the_acceptance_standing() {
 	println!("THE MAKER'S COMPLETION AFTER IT: {:?}", done);
 	assert!(done.is_err(), "the maker cannot complete an acceptance whose coin is given up in a final round");
 }
+
+/// A taker paying from many coins against an offer priced for one (web
+/// wallet #693). The maker's margin, in the asset it gives, is sized for its
+/// coin and one of the taker's; a reassignment of seven inputs is larger,
+/// and the operator takes it only when one asset's margin pays it whole. The
+/// taker tops the margin up out of what the swap gives it, by what its coins
+/// beyond the first add, shown before anything is signed (`gets` is what it
+/// receives), and the swap completes. An offer whose margin does not pay
+/// even its own part is refused before anything is signed: a maker cannot
+/// leave its part to the taker.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taker_paying_from_many_coins_tops_up_the_margin() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("MA");
+	let b = Arca::new("MB");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	for (w, asset, v) in [(&a, r.x, 10_000_000), (&b, r.y, 10_000_000), (&b, r.x, 2_000_000)] {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, asset, v);
+	}
+	r.produce().await;
+	a.ok(&["board", &x, "1000000"]);
+	r.produce().await;
+	// X is the operator's fee asset here (a floor per kvB); Y is not. The
+	// maker gives X and leaves the margin in it; the taker pays Y from six
+	// coins of 100,000.
+	for _ in 0..7 {
+		b.ok(&["board", &y, "100000", "--fee-asset", &x]);
+		r.produce().await;
+	}
+	r.fund_server(r.x, 50_000_000).await;
+	r.fund_server(r.y, 50_000_000).await;
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit the boards", || {
+		a.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+			&& b.ok(&["boards"]).as_array().unwrap().iter().all(|v| v["server"]["state"] == "credited")
+	}).await;
+	a.ok(&["sync"]);
+	b.ok(&["sync"]);
+	// The honest offer, from one coin; the taker pays from six.
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "20000", "want_asset": y, "want": "550000"})).unwrap();
+	assert_eq!(offer["details"]["inputs"].as_array().unwrap().len(), 1);
+	let x_before = total(&b, "live", &x);
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	println!("SWAP READ, SIX COINS: coins {} gets {} tops up {} maker pays {}", read["coins_spent"], read["gets"], read["tops_up"], read["maker_pays"]);
+	assert_eq!(read["coins_spent"], 6, "{}", read);
+	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
+	let done = library(&a, "swap_complete", json!({"accept": acc["accept"]}));
+	println!("COMPLETION FROM SIX TAKER COINS: {:?}", done.as_ref().map(|d| d["swap"].clone()));
+	done.unwrap();
+	let top_up = num(&read["tops_up"]["margin"]);
+	assert!(top_up > 0 && top_up < 20_000, "{}", read);
+	assert_eq!(num(&read["gets"]["value"]), 20_000 - top_up, "the wallet is shown what it receives: {}", read);
+	b.ok(&["sync"]);
+	let s = library(&b, "swaps", json!({})).unwrap();
+	assert_eq!(s.as_array().unwrap().iter().find(|w| w["swap"] == offer["swap"]).unwrap()["state"], "done");
+	assert_eq!(total(&b, "live", &x), x_before + 20_000 - top_up, "the taker holds what it was shown");
+	// One coin of the taker's against the same kind of offer: no top-up.
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "20000", "want_asset": y, "want": "50000"})).unwrap();
+	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
+	println!("SWAP READ, ONE COIN: coins {} gets {} tops up {}", read["coins_spent"], read["gets"], read["tops_up"]);
+	assert_eq!(read["coins_spent"], 1, "{}", read);
+	assert_eq!(read["tops_up"]["margin"], "0", "{}", read);
+	assert_eq!(num(&read["gets"]["value"]), 20_000);
+	library(&a, "swap_cancel", json!({"swap": offer["swap"]})).unwrap();
+	// An offer whose margin is cut to one atom (its change made larger by
+	// the rest), which the taker pays from two coins, is refused before
+	// anything is signed.
+	let offer = library(&a, "swap_offer", json!({"give_asset": x, "give": "20000", "want_asset": y, "want": "120000"})).unwrap();
+	let mut d = offer["details"].clone();
+	let margin: u64 = num(&d["margin"]);
+	let change = d["outputs"].as_array().unwrap().iter().position(|o| o["asset"] == x.as_str()).expect("the maker's change");
+	d["outputs"][change]["value"] = json!((num(&d["outputs"][change]["value"]) + margin - 1).to_string());
+	d["margin"] = json!("1");
+	let cut = hex_text(offer["offer"].as_str().unwrap().split_once(':').unwrap().0, &d);
+	let e = library(&b, "swap_read", json!({"offer": cut})).unwrap_err();
+	println!("AN OFFER THAT LEAVES ITS PART TO THE TAKER: {}", e);
+	assert!(e.contains("less than its own part"), "{}", e);
+}
