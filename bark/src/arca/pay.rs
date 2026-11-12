@@ -856,7 +856,7 @@ impl Wallet {
 		// back no refresh: the coins it names may be in one now, on their
 		// way to paying it.
 		let r = match self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, reads, spend) {
-			Err(e @ Error::Refused(_)) => {
+			Err(e @ (Error::Refused(_) | Error::Short { .. })) => {
 				if self.free_refreshes(asset)? {
 					self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, reads, spend)
 				} else {
@@ -869,7 +869,7 @@ impl Wallet {
 		// say so, and say when coins it reads are held back only while they
 		// arrive (the wallet's instant limit), which is the cause then.
 		match r {
-			Err(Error::Refused(_)) if reads != Reads::ALL
+			Err(Error::Refused(_) | Error::Short { .. }) if reads != Reads::ALL
 				&& self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, Reads::ALL, spend).is_ok() =>
 			{
 				let unread = match (reads.exit, reads.landing_2) {
@@ -964,8 +964,10 @@ impl Wallet {
 		}
 		let kept: u64 = chosen.iter().map(|i| i.checkpoint_value).sum();
 		if kept >= paid + margin {
-			return Err(Error::Refused(format!("the change would be below the operator's smallest leaf in asset {} ({} atoms): \
-				pay a little less, or that much more", asset, min_leaf)));
+			// The most it pays now: what leaves change of the smallest leaf.
+			let most = kept.saturating_sub(margin).saturating_sub(min_leaf);
+			return Err(Error::Short { asset: asset.to_string(), most, live: None, message: format!("the change would be below the operator's \
+				smallest leaf in asset {} ({} atoms): pay a little less, or that much more", asset, min_leaf) });
 		}
 		// Coins the wallet holds as its own that pay this only after a round
 		// (at the depth limit, arriving, proceeds for a cross-chain leg, of
@@ -980,6 +982,12 @@ impl Wallet {
 		let need = paid + total_live.saturating_sub(kept) + margin;
 		let refused = self.short_of(asset, need.saturating_sub(total_live), format!("the wallet holds {} of asset {} in live coins, and paying {} \
 			takes {} with the margins its transactions leave for their fees", total_live, asset, paid, need))?;
+		// Nothing more on its way covers it: the most it pays now, what its
+		// live coins hold less the margins, goes with the refusal.
+		let refused = match refused {
+			Error::Refused(message) => Error::Short { asset: asset.to_string(), most: kept.saturating_sub(margin), live: Some(total_live), message },
+			other => other,
+		};
 		Err(self.after_close(refused, &chosen, others, other_inputs, pays_margin, &margins, total_live)?)
 	}
 
@@ -2816,7 +2824,7 @@ impl Wallet {
 		if back.is_empty() {
 			return e;
 		}
-		let why = match e { Error::Refused(m) => m, other => other.to_string() };
+		let why = match e { Error::Refused(m) | Error::Short { message: m, .. } => m, other => other.to_string() };
 		Error::Refused(format!("{}: the trade that made it can never complete, and the wallet's coin(s) {} given into it come home by \
 			their checkpoint's own exit", why, back.join(", ")))
 	}
