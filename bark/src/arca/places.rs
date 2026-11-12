@@ -83,16 +83,95 @@ use super::chain::Finality;
 use super::{Error, Wallet};
 
 /// What [`Wallet::final_within`] counts a round's wait in. The operator's
-/// round interval, block time and window for a held round's forfeits are
-/// read from its `info` (`fills.round_interval_seconds`,
-/// `fills.block_seconds`, `fills.forfeit_window_seconds`), and its anchor
-/// depth from `finality.anchor_depth`; these three values stand only for an
-/// operator that publishes none. A Bitcoin block is Bitcoin's target
+/// round interval, block time, window for a held round's forfeits and the
+/// time its passes over the rounds take are read from its `info`
+/// (`fills.round_interval_seconds`, `fills.block_seconds`,
+/// `fills.forfeit_window_seconds`, `fills.round_pass_seconds`), and its
+/// anchor depth from `finality.anchor_depth`; these three values stand only
+/// for an operator that publishes none (one that publishes no pass time is
+/// counted as in [`Wallet::final_within`]). A Bitcoin block is Bitcoin's target
 /// interval, ten minutes, for each anchor block still to bury a round.
 const ROUND_SECONDS: u64 = 60;
 const BLOCK_SECONDS: u64 = 60;
 const FORFEIT_WINDOW_SECONDS: u64 = 600;
 const BITCOIN_BLOCK_SECONDS: u64 = 600;
+
+/// [`Wallet::final_within`]'s count, for a round where `finality` says
+/// (`None` for a round not built yet) on an operator that publishes `info`
+/// and counts finality at anchor depth `depth`.
+pub(crate) fn wait_counts(info: &Value, depth: u64, finality: Option<&Finality>) -> Within {
+	let round_s = info["fills"]["round_interval_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(ROUND_SECONDS);
+	let block_s = info["fills"]["block_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(BLOCK_SECONDS);
+	let forfeits_s = info["fills"]["forfeit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(FORFEIT_WINDOW_SECONDS);
+	// The operator builds a round and releases its participations in its
+	// passes over the rounds, which run at its round interval and on each
+	// block. An operator that publishes how long its passes take
+	// (`fills.round_pass_seconds`) is counted one pass to build the round and
+	// two to release it (a pass under way and the next); one that does not, a
+	// round interval and a block to release it.
+	let pass_s = info["fills"]["round_pass_seconds"].as_u64().filter(|s| *s > 0);
+	let build = pass_s.unwrap_or(0);
+	let release = pass_s.map_or(round_s + block_s, |p| 2 * p);
+	let bury = |have: u64| depth.saturating_sub(have).saturating_mul(BITCOIN_BLOCK_SECONDS);
+	let held = info["batches"]["no_sweep"].as_bool() == Some(true);
+	let after_block = 2 * block_s + bury(0) + release;
+	let w = |most: u64, usual: u64, step: Wait| Within { most, usual, step };
+	match finality {
+		None if held => w(round_s + build + forfeits_s + after_block, 2 * round_s + build + after_block, Wait::Round),
+		None => w(round_s + build + after_block, round_s + build + after_block, Wait::Round),
+		Some(Finality::NotInChain { in_mempool: false }) => w(forfeits_s + after_block, round_s + after_block, Wait::Forfeits),
+		Some(Finality::NotInChain { in_mempool: true }) => w(after_block, after_block, Wait::Block),
+		Some(Finality::Unsettled { .. }) => w(block_s + bury(0) + release, block_s + bury(0) + release, Wait::Certificate),
+		Some(Finality::Settled { depth: d, .. }) => w(bury(*d).max(block_s) + release, bury(*d).max(block_s) + release, Wait::Anchor),
+		Some(Finality::Final { .. }) => w(release, release, Wait::Release),
+	}
+}
+
+#[cfg(test)]
+mod wait_tests {
+	use super::*;
+
+	fn info(extra: Value) -> Value {
+		let mut v = json!({"fills": {"round_interval_seconds": 60, "block_seconds": 60, "forfeit_window_seconds": 600},
+			"batches": {"no_sweep": true}});
+		if let (Some(o), Some(e)) = (v["fills"].as_object_mut(), extra.as_object()) {
+			for (k, x) in e {
+				o.insert(k.clone(), x.clone());
+			}
+		}
+		v
+	}
+
+	#[test]
+	fn the_testnets_wait_term_by_term() {
+		// Round 60, held for forfeits 600 (usual: one round more), block 60,
+		// certificate 60, depth 0, release a round and a block 120.
+		let w = wait_counts(&info(json!({})), 0, None);
+		assert_eq!((w.most, w.usual, w.step), (60 + 600 + 120 + 120, 60 + 60 + 120 + 120, Wait::Round));
+		let w = wait_counts(&info(json!({})), 0, Some(&Finality::NotInChain { in_mempool: false }));
+		assert_eq!((w.most, w.usual, w.step), (600 + 120 + 120, 60 + 120 + 120, Wait::Forfeits));
+		let w = wait_counts(&info(json!({})), 0, Some(&Finality::NotInChain { in_mempool: true }));
+		assert_eq!((w.most, w.step), (120 + 120, Wait::Block));
+		let w = wait_counts(&info(json!({})), 0, Some(&Finality::Unsettled { height: 1 }));
+		assert_eq!((w.most, w.step), (60 + 120, Wait::Certificate));
+		let w = wait_counts(&info(json!({})), 0, Some(&Finality::Final { height: 1, depth: 0 }));
+		assert_eq!((w.most, w.usual, w.step), (120, 120, Wait::Release));
+		// Depth 2: two Bitcoin blocks more until buried.
+		let w = wait_counts(&info(json!({})), 2, Some(&Finality::Settled { height: 1, depth: 1 }));
+		assert_eq!((w.most, w.step), (600 + 120, Wait::Anchor));
+	}
+
+	#[test]
+	fn a_published_pass_time_replaces_the_release_guess() {
+		let fast = info(json!({"round_pass_seconds": 3}));
+		let w = wait_counts(&fast, 0, Some(&Finality::Final { height: 1, depth: 0 }));
+		assert_eq!(w.most, 6, "two passes of 3 s");
+		let w = wait_counts(&fast, 0, None);
+		assert_eq!(w.usual, 60 + 3 + 60 + 120 + 6, "a pass to build, the forfeits, block and certificate, two passes to release");
+		let unheld = json!({"fills": {"round_interval_seconds": 30, "block_seconds": 60}});
+		assert_eq!(wait_counts(&unheld, 0, None).most, 30 + 120 + 30 + 60, "a sweeping operator holds no round for forfeits");
+	}
+}
 
 /// `settle_first`'s sorting of the coins it is asked for ([`Wallet::sorted`]).
 struct Sorted {
@@ -808,32 +887,12 @@ impl Wallet {
 	/// counts that window too. What it usually takes counts a round interval
 	/// for the forfeits in place of the window.
 	pub(crate) fn final_within(&self, info: &Value, round: Option<&str>) -> Result<Within, Error> {
-		let round_s = info["fills"]["round_interval_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(ROUND_SECONDS);
-		let block_s = info["fills"]["block_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(BLOCK_SECONDS);
-		let forfeits_s = info["fills"]["forfeit_window_seconds"].as_u64().filter(|s| *s > 0).unwrap_or(FORFEIT_WINDOW_SECONDS);
-		// The operator releases in its pass over the rounds, which runs at
-		// its round interval and on each block: a pass under way and one more.
-		let release = round_s + block_s;
-		let depth = self.chain.anchor_depth();
-		let bury = |have: u64| depth.saturating_sub(have).saturating_mul(BITCOIN_BLOCK_SECONDS);
 		let txid = round.and_then(|t| elements::Txid::from_str(t).ok());
-		let held = info["batches"]["no_sweep"].as_bool() == Some(true);
-		let after_block = 2 * block_s + bury(0) + release;
-		let w = |most: u64, usual: u64, step: Wait| Within { most, usual, step };
-		let Some(txid) = txid else {
-			return Ok(if held {
-				w(round_s + forfeits_s + after_block, 2 * round_s + after_block, Wait::Round)
-			} else {
-				w(round_s + after_block, round_s + after_block, Wait::Round)
-			});
+		let finality = match txid {
+			Some(t) => Some(self.chain.finality(&t)?),
+			None => None,
 		};
-		Ok(match self.chain.finality(&txid)? {
-			Finality::NotInChain { in_mempool: false } => w(forfeits_s + after_block, round_s + after_block, Wait::Forfeits),
-			Finality::NotInChain { in_mempool: true } => w(after_block, after_block, Wait::Block),
-			Finality::Unsettled { .. } => w(block_s + bury(0) + release, block_s + bury(0) + release, Wait::Certificate),
-			Finality::Settled { depth: d, .. } => w(bury(d).max(block_s) + release, bury(d).max(block_s) + release, Wait::Anchor),
-			Finality::Final { .. } => w(release, release, Wait::Release),
-		})
+		Ok(wait_counts(info, self.chain.anchor_depth(), finality.as_ref()))
 	}
 
 	/// `coin_places`: every coin the wallet holds in a place (with its kind:

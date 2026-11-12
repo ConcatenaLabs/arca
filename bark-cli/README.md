@@ -400,7 +400,10 @@ and a board whose registration never reached the server, are not recovered.
   round is held (always, on an operator whose batches have no sweep), a
   block for the round and one for its certificate, ten minutes for each
   Bitcoin block of the anchor depth it publishes still to bury the round,
-  and a round interval and a block for the operator's release; in
+  and the operator's release, made in its passes over the rounds (two
+  passes, and one more to build the round, when it publishes how long they
+  take as `fills.round_pass_seconds`; a round interval and a block when it
+  does not); in
   `usual_in_seconds` what it usually takes (a round interval in place of the
   forfeit window); and in `waiting_for` the step it waits for (`round`,
   `forfeits`, `block`, `certificate`, `anchor` or `release`). The wallet
