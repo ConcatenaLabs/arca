@@ -107,6 +107,10 @@ unroll_at_release = true
 # The watchtowers `info` lists for holders who name none of their own: base
 # URLs of `arca watchtower serve` instances, each https://.
 watchtowers = []
+# How many batches each whole pass reads in order beside those something
+# touched (64 unless set), so every batch is read again within a bounded
+# number of passes; 0 reads only the batches the change log names.
+# read_slice = 64
 # The most outputs one sweep takes.
 max_sweep_inputs = 50
 # How often the watcher's recovery work (claims, offboards, expiry, reclaims)

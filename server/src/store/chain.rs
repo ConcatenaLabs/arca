@@ -111,10 +111,24 @@ fn i64_of(v: u64) -> i64 {
 ///   block. This term reads every row `finals` selects; with an index on the
 ///   state it reads only indexes.
 ///
+/// - Not `whole`, that last term reads only the transactions a block's
+///   disconnection took out of the chain in the last day (`tx_unblocked`,
+///   which a trigger on `tx_block` fills), through the index of the finals,
+///   rather than every final transaction there is. A final transaction can
+///   lose its last block only by such a disconnection, and every pass after
+///   it, one a poll, finds it; each process reads every final transaction
+///   once, at its first pass, as before.
+///
 /// It assumes nothing about how the chain changed since the last pass: it is
 /// a function of the tables as one snapshot shows them, like the statement it
 /// replaced, which `tests/final_passes.rs` keeps as its oracle.
-pub(super) fn unfinal_with(finals: &str) -> String {
+pub(super) fn unfinal_with(finals: &str, whole: bool) -> String {
+	let in_no_block = if whole {
+		format!("SELECT f.txid FROM ({}) f WHERE NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = f.txid)", finals)
+	} else {
+		format!("SELECT u.txid FROM (SELECT DISTINCT txid FROM tx_unblocked) u
+		             WHERE u.txid IN ({}) AND NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = u.txid)", finals)
+	};
 	format!(
 		"tip AS (SELECT anchor_height AS a FROM block ORDER BY height DESC LIMIT 1),
 		 cert AS (SELECT max(height) AS h FROM block WHERE certified),
@@ -127,8 +141,8 @@ pub(super) fn unfinal_with(finals: &str) -> String {
 		 unfinal AS (SELECT loc.txid FROM loc, tip, cert
 		             WHERE ((NOT $1 OR loc.height <= cert.h) AND GREATEST(tip.a - loc.anchor_height, 0) >= $2) IS NOT TRUE
 		             UNION ALL
-		             SELECT f.txid FROM ({}) f WHERE NOT EXISTS (SELECT 1 FROM tx_block t WHERE t.txid = f.txid))",
-		finals,
+		             {})",
+		in_no_block,
 	)
 }
 

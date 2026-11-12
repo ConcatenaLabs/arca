@@ -420,6 +420,86 @@ impl Store {
 		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
 	}
 
+	/// The batches something touched since `from` (a transaction id, 0 for
+	/// all the log holds), `(round id, output)`, and the transaction id to
+	/// read from next: the oldest transaction still running, whose changes
+	/// may yet come in under ids already passed ([`Self::forget_touches`]).
+	pub async fn touched_batches(&self, from: u64) -> Result<(Vec<(i64, u32)>, u64), StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"WITH s AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS x)
+			 SELECT s.x, t.round_id, t.vout FROM s LEFT JOIN (
+			   SELECT DISTINCT round_id, vout FROM watch_touch WHERE xid >= $1::text::xid8) t ON true",
+			&[&from.to_string()],
+		).await?;
+		let next = rows.first().map(|r| r.get::<_, String>(0)).unwrap_or_default().parse::<u64>()
+			.map_err(|e| StoreError::Corrupt(format!("a transaction id: {}", e)))?;
+		let batches = rows.iter().filter_map(|r| Some((r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i32>>(2)? as u32))).collect();
+		Ok((batches, next))
+	}
+
+	/// Forgets the touches logged by transactions older than `below`, which
+	/// a pass has read and acted on.
+	pub async fn forget_touches(&self, below: u64) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute("DELETE FROM watch_touch WHERE xid < $1::text::xid8", &[&below.to_string()]).await?;
+		Ok(())
+	}
+
+	/// A value the watcher keeps across restarts ([`Self::set_watch_cursor`]).
+	pub async fn watch_cursor(&self, name: &str) -> Result<Option<i64>, StoreError> {
+		let conn = self.conn().await?;
+		Ok(conn.query_opt("SELECT value FROM watch_cursor WHERE name = $1", &[&name]).await?.map(|r| r.get(0)))
+	}
+
+	pub async fn set_watch_cursor(&self, name: &str, value: i64) -> Result<(), StoreError> {
+		let conn = self.conn().await?;
+		conn.execute("INSERT INTO watch_cursor (name, value) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",
+			&[&name, &value]).await?;
+		Ok(())
+	}
+
+	/// The batches of final rounds a date of which falls after `from` and at
+	/// or before `to` (median times): their service horizon, or, with
+	/// `owed_after`, that long after their round.
+	pub async fn batches_due(&self, from: i64, to: i64, owed_after: Option<u32>) -> Result<Vec<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let mut rows = conn.query(
+			"SELECT b.round_id, b.vout FROM batch b JOIN round r ON r.round_id = b.round_id
+			 WHERE r.state = 'final' AND b.collect_mtp > $1 AND b.collect_mtp <= $2", &[&from, &to]).await?;
+		if let Some(a) = owed_after {
+			let a = a as i64;
+			rows.extend(conn.query(
+				"SELECT b.round_id, b.vout FROM round r JOIN batch b ON b.round_id = r.round_id
+				 WHERE r.state = 'final' AND r.created_mtp > $1 AND r.created_mtp <= $2", &[&(from - a), &(to - a)]).await?);
+		}
+		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
+	}
+
+	/// Up to `limit` batches of rounds not lost after `(round_id, vout)`, in
+	/// order: the watcher's round of every batch, a few each pass.
+	pub async fn batches_after(&self, at: (i64, i32), limit: i64) -> Result<Vec<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT b.round_id, b.vout FROM batch b JOIN round r ON r.round_id = b.round_id
+			 WHERE (b.round_id, b.vout) > ($1, $2) AND r.state <> 'lost' ORDER BY b.round_id, b.vout LIMIT $3",
+			&[&at.0, &at.1, &limit]).await?;
+		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
+	}
+
+	/// The batches with a sweep of rounds broadcast or final whose token no
+	/// final sweep has taken: those an expiry may still act on.
+	pub async fn batches_with_a_sweep(&self, no_sweep: &[u8; 32]) -> Result<Vec<(i64, u32)>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT b.round_id, b.vout FROM batch b JOIN round r ON r.round_id = b.round_id
+			 WHERE b.token <> $1 AND r.state IN ('broadcast', 'final')
+			   AND NOT EXISTS (SELECT 1 FROM watcher_tx w JOIN nursery_tx n USING (txid)
+			                   WHERE w.kind = 'sweep' AND w.subject = b.token AND n.state = 'final')
+			 ORDER BY 1, 2", &[&&no_sweep[..]]).await?;
+		Ok(rows.iter().map(|r| (r.get::<_, i64>(0), r.get::<_, i32>(1) as u32)).collect())
+	}
+
 	/// The offboard outputs of the participations `ids` that may be unlocked
 	/// now: the participation released, at the attempt and in the round the
 	/// output is of, that round final, and no final transaction of the

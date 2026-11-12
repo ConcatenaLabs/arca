@@ -770,12 +770,18 @@ impl Store {
 	/// indexes only (`chain::unfinal_with`).
 	pub async fn rounds_final_not_final(&self, certification: bool, anchor_depth: u64) -> Result<Vec<RoundRow>, StoreError> {
 		let conn = self.conn().await?;
+		let whole = !self.whole_read("rounds");
+		// What a disconnection took out of a block a day ago was found then.
+		conn.execute("DELETE FROM tx_unblocked WHERE at < now() - interval '1 day'", &[]).await?;
 		let rows = conn.query(
 			&format!("WITH {} SELECT {} FROM round r JOIN connector_output c ON c.round_id = r.round_id
 				WHERE r.state = 'final' AND r.txid IN (SELECT txid FROM unfinal) ORDER BY r.round_id",
-				super::chain::unfinal_with("SELECT txid FROM round WHERE state = 'final'"), ROUND_COLUMNS),
+				super::chain::unfinal_with("SELECT txid FROM round WHERE state = 'final'", whole), ROUND_COLUMNS),
 			&[&certification, &i64::try_from(anchor_depth).unwrap_or(i64::MAX)],
 		).await?;
+		if whole {
+			self.whole_read_done("rounds");
+		}
 		rows.iter().map(round_row).collect()
 	}
 

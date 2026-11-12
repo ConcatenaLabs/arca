@@ -1134,6 +1134,24 @@ pub struct Rounds {
 	wake: tokio::sync::Notify,
 	/// Each participation released, for the watcher's unlock lane.
 	releases: Arc<crate::watcher::Releases>,
+	/// What the in-flight cap read in this [`Rounds::run_rounds`], kept for
+	/// its later rounds; `None` outside one ([`Rounds::in_flight_reads`]).
+	cap_reads: std::sync::Mutex<Option<CapReads>>,
+	/// How long the latest passes over the rounds and builds took
+	/// ([`Rounds::pass_seconds`]).
+	pass_times: std::sync::Mutex<std::collections::VecDeque<Duration>>,
+}
+
+/// How many of the latest passes and builds [`Rounds::pass_seconds`] keeps.
+const PASSES_KEPT: usize = 64;
+
+/// The in-flight cap's reads, kept for one [`Rounds::run_rounds`]: what is in
+/// flight by asset and the slots holding it, as read, and the assets a round
+/// was built in since, which are read again before the cap judges them.
+#[derive(Default)]
+struct CapReads {
+	read: Option<(BTreeMap<[u8; 32], u64>, Vec<crate::store::InFlightSlot>)>,
+	built: HashSet<AssetId>,
 }
 
 /// A batch a round builds: its asset, its leaves (each a participation's
@@ -1228,6 +1246,7 @@ pub const SLOW_STEP: Duration = Duration::from_secs(2);
 /// Times the parts of one step of the rounds, for its `slow` line
 /// ([`SLOW_STEP`]).
 pub struct Laps {
+	area: &'static str,
 	what: String,
 	start: std::time::Instant,
 	last: std::time::Instant,
@@ -1236,8 +1255,14 @@ pub struct Laps {
 
 impl Laps {
 	pub fn start(what: impl Into<String>) -> Laps {
+		Laps::start_in("rounds", what)
+	}
+
+	/// [`Laps::start`] for a step of another part of the server, whose lines
+	/// start with `area` (`watcher: slow pass: …`).
+	pub fn start_in(area: &'static str, what: impl Into<String>) -> Laps {
 		let now = std::time::Instant::now();
-		Laps { what: what.into(), start: now, last: now, parts: vec![] }
+		Laps { area, what: what.into(), start: now, last: now, parts: vec![] }
 	}
 
 	/// Ends the part `part`, which ran since the last part ended.
@@ -1257,9 +1282,9 @@ impl Laps {
 				.collect::<Vec<_>>().join(", ")
 		};
 		if took > SLOW_STEP {
-			log::info!("rounds: slow {}: {} ms ({})", self.what, took.as_millis(), parts());
+			log::info!("{}: slow {}: {} ms ({})", self.area, self.what, took.as_millis(), parts());
 		} else if log::log_enabled!(log::Level::Debug) {
-			log::debug!("rounds: took {}: {} ms ({})", self.what, took.as_millis(), parts());
+			log::debug!("{}: took {}: {} ms ({})", self.area, self.what, took.as_millis(), parts());
 		}
 		took
 	}
@@ -1294,7 +1319,8 @@ impl Rounds {
 	{
 		Arc::new(Rounds { store, finality, params, wallet, nursery, signer, config, running: Mutex::new(()), voiding: Mutex::new(()),
 			going_out: Mutex::new(()), fundable_seen: Mutex::new(None), in_flight_seen: Mutex::new(None), holders: Mutex::new(Default::default()),
-			active, wake: tokio::sync::Notify::new(), releases: crate::watcher::Releases::new() })
+			active, wake: tokio::sync::Notify::new(), releases: crate::watcher::Releases::new(), cap_reads: std::sync::Mutex::new(None),
+			pass_times: std::sync::Mutex::new(Default::default()) })
 	}
 
 	/// Where the participations released are told, for the watcher's unlock
@@ -1721,6 +1747,60 @@ impl Rounds {
 	/// refusing it) holds back no other's; its error is logged and returned
 	/// beside the rounds built.
 	pub async fn run_rounds(&self) -> Result<(Vec<Built>, Vec<(AssetId, RoundError)>), RoundError> {
+		*self.cap_reads.lock().unwrap_or_else(|e| e.into_inner()) = Some(CapReads::default());
+		let started = std::time::Instant::now();
+		let r = self.run_rounds_reading_once().await;
+		self.took(started.elapsed());
+		*self.cap_reads.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		r
+	}
+
+	fn took(&self, d: Duration) {
+		let mut t = self.pass_times.lock().unwrap_or_else(|e| e.into_inner());
+		t.push_back(d);
+		while t.len() > PASSES_KEPT {
+			t.pop_front();
+		}
+	}
+
+	/// The most seconds one pass over the rounds or one build of them takes,
+	/// as the operator measures its latest ones, and a chain poll: how long a
+	/// release that comes due may wait on a pass under way and the poll that
+	/// starts the next (`info.fills.round_pass_seconds`). At least 1.
+	pub fn pass_seconds(&self) -> u32 {
+		let longest = self.pass_times.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().max().unwrap_or_default();
+		(longest + self.finality.config().poll_interval).as_secs_f64().ceil().clamp(1.0, u32::MAX as f64) as u32
+	}
+
+	/// What is in flight by asset and the slots that hold it, for the cap
+	/// judging participations in `assets`: within one [`Self::run_rounds`],
+	/// read once, and again only once a round was built in one of `assets`
+	/// (a round in another asset leaves these assets' figures as they were).
+	async fn in_flight_reads(&self, assets: &HashSet<AssetId>) -> Result<(BTreeMap<[u8; 32], u64>, Vec<crate::store::InFlightSlot>), RoundError> {
+		{
+			let c = self.cap_reads.lock().unwrap_or_else(|e| e.into_inner());
+			if let Some(CapReads { read: Some(r), built }) = &*c {
+				if built.is_disjoint(assets) {
+					return Ok(r.clone());
+				}
+			}
+		}
+		let read = (self.store.in_flight().await?, self.store.in_flight_slots().await?);
+		if let Some(c) = &mut *self.cap_reads.lock().unwrap_or_else(|e| e.into_inner()) {
+			c.read = Some(read.clone());
+			c.built.retain(|a| !assets.contains(a));
+		}
+		Ok(read)
+	}
+
+	/// A round in `asset` was built: the cap reads its figures again.
+	fn cap_built(&self, asset: AssetId) {
+		if let Some(c) = &mut *self.cap_reads.lock().unwrap_or_else(|e| e.into_inner()) {
+			c.built.insert(asset);
+		}
+	}
+
+	async fn run_rounds_reading_once(&self) -> Result<(Vec<Built>, Vec<(AssetId, RoundError)>), RoundError> {
 		let mut built = vec![];
 		let mut failed = vec![];
 		let mut laps = Laps::start("run_rounds");
@@ -1738,7 +1818,10 @@ impl Rounds {
 				};
 				laps.lap(format!("{} {}", ["free", "shared", "solo"][kind], short));
 				match run {
-					Ok(Some(b)) => built.push(b),
+					Ok(Some(b)) => {
+						self.cap_built(asset);
+						built.push(b);
+					},
 					Ok(None) => {},
 					Err(e) => {
 						log::warn!("rounds: the round of asset {}: {}", asset, e);
@@ -1754,7 +1837,10 @@ impl Rounds {
 				let run = if solo { self.run_solo_fill_round_of(asset).await } else { self.run_fill_round_of(asset).await };
 				laps.lap(format!("{} {}", if solo { "solo fill" } else { "fill" }, &asset.to_string()[..8]));
 				match run {
-					Ok(Some(b)) => built.push(b),
+					Ok(Some(b)) => {
+						self.cap_built(asset);
+						built.push(b);
+					},
 					Ok(None) => {},
 					Err(e) => {
 						log::warn!("rounds: the fill round of asset {}: {}", asset, e);
@@ -2659,8 +2745,9 @@ impl Rounds {
 			return Ok((chosen, vec![]));
 		}
 		let mut laps = Laps::start(format!("in-flight cap over {} participation(s)", chosen.len()));
-		let flight: BTreeMap<AssetId, u64> = self.store.in_flight().await?.into_iter()
-			.map(|(a, v)| (AssetId::from_byte_array(a), v)).collect();
+		let judged: HashSet<AssetId> = chosen.iter().flat_map(|p| p.inputs.iter().map(|i| AssetId::from_byte_array(i.asset))).collect();
+		let (flight, slots) = self.in_flight_reads(&judged).await?;
+		let flight: BTreeMap<AssetId, u64> = flight.into_iter().map(|(a, v)| (AssetId::from_byte_array(a), v)).collect();
 		laps.lap("in flight");
 		// The lowest nodes the coins `chosen` gives up rest on: the only
 		// ones whose standing can change what the cap makes of them. The
@@ -2684,7 +2771,7 @@ impl Rounds {
 		let mut open: HashSet<[u8; 32]> = HashSet::new();
 		let mut batches: BTreeSet<(i64, u32)> = BTreeSet::new();
 		let mut in_flight: BTreeMap<[u8; 32], (AssetId, u64, Vec<Option<[u8; 32]>>)> = BTreeMap::new();
-		for s in self.store.in_flight_slots().await? {
+		for s in slots {
 			let low = lowest_of(&s.record);
 			if let Some(h) = low.filter(|h| relevant.contains(h)) {
 				open.insert(h);
@@ -3506,7 +3593,7 @@ impl Rounds {
 		laps.lap("expire");
 		self.void_overdue().await?;
 		laps.lap("void overdue");
-		laps.done();
+		self.took(laps.done());
 		Ok(())
 	}
 

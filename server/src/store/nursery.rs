@@ -121,12 +121,16 @@ impl Store {
 	/// (`chain::unfinal_with`).
 	pub async fn nursery_final_not_final(&self, certification: bool, anchor_depth: u64) -> Result<Vec<NurseryRow>, StoreError> {
 		let conn = self.conn().await?;
+		let whole = !self.whole_read("nursery");
 		let rows = conn.query(
 			&format!("WITH {} SELECT {} FROM nursery_tx WHERE state = 'final' AND txid IN (SELECT txid FROM unfinal)
 				ORDER BY created_at, txid",
-				super::chain::unfinal_with("SELECT txid FROM nursery_tx WHERE state = 'final'"), NURSERY_COLUMNS),
+				super::chain::unfinal_with("SELECT txid FROM nursery_tx WHERE state = 'final'", whole), NURSERY_COLUMNS),
 			&[&certification, &i64::try_from(anchor_depth).unwrap_or(i64::MAX)],
 		).await?;
+		if whole {
+			self.whole_read_done("nursery");
+		}
 		rows.iter().map(nursery_row).collect()
 	}
 

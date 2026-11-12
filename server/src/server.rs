@@ -592,6 +592,16 @@ pub struct WatcherSection {
 	/// base URLs, each `https://`.
 	#[serde(default)]
 	pub watchtowers: Vec<String>,
+	/// How many batches each whole pass reads in order beside those something
+	/// touched, so every batch is read again within a bounded number of
+	/// passes ([`crate::watcher::SLICE`] unless set; 0 reads only what was
+	/// touched or came due).
+	#[serde(default = "default_read_slice")]
+	pub read_slice: i64,
+}
+
+fn default_read_slice() -> i64 {
+	crate::watcher::SLICE
 }
 
 impl Default for WatcherSection {
@@ -600,7 +610,7 @@ impl Default for WatcherSection {
 			enabled: true, reclaim_early: default_true(), max_sweep_inputs: default_sweep_inputs(),
 			recovery_interval_seconds: default_recovery_interval(), max_claim_inputs: default_claim_inputs(),
 			block_share_vbytes: default_block_share(), block_interval_seconds: default_block_interval(), unroll_at_release: true,
-			watchtowers: vec![],
+			watchtowers: vec![], read_slice: default_read_slice(),
 		}
 	}
 }
@@ -1963,6 +1973,7 @@ impl Server {
 				block_share_vbytes: config.watcher.block_share_vbytes.max(1),
 				block_interval: Duration::from_secs(config.watcher.block_interval_seconds.max(1)),
 				unroll_at_release: config.watcher.unroll_at_release,
+				read_slice: config.watcher.read_slice.max(0),
 				collect_owed_after,
 			});
 

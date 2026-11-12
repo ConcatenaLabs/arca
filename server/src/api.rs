@@ -320,6 +320,13 @@ pub struct FillsInfo {
 	/// forfeit window, so it hands its forfeits over in time.
 	#[serde(default)]
 	pub round_interval_seconds: u64,
+	/// The most seconds one pass over the rounds (following the chain,
+	/// releasing what is due) or one build of rounds takes, as the operator
+	/// measures its latest ones, and a chain poll: a release that comes due
+	/// may wait on one under way and on the poll that starts the next. 0 from
+	/// a server that predates it.
+	#[serde(default)]
+	pub round_pass_seconds: u32,
 	/// Whether the server takes a take that shares its order
 	/// (`take_order`'s `share`): several such takes of one order stand
 	/// together, and one round fills their sum and pays each its own leaf.

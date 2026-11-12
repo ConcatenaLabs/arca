@@ -132,7 +132,7 @@
 //! that is final again is restored, and its forfeits are the operator's to
 //! publish and claim again.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -202,6 +202,9 @@ pub struct WatcherConfig {
 	/// horizon (`[batches] collect_owed_after_seconds`; never when `None`):
 	/// see [`Watcher::collect_batch`].
 	pub collect_owed_after: Option<u32>,
+	/// How many batches each whole pass reads in order beside those touched
+	/// ([`SLICE`] by default).
+	pub read_slice: i64,
 }
 
 impl Default for WatcherConfig {
@@ -209,7 +212,7 @@ impl Default for WatcherConfig {
 		WatcherConfig {
 			reclaim_early: true, max_sweep_inputs: 50, recovery_interval: Duration::from_secs(30),
 			max_claim_inputs: 200, block_share_vbytes: 45_000, block_interval: Duration::from_secs(60), unroll_at_release: true,
-			collect_owed_after: None,
+			collect_owed_after: None, read_slice: SLICE,
 		}
 	}
 }
@@ -325,6 +328,8 @@ pub struct FeeStatus {
 	/// finishes its first, is an alert for the operator
 	/// ([`FeeStatus::metrics`]).
 	pub last_pass_at: u64,
+	/// How long the watcher's last whole pass took, in milliseconds.
+	pub last_pass_ms: u64,
 }
 
 impl FeeStatus {
@@ -349,6 +354,8 @@ impl FeeStatus {
 			its first ended: the stale exits it answers, \
 			early checkpoints with their owners' exit among them, wait on it; alert well within the shortest exit delay.\n");
 		out.push_str("# TYPE arca_watcher_last_pass_age_seconds gauge\n");
+		out.push_str(&format!("# HELP arca_watcher_last_pass_seconds How long the watcher's last whole pass took.\n\
+			# TYPE arca_watcher_last_pass_seconds gauge\narca_watcher_last_pass_seconds {:.3}\n", self.last_pass_ms as f64 / 1000.0));
 		if self.last_pass_at > 0 {
 			let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
 			out.push_str(&format!("arca_watcher_last_pass_age_seconds {}\n", now.saturating_sub(self.last_pass_at)));
@@ -433,7 +440,28 @@ pub struct Watcher {
 	/// output)`, each with the height of the tip it was refused at: the lane
 	/// tries it again on a new block, not at every chain poll.
 	refused: std::sync::Mutex<HashMap<(i64, u32), u64>>,
+	/// Every transaction the watcher has tried to publish: a batch whose step
+	/// tried one is read again on the next pass.
+	acted: std::sync::atomic::AtomicU64,
+	/// Where the whole pass's reads of the batches stand ([`Watcher::batches_to_read`]).
+	reads: Mutex<PassReads>,
+	/// The batches the last whole pass read ([`Watcher::last_read`]).
+	last_read: std::sync::Mutex<Vec<(i64, u32)>>,
 }
+
+/// Where the whole pass's reads of the batches stand: the log of what touched
+/// them read from `from_xid` on, and the batches a step acted on, or failed
+/// on, in the last pass, read again in this one.
+#[derive(Default)]
+struct PassReads {
+	from_xid: u64,
+	active: BTreeSet<(i64, u32)>,
+}
+
+/// How many batches each whole pass reads beside those touched, in order,
+/// round after round: every batch is read again within a bounded number of
+/// passes whatever touched it, a check under the log of touches.
+pub const SLICE: i64 = 64;
 
 impl Watcher {
 	#[allow(clippy::too_many_arguments)]
@@ -452,6 +480,9 @@ impl Watcher {
 			unlocking: std::sync::Mutex::new(HashMap::new()),
 			unlock_times: std::sync::Mutex::new(std::collections::VecDeque::new()),
 			refused: std::sync::Mutex::new(HashMap::new()),
+			acted: std::sync::atomic::AtomicU64::new(0),
+			reads: Mutex::new(PassReads::default()),
+			last_read: std::sync::Mutex::new(vec![]),
 		})
 	}
 
@@ -464,6 +495,11 @@ impl Watcher {
 		let kept = self.finality.config().poll_interval + LANE_SLACK;
 		let measured = self.unlock_times.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().max().unwrap_or_default();
 		(kept.max(measured) + self.config.block_interval).as_secs_f64().ceil().min(u32::MAX as f64) as u32
+	}
+
+	/// The batches, `(round id, output)`, the last whole pass read.
+	pub fn last_read(&self) -> Vec<(i64, u32)> {
+		self.last_read.lock().unwrap_or_else(|e| e.into_inner()).clone()
 	}
 
 	/// The fee pool and what waits on it, after the last pass.
@@ -483,26 +519,53 @@ impl Watcher {
 	/// exit delay), then the claims (the refund delay), then new forfeits
 	/// and the rest, which have none.
 	pub async fn pass(&self) -> Result<(), WatcherError> {
+		let mut laps = crate::rounds::Laps::start_in("watcher", "pass");
 		self.answer_stale_channel_states().await?;
+		laps.lap("channels");
 		let _one = self.running.lock().await;
+		laps.lap("wait");
 		let now = self.now().await?;
 		self.answer_stale_exits().await?;
+		laps.lap("stale exits");
 		self.claim_paid_htlcs().await?;
 		self.refund_unclaimed_receives(now).await?;
+		laps.lap("htlcs");
 		self.claim_forfeits().await?;
+		laps.lap("claims");
 		self.recover_boards(now).await?;
+		laps.lap("boards");
 		self.recover_board_transfers(now).await?;
+		laps.lap("board transfers");
 		self.answer_stale_exits().await?;
+		laps.lap("stale exits again");
 		self.offboards().await?;
+		laps.lap("offboards");
 		self.land_orders(now).await?;
+		laps.lap("orders");
 		self.lapses(now).await?;
-		self.expiries(now).await?;
-		self.reclaims(now).await?;
-		self.collections(now).await?;
+		laps.lap("lapses");
+		let mut reads = self.reads.lock().await;
+		let (set, next) = self.batches_to_read(&reads, now).await?;
+		let batches = self.batch_rows(&set).await?;
+		*self.last_read.lock().unwrap_or_else(|e| e.into_inner()) = set.iter().copied().collect();
+		laps.lap(format!("{} batch(es) to read", batches.len()));
+		let mut active = self.expiries(now, &batches).await?;
+		laps.lap("expiries");
+		active.extend(self.reclaims(now, &batches).await?);
+		laps.lap("reclaims");
+		active.extend(self.collections(now, &batches).await?);
+		laps.lap("collections");
+		self.store.forget_touches(next).await?;
+		self.store.set_watch_cursor("due_mtp", now.to_consensus_u32() as i64).await?;
+		*reads = PassReads { from_xid: next, active };
+		drop(reads);
 		self.returns().await?;
 		self.owed().await?;
+		laps.lap("returns and owed");
 		self.status.lock().unwrap_or_else(|e| e.into_inner()).last_pass_at =
 			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+		let took = laps.done();
+		self.status.lock().unwrap_or_else(|e| e.into_inner()).last_pass_ms = took.as_millis() as u64;
 		Ok(())
 	}
 
@@ -775,6 +838,7 @@ impl Watcher {
 	async fn publish_naming(&self, mut r: Ready, kind: &'static str, subject: Vec<u8>, detail: String, round: Option<i64>)
 		-> Result<Option<Txid>, WatcherError>
 	{
+		self.acted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 		let txid = r.tx.txid();
 		for (i, c) in &r.wallet {
 			self.wallet.sign_input(&mut r.tx, *i, c)?;
@@ -1850,8 +1914,8 @@ impl Watcher {
 		}
 		{
 			let mut st = self.status.lock().unwrap_or_else(|e| e.into_inner());
-			let last_pass_at = st.last_pass_at;
-			*st = FeeStatus { pools, held_for_space: held_back, held_for_fees, last_pass_at };
+			let (last_pass_at, last_pass_ms) = (st.last_pass_at, st.last_pass_ms);
+			*st = FeeStatus { pools, held_for_space: held_back, held_for_fees, last_pass_at, last_pass_ms };
 		}
 		Ok(())
 	}
@@ -2451,21 +2515,85 @@ impl Watcher {
 	}
 
 	// -----------------------------------------------------------------------
+	// The batches a pass reads
+	// -----------------------------------------------------------------------
+
+	/// The batches this pass reads, and the transaction id to read the log of
+	/// touches from next: every batch something touched since the last pass
+	/// ([`Store::touched_batches`]), every batch a step acted on or failed on
+	/// in the last pass, every batch a date of which came due since (its
+	/// service horizon, or `collect_owed_after` after its round), and the
+	/// next [`SLICE`] batches in order. A batch nothing touched and no date
+	/// calls for is not read again: its steps would do as they did.
+	async fn batches_to_read(&self, reads: &PassReads, now: MedianTime) -> Result<(BTreeSet<(i64, u32)>, u64), WatcherError> {
+		let (touched, next) = self.store.touched_batches(reads.from_xid).await?;
+		let mut set: BTreeSet<(i64, u32)> = touched.into_iter().collect();
+		set.extend(reads.active.iter().copied());
+		let now = now.to_consensus_u32() as i64;
+		let due_from = self.store.watch_cursor("due_mtp").await?.unwrap_or(now);
+		set.extend(self.store.batches_due(due_from, now, self.config.collect_owed_after).await?);
+		let at = (self.store.watch_cursor("slice_round").await?.unwrap_or(0), self.store.watch_cursor("slice_vout").await?.unwrap_or(-1));
+		let slice = self.store.batches_after((at.0, at.1 as i32), self.config.read_slice).await?;
+		let last = slice.last().map_or((0, -1), |(r, v)| (*r, *v as i64));
+		self.store.set_watch_cursor("slice_round", last.0).await?;
+		self.store.set_watch_cursor("slice_vout", last.1).await?;
+		set.extend(slice);
+		Ok((set, next))
+	}
+
+	/// Each batch of `set` with its round, the round not lost, in order.
+	async fn batch_rows(&self, set: &BTreeSet<(i64, u32)>) -> Result<Vec<(RoundRow, crate::store::BatchRow)>, WatcherError> {
+		let mut out = vec![];
+		let mut last: Option<(i64, Option<RoundRow>, Vec<crate::store::BatchRow>)> = None;
+		for &(round_id, vout) in set {
+			if last.as_ref().map(|l| l.0) != Some(round_id) {
+				let round = self.store.round(round_id).await?.filter(|r| r.state != RoundState::Lost);
+				let batches = if round.is_some() { self.store.batches(round_id).await? } else { vec![] };
+				last = Some((round_id, round, batches));
+			}
+			let Some((_, Some(round), batches)) = &last else { continue };
+			if let Some(b) = batches.iter().find(|b| b.vout == vout) {
+				out.push((round.clone(), b.clone()));
+			}
+		}
+		Ok(out)
+	}
+
+	/// Runs `step` for one batch: whether it tried to publish anything, or
+	/// failed, so the next pass reads the batch again.
+	async fn acted<F>(&self, what: String, step: F) -> Result<bool, WatcherError>
+	where
+		F: std::future::Future<Output = Result<(), WatcherError>>,
+	{
+		let before = self.acted.load(std::sync::atomic::Ordering::SeqCst);
+		let r = step.await;
+		let failed = r.is_err();
+		Self::item(&what, r)?;
+		Ok(failed || self.acted.load(std::sync::atomic::Ordering::SeqCst) != before)
+	}
+
+	// -----------------------------------------------------------------------
 	// 6. Expiry
 	// -----------------------------------------------------------------------
 
 	/// Releases each batch's token at its expiry and sweeps the batch after
 	/// the notice.
-	async fn expiries(&self, now: MedianTime) -> Result<(), WatcherError> {
-		let mut rounds = self.store.rounds_in(RoundState::Final).await?;
-		rounds.extend(self.store.rounds_in(RoundState::Broadcast).await?);
-		for round in rounds {
-			for b in self.store.batches(round.round_id).await? {
-				let r = self.expire(&round, &b, now).await;
-				Self::item(&format!("the expiry of the batch at output {} of round {}", b.vout, round.round_id), r)?;
+	async fn expiries(&self, now: MedianTime, batches: &[(RoundRow, crate::store::BatchRow)]) -> Result<BTreeSet<(i64, u32)>, WatcherError> {
+		let mut active = BTreeSet::new();
+		// A batch without a sweep never expires; every batch with a sweep its
+		// last sweep has not taken is read each pass, as its clock runs.
+		let no_sweep = arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
+		let mut todo: Vec<(RoundRow, crate::store::BatchRow)> = batches.iter().filter(|(_, b)| b.token != no_sweep).cloned().collect();
+		let have: BTreeSet<(i64, u32)> = todo.iter().map(|(r, b)| (r.round_id, b.vout)).collect();
+		let swept: BTreeSet<(i64, u32)> = self.store.batches_with_a_sweep(&no_sweep).await?.into_iter().filter(|k| !have.contains(k)).collect();
+		todo.extend(self.batch_rows(&swept).await?);
+		for (round, b) in todo.iter().filter(|(r, _)| matches!(r.state, RoundState::Final | RoundState::Broadcast)) {
+			let what = format!("the expiry of the batch at output {} of round {}", b.vout, round.round_id);
+			if self.acted(what, self.expire(round, b, now)).await? {
+				active.insert((round.round_id, b.vout));
 			}
 		}
-		Ok(())
+		Ok(active)
 	}
 
 	/// Where the batch's token is: the outpoint, and the script holding it,
@@ -2738,24 +2866,15 @@ impl Watcher {
 	/// Reclaims every lowest node on the chain whose owners have all
 	/// released it, and with `reclaim_early` unrolls toward them through
 	/// nodes all of whose owners have.
-	async fn reclaims(&self, now: MedianTime) -> Result<(), WatcherError> {
-		let mut batches = self.store.batches_with_releases().await?;
-		for b in self.store.batches_with_delegations().await?.into_iter().chain(self.store.batches_with_slot_releases().await?) {
-			if !batches.contains(&b) {
-				batches.push(b);
+	async fn reclaims(&self, now: MedianTime, batches: &[(RoundRow, crate::store::BatchRow)]) -> Result<BTreeSet<(i64, u32)>, WatcherError> {
+		let mut active = BTreeSet::new();
+		for (round, b) in batches.iter().filter(|(r, _)| r.state == RoundState::Final) {
+			let what = format!("the reclaim of the batch at output {} of round {}", b.vout, round.round_id);
+			if self.acted(what, self.reclaim_batch(round, b, now)).await? {
+				active.insert((round.round_id, b.vout));
 			}
 		}
-		for (round_id, vout) in batches {
-			let round = match self.store.round(round_id).await? {
-				Some(r) if r.state == RoundState::Final => r,
-				_ => continue,
-			};
-			for b in self.store.batches(round_id).await?.into_iter().filter(|b| b.vout == vout) {
-				let r = self.reclaim_batch(&round, &b, now).await;
-				Self::item(&format!("the reclaim of the batch at output {} of round {}", b.vout, round.round_id), r)?;
-			}
-		}
-		Ok(())
+		Ok(active)
 	}
 
 	async fn reclaim_batch(&self, round: &RoundRow, b: &crate::store::BatchRow, now: MedianTime) -> Result<(), WatcherError> {
@@ -2961,10 +3080,11 @@ impl Watcher {
 	/// [`WatcherConfig::collect_owed_after`], the paths to the coins the
 	/// operator is owed of each tree batch without a sweep older than that
 	/// and not past its horizon yet: see [`Self::collect_batch`].
-	async fn collections(&self, now: MedianTime) -> Result<(), WatcherError> {
+	async fn collections(&self, now: MedianTime, batches: &[(RoundRow, crate::store::BatchRow)]) -> Result<BTreeSet<(i64, u32)>, WatcherError> {
 		let no_sweep = arca_covenant::clock::no_sweep_token().into_inner().to_byte_array();
-		for round in self.store.rounds_in(RoundState::Final).await? {
-			for b in self.store.batches(round.round_id).await? {
+		let mut active = BTreeSet::new();
+		for (round, b) in batches.iter().filter(|(r, _)| r.state == RoundState::Final) {
+			{
 				let Some(at) = b.collect_mtp else { continue };
 				let owed_only = if now.to_consensus_u32() >= at {
 					// A batch with a sweep is only ever collected early.
@@ -2976,11 +3096,13 @@ impl Watcher {
 				} else {
 					continue;
 				};
-				let r = self.collect_batch(&round, &b, owed_only, now).await;
-				Self::item(&format!("the collection of the batch at output {} of round {}", b.vout, round.round_id), r)?;
+				let what = format!("the collection of the batch at output {} of round {}", b.vout, round.round_id);
+				if self.acted(what, self.collect_batch(round, b, owed_only, now)).await? {
+					active.insert((round.round_id, b.vout));
+				}
 			}
 		}
-		Ok(())
+		Ok(active)
 	}
 
 	/// Collects the batch `b` without a sweep, past its service horizon, one
