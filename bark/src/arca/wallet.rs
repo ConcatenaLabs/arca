@@ -549,18 +549,112 @@ pub(crate) fn amount(v: &Value, what: &str) -> Result<u64, Error> {
 	parse(what, v.as_str().ok_or_else(|| Error::Parse(format!("{} is missing", what)))?)
 }
 
-/// How many times the node's relay floor every reserve on a new leaf's path
-/// holds, when the node accepts the leaf's asset for fees: the
-/// specification's cover for a fourfold rise in the floor.
+/// How many times its relay floor the operator builds every reserve on a
+/// new leaf's path to hold, when its node accepts the leaf's asset for fees:
+/// the specification's cover for a fourfold rise in the floor. A round's
+/// published fee-rate rule carries at least this multiple
+/// ([`check_reserve_rule`]).
 pub const RESERVE_MULTIPLE: u64 = 4;
 
-/// The least reserve the wallet accepts on a new leaf's path, given the
-/// node's relay floor in the leaf's asset (`None` when the node does not
-/// accept the asset for fees).
+/// How many times its own node's relay floor now every reserve on a new
+/// leaf's path must still hold for the wallet to take the leaf: three. The
+/// operator built the reserves at [`RESERVE_MULTIPLE`] times its floor,
+/// earlier and often at another node, and publishes that floor with the
+/// batch; the floor is a reading of a moving input, so the wallet takes the
+/// batch while its own floor now is at most a third above the published one
+/// (on the testnet it rose 0.7 % in the minutes a round was held), and so
+/// keeps at least three times its floor now of the fourfold cover. Beyond
+/// that the round cannot satisfy it, and it declines it.
+pub const RESERVE_KEPT: u64 = 3;
+
+/// How many times its own node's relay floor now the wallet asks each
+/// reserve on a new leaf's path to pay, node by node: once, so that every
+/// spend on the path pays its own way out at the floor it reads now, under a
+/// fixed rule as under a fee-rate one. A fee-rate rule is bound beyond that
+/// by [`check_reserve_rule`].
+pub const RESERVE_COVER: u64 = 1;
+
+/// The least reserve the wallet accepts on each node and entry of a new
+/// leaf's path, given the node's relay floor in the leaf's asset now (`None`
+/// when the node does not accept the asset for fees): [`RESERVE_COVER`]
+/// times that floor for each spend, or one atom.
 pub fn reserve_floor(floor_per_kvb: Option<u64>) -> arca_covenant::ReserveFloor {
 	match floor_per_kvb {
-		Some(f) => arca_covenant::ReserveFloor::FeeRate { floor_per_kvb: f, multiple: RESERVE_MULTIPLE },
+		Some(f) => arca_covenant::ReserveFloor::FeeRate { floor_per_kvb: f, multiple: RESERVE_COVER },
 		None => arca_covenant::ReserveFloor::Atoms(1),
+	}
+}
+
+/// Refuses a batch whose published fee-rate rule keeps less than the wallet
+/// accepts: a multiple below [`RESERVE_MULTIPLE`], which every operator
+/// builds at, or, where the wallet's node accepts the asset (`floor_per_kvb`
+/// is its floor now), a published floor so far below it that the reserves
+/// hold less than [`RESERVE_KEPT`] times the wallet's floor
+/// (`published floor × multiple < RESERVE_KEPT × floor now`). The batch is
+/// rebuilt from the published rule, so its reserves are what the rule gives
+/// and hold at least that. A fixed rule (the operator's node did not accept
+/// the asset) is judged node by node ([`reserve_floor`]).
+pub fn check_reserve_rule(rule: arca_covenant::ReserveRule, floor_per_kvb: Option<u64>) -> Result<(), String> {
+	let arca_covenant::ReserveRule::FeeRate { floor_per_kvb: built, multiple } = rule else { return Ok(()) };
+	if multiple < RESERVE_MULTIPLE {
+		return Err(format!("the batch's reserves are built at {} times a floor of {} per 1,000 vB; every operator builds them at {} times its \
+			floor", multiple, built, RESERVE_MULTIPLE));
+	}
+	if let Some(now) = floor_per_kvb {
+		if (built as u128) * (multiple as u128) < (now as u128) * (RESERVE_KEPT as u128) {
+			return Err(format!("the batch's reserves are built at {} times a floor of {} per 1,000 vB, which keeps less than {} times the \
+				wallet's node's floor of {} per 1,000 vB now: the wallet takes a batch whose floor its own is at most a third above",
+				multiple, built, RESERVE_KEPT, now));
+		}
+	}
+	Ok(())
+}
+
+/// The least reserve the wallet accepts on the path of a new leaf of a batch
+/// built by `rule`, given its node's floor in the leaf's asset now (`None`
+/// when the node does not accept the asset for fees): [`reserve_floor`],
+/// once the rule passes [`check_reserve_rule`]. One atom, whatever the rule,
+/// when `forfeited`: the wallet itself holds a forfeit it signed, for this
+/// participation's round, of every coin the participation gives up, so that
+/// taking the leaf gives up nothing it has not given up already (and it
+/// signs no forfeit but those again); refusing the leaf could only lose it.
+pub fn round_leaf_floor(rule: arca_covenant::ReserveRule, floor_per_kvb: Option<u64>, forfeited: bool)
+	-> Result<arca_covenant::ReserveFloor, String>
+{
+	if forfeited {
+		return Ok(arca_covenant::ReserveFloor::Atoms(1));
+	}
+	check_reserve_rule(rule, floor_per_kvb)?;
+	Ok(reserve_floor(floor_per_kvb))
+}
+
+/// Whether `refusal`, the wallet's refusal of a new leaf a round gives it,
+/// is of the leaf's reserves: one on a node, the entry or an accumulator
+/// slot's exit below [`reserve_floor`], or a published rule below
+/// [`check_reserve_rule`]. The reserves are the round's and stay as built,
+/// and once each pays its spend at the wallet's floor now a refusal means the
+/// floor rose more than the published multiple since the build: the round
+/// cannot cure it, and the wallet declines it at once
+/// ([`super::Wallet::refused_round`]). A refusal of anything else the
+/// operator serves (a published tree, a status) is asked again at the next
+/// sync: an honest answer completes the round.
+pub fn is_reserve_refusal(refusal: &str) -> bool {
+	["holds a reserve of", "the reserve of the slot's exit is", "the batch's reserves are built at"].iter().any(|m| refusal.contains(m))
+}
+
+/// What a refusal of a reserve on a new leaf's path says beside the level and
+/// the amounts: the floor and multiple the batch was built at, and the
+/// wallet's floor now.
+pub(crate) fn reserve_context(rule: arca_covenant::ReserveRule, floor_per_kvb: Option<u64>) -> String {
+	let built = match rule {
+		arca_covenant::ReserveRule::FeeRate { floor_per_kvb, multiple } =>
+			format!("the batch was built at {} times a floor of {} per 1,000 vB", multiple, floor_per_kvb),
+		arca_covenant::ReserveRule::Fixed { node, entry } => format!("the batch was built with fixed reserves ({} a node, {} an entry)", node, entry),
+	};
+	match floor_per_kvb {
+		Some(f) => format!("{}; the wallet's node asks {} per 1,000 vB of this asset now, and the reserves no longer pay the leaf's way out \
+			at it", built, f),
+		None => built,
 	}
 }
 
@@ -1071,14 +1165,29 @@ impl Wallet {
 
 	/// The policy for accepting a leaf of `asset` from a round, at `now`,
 	/// and whether every exit of it will need a fee coin: its reserves must
-	/// cover [`RESERVE_MULTIPLE`] times the node's relay floor in `asset`
-	/// when the node accepts `asset` for fees, so the leaf's own value pays
-	/// its way out; where the node does not accept it, one atom, the
-	/// operator's own rule, and each transaction of an exit then takes a fee
-	/// coin in an accepted asset.
-	pub(crate) fn leaf_policy(&self, asset: AssetId, now: MedianTime) -> Result<(WalletPolicy, bool), Error> {
+	/// pay each spend on its path at the node's relay floor in `asset` now
+	/// ([`RESERVE_COVER`]) when the node accepts `asset` for fees, so the
+	/// leaf's own value pays its way out; where the node does not accept it,
+	/// one atom, the operator's own rule, and each transaction of an exit then
+	/// takes a fee coin in an accepted asset. The floor read is returned too.
+	pub(crate) fn leaf_policy(&self, asset: AssetId, now: MedianTime) -> Result<(WalletPolicy, bool, Option<u64>), Error> {
 		let floor = self.chain.floor_per_kvb(asset)?;
-		Ok((WalletPolicy { min_reserve: reserve_floor(floor), ..self.accept_policy(now) }, floor.is_none()))
+		Ok((WalletPolicy { min_reserve: reserve_floor(floor), ..self.accept_policy(now) }, floor.is_none(), floor))
+	}
+
+	/// [`Self::leaf_policy`] for a leaf of `batch`, whose published reserve
+	/// rule is checked first against the wallet's floor now
+	/// ([`check_reserve_rule`]); `forfeited` when the wallet holds a forfeit
+	/// it signed, for this round, of every coin the participation gives up:
+	/// the leaf's reserves are then held to one atom, as a coin the wallet
+	/// holds is ([`Self::followed_policy`]), and an exit that needs more takes
+	/// a fee coin ([`round_leaf_floor`]).
+	pub(crate) fn batch_leaf_policy(&self, batch: &arca_covenant::Batch, asset: AssetId, now: MedianTime, forfeited: bool)
+		-> Result<(WalletPolicy, bool, Option<u64>), Error>
+	{
+		let (policy, fee_coin, floor) = self.leaf_policy(asset, now)?;
+		let min_reserve = round_leaf_floor(batch.reserve(), floor, forfeited).map_err(Error::Refused)?;
+		Ok((WalletPolicy { min_reserve, ..policy }, fee_coin, floor))
 	}
 
 	/// The policy for a coin held or received out of round, at `now`.
@@ -4843,7 +4952,7 @@ mod tests {
 	}
 
 	#[test]
-	fn reserves_cover_four_times_the_floor_where_the_asset_pays_fees() {
+	fn reserves_pay_each_spend_at_the_floor_where_the_asset_pays_fees() {
 		let (record, policy) = one_atom_tree();
 		let accepted = WalletPolicy { min_reserve: reserve_floor(Some(100)), ..policy };
 		assert!(matches!(accepted.check(&record), Err(RecordError::NodeReserve { level: 0, reserve: 1, .. })),

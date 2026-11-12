@@ -1670,17 +1670,125 @@ fn set_fee_rates(r: &Running, rates: &[(AssetId, u64)]) {
 /// A round whose tree in asset Y holds one-atom reserves, the operator's
 /// rule for an asset the node does not take for fees, while the wallet's
 /// node does take Y: the wallet refuses the leaf before it signs anything,
-/// since its reserves would not pay its own exit. Where the node does not
-/// take Y, one atom is the rule, and the wallet says, before it gives up a
-/// coin and again when it takes the leaf, that every exit of it needs a fee
-/// coin.
+/// since its reserves would not pay its own exit, and, the round being unable
+/// to cure that, declines it at once: the operator expires the participation
+/// and the coin is the wallet's again, live, in the same sync. Where the node
+/// does not take Y, one atom is the rule, and the wallet says, before it gives
+/// up a coin and again when it takes the leaf, that every exit of it needs a
+/// fee coin.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tree_whose_reserves_cannot_pay_its_exit_is_refused() {
 	let mut r = Running::start().await;
-	let url = r.url();
+	let proxy = Proxy::start(&r.url());
+	let url = proxy.url.clone();
 	let (x, y) = (r.x, r.y);
 	let c = Arca::new("F11");
-	c.ok(&create_args(&url, &r.node_url()));
+	let board = reserve_case_board(&mut r, &c, &url).await;
+	let round = final_round(&r).await;
+	println!("F11 round {} built while Y is not taken for fees", round.txid());
+	// The wallet's node now takes Y for fees.
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let s = c.ok(&["sync"]);
+	let p = &s["participations"][0];
+	let why = p["refused"].as_str().unwrap_or_else(|| panic!("not refused: {}", s)).to_string();
+	println!("F11 one-atom reserves in an asset the node takes for fees: REFUSED: {}", why);
+	assert!(why.contains("reserve of 1"), "{}", why);
+	assert!(why.contains("fixed reserves"), "the refusal names the rule the batch was built by: {}", why);
+	assert_eq!(p["declined"], json!(round.txid().to_string()), "declined at once: {}", s);
+	assert_eq!(p["state"], "expired", "{}", s);
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "no forfeit was signed");
+	assert_eq!(proxy.count("/v1/decline_participation"), 1);
+	assert_eq!(coin_of(&c, &board)["state"], "live", "the coin is the wallet's again in the same sync");
+	let pid = unhex(p["participation"].as_str().unwrap()).try_into().unwrap();
+	let row = r.server.store.participation(&pid).await.unwrap().unwrap();
+	assert_eq!(row.state.as_str(), "expired", "the operator expired it");
+	let refusals = c.ok(&["refusals"]);
+	assert!(refusals.to_string().contains(&format!("declined round {}", round.txid())), "said in its refusals: {}", refusals);
+	// The node no longer takes Y: one atom is the rule there, and the coin
+	// is refreshed in a round of its own.
+	set_fee_rates(&r, &[(x, 100_000_000)]);
+	let p = c.ok(&["participate", "--leaf", &board]);
+	assert_eq!(p["participations"][0]["exit_needs_fee_coin"]["assets"], json!([y.to_string()]), "{}", p);
+	final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	let done = s["participations"].as_array().unwrap().iter().find(|p| p["state"] == "released").cloned()
+		.unwrap_or_else(|| panic!("the second refresh: {}", s));
+	println!("F11 the coin refreshed where the node does not take Y: {}", done["exit_needs_fee_coin"]);
+	assert_eq!(done["exit_needs_fee_coin"]["assets"], json!([y.to_string()]), "{}", s);
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// F11's wallet against an operator that takes no decline (one whose `info`
+/// does not offer `participations.decline`, as before the operator learned
+/// it): the wallet refuses the leaf and asks nothing more of the operator;
+/// the coin stays given up, and the refresh completes once the node's view
+/// lets the wallet take the leaf. So a wallet of this library works with an
+/// operator a version behind it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_tree_waits_where_the_operator_takes_no_decline() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			v["participations"].as_object_mut().unwrap().remove("decline");
+		}
+		None
+	})));
+	let url = proxy.url.clone();
+	let (x, y) = (r.x, r.y);
+	let c = Arca::new("F11B");
+	let board = reserve_case_board(&mut r, &c, &url).await;
+	final_round(&r).await;
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let s = c.ok(&["sync"]);
+	let p = &s["participations"][0];
+	let why = p["refused"].as_str().unwrap_or_else(|| panic!("not refused: {}", s)).to_string();
+	println!("F11B refused, the operator taking no decline: {}", why);
+	assert!(why.contains("reserve of 1"), "{}", why);
+	assert!(p["declined"].is_null(), "{}", s);
+	assert_eq!(proxy.count("/v1/decline_participation"), 0, "nothing asked of an operator that takes no decline");
+	assert_eq!(coin_of(&c, &board)["state"], "given", "no forfeit was signed");
+	set_fee_rates(&r, &[(x, 100_000_000)]);
+	let s = c.ok(&["sync"]);
+	assert_eq!(s["participations"][0]["state"], "released", "{}", s);
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// F11 against an operator that calls the participation `released` while it
+/// holds no forfeit of it: the wallet holds no forfeit of its own for that
+/// round, so the word counts for nothing. It refuses the one-atom reserves,
+/// signs no forfeit, and declines the round; its coin is live again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_saying_released_gets_no_forfeit_for_a_refused_tree() {
+	let mut r = Running::start().await;
+	let proxy = Proxy::start(&r.url());
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/participation_status" && status == 200 && v["state"] == "issued" {
+			v["state"] = json!("released");
+		}
+		None
+	})));
+	let url = proxy.url.clone();
+	let y = r.y;
+	let c = Arca::new("F11C");
+	let board = reserve_case_board(&mut r, &c, &url).await;
+	final_round(&r).await;
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let s = c.ok(&["sync"]);
+	let p = &s["participations"][0];
+	let why = p["refused"].as_str().unwrap_or_else(|| panic!("not refused: {}", s)).to_string();
+	println!("F11C the operator says released, the wallet holds no forfeit: REFUSED: {}", why);
+	assert!(why.contains("reserve of 1"), "{}", why);
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "no forfeit was signed");
+	assert_eq!(coin_of(&c, &board)["state"], "live", "declined: the coin is the wallet's again");
+	let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+/// A wallet of F11 boarded in Y with its fee in X, its refresh asked while
+/// the node does not take Y: the round builds Y's tree with one-atom reserves.
+async fn reserve_case_board(r: &mut Running, c: &Arca, url: &str) -> String {
+	let (x, y) = (r.x, r.y);
+	c.ok(&create_args(url, &r.node_url()));
 	for (a, v) in [(y, 5_000_000), (x, 1_000_000)] {
 		let s = script(&c.ok(&["address"]));
 		r.pay_to(s, a, v);
@@ -1694,25 +1802,9 @@ async fn a_tree_whose_reserves_cannot_pay_its_exit_is_refused() {
 	c.ok(&["sync"]);
 	let p = c.ok(&["participate", "--leaf", &board]);
 	let p = &p["participations"][0];
-	println!("F11 participate in Y, which the node does not take for fees: {}", p["exit_needs_fee_coin"]);
+	println!("participate in Y, which the node does not take for fees: {}", p["exit_needs_fee_coin"]);
 	assert_eq!(p["exit_needs_fee_coin"]["assets"], json!([y.to_string()]), "stated before the coin is given up: {}", p);
-	let round = final_round(&r).await;
-	println!("F11 round {} built while Y is not taken for fees", round.txid());
-	// The wallet's node now takes Y for fees.
-	common::node::list_fee_asset(&r.rt, y, 100_000_000);
-	let s = c.ok(&["sync"]);
-	let why = s["participations"][0]["refused"].as_str().unwrap_or_else(|| panic!("not refused: {}", s)).to_string();
-	println!("F11 one-atom reserves in an asset the node takes for fees: REFUSED: {}", why);
-	assert!(why.contains("reserve of 1"), "{}", why);
-	assert_eq!(coin_of(&c, &board)["state"], "given", "no forfeit was signed");
-	// The node no longer takes Y: one atom is the rule there.
-	set_fee_rates(&r, &[(x, 100_000_000)]);
-	let s = c.ok(&["sync"]);
-	let done = &s["participations"][0];
-	println!("F11 the same tree where the node does not take Y: {}", done["exit_needs_fee_coin"]);
-	assert_eq!(done["state"], "released", "{}", s);
-	assert_eq!(done["exit_needs_fee_coin"]["assets"], json!([y.to_string()]), "{}", s);
-	let _ = std::fs::remove_dir_all(&c.dir);
+	board
 }
 
 /// D51. A swap's taker sees the dates of the coins it would get before it

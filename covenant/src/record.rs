@@ -173,7 +173,6 @@ use crate::script::{asset_bytes, children_hash, sha256, Child, ExplicitOutput};
 use crate::sweep::Sweep;
 use crate::taptree::TapOutput;
 use crate::time::{MedianTime, RelativeTime};
-use crate::tree::fee_rate_reserve;
 use crate::{EntryPolicy, LeafPolicy};
 
 /// The record format this crate writes and reads.
@@ -1309,8 +1308,15 @@ pub enum ReserveFloor {
 	/// The specification's rule at the wallet's own floor, in the batch
 	/// asset's atoms per 1,000 vbytes: every node and the entry hold at least
 	/// what [`crate::ReserveRule::FeeRate`] gives them at that floor and
-	/// multiple. A wallet that sets the floor above the operator's refuses the
-	/// operator's honest batches.
+	/// multiple, sized by the same functions the builder sizes them by
+	/// ([`crate::tree::node_reserve`], [`crate::tree::entry_reserve`]). The
+	/// floor is a reading of a moving input, taken later than the operator's
+	/// and often at another node: a wallet that asks the operator's full
+	/// multiple of its own floor refuses an honest batch whenever the floor
+	/// rose by an atom since the build. A wallet asks a multiple of 1 here,
+	/// that each spend on the path pays its way at its floor now, and binds
+	/// the rest through the batch's published rule: its multiple, and its
+	/// floor against the wallet's own now within a stated drift.
 	FeeRate { floor_per_kvb: u64, multiple: u64 },
 }
 
@@ -1560,12 +1566,9 @@ impl BranchNode {
 	/// times `floor_per_kvb` for its unroll with the reserve as the fee, the
 	/// witness at its full length, as the tree builder sizes it.
 	pub fn fee_rate_reserve(&self, floor_per_kvb: u64, multiple: u64) -> u64 {
-		let widest = MemberProof { index: 0, siblings: vec![[0; 32]; self.gate.depth] };
-		let mut below = vec![vec![0; 64], vec![0; 5]];
-		below.extend(widest.witness_items(&self.operator));
-		let w = self.taproot.witness(&self.unroll, below);
 		let outputs = self.children.iter().map(|c| c.output().txout()).collect();
-		fee_rate_reserve(floor_per_kvb, multiple, w, outputs, self.children[0].asset)
+		crate::tree::node_reserve(crate::ReserveRule::FeeRate { floor_per_kvb, multiple }, &self.taproot, &self.unroll, &self.operator,
+			self.gate.depth, outputs, self.children[0].asset)
 	}
 
 	/// The operator's reclaim of this node, a lowest node, at `node`:
@@ -1668,8 +1671,7 @@ impl Branch {
 	/// times `floor_per_kvb` for its unlock into the leaf with the reserve as
 	/// the fee.
 	pub fn entry_fee_rate_reserve(&self, floor_per_kvb: u64, multiple: u64) -> u64 {
-		let w = self.entry_tap.witness(&self.entry.unlock_script(), vec![vec![0; 32]]);
-		fee_rate_reserve(floor_per_kvb, multiple, w, vec![self.leaf_output().txout()], self.entry.asset)
+		crate::tree::entry_reserve(crate::ReserveRule::FeeRate { floor_per_kvb, multiple }, &self.entry, self.leaf_output().txout())
 	}
 
 	/// The sweep path of every output above the leaf: each node's, then the

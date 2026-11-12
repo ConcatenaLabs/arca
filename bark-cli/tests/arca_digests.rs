@@ -106,6 +106,15 @@ fn the_wallets_digests_are_the_servers() {
 		assert_eq!(bark::arca::client::withdraw_digest(&chain, &s, &mine), server::participations::withdraw_digest(&chain, &s, &theirs));
 		assert_ne!(bark::arca::client::withdraw_digest(&chain, &s, &mine), mine, "a withdrawal never signs the id an attestation signs");
 		assert_ne!(bark::arca::client::withdraw_digest(&chain, &s, &mine), key_proof_digest(&mine), "nor a key proof's digest");
+		// A decline names its round: one signed for a round declines no other,
+		// and is no withdrawal.
+		let round = elements::Txid::from_byte_array([7; 32]);
+		let other = elements::Txid::from_byte_array([8; 32]);
+		let decline = bark::arca::client::decline_digest(&chain, &s, &mine, &round);
+		assert_eq!(decline, server::participations::decline_digest(&chain, &s, &theirs, &round));
+		assert_ne!(decline, bark::arca::client::decline_digest(&chain, &s, &mine, &other), "another round, another digest");
+		assert_ne!(decline, bark::arca::client::withdraw_digest(&chain, &s, &mine), "a decline is no withdrawal");
+		assert_ne!(decline, mine, "nor the attestation's id");
 		assert_ne!(key_proof_digest(&mine), mine, "a key proof is not the attestation of a coin");
 		ids_seen.push(mine);
 	}

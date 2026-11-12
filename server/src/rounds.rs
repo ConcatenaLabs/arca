@@ -1223,6 +1223,20 @@ fn participation_key(k: usize) -> [u8; 32] {
 	b
 }
 
+/// What a declined participation came to ([`Rounds::decline`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declined {
+	/// Its round, held for its forfeits, was dropped unbroadcast: the
+	/// participation is void, its coins given back, the others run again.
+	Dropped,
+	/// Its round is out: the participation expired, its coins given back.
+	Expired,
+	/// Void or expired already.
+	Already,
+	/// Not declined, and why.
+	Refused(String),
+}
+
 /// Why a participation its owners withdrew is void.
 pub const WITHDRAWN: &str = "withdrawn by the owners of its coins before a round took it: its coins are theirs again, live";
 
@@ -2166,6 +2180,74 @@ impl Rounds {
 			}
 		}
 		Ok(self.store.withdraw_participation(id, WITHDRAWN, &gone).await?)
+	}
+
+	/// Takes participation `id` out of the round `round_txid` at the request
+	/// of the owners of its coins, whose wallet refuses a new leaf the round
+	/// gives it for a reason that round cannot cure (its reserves do not pay
+	/// the leaf's way out at the wallet's floor, a leaf not as asked): the
+	/// coins are theirs again at once, rather than at the forfeit deadline.
+	///
+	/// A round held for its forfeits, not yet broadcast, is dropped
+	/// unbroadcast with the participation void, as when its forfeits do not
+	/// come within the window ([`Self::drop_held_round`]): every other
+	/// participation of it runs again in the round built next. A round that
+	/// went out, final, keeps its other participations: the declined one
+	/// expires now, as it would at its deadline
+	/// ([`Store::expire_participation`]), so long as no forfeit of it is
+	/// recorded for that round (one that is may have reached the signer, and
+	/// the coin stays given up under it). Refused for a distribution and a
+	/// plan's step, which their payer or plan settle, and for a participation
+	/// not in that round now.
+	pub async fn decline(&self, id: &[u8; 32], round_txid: &Txid, why: &str) -> Result<Declined, RoundError> {
+		let Some(p) = self.store.participation(id).await? else { return Ok(Declined::Refused("no such participation".into())) };
+		if matches!(p.state, ParticipationState::Void | ParticipationState::Expired) {
+			return Ok(Declined::Already);
+		}
+		if self.store.is_distribution(id).await? || self.store.plan_step_of(id).await?.is_some() {
+			return Ok(Declined::Refused("a distribution or a plan's step is settled by its payer or its plan, not declined".into()));
+		}
+		let Some(r) = self.store.round_by_txid(&round_txid.to_byte_array()).await? else {
+			return Ok(Declined::Refused(format!("no round {} is known", round_txid)));
+		};
+		if p.state != ParticipationState::Issued || p.round_id != Some(r.round_id) {
+			return Ok(Declined::Refused(format!("the participation is {} and not in round {} now", p.state.as_str(), round_txid)));
+		}
+		let held = !self.store.round_fills(r.round_id).await?.is_empty() || self.store.round_held(r.round_id).await?;
+		if r.state == RoundState::Built && held {
+			// Under the lock the passes hold while rounds go out, so the
+			// round is either out already or dropped here.
+			let _going_out = self.going_out.lock().await;
+			let mut reason = format!("the owners of its coins declined round {}: {}", round_txid, why);
+			if self.drop_held_round(&r, &[(*id, reason.clone())]).await? {
+				// As for one whose forfeits did not come: its coins run again
+				// only in a round of their own for a while, so that a
+				// participant who declines round after round holds back
+				// nobody else.
+				let now = self.now().await?.to_consensus_u32();
+				let window = self.params.fill_forfeit_window_seconds;
+				let until = self.store.strike_coins(&Self::given_up(&p), now, window.max(1), STRIKE_CAP).await?;
+				reason.push_str(&format!("; its coins run again only in a round of their own, from median time {}", until));
+				log::warn!("participation {}: {}", crate::signer::hex(id), reason);
+				return Ok(Declined::Dropped);
+			}
+			return Ok(Declined::Refused(format!("round {} is no longer held: it went out meanwhile; decline it again once it is final",
+				round_txid)));
+		}
+		if r.state != RoundState::Final {
+			return Ok(Declined::Refused(format!("round {} is {}: a broadcast round is declined once it is final", round_txid, r.state.as_str())));
+		}
+		let (_, whole, unsigned) = self.store.forfeit_count(id, r.round_id).await?;
+		if whole + unsigned > 0 {
+			return Ok(Declined::Refused(format!("{} forfeit(s) of it are recorded for round {}: it is completed, or expires at its \
+				deadline, as any other", whole + unsigned, round_txid)));
+		}
+		if self.store.expire_participation(id, u32::MAX).await? {
+			log::warn!("participation {} expired at the request of the owners of its coins, who declined round {}: {}; its coins are \
+				given back, its new leaves never credited", crate::signer::hex(id), round_txid, why);
+			return Ok(Declined::Expired);
+		}
+		Ok(Declined::Refused("it was released or expired meanwhile".into()))
 	}
 
 	/// Whether the round `round_id` can never confirm: a held round dropped

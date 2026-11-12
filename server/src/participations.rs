@@ -159,6 +159,29 @@ pub fn withdraw_digest(chain: &Chain, operator: &XOnlyPublicKey, id: &[u8; 32]) 
 	sha256::Hash::from_engine(e).to_byte_array()
 }
 
+/// The tag of the digest the owner of each coin a participation gives up
+/// signs to decline the round it is in.
+pub const DECLINE_TAG: &[u8] = b"Arca/participation-decline";
+
+/// What the owner key of each coin given up signs to take participation `id`
+/// out of round `round` ([`crate::rounds::Rounds::decline`]):
+/// `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ id ‖ round)`,
+/// `T = SHA256("Arca/participation-decline")`, `round` the round's txid in its
+/// internal byte order. The tag keeps it apart from the withdrawal, the
+/// attestation and the key proof; the round keeps it to that round, so it
+/// declines no later round the participation runs in.
+pub fn decline_digest(chain: &Chain, operator: &XOnlyPublicKey, id: &[u8; 32], round: &elements::Txid) -> [u8; 32] {
+	let tag = sha256::Hash::hash(DECLINE_TAG);
+	let mut e = sha256::Hash::engine();
+	e.input(tag.as_byte_array());
+	e.input(tag.as_byte_array());
+	e.input(&chain.genesis_bytes());
+	e.input(&operator.serialize());
+	e.input(id);
+	e.input(&round.to_byte_array());
+	sha256::Hash::from_engine(e).to_byte_array()
+}
+
 /// A coin given up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputRequest {
@@ -396,6 +419,11 @@ pub enum ParticipationError {
 	NotWithdrawable(String, String),
 	#[error("input {0}: the withdrawal is not the coin's owner's signature over the participation's withdrawal digest")]
 	BadWithdrawal(usize),
+	/// A decline of a round a participation cannot be taken out of.
+	#[error("participation {0} is not taken out of the round: {1}")]
+	NotDeclined(String, String),
+	#[error("input {0}: the decline is not the coin's owner's signature over the participation's decline digest for that round")]
+	BadDecline(usize),
 	#[error("leaf {0} is no claim of a distribution this server knows")]
 	UnknownClaim(LeafId),
 	#[error("claim leaf {0} is not open yet: its distribution is not released, so no preimage opens its entry; it is taken up once \
@@ -481,7 +509,8 @@ impl ParticipationError {
 			Unknown(_) => "unknown_participation",
 			InRound(..) => "in_round",
 			NotWithdrawable(..) => "not_withdrawable",
-			BadWithdrawal(_) => "bad_signature",
+			BadWithdrawal(_) | BadDecline(_) => "bad_signature",
+			NotDeclined(..) => "not_declined",
 			UnknownClaim(_) => "unknown_leaf",
 			ClaimNotReleased(_) => "not_live",
 			ClaimLapsed(..) => "lapsed",
@@ -1373,6 +1402,41 @@ impl Participations {
 			Withdrawal::InRound(s) => return Err(ParticipationError::InRound(hex(id), s.as_str())),
 			Withdrawal::Refused(why) => return Err(ParticipationError::NotWithdrawable(hex(id), why)),
 			Withdrawal::Unknown => return Err(ParticipationError::Unknown(hex(id))),
+		}
+		self.status(id).await
+	}
+
+	/// Takes participation `id` out of round `round` for the owners of the
+	/// coins it gives up, whose wallet refuses a leaf that round gives it:
+	/// `signatures` holds, for each coin in its order, its owner key's
+	/// signature over [`decline_digest`]. What follows is
+	/// [`crate::rounds::Rounds::decline`]'s: the participation void with its
+	/// round dropped unbroadcast, or expired in a round that is out; either
+	/// way the coins it gave up for which no forfeit is recorded are given
+	/// back (`not_declined` when it cannot be). `why`, the wallet's reason, is
+	/// logged.
+	pub async fn decline(&self, id: &[u8; 32], round: &elements::Txid, signatures: &[Signature], why: &str,
+		rounds: &crate::rounds::Rounds) -> Result<Status, ParticipationError>
+	{
+		let row = self.store.participation(id).await?.ok_or_else(|| ParticipationError::Unknown(hex(id)))?;
+		if signatures.len() != row.inputs.len() || row.inputs.is_empty() {
+			return Err(ParticipationError::Malformed(format!("{} signatures for {} coins given up", signatures.len(), row.inputs.len())));
+		}
+		let digest = decline_digest(&self.params.chain, &self.params.operator, id, round);
+		for (k, (i, sig)) in row.inputs.iter().zip(signatures).enumerate() {
+			let leaf = self.store.leaf(&i.leaf_id).await?
+				.ok_or_else(|| ParticipationError::Internal(format!("coin {} of participation {} is not recorded", LeafId(i.leaf_id), hex(id))))?;
+			let owner = arca_covenant::CoinRecord::from_bytes(&leaf.record).ok().and_then(|r| r.owner()).map(|(k, _)| k)
+				.ok_or_else(|| ParticipationError::Internal(format!("coin {} has no owner its record names", LeafId(i.leaf_id))))?;
+			if !verify_digest(sig, &digest, &owner) {
+				return Err(ParticipationError::BadDecline(k));
+			}
+		}
+		let why: String = why.chars().filter(|c| !c.is_control()).take(400).collect();
+		use crate::rounds::Declined;
+		match rounds.decline(id, round, &why).await.map_err(|e| ParticipationError::Internal(e.to_string()))? {
+			Declined::Dropped | Declined::Expired | Declined::Already => {},
+			Declined::Refused(r) => return Err(ParticipationError::NotDeclined(hex(id), r)),
 		}
 		self.status(id).await
 	}
