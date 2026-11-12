@@ -1162,9 +1162,31 @@ is signed, and `--shown` pays only on that very fee and those coins. The answer
 says how soon the round is due (`round_within_seconds`, the operator's interval
 between rounds while participations wait) when the operator publishes one.
 
+`--coins ID,…` in place of `--amount` moves the whole of those coins and no
+other: the amount paid is what they hold less the fee, and there is no change.
+Each must be a live coin of `A` the wallet can give up now; one a round must
+refresh first is answered `settle_first`, naming it, and any other is refused,
+named. A coin settled first keeps its name: the coin its refresh made, when
+that refresh gave it up alone and made one plain coin of the wallet's own, is
+moved in its place; one refreshed together with other coins is refused, named,
+and the change of a payment, an order or a take is never moved for the coin
+it spent. Where the schedule's rounding meets no
+amount exactly, the fee is one atom above it (the operator refuses a fee short
+of its schedule, never one above). A move that would pay out less than the
+operator's smallest output is refused at the quote, naming the smallest amount
+that goes. Before the wallet holds a coin, `--value N --expiry T --quote` says
+what moving a coin of `N` with exit date `T` whole would pay and cost, from
+the operator's published fees, so a program can price a coin a trade is about
+to bring: when such a coin would arrive past the wallet's instant limit (or
+after a received coin that is arriving), the round it goes through first is
+counted (`fee.settle`). `fee.amount` is then the whole fee, the settle
+included, and `--max-fee-ppm` bounds each part on its own, as each is bounded
+when it is made: the settle against the coin's value, the move against what it
+pays out, never their sum against the amount.
+
 `sync` hands over the forfeits once the round is final, and the operator then
 unlocks the round's offboard output into the address: its output 0 pays exactly
-the amount there. The wallet unlocks it itself when the operator has not within
+the amount there (`arca offboards` names the output, `vout`, once paid). The wallet unlocks it itself when the operator has not within
 ten minutes of median time. `arca offboards` reads where each stands from the
 chain: `waiting` for its round, `in_round`, `unlocking`, `paid` (the unlock's
 `txid`, and whether it is `final`), `reclaimed` (the operator took the output
@@ -1180,6 +1202,7 @@ given up to it again, and `sync` completes it. Only one the operator does not
 hold is made anew, as a participation of its own.
 
     arca offboard --asset X --amount 300000 --address ADDR --quote   # fee, coins, change
+    arca offboard --asset X --coins ID --address ADDR --quote        # that coin, whole
     arca offboard … --shown '<the quote>'                            # paid in the next round
     arca offboards                                                   # where each stands
 

@@ -133,9 +133,12 @@ nothing twice: `settling`, `waiting`, `done`, `left`, `ready`),
 `coin_places` (each coin's place, `settled`, `proceeds`, `counted` or `arriving`, the totals by asset,
 what is spendable now, and the limit),
 `withdraw_participation {participation}`, `refusals`; a payment to an address on the chain from leaves
-(`offboard_quote {asset, amount, address | script, max_fee_ppm?}`, `offboard
-{asset, amount, address | script, fee_asset?, max_fee_ppm?, shown?}`,
-`offboards`); a take of an on-chain order and an order placed from
+(`offboard_quote {asset, amount | coins | value + expiry, address | script, max_fee_ppm?}`, `offboard
+{asset, amount | coins, address | script, fee_asset?, max_fee_ppm?, shown?}`,
+`offboards`; `coins` moves the whole of the named coins and no other, with no change, a coin settled first
+still named by its old id, and `value` with `expiry` prices that move for a coin before the wallet
+holds it, the round it goes through first counted when it would arrive past the instant limit: `fee.amount` is
+then the whole fee, `fee.settle` its part, and `max_fee_ppm` bounds the settle and the move each on its own); a take of an on-chain order and an order placed from
 leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
 `order_refund`); an order resting in the tree (`order_rest_quote`,
 `order_rest`, `order_resting {orders?, brief?}`, `order_fill_resting_quote {order,
