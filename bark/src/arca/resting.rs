@@ -863,11 +863,10 @@ impl Wallet {
 				// refused transfer, the wallet reads what the other stores did
 				// now rather than at its next catch-up, so it stops counting the
 				// coin and holds what replaced it (arca #839).
+				// Held out of every spend until a catch-up settles it.
 				if let Error::Server { code, message, .. } = &e {
-					if code == "double_spend" && super::pay::leaf_named(message).is_some_and(|l| given.contains(&l)) {
-						if let Err(c) = self.catch_up() {
-							self.store.refused("the catch-up after a coin spent elsewhere", &c.to_string())?;
-						}
+					if let Some(l) = super::pay::leaf_named(message).filter(|l| code == "double_spend" && given.contains(l)) {
+						self.caught_up_after_spent(&l)?;
 					}
 				}
 				Err(e)
