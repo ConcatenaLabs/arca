@@ -171,10 +171,19 @@ impl Wallet {
 		let schedule = schedule_of(&info, asset);
 		let margin = self.offboard_margin(&info, asset, script)?;
 		let now = self.now()?.to_consensus_u32();
-		let refresh = refresh_fee(&schedule, value, expiry, now);
-		let (amount, fee) = whole_amount(&schedule, value, refresh, margin).ok_or_else(|| Error::Refused(format!("a coin of {} of asset {} \
-			holds no more than the fee of moving it on the chain (refresh {}, offboard {}, unlock margin {})", value, asset, refresh,
-			offboard_fee(&schedule, 0), margin)))?;
+		// A coin that would arrive past the wallet's instant limit goes
+		// through a round of its own first (`settle_first`), which takes a
+		// refresh fee of it, and the move then gives up the coin that round
+		// made, of the same exit date.
+		let settle = if self.would_arrive(asset, value)? { refresh_fee(&schedule, value, expiry, now) } else { 0 };
+		let held = value.checked_sub(settle).filter(|v| *v > 0).ok_or_else(|| Error::Refused(format!("a coin of {} of asset {} holds no \
+			more than the fee of the round it must go through first ({})", value, asset, settle)))?;
+		let refresh = refresh_fee(&schedule, held, expiry, now);
+		let (amount, fee) = whole_amount(&schedule, held, refresh, margin).ok_or_else(|| Error::Refused(format!("a coin of {} of asset {} \
+			holds no more than the fee of moving it on the chain (settle {}, refresh {}, offboard {}, unlock margin {})", value, asset, settle,
+			refresh, offboard_fee(&schedule, 0), margin)))?;
+		let fee = fee.saturating_add(settle);
+		Self::at_least_min(&info, asset, amount, fee)?;
 		let bound = max_fee_ppm.unwrap_or(DEFAULT_MAX_FEE_PPM);
 		if !fee_within(fee, amount, bound) {
 			return Err(Error::Refused(format!("moving a coin of {} of asset {} on the chain costs {}, above the wallet's bound of {} ppm of \
@@ -182,9 +191,79 @@ impl Wallet {
 		}
 		Ok(json!({"asset": asset.to_string(), "value": value.to_string(), "expiry": expiry, "amount": amount.to_string(),
 			"script": hex(script.as_bytes()), "address": self.chain.address(script)?,
-			"fee": {"asset": asset.to_string(), "amount": fee.to_string(), "refresh": refresh.to_string(),
+			"fee": {"asset": asset.to_string(), "amount": fee.to_string(), "settle": settle.to_string(), "refresh": refresh.to_string(),
 				"offboard": offboard_fee(&schedule, amount).to_string(), "unlock_margin": margin.to_string()},
 			"change": "0"}))
+	}
+
+	/// Whether a coin of `value` of `asset` the wallet receives now would
+	/// arrive past its instant limit ([`super::places`]): then it pays out
+	/// of the tree only once a round has refreshed it. False while the
+	/// wallet sets no limit; true for an asset the node gives no rate for.
+	fn would_arrive(&self, asset: AssetId, value: u64) -> Result<bool, Error> {
+		let places = self.places()?;
+		let Some(limit) = places.limit else { return Ok(false) };
+		let rates = self.chain.fee_rates()?;
+		Ok(match rates.get(&asset) {
+			None => true,
+			Some(r) => places.counted.saturating_add(value as u128 * *r as u128 / 100_000_000) > limit.value,
+		})
+	}
+
+	/// Refuses a whole move that would pay out less than the operator's
+	/// smallest output of `asset`, which it would refuse in the round,
+	/// naming the smallest amount that goes and the coin it takes.
+	fn at_least_min(info: &Value, asset: AssetId, amount: u64, fee: u64) -> Result<(), Error> {
+		let min = Self::min_leaf(info, asset)?;
+		if amount < min {
+			return Err(Error::Refused(format!("moving it on the chain would pay {} of asset {} after a fee of {}, below the operator's \
+				smallest output of {}: a move pays at least {}, from a coin of at least {}", amount, asset, fee, min, min,
+				min.saturating_add(fee))));
+		}
+		Ok(())
+	}
+
+	/// The coin the wallet holds now in place of `id`: `id` itself, or, when
+	/// a refresh of the wallet's own gave `id` up alone and is released, the
+	/// coin that refresh made, followed through each such refresh. A coin
+	/// settled first (`settle_first`) is so named by its old id. `None` when
+	/// the wallet holds neither; a refresh that gave up other coins with it
+	/// made a coin that is not `id`'s alone, and is refused, named.
+	fn successor(&self, id: &str) -> Result<Option<String>, Error> {
+		let mut at = id.to_string();
+		for _ in 0..8 {
+			let Some(c) = self.store.coin(&at)? else { return Ok(None) };
+			if c.state != "spent" {
+				return Ok(Some(at));
+			}
+			let Some(pid) = c.spent_by.as_deref().and_then(|s| s.strip_prefix("participation ")) else { return Ok(Some(at)) };
+			let Some((_, _, given, wanted, state, _, _)) = self.store.participation(pid)? else { return Ok(Some(at)) };
+			if state != "released" {
+				return Ok(Some(at));
+			}
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			if given != [at.clone()] {
+				return Err(Error::Refused(format!("coin {} was refreshed together with {} other coins: the coin that round made is not \
+					its alone, so it cannot be named for it", id, given.len().saturating_sub(1))));
+			}
+			let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
+			let mut made = vec![];
+			for w in wanted.as_array().cloned().unwrap_or_default() {
+				if w["asset"].as_str() != Some(c.asset.as_str()) {
+					continue;
+				}
+				if let Some(n) = w["nonce"].as_str().and_then(|n| super::chain::unhex32(n).ok()) {
+					if let Some(l) = self.store.nonce(&n)?.and_then(|r| r.leaf_id) {
+						made.push(l);
+					}
+				}
+			}
+			match made.as_slice() {
+				[one] => at = one.clone(),
+				_ => return Ok(Some(at)),
+			}
+		}
+		Ok(Some(at))
 	}
 
 	/// The margin an offboard output to `script` holds for its unlock, from
@@ -216,7 +295,10 @@ impl Wallet {
 		let mut chosen = vec![];
 		let mut first = vec![];
 		let mut refresh = 0u64;
-		for id in ids {
+		for named in ids {
+			// A coin settled first is named by its old id: the coin its
+			// refresh made goes in its place.
+			let id = &self.successor(named)?.unwrap_or_else(|| named.clone());
 			if let Some(k) = can.iter().position(|c| &c.row.leaf_id == id) {
 				let c = can.swap_remove(k);
 				let (record, held) = self.held(&c.row)?;
@@ -230,7 +312,7 @@ impl Wallet {
 				first.push(h);
 				continue;
 			}
-			return Err(Error::Refused(format!("coin {} is not a live coin of asset {} the wallet can give up now", id, asset)));
+			return Err(Error::Refused(format!("coin {} is not a live coin of asset {} the wallet can give up now", named, asset)));
 		}
 		if !first.is_empty() {
 			let more: u64 = first.iter().map(|(_, v, _)| *v).sum();
@@ -258,6 +340,7 @@ impl Wallet {
 				let (amount, fee) = whole_amount(&schedule, total, refresh, margin).ok_or_else(|| Error::Refused(format!("the named coins \
 					of asset {} hold {}, no more than the fee of moving them on the chain (refresh {}, offboard {}, unlock margin {})", asset,
 					total, refresh, offboard_fee(&schedule, 0), margin)))?;
+				Self::at_least_min(info, asset, amount, fee)?;
 				let bound = max_fee_ppm.unwrap_or(DEFAULT_MAX_FEE_PPM);
 				if !fee_within(fee, amount, bound) {
 					return Err(Error::Refused(format!("paying {} of asset {} on the chain costs {}, above the wallet's bound of {} ppm of the \
@@ -363,14 +446,19 @@ impl Wallet {
 		// The same offboard asked again (same asset, amount and address)
 		// while the first is still the wallet's to finish: it goes on.
 		let list: Vec<Value> = self.store.meta(OFFBOARDS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
-		// Of named coins, the same is one that gives up those coins.
+		// Of named coins, the same is one that gives up those coins (each as
+		// the wallet holds it now: [`Self::successor`]).
+		let named_now: Vec<String> = match of {
+			OffboardOf::Coins(ids) => ids.iter().map(|i| self.successor(i).map(|s| s.unwrap_or_else(|| i.clone()))).collect::<Result<_, _>>()?,
+			OffboardOf::Amount(_) => vec![],
+		};
 		for e in list.iter().rev() {
 			let pid = e["offboard"].as_str().unwrap_or("");
 			let same = e["asset"] == json!(asset.to_string()) && e["script"] == json!(hex(script.as_bytes())) && e["at"].is_null()
 				&& match of {
 					OffboardOf::Amount(amount) => e["amount"] == json!(amount.to_string()),
-					OffboardOf::Coins(ids) => self.store.participation(pid)?.and_then(|p| serde_json::from_str::<Vec<String>>(&p.2).ok())
-						.is_some_and(|mut g| { let mut n = ids.to_vec(); g.sort(); n.sort(); g == n }),
+					OffboardOf::Coins(_) => self.store.participation(pid)?.and_then(|p| serde_json::from_str::<Vec<String>>(&p.2).ok())
+						.is_some_and(|mut g| { let mut n = named_now.clone(); g.sort(); n.sort(); g == n }),
 				};
 			let open = self.store.participation_state(pid)?.is_some_and(|s| matches!(s.as_str(), "submitting" | "pending" | "issued" | "forfeiting"));
 			if same && open {

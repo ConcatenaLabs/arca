@@ -469,7 +469,7 @@ async fn an_offboard_of_named_coins_moves_them_whole_and_touches_no_other() {
 	assert!(!ok && v["error"]["message"].as_str().unwrap().contains("is not a live coin"), "{}", v);
 	let q = a.ok(&["offboard", "--asset", &xs, "--coins", &id, "--address", &address, "--quote"]);
 	println!("the move of the named coin: {}", q);
-	assert_eq!((&q["gives"], &q["change"], &q["amount"], &q["fee"]), (&json!([id]), &json!("0"), &whole["amount"], &whole["fee"]),
+	assert_eq!((&q["gives"], &q["change"], &q["amount"], &q["fee"]["amount"]), (&json!([id]), &json!("0"), &whole["amount"], &whole["fee"]["amount"]),
 		"the named coin alone, whole, at the fee its value and date quoted");
 	let mut stale = q.clone();
 	stale["fee"]["amount"] = json!("1");

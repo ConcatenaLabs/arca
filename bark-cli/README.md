@@ -1166,12 +1166,17 @@ between rounds while participations wait) when the operator publishes one.
 other: the amount paid is what they hold less the fee, and there is no change.
 Each must be a live coin of `A` the wallet can give up now; one a round must
 refresh first is answered `settle_first`, naming it, and any other is refused,
-named. Where the schedule's rounding meets no amount exactly, the fee is one
-atom above it (the operator refuses a fee short of its schedule, never one
-above). Before the wallet holds a coin, `--value N --expiry T --quote` says
+named. A coin settled first keeps its name: the coin its refresh made, when
+that refresh gave it up alone, is moved in its place; one refreshed together
+with other coins is refused, named. Where the schedule's rounding meets no
+amount exactly, the fee is one atom above it (the operator refuses a fee short
+of its schedule, never one above). A move that would pay out less than the
+operator's smallest output is refused at the quote, naming the smallest amount
+that goes. Before the wallet holds a coin, `--value N --expiry T --quote` says
 what moving a coin of `N` with exit date `T` whole would pay and cost, from
 the operator's published fees, so a program can price a coin a trade is about
-to bring.
+to bring: when such a coin would arrive past the wallet's instant limit, the
+round it goes through first is counted (`fee.settle`).
 
 `sync` hands over the forfeits once the round is final, and the operator then
 unlocks the round's offboard output into the address: its output 0 pays exactly
