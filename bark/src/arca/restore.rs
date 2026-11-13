@@ -1332,45 +1332,52 @@ impl Wallet {
 	/// check, and the notes.
 	fn settle_held_history(&mut self, list: &[Value]) -> Result<(Vec<Value>, Vec<Value>), Error> {
 		let now = self.now()?;
-		let (mut held, mut rest) = (vec![], vec![]);
-		// One read of the ids held for the whole list, which a long history
-		// makes hundreds of coins; each coin held is read then.
-		let ids = self.store.coin_ids()?;
-		for e in list {
-			let id = e["leaf_id"].as_str().unwrap_or("");
-			match if ids.contains(id) { self.store.coin(id)? } else { None } {
-				Some(c) => held.push((e.clone(), c)),
-				None => rest.push(e.clone()),
-			}
-		}
 		let mut notes = vec![];
-		if held.is_empty() {
-			return Ok((rest, notes));
-		}
-		let wanted: BTreeSet<[u8; 32]> = held.iter().map(|(_, c)| c.owner_nonce).collect();
-		let spenders = self.held_spenders(&wanted, &BTreeSet::new(), now)?;
-		let mut settled = 0;
-		for (e, c) in held {
-			if !matches!(c.state.as_str(), "live" | "pending" | "sending") {
-				continue;
+		let mut rest: Vec<Value> = list.to_vec();
+		// Settled in rounds: a coin settled here may have been given up in a
+		// participation the operator released, now followed in its forfeit
+		// step on the wallet's own forfeits. It is completed here, as a
+		// coin's pass completes it (not left with no new leaves recorded until
+		// a later step, when a sync would run its forfeit step again and a
+		// quote would count its new leaves as arriving), and the completion
+		// can bring in new leaves that are themselves entries of the list,
+		// given up later: those are settled in the next round, until a round
+		// brings in nothing, so none leaves the list unsettled.
+		loop {
+			let (mut held, mut unheld) = (vec![], vec![]);
+			// One read of the ids held for the whole list, which a long history
+			// makes hundreds of coins; each coin held is read then.
+			let ids = self.store.coin_ids()?;
+			for e in rest {
+				let id = e["leaf_id"].as_str().unwrap_or("");
+				match if ids.contains(id) { self.store.coin(id)? } else { None } {
+					Some(c) => held.push((e, c)),
+					None => unheld.push(e),
+				}
 			}
-			let Some(coin) = self.held_valid(&c, now) else { continue };
-			notes.extend(self.restore_given(&c.leaf_id, &e, &coin, now, &spenders)?);
-			settled += 1;
-		}
-		// A coin settled here may have been given up in a participation the
-		// operator released, now followed in its forfeit step on the wallet's
-		// own forfeits: it is completed here, as a coin's pass completes it,
-		// and not left given up with no new leaves recorded until a later
-		// step, when a sync would run its forfeit step again and a quote
-		// would count its new leaves as arriving.
-		if settled > 0 {
+			rest = unheld;
+			if held.is_empty() {
+				return Ok((rest, notes));
+			}
+			let wanted: BTreeSet<[u8; 32]> = held.iter().map(|(_, c)| c.owner_nonce).collect();
+			let spenders = self.held_spenders(&wanted, &BTreeSet::new(), now)?;
+			let mut settled = 0;
+			for (e, c) in held {
+				if !matches!(c.state.as_str(), "live" | "pending" | "sending") {
+					continue;
+				}
+				let Some(coin) = self.held_valid(&c, now) else { continue };
+				notes.extend(self.restore_given(&c.leaf_id, &e, &coin, now, &spenders)?);
+				settled += 1;
+			}
+			if settled == 0 {
+				return Ok((rest, notes));
+			}
 			let (mut restored, mut not_recovered) = (vec![], vec![]);
 			notes.extend(self.restore_participations(&mut BTreeMap::new(), now, &mut restored, &mut not_recovered)?);
 			notes.extend(restored.into_iter().map(|r| json!({"leaf_id": r["leaf_id"], "note": "recovered from the published tree", "restored": r})));
 			notes.extend(not_recovered);
 		}
-		Ok((rest, notes))
 	}
 
 	/// What the records of every coin the store holds say of the coins they
