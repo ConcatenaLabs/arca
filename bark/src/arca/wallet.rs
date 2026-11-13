@@ -3543,7 +3543,11 @@ impl Wallet {
 	/// Each forfeit the wallet signed for the lost round is followed again
 	/// ([`Self::watch_forfeits`]): one the operator published is the wallet's
 	/// to refund once its delay has run; one never published can never be
-	/// claimed, and is void.
+	/// claimed, and is void. A coin held `handed` for that round (its new
+	/// leaves taken without a forfeit of the wallet's own of it,
+	/// [`super::round::HANDED`]) is given up to the next run as well, as it
+	/// was before the round took its place: given back or brought home as
+	/// any coin of the participation is.
 	fn round_lost(&mut self, round: &Txid) -> Result<Vec<Value>, Error> {
 		let r = round.to_string();
 		let mut back = vec![];
@@ -3567,7 +3571,7 @@ impl Wallet {
 							s.set_forfeit_state(l, &r, "signed", &why)?;
 						}
 					}
-					if s.coin(l)?.is_some_and(|c| matches!(c.state.as_str(), "spent" | "forfeited")) {
+					if s.coin(l)?.is_some_and(|c| matches!(c.state.as_str(), "spent" | "forfeited" | super::round::HANDED)) {
 						s.set_coin_state(l, "given", &why)?;
 					}
 				}

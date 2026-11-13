@@ -1718,7 +1718,28 @@ impl Wallet {
 				out.push(json!({"participation": pid, "state": "released", "released": r}));
 			}
 		}
-		for (pid, body, given, wanted, state, _, _) in self.store.participations_not_in(&["released", "void", "expired", "refused", "lost"])? {
+		const UNDONE: [&str; 5] = ["released", "void", "expired", "refused", "lost"];
+		// Participations a restore found in their forfeit step, on the
+		// wallet's own forfeits, whose new leaves it has not recorded yet: the
+		// restore's own pass rebuilds them from the published tree and
+		// completes those the operator released ([`Self::restore_participations`]),
+		// once for all of them; one it cannot rebuild now stops no other.
+		// Their forfeit step is not run again.
+		let mut rebuilt = BTreeSet::new();
+		for (pid, body, _, _, state, _, _) in self.store.participations_not_in(&UNDONE)? {
+			if state == "forfeiting" && serde_json::from_str::<Value>(&body).is_ok_and(|b| b["restored"] == json!(true))
+				&& self.store.participation_news(&pid)?.is_none()
+			{
+				rebuilt.insert(pid);
+			}
+		}
+		if !rebuilt.is_empty() {
+			let (mut restored, mut not_recovered) = (vec![], vec![]);
+			let now = self.now()?;
+			let notes = self.restore_participations(&mut BTreeMap::new(), now, &mut restored, &mut not_recovered)?;
+			out.push(json!({"participations": rebuilt, "state": "forfeiting", "restored": notes, "not_recovered": not_recovered}));
+		}
+		for (pid, body, given, wanted, state, _, _) in self.store.participations_not_in(&UNDONE)? {
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
 			if state == "released" {
 				continue;
@@ -1781,18 +1802,11 @@ impl Wallet {
 							},
 						}
 					}
-					// A participation a restore found in its forfeit step, on the
-					// wallet's own forfeits, whose new leaves it has not recorded yet:
-					// the restore's own pass rebuilds them from the published tree and
-					// completes it ([`Self::restore_participations`]); its forfeit
-					// step is not run again.
-					if state == "forfeiting" && self.store.participation_news(&pid)?.is_none()
-						&& serde_json::from_str::<Value>(&body).is_ok_and(|b| b["restored"] == json!(true))
-					{
-						let (mut restored, mut not_recovered) = (vec![], vec![]);
-						let now = self.now()?;
-						let notes = self.restore_participations(&mut BTreeMap::new(), now, &mut restored, &mut not_recovered)?;
-						out.push(json!({"participation": pid, "state": "forfeiting", "restored": notes, "not_recovered": not_recovered}));
+					// Rebuilt by the restore's pass above in this sync, and not
+					// released: its forfeit step is not run again in the same sync.
+					if rebuilt.contains(&pid) {
+						out.push(json!({"participation": pid, "state": "forfeiting", "note": "a restore found it in its forfeit step; rebuilt \
+							from the published tree in this sync"}));
 						continue;
 					}
 					if self.handed_held(&pid, &st)? {
@@ -2527,9 +2541,10 @@ impl Wallet {
 	/// [`Self::take_released`] spends it. Any other is held as given,
 	/// `handed`: the operator's history says it went into this round, which
 	/// the wallet does not take as spending it. It counts in no balance and
-	/// pays nothing, and it can still be exited (D41); the wallet takes it
-	/// on the chain as it would any coin it holds should the new leaves be
-	/// lost.
+	/// pays nothing, and it can still be exited (D41). Should the round be
+	/// lost, it is given up to the participation's next run again, as every
+	/// coin of it is (`round_lost`), and given back or brought
+	/// home as they are.
 	#[allow(clippy::too_many_arguments)]
 	fn take_unsigned(&mut self, pid: &str, round_txid: &Txid, round: &Transaction, news: &[(NewValid, NewRecord, [u8; 32])], claim_leaf: &[bool],
 		preimages: &[[u8; 32]], unlock_hash: &[u8; 32], offboards: &[(OffboardPolicy, u32)], short: &[String], now: MedianTime)
@@ -3266,6 +3281,8 @@ pub(crate) const DECIDED: [&str; 2] = ["refunded", "claimed"];
 /// forfeit of its own ([`Wallet::take_unsigned`]): the operator's history
 /// says it went into that round, which the wallet does not take as spending
 /// it. It counts in no balance and pays nothing; it can still be exited.
+/// Should that round be lost, it is given up to the participation's next
+/// run again (`given`), as every coin of it is.
 pub const HANDED: &str = "handed";
 
 #[cfg(test)]

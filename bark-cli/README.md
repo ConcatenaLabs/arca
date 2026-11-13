@@ -2266,7 +2266,8 @@ A coin's states: `pending` (what it rests on is not final), `live`, `offered`
 signed, the preimage not in hand), `handed` (given up in a round whose new
 leaves the wallet took without signing anything, and of which it holds no
 forfeit of its own: counted in no balance, paying nothing, and still
-exitable), `paying` (the `htlc-1` leaf of a payment
+exitable; should that round be lost, it is `given` to the participation's next
+run again, as every coin of it is), `paying` (the `htlc-1` leaf of a payment
 over Lightning the operator has not decided), `receiving` (the `htlc-1` leaf
 of a payment received over Lightning, not yet claimed), `spent`, `exiting`,
 `exited` and `lost`.

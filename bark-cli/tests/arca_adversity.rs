@@ -1869,6 +1869,133 @@ async fn a_restored_wallet_takes_a_released_leaf_of_a_final_round_signing_nothin
 	}
 }
 
+/// F11D's take, from an operator whose info publishes no
+/// `participations.decline` (one built before declines: the testnet's): the
+/// leaf is still taken unsigned, nothing is forfeited, released or declined,
+/// and the balance is the lost wallet's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_released_leaf_is_taken_unsigned_from_an_operator_without_declines() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let c = Arca::new("F11V");
+	let url = r.url();
+	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
+	c.ok(&["participate", "--leaf", &boards[0]]);
+	final_round(&r).await;
+	c.ok(&["sync"]);
+	let lost = c.ok(&["balance"]);
+	common::node::list_fee_asset(&r.rt, x, 40_000_000);
+	let mnemonic = std::fs::read_to_string(c.dir.join("mnemonic")).unwrap();
+	let node = r.node_url();
+	let proxy = Proxy::start(&r.url());
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			if let Some(p) = v["participations"].as_object_mut() {
+				p.remove("decline");
+			}
+		}
+		if path == "/v1/leaf_data" && status == 200 {
+			for l in v["leaves"].as_array_mut().into_iter().flatten() {
+				for g in l["given"].as_array_mut().into_iter().flatten() {
+					if g["participation"].is_object() {
+						g["participation"]["forfeits"] = json!([]);
+					}
+				}
+			}
+		}
+		None
+	})));
+	let d = Arca::new("F11V2");
+	let mut args = create_args(&proxy.url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	d.ok(&args);
+	let mut taken = None;
+	for _ in 0..4 {
+		let s = d.ok(&["sync"]);
+		if let Some(p) = s["participations"].as_array().into_iter().flatten().find(|p| p["unsigned"].is_array()) {
+			taken = Some(p.clone());
+			break;
+		}
+	}
+	common::node::list_fee_asset(&r.rt, x, 100_000_000);
+	println!("F11V taken: {:?} | forfeit_leaves {} release_leaves {} decline {} | old {} | balance {} (lost {})",
+		taken.as_ref().map(|p| p["state"].clone()), proxy.count("/v1/forfeit_leaves"), proxy.count("/v1/release_leaves"),
+		proxy.count("/v1/decline_participation"), coin_of(&d, &boards[0])["state"], d.ok(&["balance"])["held"], lost["held"]);
+	assert!(taken.is_some_and(|p| p["state"] == "released"), "the leaf taken unsigned");
+	assert_eq!(proxy.count("/v1/forfeit_leaves") + proxy.count("/v1/release_leaves") + proxy.count("/v1/decline_participation"), 0,
+		"nothing signed or declined");
+	assert_eq!(coin_of(&d, &boards[0])["state"], "handed");
+	assert_eq!(d.ok(&["balance"])["held"], lost["held"]);
+	for w in [&c, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A coin held `handed` whose round is then lost for good. The wallet's
+/// leaf L0 is refreshed in round R, final; restored through an operator that
+/// serves no forfeit of L0's, after the node's floor in X rose two and a
+/// half times, the wallet takes R's leaf unsigned and holds L0 `handed`.
+/// Then R goes out of the chain and X takes its input, buried. L0 is given
+/// up to the participation's next run again, as any coin of a lost round,
+/// and, the wallet away until a day past R's leaf's exit date, comes home
+/// on the chain: it is not left `handed`, counted nowhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handed_coin_whose_round_is_lost_comes_home() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let c = Arca::new("HL");
+	let (leaf0, leaf_r, rtx, p_r) = round_of_its_own(&mut r, &c).await;
+	common::node::list_fee_asset(&r.rt, x, 40_000_000);
+	let mnemonic = std::fs::read_to_string(c.dir.join("mnemonic")).unwrap();
+	let node = r.node_url();
+	let proxy = Proxy::start(&r.url());
+	let l0 = leaf0.clone();
+	proxy.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/leaf_data" && status == 200 {
+			for l in v["leaves"].as_array_mut().into_iter().flatten() {
+				if l["leaf_id"].as_str() != Some(l0.as_str()) {
+					continue;
+				}
+				for g in l["given"].as_array_mut().into_iter().flatten() {
+					if g["participation"].is_object() {
+						g["participation"]["forfeits"] = json!([]);
+					}
+				}
+			}
+		}
+		None
+	})));
+	let d = Arca::new("HL2");
+	let mut args = create_args(&proxy.url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	d.ok(&args);
+	for _ in 0..4 {
+		d.ok(&["sync"]);
+		if coin_of(&d, &leaf0)["state"] == "handed" {
+			break;
+		}
+	}
+	common::node::list_fee_asset(&r.rt, x, 100_000_000);
+	println!("HL restored: L0 {} | R's leaf {} | balance {}", coin_of(&d, &leaf0)["state"], coin_of(&d, &leaf_r)["state"], d.ok(&["balance"])["held"]);
+	assert_eq!(coin_of(&d, &leaf0)["state"], "handed", "R's leaf taken without a forfeit of L0's");
+	assert_eq!(coin_of(&d, &leaf_r)["state"], "live");
+	let by = d57_latest_exit_by(&d, std::slice::from_ref(&leaf_r));
+	round_out(&mut r, &rtx, p_r).await;
+	let s = sync_of(&d);
+	let (lr, l0) = (coin_of(&d, &leaf_r), coin_of(&d, &leaf0));
+	println!("HL R {} lost for good: participations {} | R's leaf {} | L0 {} | {}", rtx.txid(), s["participations"], lr["state"], l0["state"],
+		l0["note"]);
+	assert_ne!(l0["state"], "handed", "L0 is given up to the next run again: {}", l0);
+	// Away until a day past R's leaf's exit date, as a wallet whose round
+	// was lost for good brings the coin it gave up home.
+	d57_to(&r, by + 86_400).await;
+	let state = home_of(&r, &d, &leaf0, 24).await;
+	println!("HL in the end: L0 {} ({}) | balance on the chain {}", state, coin_of(&d, &leaf0)["note"], d.ok(&["balance"])["sequentia_onchain"]);
+	assert_eq!(state, "exited", "the coin given up for a lost round comes home");
+	let _ = std::fs::remove_dir_all(&c.dir);
+	let _ = std::fs::remove_dir_all(&d.dir);
+}
+
 /// A wallet of F11 boarded in Y with its fee in X, its refresh asked while
 /// the node does not take Y: the round builds Y's tree with one-atom reserves.
 async fn reserve_case_board(r: &mut Running, c: &Arca, url: &str) -> String {

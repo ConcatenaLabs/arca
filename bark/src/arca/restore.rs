@@ -2053,147 +2053,168 @@ impl Wallet {
 					continue;
 				},
 			};
-			let rtx = round.clone().or(st["round"]["txid"].as_str().map(str::to_string)).unwrap_or_default();
-			// The round as the node holds it, or, for a take whose round is
-			// held unbroadcast for its takes' forfeits, as the take's status
-			// serves it (without its witnesses, its txid the round's), as
-			// `sync` reads it.
-			let round_tx: Option<elements::Transaction> = match Txid::from_str(&rtx) {
-				Ok(t) => match self.chain.transaction(&t)? {
-					Some(tx) => Some(tx),
-					None => st["round"]["tx"].as_str().and_then(|h| unhex(h).ok())
-						.and_then(|b| elements::encode::deserialize::<elements::Transaction>(&b).ok()).filter(|tx| tx.txid() == t),
-				},
-				Err(_) => None,
-			};
-			let released = st["state"] == "released" && st["round"]["txid"].as_str() == Some(rtx.as_str());
-			let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
-			let mut news = vec![];
-			let mut preimage = None;
-			let mut withheld = vec![];
-			for (o, w) in st["outputs"].as_array().cloned().unwrap_or_default().iter().zip(wanted.as_array().cloned().unwrap_or_default()) {
-				let Ok(nonce) = unhex32(w["nonce"].as_str().unwrap_or("")) else { continue };
-				let (Some(vout), Some(index)) = (o["batch_vout"].as_u64(), o["leaf_index"].as_u64()) else { continue };
-				let leaf_id = o["leaf_id"].as_str().unwrap_or("").to_string();
-				let held = self.store.coin(&leaf_id)?;
-				let served_preimage = match &held {
-					Some(c) => NewRecord::of_coin(&Self::record_of(c)?).map(|(_, p, _)| p),
-					None => None,
-				};
-				// The leaf as the wallet validated it before signing: its
-				// preimage, when one is in hand, is checked to open it.
-				let built = match self.leaf_from_tree(trees, &rtx, vout as u32, index as usize, &nonce, served_preimage, now) {
-					Ok(b) => Some(b),
-					Err(why) if why.contains("its preimage has not gone out") => None,
-					Err(why) => {
-						if held.is_none() {
-							not_recovered.push(missed(&leaf_id, format!("a new leaf of participation {}: {}", pid, why)));
-						}
-						notes.push(json!({"participation": pid, "leaf_id": leaf_id, "note": why}));
-						continue;
-					},
-				};
-				let (record, auths, p) = match built.as_ref().and_then(|(c, _)| NewRecord::of_coin(c)) {
-					Some((record, preimage, auths)) => (record, auths, Some(preimage)),
-					None => {
-						// No preimage anywhere: the leaf as the tree builds it,
-						// validated, its authorisations signed, to be opened
-						// by a preimage the chain or the operator gives later.
-						let (_, tree) = self.published_tree(trees, &rtx, vout as u32).map_err(Error::Refused)?;
-						if index as usize >= tree.len() {
-							return Err(Error::Refused(format!("the published batch of {}:{} has no leaf {}", rtx, vout, index)));
-						}
-						let record = NewRecord::of(tree, index as usize);
-						let round_tx = round_tx.clone()
-							.ok_or_else(|| Error::Missing(format!("round {} is not on the chain the node holds", rtx)))?;
-						let owner = self.keys.leaf_xonly(&nonce)?;
-						let first = record.first_expiry();
-						let valid = record.validate(&round_tx, &self.followed_policy(first, now), &owner, &nonce)
-							.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", rtx, e)))?;
-						let key = self.keys.leaf(&nonce)?;
-						let at = auth_time(first, now).map_err(Error::Node)?;
-						(record, valid.sign_auths(&key, at), None)
-					},
-				};
-				if p.is_some() {
-					preimage = p;
+			// One participation that cannot be rebuilt or completed now (its
+			// round not on the chain the node holds, a tree that fails the
+			// checks) stays in its forfeit step, with the reason, and stops no
+			// other: a later pass takes it up again. A store that fails stops
+			// the pass.
+			if let Err(e) = self.rebuild_participation(trees, now, restored, not_recovered, &mut notes, &pid, &given_json, &wanted, round, &st) {
+				if matches!(e, Error::Store(_)) {
+					return Err(e);
 				}
-				if held.is_none() {
-					withheld.push(leaf_id.clone());
-				}
-				news.push((leaf_id.clone(), held.is_some(), nonce, record.clone(), auths.clone(),
-					json!({"record": hex(&record.to_bytes()?), "nonce": hex(&nonce),
-					"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()})));
-			}
-			if let Some(round_tx) = &round_tx {
-				self.store.put_tx(&rtx, &elements::encode::serialize(round_tx), "round")?;
-			}
-			let all: Vec<Value> = news.iter().map(|n| n.5.clone()).collect();
-			self.store.set_participation_news(&pid, &json!({"round": rtx, "leaves": all}).to_string())?;
-			if !released {
-				notes.push(json!({"participation": pid, "state": "forfeiting", "round": rtx}));
-				continue;
-			}
-			match preimage {
-				Some(p) => {
-					// A new leaf the wallet does not hold yet is checked as any
-					// coin restored is, as of its expiry once that has passed:
-					// one whose path a final sweep cut is not taken. The
-					// participation is completed with the others, its coins
-					// given up spent.
-					let mut kept_news = vec![];
-					for (leaf_id, held, nonce, record, auths, entry) in &news {
-						if !held {
-							let coin = record.coin(p, auths.clone())?;
-							if let Err(why) = self.checked_as_held(&coin, &record.owner(), nonce, now) {
-								not_recovered.push(missed(leaf_id, format!("a new leaf of participation {}: {}", pid, why)));
-								withheld.retain(|w| w != leaf_id);
-								continue;
-							}
-						}
-						kept_news.push(entry.clone());
-					}
-					self.store.set_participation_news(&pid, &json!({"round": rtx, "leaves": kept_news}).to_string())?;
-					let kept = self.finish(&pid, p, "settled")?;
-					for k in kept {
-						let id = k["leaf_id"].as_str().unwrap_or("").to_string();
-						if withheld.contains(&id) {
-							notes.push(json!({"leaf_id": id, "note": format!("the server does not serve this leaf, which participation {} \
-								released for the wallet: withheld; recovered from the published tree and the preimage, checked against the round", pid)}));
-							restored.push(json!({"leaf_id": id, "kind": "batch", "asset": k["asset"], "value": k["value"], "state": "live",
-								"from": "the published tree"}));
-						}
-					}
-					notes.push(json!({"participation": pid, "state": "released", "round": rtx}));
-				},
-				// A participation that wanted only offboards has no new leaf
-				// to give a preimage: released, its round final in the chain,
-				// the coins it gave up are spent, as the wallet that made it
-				// finds them.
-				None if released && news.is_empty() && self.offboards_final(&wanted, &rtx)? => {
-					let given: Vec<String> = serde_json::from_str(&given_json).map_err(|e| Error::Store(e.to_string()))?;
-					self.store.atomically(|s| {
-						for l in &given {
-							s.set_coin_spent(l, &format!("participation {}", pid))?;
-							s.set_forfeit_state(l, &rtx, "settled", "")?;
-						}
-						s.set_participation(&pid, "released", None, Some(&rtx))
-					})?;
-					notes.push(json!({"participation": pid, "state": "released", "round": rtx, "note": "it wanted offboards alone, and its \
-						round is final in the chain: the coins given up for it are spent"}));
-				},
-				None => {
-					for id in &withheld {
-						not_recovered.push(missed(id, format!("the server does not serve this leaf, which participation {} released for the \
-							wallet, and its preimage has not gone out: the published tree of round {} shows none, and the server serves no record of \
-							it; the coin given up for it stays under its forfeit, followed on the chain, and sync completes the leaf once the \
-							preimage is out", pid, rtx)));
-					}
-					notes.push(json!({"participation": pid, "state": "forfeiting", "round": rtx, "note": "released at the server, and the wallet \
-						holds no preimage of its new leaves: the coins given up stay under their forfeits, followed on the chain"}));
-				},
+				notes.push(json!({"participation": pid, "state": "forfeiting", "error": e.to_string()}));
 			}
 		}
 		Ok(notes)
+	}
+
+	/// Participation `pid` of [`Self::restore_participations`], `st` its status
+	/// as the operator serves it.
+	#[allow(clippy::too_many_arguments)]
+	fn rebuild_participation(&mut self, trees: &mut BTreeMap<(String, u32), (Value, Batch)>, now: MedianTime, restored: &mut Vec<Value>,
+		not_recovered: &mut Vec<Value>, notes: &mut Vec<Value>, pid: &str, given_json: &str, wanted: &str, round: Option<String>, st: &Value)
+		-> Result<(), Error>
+	{
+		let rtx = round.clone().or(st["round"]["txid"].as_str().map(str::to_string)).unwrap_or_default();
+		// The round as the node holds it, or, for a take whose round is
+		// held unbroadcast for its takes' forfeits, as the take's status
+		// serves it (without its witnesses, its txid the round's), as
+		// `sync` reads it.
+		let round_tx: Option<elements::Transaction> = match Txid::from_str(&rtx) {
+			Ok(t) => match self.chain.transaction(&t)? {
+				Some(tx) => Some(tx),
+				None => st["round"]["tx"].as_str().and_then(|h| unhex(h).ok())
+					.and_then(|b| elements::encode::deserialize::<elements::Transaction>(&b).ok()).filter(|tx| tx.txid() == t),
+			},
+			Err(_) => None,
+		};
+		let released = st["state"] == "released" && st["round"]["txid"].as_str() == Some(rtx.as_str());
+		let wanted: Value = serde_json::from_str(&wanted).map_err(|e| Error::Store(e.to_string()))?;
+		let mut news = vec![];
+		let mut preimage = None;
+		let mut withheld = vec![];
+		for (o, w) in st["outputs"].as_array().cloned().unwrap_or_default().iter().zip(wanted.as_array().cloned().unwrap_or_default()) {
+			let Ok(nonce) = unhex32(w["nonce"].as_str().unwrap_or("")) else { continue };
+			let (Some(vout), Some(index)) = (o["batch_vout"].as_u64(), o["leaf_index"].as_u64()) else { continue };
+			let leaf_id = o["leaf_id"].as_str().unwrap_or("").to_string();
+			let held = self.store.coin(&leaf_id)?;
+			let served_preimage = match &held {
+				Some(c) => NewRecord::of_coin(&Self::record_of(c)?).map(|(_, p, _)| p),
+				None => None,
+			};
+			// The leaf as the wallet validated it before signing: its
+			// preimage, when one is in hand, is checked to open it.
+			let built = match self.leaf_from_tree(trees, &rtx, vout as u32, index as usize, &nonce, served_preimage, now) {
+				Ok(b) => Some(b),
+				Err(why) if why.contains("its preimage has not gone out") => None,
+				Err(why) => {
+					if held.is_none() {
+						not_recovered.push(missed(&leaf_id, format!("a new leaf of participation {}: {}", pid, why)));
+					}
+					notes.push(json!({"participation": pid, "leaf_id": leaf_id, "note": why}));
+					continue;
+				},
+			};
+			let (record, auths, p) = match built.as_ref().and_then(|(c, _)| NewRecord::of_coin(c)) {
+				Some((record, preimage, auths)) => (record, auths, Some(preimage)),
+				None => {
+					// No preimage anywhere: the leaf as the tree builds it,
+					// validated, its authorisations signed, to be opened
+					// by a preimage the chain or the operator gives later.
+					let (_, tree) = self.published_tree(trees, &rtx, vout as u32).map_err(Error::Refused)?;
+					if index as usize >= tree.len() {
+						return Err(Error::Refused(format!("the published batch of {}:{} has no leaf {}", rtx, vout, index)));
+					}
+					let record = NewRecord::of(tree, index as usize);
+					let round_tx = round_tx.clone()
+						.ok_or_else(|| Error::Missing(format!("round {} is not on the chain the node holds", rtx)))?;
+					let owner = self.keys.leaf_xonly(&nonce)?;
+					let first = record.first_expiry();
+					let valid = record.validate(&round_tx, &self.followed_policy(first, now), &owner, &nonce)
+						.map_err(|e| Error::Refused(format!("the new leaf in round {} fails the wallet's checks: {}", rtx, e)))?;
+					let key = self.keys.leaf(&nonce)?;
+					let at = auth_time(first, now).map_err(Error::Node)?;
+					(record, valid.sign_auths(&key, at), None)
+				},
+			};
+			if p.is_some() {
+				preimage = p;
+			}
+			if held.is_none() {
+				withheld.push(leaf_id.clone());
+			}
+			news.push((leaf_id.clone(), held.is_some(), nonce, record.clone(), auths.clone(),
+				json!({"record": hex(&record.to_bytes()?), "nonce": hex(&nonce),
+				"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()})));
+		}
+		if let Some(round_tx) = &round_tx {
+			self.store.put_tx(&rtx, &elements::encode::serialize(round_tx), "round")?;
+		}
+		let all: Vec<Value> = news.iter().map(|n| n.5.clone()).collect();
+		self.store.set_participation_news(pid, &json!({"round": rtx, "leaves": all}).to_string())?;
+		if !released {
+			notes.push(json!({"participation": pid, "state": "forfeiting", "round": rtx}));
+			return Ok(());
+		}
+		match preimage {
+			Some(p) => {
+				// A new leaf the wallet does not hold yet is checked as any
+				// coin restored is, as of its expiry once that has passed:
+				// one whose path a final sweep cut is not taken. The
+				// participation is completed with the others, its coins
+				// given up spent.
+				let mut kept_news = vec![];
+				for (leaf_id, held, nonce, record, auths, entry) in &news {
+					if !held {
+						let coin = record.coin(p, auths.clone())?;
+						if let Err(why) = self.checked_as_held(&coin, &record.owner(), nonce, now) {
+							not_recovered.push(missed(leaf_id, format!("a new leaf of participation {}: {}", pid, why)));
+							withheld.retain(|w| w != leaf_id);
+							continue;
+						}
+					}
+					kept_news.push(entry.clone());
+				}
+				self.store.set_participation_news(pid, &json!({"round": rtx, "leaves": kept_news}).to_string())?;
+				let kept = self.finish(pid, p, "settled")?;
+				for k in kept {
+					let id = k["leaf_id"].as_str().unwrap_or("").to_string();
+					if withheld.contains(&id) {
+						notes.push(json!({"leaf_id": id, "note": format!("the server does not serve this leaf, which participation {} \
+							released for the wallet: withheld; recovered from the published tree and the preimage, checked against the round", pid)}));
+						restored.push(json!({"leaf_id": id, "kind": "batch", "asset": k["asset"], "value": k["value"], "state": "live",
+							"from": "the published tree"}));
+					}
+				}
+				notes.push(json!({"participation": pid, "state": "released", "round": rtx}));
+			},
+			// A participation that wanted only offboards has no new leaf
+			// to give a preimage: released, its round final in the chain,
+			// the coins it gave up are spent, as the wallet that made it
+			// finds them.
+			None if released && news.is_empty() && self.offboards_final(&wanted, &rtx)? => {
+				let given: Vec<String> = serde_json::from_str(&given_json).map_err(|e| Error::Store(e.to_string()))?;
+				self.store.atomically(|s| {
+					for l in &given {
+						s.set_coin_spent(l, &format!("participation {}", pid))?;
+						s.set_forfeit_state(l, &rtx, "settled", "")?;
+					}
+					s.set_participation(pid, "released", None, Some(&rtx))
+				})?;
+				notes.push(json!({"participation": pid, "state": "released", "round": rtx, "note": "it wanted offboards alone, and its \
+					round is final in the chain: the coins given up for it are spent"}));
+			},
+			None => {
+				for id in &withheld {
+					not_recovered.push(missed(id, format!("the server does not serve this leaf, which participation {} released for the \
+						wallet, and its preimage has not gone out: the published tree of round {} shows none, and the server serves no record of \
+						it; the coin given up for it stays under its forfeit, followed on the chain, and sync completes the leaf once the \
+						preimage is out", pid, rtx)));
+				}
+				notes.push(json!({"participation": pid, "state": "forfeiting", "round": rtx, "note": "released at the server, and the wallet \
+					holds no preimage of its new leaves: the coins given up stay under their forfeits, followed on the chain"}));
+			},
+		}
+		Ok(())
 	}
 }
