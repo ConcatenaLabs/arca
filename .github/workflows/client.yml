@@ -21,13 +21,16 @@ jobs:
       - name: Find the node build
         id: node
         run: |
+          # The newest successful run is picked from an unfiltered listing: the
+          # listing that filters on status server-side has answered with a run
+          # three months old.
           # GitHub's listing of runs now and then answers with none at all
           # (total_count 0), which a workflow with builds never has: asked
           # again until it lists one.
           run=""
           for i in $(seq 1 10); do
-            run=$(gh api "repos/ConcatenaLabs/Sequentia/actions/workflows/build-dev.yml/runs?branch=master&status=success&per_page=1" \
-              --jq 'select(.total_count > 0) | .workflow_runs[0] | {databaseId: .id, headSha: .head_sha}' || true)
+            run=$(gh api "repos/ConcatenaLabs/Sequentia/actions/workflows/build-dev.yml/runs?branch=master&per_page=30" \
+              --jq '[.workflow_runs[] | select(.conclusion == "success")] | first | select(. != null) | {databaseId: .id, headSha: .head_sha}' || true)
             [ -n "$run" ] && break
             echo "GitHub listed no successful node build (try $i of 10); asking again"
             sleep 6
@@ -141,7 +144,7 @@ jobs:
           echo "MINT_LIMITER=$HOME/.mint-limiter/bin/mint-limiter" >> "$GITHUB_ENV"
 
       - name: Scenarios
-        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer --test arca_command_view --test arca_bond --test arca_supervised --test arca_accumulator --test arca_channel --test arca_anchor_depth --test arca_owed --test arca_watchtower --test arca_speed_up --test arca_refresh_withdraw --test arca_quote_waiting_refresh --test arca_no_sweep --test arca_mailbox_reads --test arca_batch_bases --test arca_swap_coins --test arca_block_times_reorg --test arca_refresh_pieces --test arca_refresh_needed --test arca_checkpoint_exit --test arca_coin_places --test arca_bond_watch_reads --test arca_settle_first -- --nocapture
+        run: cargo test --locked -p arca-cli --test arca_scenarios --test arca_adversity --test arca_restore --test arca_digests --test arca_assets --test arca_bitcoin_side --test arca_program_commands --test arca_quotes --test arca_swap_commands --test arca_claims --test arca_offline_refresh --test arca_issuer --test arca_command_view --test arca_bond --test arca_supervised --test arca_accumulator --test arca_channel --test arca_anchor_depth --test arca_owed --test arca_watchtower --test arca_speed_up --test arca_refresh_withdraw --test arca_quote_waiting_refresh --test arca_no_sweep --test arca_mailbox_reads --test arca_batch_bases --test arca_swap_coins --test arca_block_times_reorg --test arca_refresh_pieces --test arca_refresh_needed --test arca_checkpoint_exit --test arca_coin_places --test arca_bond_watch_reads --test arca_settle_first --test arca_sync_slices -- --nocapture
 
       # Built with the test-only `shape-probe` feature, after every other
       # test of this job: the one way to reach a trade refused after its
