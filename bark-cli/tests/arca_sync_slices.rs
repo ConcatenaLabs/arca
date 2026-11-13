@@ -388,7 +388,11 @@ async fn a_cut_at_every_safe_point_leaves_every_command_its_wallet() {
 				let live: Vec<String> = m.ok(&["coins"]).as_array().unwrap().iter()
 					.filter(|c| c["state"] == "live" && c["asset"] == x.to_string() && (c["value"] == "20000" || c["value"] == 20000))
 					.map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
-				live.first().is_some_and(|l| m.run(&["participate", "--leaf", l]).0)
+				live.first().is_some_and(|l| {
+					let (ok, v) = m.run(&["participate", "--leaf", l]);
+					println!("SL3 refresh between slices: {}", v["participations"][0]["state"]);
+					ok
+				})
 			},
 			"history" => lib_at(&mdir, "restore_history", &json!({"budget_ms": 100})).is_ok(),
 			_ => lib_at(&mdir, "coin_places", &json!({})).is_ok(),
@@ -400,6 +404,8 @@ async fn a_cut_at_every_safe_point_leaves_every_command_its_wallet() {
 		}
 	});
 	let longest = s.iter().map(|(_, ms)| *ms).max().unwrap();
+	let last = &s.last().unwrap().0;
+	println!("SL3 the pass's participations: {}", last["participations"]);
 	println!("SL3 {} slices of 1 ms, the longest {} ms; commands between them (asked, answered): {:?}", s.len(), longest, ran);
 	for (v, _) in &s {
 		assert!(v["error"].is_null(), "{}", v);
@@ -409,9 +415,14 @@ async fn a_cut_at_every_safe_point_leaves_every_command_its_wallet() {
 		assert!(ran.get(k).is_some_and(|(_, ok)| *ok > 0), "{} ran between two slices: {:?}", k, ran);
 	}
 	// Every refresh and payment settles: what the wallet holds of X is what
-	// it held, less what it paid.
+	// it held, less what it paid. (A payment between two slices may have
+	// taken back a waiting refresh to pay with: then no round stands.)
 	m.ok(&["sync"]);
-	final_round(&r).await;
+	if let Some(built) = r.server.rounds.run_round().await.unwrap() {
+		r.produce().await;
+		r.bury().await;
+		r.round_state(&built.tx.txid(), RoundState::Final).await;
+	}
 	m.ok(&["sync"]);
 	m.ok(&["sync"]);
 	let after = total(&m);
