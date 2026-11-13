@@ -36,7 +36,7 @@
 //! | `/round` | Builds a round of whatever participations stand, mines it, buries it and waits for it to be final; its txid, or `null` when none stood |
 //! | `/advance {seconds}` | Moves the chain's median time at least that far on |
 //! | `/rpc {method, params}` | One call to the node, its result |
-//! | `/fees {asset, refresh_ppm?, offboard_base?}` | Sets the asset's refresh fee, or the fixed part of its offboard fee (what a take pays), and reloads the server's configuration, as an operator's SIGHUP does |
+//! | `/fees {asset, refresh_ppm?, offboard_base?, in_flight_cap?}` | Sets the asset's refresh fee, the fixed part of its offboard fee (what a take pays), or its in-flight cap in atoms (`null`: none), and reloads the server's configuration, as an operator's SIGHUP does |
 //! | `/build` | Builds the rounds of whatever participations stand, and broadcasts none that waits on a take's forfeits: their txids, sizes and the orders each fills |
 //! | `/pass` | One pass over the rounds: a round held for takes' forfeits goes out once every one is in |
 //! | `/settle` | One pass of the watcher (releases, notices, sweeps, the return of unclaimed claims), a block buried two Bitcoin blocks deep, one pass of the nursery and another of the watcher, as an operator's timers do between them; the chain's tip |
@@ -45,7 +45,7 @@
 //! | `/restart` | Stops the server and starts it again on the same database, at the same address, as an operator's restart does; the chain and the signer keep running |
 //! | `/freeze {script}` | A freeze record of the supervised asset naming the script (hex), signed by its issuer and mined |
 //! | `/lift {script}` | Spends that record, lifting the freeze, and mines it |
-//! | `/bond_post {amount?}` | Posts the operator's equivocation bond in X (5,000,000 unless named), names it in the configuration, and starts the server again |
+//! | `/bond_post {amount?, instant_budget_fraction?}` | Posts the operator's equivocation bond in X (5,000,000 unless named), names it in the configuration with the share of it the operator suggests as an instant budget (none unless named), and starts the server again |
 //! | `/bond_notice` | Gives the bond's notice, names it, and starts the server again: the bond reads `noticed` |
 //! | `/bond_drop` | Names no bond in the configuration, and starts the server again: a wallet that saw one reads it `missing` |
 //! | `/quit` | Stops the server, the signer and the chain, and ends the test |
@@ -456,6 +456,7 @@ async fn profile_handle(r: &mut Running, p: &mut Profiles, path: &str, b: &Value
 		},
 		"/bond_post" => {
 			let amount = b["amount"].as_u64().unwrap_or(5_000_000);
+			let fraction = b["instant_budget_fraction"].as_f64();
 			let w = keypair("browsers bond W");
 			let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
 			let policy = match BondPolicy::new(chain, keypair("operator").x_only_public_key().0, w.x_only_public_key().0,
@@ -470,7 +471,7 @@ async fn profile_handle(r: &mut Running, p: &mut Profiles, path: &str, b: &Value
 			let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
 			let op = OutPoint::new(tx.txid(), vout);
 			r.config.bond = Some(BondSection { withdraw_key: w.x_only_public_key().0.to_string(), notice_units: notice_units(),
-				outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: None, instant_limit_value: None });
+				outpoint: Some(format!("{}:{}", op.txid, op.vout)), notice: None, instant_budget_fraction: fraction, instant_limit_value: None });
 			r.restart_server().await;
 			r.synced().await;
 			p.bond = Some((w, op));
@@ -616,8 +617,10 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 			let asset = b["asset"].as_str().ok_or("no asset")?;
 			let ppm = b["refresh_ppm"].as_u64();
 			let offboard_base = b["offboard_base"].as_u64();
-			if ppm.is_none() && offboard_base.is_none() {
-				return Err("name refresh_ppm or offboard_base".into());
+			// `in_flight_cap`: atoms, or `null` for no cap.
+			let cap = b.get("in_flight_cap").map(|v| v.as_u64().map(|c| c.to_string()));
+			if ppm.is_none() && offboard_base.is_none() && cap.is_none() {
+				return Err("name refresh_ppm, offboard_base or in_flight_cap".into());
 			}
 			let mut config = r.config.clone();
 			let a = config.assets.iter_mut().find(|a| a.asset == asset).ok_or("the server does not serve that asset")?;
@@ -626,6 +629,9 @@ async fn handle(r: &mut Running, path: &str, b: &Value) -> Result<Value, String>
 			}
 			if let Some(base) = offboard_base {
 				a.offboard_base = Some(base.to_string());
+			}
+			if let Some(c) = cap {
+				a.in_flight_cap = c;
 			}
 			let reloaded = r.server.reload(&config).await.map_err(|e| e.to_string())?;
 			r.config = config;
