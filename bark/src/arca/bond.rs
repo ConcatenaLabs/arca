@@ -45,9 +45,11 @@
 //! completes; one whose checkpoint has none counts as a coin received out
 //! of round does. A coin given to a round participation (a refresh, an
 //! offboard, an order, a take, a distribution) is judged by its own lineage
-//! too: until its round is final the wallet has signed nothing that spends
-//! it, and from then on only its forfeit to the operator, as for any coin
-//! given up in a round. `coin_places` names each coin counted (`at_risk`).
+//! too: the one thing the wallet signs that spends it is its forfeit, as for
+//! any coin given up in a round, to the operator alone and claimable only
+//! with that round's connector, whether signed once the round is final or
+//! before it is broadcast (an operator with `forfeits_before_broadcast`).
+//! `coin_places` names each coin counted (`at_risk`).
 //!
 //! The wallet keeps the operator's signature over every message of its
 //! coins' lineage ([`arca_covenant::bond::cosigned_by`]) and writes it as
@@ -337,12 +339,15 @@ impl Wallet {
 	///   owner's exit on every checkpoint paid the wallet. Should that trade
 	///   die, the coin the wallet gave comes home by its exit.
 	/// - A coin given to a round participation (`given`, and one of `in_round`)
-	///   is judged by its own lineage, as while it is live. Until the round
-	///   holding the participation is final, the wallet has signed nothing
-	///   over the coin but digests under the participation's own tags (its
-	///   attestation, a withdrawal, a decline), none of which spends it; from
-	///   then on its forfeit, to the operator alone, as for every coin given
-	///   up in a round (the coin is then `forfeited`, judged so already).
+	///   is judged by its own lineage, as while it is live. Over the coin the
+	///   wallet signs digests under the participation's own tags (its
+	///   attestation, a withdrawal, a decline), none of which spends it, and
+	///   its forfeit, as for every coin given up in a round: to the operator
+	///   alone and claimable only with that round's connector, whether signed
+	///   once the round is final (the coin is then `forfeited`, judged so
+	///   already) or before the round is broadcast, for an operator with
+	///   `forfeits_before_broadcast` (a round then lost leaves the coin
+	///   `given` with its forfeit signed).
 	///   Nothing in a round gives another party a key to the coin's lineage.
 	/// - A coin on its way into a swap or a fill (`offered`, `sending`, or a
 	///   `given` coin no open participation names) whose checkpoint has its
