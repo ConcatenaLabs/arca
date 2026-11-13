@@ -188,12 +188,14 @@ impl Store {
 	pub async fn served_since(&self, key: &[u8; 32], since: (u64, i64), limit: i64) -> Result<Vec<(ServedLeaf, (u64, i64))>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			&format!("SELECT {}, made::text FROM (
+			// The cursor is compared and ordered as a transaction id
+			// (`l.made`), never as its text: "1000000" sorts before "999999".
+			&format!("SELECT {}, l.made::text AS made_text FROM (
 			     SELECT l.*, GREATEST(COALESCE(l.made_xid, '0'::xid8), COALESCE((SELECT m.bound_xid FROM leaf_mailbox m
 			                 WHERE m.owner_key = l.owner_key AND m.mailbox_key = $1), '0'::xid8)) AS made
 			     FROM leaf l WHERE l.leaf_id IN ({})) l
-			 WHERE (made, l.seq) > ($2::text::xid8, $3) AND made < pg_snapshot_xmin(pg_current_snapshot())
-			 ORDER BY made, l.seq LIMIT $4", SERVED_COLUMNS, SERVED_TO),
+			 WHERE (l.made, l.seq) > ($2::text::xid8, $3) AND l.made < pg_snapshot_xmin(pg_current_snapshot())
+			 ORDER BY l.made, l.seq LIMIT $4", SERVED_COLUMNS, SERVED_TO),
 			&[&&key[..], &since.0.to_string(), &since.1, &limit],
 		).await?;
 		let mut made = Vec::with_capacity(rows.len());

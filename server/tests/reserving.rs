@@ -319,6 +319,43 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	assert_eq!(asked.len(), 2, "the coin given up for good and the leaf asked by id, whole: {}", page);
 	assert_eq!(*asked.iter().find(|e| e["leaf_id"] == json!(change_id.to_string())).unwrap(), entry(&all, &change_id));
 	assert_eq!(*asked.iter().find(|e| e["leaf_id"] == json!(new_valid.leaf_id.to_string())).unwrap(), entry(&all, &new_valid.leaf_id));
+	// Neither list crowds out the other: a hundred leaves asked by id (the
+	// most a read takes) and the coin given up for good are all answered.
+	let mut hundred: Vec<[u8; 32]> = (0..99u8).map(|i| [i ^ 0xa5; 32]).collect();
+	hundred.push(new_valid.leaf_id.0);
+	let page = settled(&since, 100, &[change_id.0], &hundred).ok();
+	let asked: Vec<&str> = page["asked"].as_array().unwrap().iter().filter_map(|e| e["leaf_id"].as_str()).collect();
+	assert!(asked.contains(&change_id.to_string().as_str()) && asked.contains(&new_valid.leaf_id.to_string().as_str()),
+		"the coin given up for good and the leaf by id, with a hundred ids asked: {:?}", asked);
+
+	// The settled cursor orders and compares transaction ids as numbers: A's
+	// leaves made by transactions 8, 9 and 10 (in that order; "10" sorts
+	// before "8" as text) are each served once, in that order, a page of one
+	// at a time.
+	{
+		let (sql, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+		tokio::spawn(conn);
+		for (i, e) in all.iter().enumerate() {
+			sql.execute("UPDATE leaf SET made_xid = $2::text::xid8 WHERE leaf_id = decode($1, 'hex')",
+				&[&e["leaf_id"].as_str().unwrap(), &(8 + i).to_string()]).await.unwrap();
+		}
+		sql.execute("UPDATE leaf_mailbox SET bound_xid = '3'::xid8", &[]).await.unwrap();
+		let mut since = "0".to_string();
+		let mut read = vec![];
+		loop {
+			let page = settled(&since, 1, &[], &[]).ok();
+			let Some(l) = page["leaves"].as_array().unwrap().first().cloned() else { break };
+			since = page["next"].as_str().unwrap().to_string();
+			read.push(l);
+			assert!(read.len() <= all.len(), "a leaf served twice: {:?}", read);
+		}
+		assert_eq!(read, all, "every leaf once, in order, across 9 to 10");
+		// The leaves' cursors as transactions 9 and 10 with their seq: past
+		// 9, the leaf of 10 alone.
+		let past = settled(&format!("9.{}", all[1]["cursor"].as_str().unwrap()), 100, &[], &[]).ok();
+		assert_eq!(past["leaves"].as_array().unwrap().len(), 1, "{}", past);
+	}
+
 	// The proof binds every part of the read.
 	let request = server::auth::leaf_since_request("0", 1, &[change_id.0], &[]);
 	let good = r.http.auth_for("leaf_data", &a_mailbox, &r.chain, &request);

@@ -2060,24 +2060,27 @@ async fn leaf_data_since(app: &App, req: &api::LeafDataRequest, since: &str) -> 
 		next = Some(format!("{}.{}", x, q));
 	}
 	// The held coins served to the key, and the whole entry of those given
-	// up for good and of the leaves asked for by id: a page's worth at most,
-	// the rest asked again by the next read.
+	// up for good and of the leaves asked for by id. Each list is bounded on
+	// its own (a page of entries, and a page's bytes of records), so neither
+	// crowds out the other: the held coins given up for good first, which a
+	// wallet must stop counting; what is left out is asked again by the next
+	// read, its coins still held and its leaves still untaken.
 	let states = app.store.held_states(&key, &held).await?;
-	let mut wanted: Vec<[u8; 32]> = ids.clone();
-	for (id, _, given) in &states {
-		if *given && !wanted.contains(id) {
-			wanted.push(*id);
-		}
-	}
-	wanted.truncate(LEAF_PAGE as usize);
+	let mut given: Vec<[u8; 32]> = states.iter().filter(|(_, _, g)| *g).map(|(id, _, _)| *id).collect();
+	given.truncate(LEAF_PAGE as usize);
+	let by_id: Vec<[u8; 32]> = ids.iter().filter(|i| !given.contains(i)).copied().collect();
 	let mut asked = vec![];
-	let mut bytes = 0usize;
-	for r in app.store.served_by_ids(&key, &wanted).await? {
-		bytes += r.leaf.record.len();
-		if !asked.is_empty() && bytes > LEAF_PAGE_BYTES {
-			break;
+	for list in [given, by_id] {
+		let mut bytes = 0usize;
+		let mut first = true;
+		for r in app.store.served_by_ids(&key, &list).await? {
+			bytes += r.leaf.record.len();
+			if !first && bytes > LEAF_PAGE_BYTES {
+				break;
+			}
+			first = false;
+			asked.push(served_entry(app, r).await?);
 		}
-		asked.push(served_entry(app, r).await?);
 	}
 	let held = states.into_iter().map(|(id, state, given)| api::HeldLeaf { leaf_id: hex(&id), state: leaf_state(state).into(), given })
 		.collect();
