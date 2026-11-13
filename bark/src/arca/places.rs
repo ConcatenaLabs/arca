@@ -1077,9 +1077,23 @@ impl Wallet {
 	/// a `board` arriving waits on its board's block and anchor), the totals of
 	/// each place by asset, what can be spent now by asset (`settled`,
 	/// `proceeds` and `counted` coins that are live), and the instant limit.
+	/// Each coin says whether the wallet counts it at risk out of round now
+	/// (`at_risk`): what the operator, with someone other than the wallet,
+	/// could take by signing twice, which the bond and the instant budget
+	/// weigh ([`super::bond`]); the coins so marked sum, by asset, to the
+	/// bond answer's `out_of_round`. A caller reads that mark, not the
+	/// lineage and the state, to know what counts against the budget. When a
+	/// coin's record cannot be read the mark is `null` for every coin and
+	/// `at_risk_error` says why; the places still answer.
 	/// See the [module documentation](self).
 	pub fn coin_places(&self) -> Result<Value, Error> {
 		let p = self.places()?;
+		// Unknown (`null`) for every coin, with why, when it cannot be read: the
+		// places still answer.
+		let (at_risk, at_risk_error) = match self.at_risk_coins() {
+			Ok(cs) => (Some(cs.into_iter().map(|c| c.leaf_id).collect::<BTreeSet<String>>()), None),
+			Err(e) => (None, Some(e.to_string())),
+		};
 		// A coin held out as spent elsewhere is the wallet's still, and not
 		// spendable now ([`Wallet::spent_elsewhere`]).
 		let held = self.spent_elsewhere_until()?;
@@ -1094,7 +1108,7 @@ impl Wallet {
 			let hops = Self::record_of(c).map(|r| record_hops(&r)).unwrap_or(0);
 			let mut v = json!({"leaf_id": c.leaf_id, "asset": c.asset, "value": c.value.to_string(), "state": c.state, "kind": c.kind,
 				"lineage": match lineage { Lineage::Own => "own", Lineage::Trade => "trade", Lineage::Received => "received" },
-				"place": place.name(), "hops": hops});
+				"place": place.name(), "hops": hops, "at_risk": at_risk.as_ref().map(|a| a.contains(&c.leaf_id))});
 			if p.channels.contains(&c.leaf_id) {
 				v["channel"] = json!(true);
 			}
@@ -1112,7 +1126,7 @@ impl Wallet {
 		Ok(json!({
 			"instant_limit": limit, "coins": coins, "totals": totals,
 			"spendable": spendable.into_iter().map(|(a, v)| (a, json!(v.to_string()))).collect::<serde_json::Map<_, _>>(),
-			"unvalued": p.unvalued,
+			"unvalued": p.unvalued, "at_risk_error": at_risk_error,
 		}))
 	}
 }

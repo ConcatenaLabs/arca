@@ -43,7 +43,11 @@
 //! coin on its way into a swap whose checkpoint has its owner's exit is
 //! judged by its own lineage, since it comes home if the swap never
 //! completes; one whose checkpoint has none counts as a coin received out
-//! of round does.
+//! of round does. A coin given to a round participation (a refresh, an
+//! offboard, an order, a take, a distribution) is judged by its own lineage
+//! too: until its round is final the wallet has signed nothing that spends
+//! it, and from then on only its forfeit to the operator, as for any coin
+//! given up in a round. `coin_places` names each coin counted (`at_risk`).
 //!
 //! The wallet keeps the operator's signature over every message of its
 //! coins' lineage ([`arca_covenant::bond::cosigned_by`]) and writes it as
@@ -281,21 +285,46 @@ impl Wallet {
 
 	/// What the wallet holds at risk out of round, by asset: each coin the
 	/// operator and someone else could take from it by signing twice
-	/// ([`Self::at_risk`]), not yet refreshed in a round.
+	/// ([`Self::at_risk_coins`]), not yet refreshed in a round.
 	fn out_of_round(&self) -> Result<BTreeMap<AssetId, u64>, Error> {
 		let mut out: BTreeMap<AssetId, u64> = BTreeMap::new();
-		for c in self.store.coins_in_states(&HELD)? {
-			if HELD.contains(&c.state.as_str()) && self.at_risk(&c)? {
-				let a = AssetId::from_str(&c.asset).map_err(|e| Error::Store(e.to_string()))?;
-				*out.entry(a).or_default() = out.get(&a).copied().unwrap_or(0).saturating_add(c.value);
+		for c in self.at_risk_coins()? {
+			let a = AssetId::from_str(&c.asset).map_err(|e| Error::Store(e.to_string()))?;
+			*out.entry(a).or_default() = out.get(&a).copied().unwrap_or(0).saturating_add(c.value);
+		}
+		Ok(out)
+	}
+
+	/// The coins the wallet holds at risk out of round ([`Self::at_risk`]):
+	/// what [`Self::out_of_round`] sums, and what `coin_places` names
+	/// (`at_risk`).
+	pub(crate) fn at_risk_coins(&self) -> Result<Vec<super::store::CoinRow>, Error> {
+		let coins = self.store.coins_in_states(&HELD)?;
+		let in_round = if coins.iter().any(|c| c.state == "given") { self.given_to_rounds()? } else { BTreeSet::new() };
+		let mut out = vec![];
+		for c in coins {
+			if HELD.contains(&c.state.as_str()) && self.at_risk(&c, &in_round)? {
+				out.push(c);
 			}
+		}
+		Ok(out)
+	}
+
+	/// The coins a participation the wallet keeps open gives up, by leaf id:
+	/// one not yet released, withdrawn, refused or lost.
+	fn given_to_rounds(&self) -> Result<BTreeSet<String>, Error> {
+		let mut out = BTreeSet::new();
+		for (_, _, given, ..) in self.store.participations_not_in(&["released", "withdrawn", "refused", "lost"])? {
+			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+			out.extend(given);
 		}
 		Ok(out)
 	}
 
 	/// Whether the coin `c` is at risk out of round: whether the operator,
 	/// with someone other than the wallet, could take it from the wallet by
-	/// signing a second spend.
+	/// signing a second spend. `in_round` holds the coins open
+	/// participations give up ([`Self::given_to_rounds`]).
 	///
 	/// - A coin of `received` lineage ([`super::places::Lineage`]): a
 	///   payment received, or what a trade paid the wallet (change included)
@@ -307,15 +336,25 @@ impl Wallet {
 	///   spends it. Nor is a coin of `trade` lineage: what a trade with its
 	///   owner's exit on every checkpoint paid the wallet. Should that trade
 	///   die, the coin the wallet gave comes home by its exit.
-	/// - A coin on its way into a swap or a fill (`offered`, `sending`,
-	///   `given`) whose checkpoint has its owner's exit is judged by its own
-	///   lineage: if the trade never completes, the coin comes home by that
-	///   exit. One whose checkpoint has none counts as a coin received out of
-	///   round does, as it always has: should the trade die, it would stand
-	///   in a checkpoint only the wallet and the operator can spend.
-	fn at_risk(&self, c: &super::store::CoinRow) -> Result<bool, Error> {
+	/// - A coin given to a round participation (`given`, and one of `in_round`)
+	///   is judged by its own lineage, as while it is live. Until the round
+	///   holding the participation is final, the wallet has signed nothing
+	///   over the coin but digests under the participation's own tags (its
+	///   attestation, a withdrawal, a decline), none of which spends it; from
+	///   then on its forfeit, to the operator alone, as for every coin given
+	///   up in a round (the coin is then `forfeited`, judged so already).
+	///   Nothing in a round gives another party a key to the coin's lineage.
+	/// - A coin on its way into a swap or a fill (`offered`, `sending`, or a
+	///   `given` coin no open participation names) whose checkpoint has its
+	///   owner's exit is judged by its own lineage: if the trade never
+	///   completes, the coin comes home by that exit. One whose checkpoint has
+	///   none counts as a coin received out of round does, as it always has:
+	///   should the trade die, it would stand in a checkpoint only the wallet
+	///   and the operator can spend.
+	fn at_risk(&self, c: &super::store::CoinRow, in_round: &BTreeSet<String>) -> Result<bool, Error> {
 		let paid_out = c.kind == "transfer" || c.kind == "fill";
-		if matches!(c.state.as_str(), "offered" | "sending" | "given") && !self.given_with_exit(c)? {
+		let to_round = c.state == "given" && in_round.contains(&c.leaf_id);
+		if matches!(c.state.as_str(), "offered" | "sending" | "given") && !to_round && !self.given_with_exit(c)? {
 			return Ok(paid_out);
 		}
 		if !paid_out {
