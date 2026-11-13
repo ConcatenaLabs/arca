@@ -180,8 +180,9 @@ enum Cmd {
 		/// Atoms of the reference unit, or off.
 		value: String,
 	},
-	/// Every coin in its place (settled, proceeds, counted, arriving), the
-	/// totals of each place by asset, and the instant limit.
+	/// Every coin in its place (settled, proceeds, counted, arriving) and
+	/// whether it counts at risk against the bond (`at_risk`), the totals of
+	/// each place by asset, and the instant limit.
 	CoinPlaces,
 	/// Puts through the operator's next round the coins a refusal of kind
 	/// settle_first named (or, with --asset alone, every coin of it that
