@@ -39,10 +39,21 @@ ALTER TABLE leaf_served ADD PRIMARY KEY (mailbox_key, served_xid, seq);
 ALTER TABLE leaf_served ADD CONSTRAINT leaf_served_once UNIQUE (mailbox_key, leaf_id);
 ALTER TABLE leaf_served ADD CONSTRAINT leaf_served_leaf FOREIGN KEY (leaf_id) REFERENCES leaf (leaf_id) ON DELETE CASCADE;
 
+-- Each trigger first takes a lock on the owner key, held to the end of its
+-- transaction (`leaf_served_lock`): a leaf and its key's binding inserted by
+-- two transactions at once would otherwise each read without the other's
+-- row, and the leaf would never be kept for the mailbox. The second waits
+-- for the first to commit, and its INSERT, a statement after the lock, reads
+-- with a snapshot that holds the first's row.
+CREATE FUNCTION leaf_served_lock(owner BYTEA) RETURNS void LANGUAGE sql AS $$
+	SELECT pg_advisory_xact_lock(hashtextextended('arca/leaf_served/' || encode(owner, 'hex'), 0))
+$$;
+
 -- A leaf is served to its owner key, and to the mailbox its key is bound to
 -- already.
 CREATE FUNCTION leaf_served_of_leaf() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+	PERFORM leaf_served_lock(NEW.owner_key);
 	INSERT INTO leaf_served (mailbox_key, served_xid, seq, leaf_id)
 	SELECT s.k, GREATEST(COALESCE(NEW.made_xid, '0'::xid8), s.x, pg_current_xact_id()), NEW.seq, NEW.leaf_id FROM (
 		SELECT NEW.owner_key AS k, '0'::xid8 AS x
@@ -55,6 +66,7 @@ CREATE TRIGGER leaf_served_on_leaf AFTER INSERT ON leaf FOR EACH ROW EXECUTE FUN
 -- A binding serves every leaf of the key to the mailbox from then on.
 CREATE FUNCTION leaf_served_of_binding() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+	PERFORM leaf_served_lock(NEW.owner_key);
 	INSERT INTO leaf_served (mailbox_key, served_xid, seq, leaf_id)
 	SELECT NEW.mailbox_key, GREATEST(COALESCE(l.made_xid, '0'::xid8), COALESCE(NEW.bound_xid, '0'::xid8), pg_current_xact_id()), l.seq, l.leaf_id
 	FROM leaf l WHERE l.owner_key = NEW.owner_key
@@ -66,6 +78,7 @@ CREATE TRIGGER leaf_served_on_binding AFTER INSERT ON leaf_mailbox FOR EACH ROW 
 -- A transfer's output is served to the mailbox it is posted to.
 CREATE FUNCTION leaf_served_of_output() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+	PERFORM leaf_served_lock((SELECT owner_key FROM leaf WHERE leaf_id = NEW.leaf_id));
 	INSERT INTO leaf_served (mailbox_key, served_xid, seq, leaf_id)
 	SELECT NEW.mailbox_key, GREATEST(COALESCE(l.made_xid, '0'::xid8), pg_current_xact_id()), l.seq, l.leaf_id
 	FROM leaf l WHERE l.leaf_id = NEW.leaf_id

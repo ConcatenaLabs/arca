@@ -530,3 +530,76 @@ async fn the_published_tree_lists_every_node_and_each_preimage_once_it_went_out(
 	let _ = (b_tx, nb);
 	println!("published tree of {}:{}: {} levels of nodes; A's preimage out, B's not", built.tx.txid(), vout, levels.len());
 }
+
+/// A leaf, and its owner key's binding to a mailbox, inserted by two
+/// transactions open at once, kept for the mailbox (`leaf_served`) whichever
+/// commits first: each trigger waits for the other's transaction on the
+/// owner key's lock, then reads its row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leaf_and_its_binding_made_at_once_are_served_to_the_mailbox() {
+	let db = common::db::TestDb::new().await;
+	for (round, leaf_first_commit) in [(1u8, true), (2u8, false)] {
+		let (owner, mailbox, leaf_id) = ([round; 32], [round ^ 0xf0; 32], [round ^ 0x0f; 32]);
+		let connect = || async {
+			let (c, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+			tokio::spawn(conn);
+			c
+		};
+		let (t1, t2) = (connect().await, connect().await);
+		t1.batch_execute("BEGIN").await.unwrap();
+		t1.execute("INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES ($1, 'leaf', $2)", &[&&leaf_id[..], &&leaf_id[..]]).await.unwrap();
+		t1.execute("INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state)
+			VALUES ($1, 'batch', $2, 1000, $3, $1, 0, '\\x00', 'live')", &[&&leaf_id[..], &&[7u8; 32][..], &&owner[..]]).await.unwrap();
+		t2.batch_execute("BEGIN").await.unwrap();
+		// The binding's trigger waits on the owner key's lock while the leaf's
+		// transaction is open: insert it in a task of its own.
+		let t2 = std::sync::Arc::new(t2);
+		let t2b = t2.clone();
+		let bind = tokio::spawn(async move {
+			t2b.execute("INSERT INTO leaf_mailbox (owner_key, mailbox_key, proof) VALUES ($1, $2, $3)",
+				&[&&owner[..], &&mailbox[..], &&[9u8; 64][..]]).await.unwrap();
+		});
+		tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+		if leaf_first_commit {
+			t1.batch_execute("COMMIT").await.unwrap();
+			bind.await.unwrap();
+			t2.batch_execute("COMMIT").await.unwrap();
+		} else {
+			// The binding cannot commit before the leaf's lock is released:
+			// the leaf's transaction commits, then the binding's.
+			assert!(!bind.is_finished(), "the binding waits for the leaf's transaction");
+			t1.batch_execute("COMMIT").await.unwrap();
+			bind.await.unwrap();
+			t2.batch_execute("COMMIT").await.unwrap();
+		}
+		let n: i64 = t1.query_one("SELECT count(*) FROM leaf_served WHERE mailbox_key = $1 AND leaf_id = $2", &[&&mailbox[..], &&leaf_id[..]])
+			.await.unwrap().get(0);
+		assert_eq!(n, 1, "round {}: the leaf is kept for the mailbox it was bound to meanwhile", round);
+	}
+	// The other order: the binding's transaction first, the leaf inserted
+	// while it is open.
+	let (owner, mailbox, leaf_id) = ([3u8; 32], [0xf3u8; 32], [0x0cu8; 32]);
+	let (t1, c1) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(c1);
+	let (t2, c2) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(c2);
+	t2.batch_execute("BEGIN").await.unwrap();
+	t2.execute("INSERT INTO leaf_mailbox (owner_key, mailbox_key, proof) VALUES ($1, $2, $3)", &[&&owner[..], &&mailbox[..], &&[9u8; 64][..]])
+		.await.unwrap();
+	t1.batch_execute("BEGIN").await.unwrap();
+	t1.execute("INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES ($1, 'leaf', $2)", &[&&leaf_id[..], &&leaf_id[..]]).await.unwrap();
+	let t1 = std::sync::Arc::new(t1);
+	let t1b = t1.clone();
+	let make = tokio::spawn(async move {
+		t1b.execute("INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state)
+			VALUES ($1, 'batch', $2, 1000, $3, $1, 0, '\\x00', 'live')", &[&&leaf_id[..], &&[7u8; 32][..], &&owner[..]]).await.unwrap();
+	});
+	tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+	assert!(!make.is_finished(), "the leaf waits for the binding's transaction");
+	t2.batch_execute("COMMIT").await.unwrap();
+	make.await.unwrap();
+	t1.batch_execute("COMMIT").await.unwrap();
+	let n: i64 = t2.query_one("SELECT count(*) FROM leaf_served WHERE mailbox_key = $1 AND leaf_id = $2", &[&&mailbox[..], &&leaf_id[..]])
+		.await.unwrap().get(0);
+	assert_eq!(n, 1, "the leaf is kept for the mailbox its key was bound to meanwhile");
+}
