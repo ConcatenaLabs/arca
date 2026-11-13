@@ -456,7 +456,8 @@ pub fn status_of(code: &str) -> StatusCode {
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
 		"owed_claimed" | "owed_withdrawn" => StatusCode::CONFLICT,
-		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" | "unknown_fill" => StatusCode::NOT_FOUND,
+		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" | "unknown_fill" | "unknown_lock" =>
+			StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
 			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" | "frozen" | "in_round" | "not_withdrawable" | "not_declined" =>
 			StatusCode::CONFLICT,
