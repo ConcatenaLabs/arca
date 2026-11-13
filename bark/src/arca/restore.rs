@@ -638,6 +638,11 @@ impl Wallet {
 		self.take_served_bases(e);
 		let a = self.checked_as_held(&record, &owner, &nonce, now)?;
 		let (mut state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		// A lock served to its payee is held apart from the spendable coins,
+		// as the mailbox holds it ([`super::lock`]).
+		if record.is_lock() {
+			state = super::lock::LOCK_IN;
+		}
 		let mut row = self.row(&record, &a, state, &note).map_err(|e| e.to_string())?;
 		// A board is live once the operator credits it, whatever the chain
 		// reads ([`Wallet::board_waits`]): a restore or another device's

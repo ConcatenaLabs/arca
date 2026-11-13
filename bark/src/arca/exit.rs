@@ -170,7 +170,7 @@ pub(crate) fn bid_share_ppm(from: u32, timeout: u32, now: u32) -> u64 {
 /// longer script and a received leaf's preimage in its witness, about 250,
 /// priced at 300.
 fn claim_vsize(leaf: &arca_covenant::LeafPolicy) -> u64 {
-	if leaf.htlc.is_some() { 300 } else if leaf.landing.is_some() { 240 } else { 220 }
+	if leaf.htlc.is_some() || leaf.lock.is_some() { 300 } else if leaf.landing.is_some() { 240 } else { 220 }
 }
 
 impl Wallet {
@@ -323,6 +323,14 @@ impl Wallet {
 	/// leaf received over Lightning comes home by its owner's claim with the
 	/// payment's preimage (which the operator then reads there).
 	fn claim_witness(&self, coin: &ValidCoin, nonce: &[u8; 32]) -> Result<Vec<Vec<u8>>, Error> {
+		// A lock comes home to its payee by CLAIM with the preimage, to its
+		// payer by REFUND with nothing more.
+		if let Some(p) = coin.leaf.lock_policy() {
+			if self.keys.leaf_xonly(nonce)? == p.terms.refunder {
+				return Ok(vec![]);
+			}
+			return Ok(vec![self.lock_preimage(&hex(&p.terms.payment_hash))?.to_vec()]);
+		}
 		Ok(match coin.leaf.htlc {
 			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![self.received_preimage(&t.payment_hash, nonce)?.to_vec()],
 			_ => vec![],
@@ -347,6 +355,9 @@ impl Wallet {
 			return self.with_fee(payer, &|f| o.landing_tx(leaf_at, value, f).map_err(|e| Error::Refused(e.to_string())));
 		}
 		let min_fee = payer.min_fee;
+		// A lock: CLAIM by its payee (with the preimage, past its delay),
+		// REFUND by its payer (from its timeout, past the payer's delay).
+		let lock = leaf.lock_policy().map(|p| (key.x_only_public_key().0 == p.terms.refunder, p));
 		self.key_spend_with(payer, key, after, &|f| {
 			let out = match f {
 				FeeSource::Reserve | FeeSource::Split { .. } => {
@@ -358,6 +369,10 @@ impl Wallet {
 				},
 				FeeSource::Coin { .. } | FeeSource::Burning { .. } => ExplicitOutput::new(asset, value, to.clone()),
 			};
+			if let Some((refund, p)) = &lock {
+				return if *refund { p.refund_tx(leaf_at, asset, value, &[out], f) } else { p.claim_tx(leaf_at, asset, value, &[out], f) }
+					.map_err(|e| Error::Refused(e.to_string()));
+			}
 			match leaf.htlc {
 				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
 				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
@@ -786,7 +801,8 @@ impl Wallet {
 	/// Refuses what the exit would refuse for the same reason.
 	pub fn exit_quote(&mut self, leaf_id: &str, fee_asset: Option<AssetId>) -> Result<Value, Error> {
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Refused(format!("no coin {}", leaf_id)))?;
-		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving" | super::round::HANDED) {
+		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving" | super::lock::LOCK_IN | super::lock::LOCK_OUT
+			| super::round::HANDED) {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
 		if self.channel_worth(&row)?.is_some() {
@@ -846,8 +862,9 @@ impl Wallet {
 		// 32 bytes, whatever it is).
 		let (asset, value, leaf) = (coin.asset, coin.value, coin.leaf);
 		let to = Script::from(vec![0u8; 22]);
-		let after = match leaf.htlc {
-			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![vec![0u8; 32]],
+		let after = match (leaf.htlc, leaf.lock_policy()) {
+			(Some(t), _) if t.direction == arca_covenant::HtlcDirection::Receive => vec![vec![0u8; 32]],
+			(_, Some(p)) if key.x_only_public_key().0 != p.terms.refunder => vec![vec![0u8; 32]],
 			_ => vec![],
 		};
 		// The claim pays to the wallet already: it needs no anchor.
@@ -897,7 +914,8 @@ impl Wallet {
 		// A coin handed over to a participation or a transfer is the wallet's
 		// until the chain shows otherwise: one taken by a round or a
 		// co-signed spend is `spent`, and is not exited.
-		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving" | super::round::HANDED) {
+		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving" | super::lock::LOCK_IN | super::lock::LOCK_OUT
+			| super::round::HANDED) {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
 		// A channel leaf closes on the chain by its own steps: its latest
@@ -1113,7 +1131,7 @@ impl Wallet {
 					"vsize": claim.tx.vsize(), "pays": claim.tx.output[0].value.explicit().map(|v| v.to_string()),
 					"to": self.chain.address(&to)?}}))
 			},
-			Err(e) if e.to_string().contains("non-BIP68-final") => {
+			Err(e) if e.to_string().contains("non-BIP68-final") || e.to_string().contains("non-final") => {
 				record_exit("waiting", payer.asset, self)?;
 				// When the claim's delay ends, from the leaf's block, for the
 				// schedule (`claim_from`); a refund of a payment out of the tree
@@ -1124,6 +1142,10 @@ impl Wallet {
 						if let Some(t) = leaf.htlc.filter(|t| t.direction == arca_covenant::HtlcDirection::Send) {
 							from = from.max(t.timeout.to_consensus_u32() as u64);
 						}
+						// A lock's payer refunds from its timeout and its own delay.
+						if let Some(p) = leaf.lock_policy().filter(|p| key.x_only_public_key().0 == p.terms.refunder) {
+							from = (mtp as u64 + p.terms.refund_delay.seconds()).max(p.terms.timeout.to_consensus_u32() as u64);
+						}
 						if let Some((st, j, c)) = self.store.exit(leaf_id)? {
 							let mut v: Value = serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?;
 							v["claim_from"] = json!(from);
@@ -1132,8 +1154,12 @@ impl Wallet {
 					}
 				}
 				Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps,
-					"next": format!("the exit delay of {} s runs from the leaf's confirmation; the node refused the claim before it: {}",
-						leaf.exit_delay.seconds(), e)}))
+					"next": match leaf.lock_policy().filter(|p| key.x_only_public_key().0 == p.terms.refunder) {
+						Some(p) => format!("the lock's refund opens at its timeout (median time {}) and {} s after the leaf's confirmation, \
+							whichever is later; the node refused it before: {}", p.terms.timeout.to_consensus_u32(), p.terms.refund_delay.seconds(), e),
+						None => format!("the exit delay of {} s runs from the leaf's confirmation; the node refused the claim before it: {}",
+							leaf.exit_delay.seconds(), e),
+					}}))
 			},
 			Err(e) => Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps, "error": e.to_string()})),
 		}
@@ -2057,8 +2083,7 @@ impl Wallet {
 		// Locks between two holders: a held one claimed once its preimage is
 		// known, one the wallet made marked paid once claimed, or refunded
 		// from its timeout.
-		let locks = if talk { self.progress_locks().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
-			else { Value::Array(vec![]) };
+		let locks = self.progress_locks(talk).map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		steps.lap(self, "locks");
 		self.exits_meanwhile();
 		// What other stores of the mnemonic did: coins they made taken, coins

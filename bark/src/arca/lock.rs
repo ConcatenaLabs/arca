@@ -162,22 +162,58 @@ impl Wallet {
 			}
 			return Ok(r["request"].clone());
 		}
+		let key = self.lock_key()?;
+		self.lock_request_keyed(&key, asset, value, hash, min_timeout)
+	}
+
+	/// Whether a lock of `value` of `asset` fits the wallet's instant room
+	/// now: always while it sets no instant limit; never while the node
+	/// gives no rate for the asset.
+	pub(crate) fn lock_fits_room(&self, asset: AssetId, value: u64) -> Result<bool, Error> {
+		let Some(limit) = self.instant_limit()? else { return Ok(true) };
+		let Some(rate) = self.chain.fee_rates()?.get(&asset).copied().filter(|r| *r > 0) else { return Ok(false) };
+		let worth = value as u128 * rate as u128 / 100_000_000;
+		let counted = self.places()?.counted;
+		Ok(counted.saturating_add(worth) <= limit.value)
+	}
+
+	/// The key a payee draws for a lock before it knows the hash (a swap's
+	/// maker that gives BTC, whose taker names the hash): what a lock
+	/// request carries of it, its nonce kept for the lock.
+	pub(crate) fn lock_key(&mut self) -> Result<Value, Error> {
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "lock")?;
-		let mut req = json!({
-			"kind": REQUEST_KIND, "genesis_hash": self.genesis.genesis_hash().to_string(), "operator": self.operator.to_string(),
-			"owner": hex(&owner.serialize()), "owner_nonce": hex(&nonce),
-			"mailbox": hex(&self.keys.mailbox()?.x_only_public_key().0.serialize()),
-			"exit_delay_units": self.cfg.exit_delay_units, "asset": asset.to_string(), "value": value.to_string(),
-			"payment_hash": h, "reads": arca_covenant::RECORD_FORMATS,
-		});
+		Ok(json!({"owner": hex(&owner.serialize()), "owner_nonce": hex(&nonce),
+			"mailbox": hex(&self.keys.mailbox()?.x_only_public_key().0.serialize()), "exit_delay_units": self.cfg.exit_delay_units,
+			"reads": arca_covenant::RECORD_FORMATS}))
+	}
+
+	/// [`Self::lock_request`] under a key drawn before ([`Self::lock_key`]).
+	pub(crate) fn lock_request_keyed(&mut self, key: &Value, asset: AssetId, value: u64, hash: [u8; 32], min_timeout: Option<u32>)
+		-> Result<Value, Error>
+	{
+		let h = hex(&hash);
+		let nonce = key["owner_nonce"].as_str().unwrap_or("").to_string();
+		let mut req = Self::lock_request_of(self, key, asset, value, &h);
 		if let Some(t) = min_timeout {
 			req["min_timeout"] = json!(t);
 		}
 		self.set_lock("payee", &h, json!({"role": "payee", "hash": h, "asset": asset.to_string(), "value": value.to_string(),
-			"nonce": hex(&nonce), "min_timeout": min_timeout, "state": "asked", "request": req.clone(), "created_at": wall_now()}))?;
+			"nonce": nonce, "min_timeout": min_timeout, "state": "asked", "request": req.clone(), "created_at": wall_now()}))?;
 		Ok(req)
+	}
+
+	/// A lock request from a payee's key and the lock's terms.
+	pub(crate) fn lock_request_of(&self, key: &Value, asset: AssetId, value: u64, hash: &str) -> Value {
+		let mut req = key.clone();
+		req["kind"] = json!(REQUEST_KIND);
+		req["genesis_hash"] = json!(self.genesis.genesis_hash().to_string());
+		req["operator"] = json!(self.operator.to_string());
+		req["asset"] = json!(asset.to_string());
+		req["value"] = json!(value.to_string());
+		req["payment_hash"] = json!(hash);
+		req
 	}
 
 	/// The payer's side: locks `value` of `asset` (the request's) to the
@@ -291,8 +327,32 @@ impl Wallet {
 		}
 	}
 
+	/// The preimage of the lock the wallet holds as its payee under `hash`:
+	/// its own, or the operator's once the payer posted it. Refused while
+	/// neither has it: the lock is claimed on the chain only with it.
+	pub(crate) fn lock_preimage(&self, hash: &str) -> Result<[u8; 32], Error> {
+		if let Some(p) = self.lock_rec("payee", hash)?.and_then(|r| r["preimage"].as_str().map(String::from)) {
+			return unhex32(&p);
+		}
+		let st = self.lock_status(hash).map_err(|e| Error::Refused(format!("the lock's preimage is not known, and the operator does 			not answer: {}", e)))?;
+		match st["preimage"].as_str() {
+			Some(p) => {
+				let pre = unhex32(p)?;
+				if hex(&sha256::Hash::hash(&pre).to_byte_array()) != hash {
+					return Err(Error::Refused("the operator's preimage does not open the lock's hash".into()));
+				}
+				if let Some(mut r) = self.lock_rec("payee", hash)? {
+					r["preimage"] = json!(p);
+					self.set_lock("payee", hash, r)?;
+				}
+				Ok(pre)
+			},
+			None => Err(Error::Refused(format!("the preimage of hash {} is not known yet: the lock is claimed on the chain only with it", hash))),
+		}
+	}
+
 	/// The coin row of the lock the wallet holds as `role` under `hash`.
-	fn lock_row(&self, role: &str, hash: &str) -> Result<Option<CoinRow>, Error> {
+	pub(crate) fn lock_row(&self, role: &str, hash: &str) -> Result<Option<CoinRow>, Error> {
 		let state = if role == "payee" { LOCK_IN } else { LOCK_OUT };
 		for c in self.store.coins_in(state)? {
 			let Ok(record) = CoinRecord::from_bytes(&c.record) else { continue };
@@ -453,8 +513,12 @@ impl Wallet {
 	/// it) while the operator still co-signs a claim; the payer marks a lock
 	/// the payee claimed as paid, and refunds one still open from its
 	/// timeout. Each step that fails is said and tried again at the next.
-	pub(crate) fn progress_locks(&mut self) -> Result<Vec<Value>, Error> {
-		let mut out = vec![];
+	pub(crate) fn progress_locks(&mut self, talk: bool) -> Result<Vec<Value>, Error> {
+		self.adopt_locks()?;
+		let mut out = self.locks_home(talk)?;
+		if !talk {
+			return Ok(out);
+		}
 		let now = self.now()?.to_consensus_u32() as u64;
 		for (k, rec) in self.locks_map()? {
 			let (role, hash) = k.split_once('/').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
@@ -488,8 +552,15 @@ impl Wallet {
 						Err(e) => json!({"payment_hash": hash, "role": "payee", "error": e.to_string()}),
 					});
 				},
-				("payer", "locked") => {
+				("payer", "locked" | "locking") => {
 					let Some(row) = self.lock_row("payer", &hash)? else { continue };
+					if rec["state"] == "locking" {
+						// The transfer asked was answered by a later post (`sync`).
+						let mut r = rec.clone();
+						r["state"] = json!("locked");
+						r["leaf_id"] = json!(row.leaf_id);
+						self.set_lock("payer", &hash, r)?;
+					}
 					let st = self.lock_status(&hash).ok();
 					let theirs = st.as_ref().and_then(|s| s["locks"].as_array()).and_then(|l| l.iter().find(|x| x["leaf_id"] == row.leaf_id.as_str())).cloned();
 					if theirs.as_ref().is_some_and(|l| l["state"] == "claimed") {
@@ -504,7 +575,15 @@ impl Wallet {
 					if now >= rec["timeout"].as_u64().unwrap_or(u64::MAX) {
 						out.push(match self.lock_refund(&hash) {
 							Ok(v) => json!({"payment_hash": hash, "role": "payer", "refunded": v["transfer"]["outputs"]}),
-							Err(e) => json!({"payment_hash": hash, "role": "payer", "error": e.to_string()}),
+							Err(e) => {
+								// Refused or unanswered: the next sync takes it on the
+								// chain by REFUND ([`Self::locks_home`]).
+								let mut r = self.lock_rec("payer", &hash)?.unwrap_or(rec.clone());
+								r["refund_tries"] = json!(r["refund_tries"].as_u64().unwrap_or(0) + 1);
+								r["refund_error"] = json!(e.to_string());
+								self.set_lock("payer", &hash, r)?;
+								json!({"payment_hash": hash, "role": "payer", "error": e.to_string()})
+							},
 						});
 					}
 				},
@@ -512,6 +591,83 @@ impl Wallet {
 			}
 		}
 		Ok(out)
+	}
+
+	/// Gives every lock coin the wallet holds without a lock record (a
+	/// restore from the phrase found it in the mailbox) the record its side
+	/// keeps: the payee's held, claimed once the preimage is known; the
+	/// payer's locked, refunded from its timeout unless claimed.
+	pub(crate) fn adopt_locks(&mut self) -> Result<(), Error> {
+		for (state, role) in [(LOCK_IN, "payee"), (LOCK_OUT, "payer")] {
+			for c in self.store.coins_in(state)? {
+				let Ok(record) = CoinRecord::from_bytes(&c.record) else { continue };
+				let Some((t, owner, ..)) = lock_terms(&record) else { continue };
+				let h = hex(&t.payment_hash);
+				if self.lock_rec(role, &h)?.is_some() {
+					continue;
+				}
+				let mut rec = json!({"role": role, "hash": h, "asset": c.asset, "value": c.value.to_string(), "leaf_id": c.leaf_id,
+					"timeout": t.timeout.to_consensus_u32(), "restored": true, "created_at": wall_now()});
+				if role == "payee" {
+					rec["state"] = json!("held");
+					rec["nonce"] = json!(hex(&c.owner_nonce));
+				} else {
+					rec["state"] = json!("locked");
+					rec["refund_nonce"] = json!(hex(&c.owner_nonce));
+					rec["payee"] = json!(hex(&owner.serialize()));
+				}
+				self.set_lock(role, &h, rec)?;
+			}
+		}
+		Ok(())
+	}
+
+	/// Takes on the chain every lock that must go there, whatever the
+	/// operator does: the payee's, from its home date ([`Self::lock_home`]),
+	/// once it holds the preimage or has paid for it (the claim then waits
+	/// on the chain for the preimage); the payer's, from its timeout, once
+	/// its refund out of round was refused or the operator does not answer
+	/// (`talk` false). An exit already under way
+	/// is followed by the schedule as any exit is.
+	pub(crate) fn locks_home(&mut self, talk: bool) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		let now = self.now()?.to_consensus_u32() as u64;
+		for (k, rec) in self.locks_map()? {
+			let (role, hash) = k.split_once('/').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
+			let Some(row) = self.lock_row(&role, &hash)? else { continue };
+			if self.store.exit(&row.leaf_id)?.is_some() {
+				continue;
+			}
+			let due = match role.as_str() {
+				"payee" => {
+					let owed = matches!(rec["state"].as_str(), Some("asked" | "held")) && (!rec["preimage"].is_null() || rec["paid"] == true);
+					let (_, a) = self.held(&row)?;
+					let home = self.lock_home(&a.valid, 60)?;
+					owed && now >= home
+				},
+				_ => rec["state"] == "locked" && now >= rec["timeout"].as_u64().unwrap_or(u64::MAX)
+					&& (!talk || rec["refund_tries"].as_u64().unwrap_or(0) >= 1),
+			};
+			if !due {
+				continue;
+			}
+			out.push(match self.exit(&row.leaf_id, None) {
+				Ok(v) => json!({"payment_hash": hash, "role": role, "on_chain": v}),
+				Err(e) => json!({"payment_hash": hash, "role": role, "on_chain_error": e.to_string()}),
+			});
+		}
+		Ok(out)
+	}
+
+	/// Notes that the payee's wallet has paid for the preimage of `hash`
+	/// (its BTC payment is out): from the lock's home date it is taken on the
+	/// chain unless claimed, and its claim there waits for the preimage.
+	pub fn lock_paid(&mut self, hash: &str) -> Result<(), Error> {
+		if let Some(mut r) = self.lock_rec("payee", hash)? {
+			r["paid"] = json!(true);
+			self.set_lock("payee", hash, r)?;
+		}
+		Ok(())
 	}
 
 	/// Hands the payee's wallet the preimage of `hash`, learnt elsewhere (a

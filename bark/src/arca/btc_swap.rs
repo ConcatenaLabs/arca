@@ -267,6 +267,14 @@ impl Wallet {
 		});
 		let mut rec = json!({"role": role, "maker": true, "state": "offered", "asset": asset.to_string(), "atoms": atoms.to_string(),
 			"sats": sats.to_string(), "created_at": wall_now()});
+		// Q, the maker giving BTC, offers to take the asset as a lock straight
+		// from P (`htlc-2`) when the operator co-signs locks and the asset
+		// fits its instant room: the key for it now, the hash from P's take.
+		if role == "Q" && Self::operator_locks(&info) && self.lock_fits_room(asset, atoms)? {
+			let key = self.lock_key()?;
+			offer["lock"] = key.clone();
+			rec["lock_key"] = key;
+		}
 		if role == "P" {
 			let invoice = bitcoin["invoice"].as_str().ok_or_else(|| Error::Refused("P's offer carries its Bark invoice for the BTC, and \
 				the Bitcoin side gave none".into()))?;
@@ -372,6 +380,13 @@ impl Wallet {
 				rec["hash"] = json!(hash);
 				rec["invoice_btc"] = json!(invoice);
 				rec["invoice_btc_expiry"] = json!(expiry);
+				// The asset as a lock straight from P when the operator co-signs
+				// locks and it fits the instant room; the receive under the hash
+				// stays, for a P that locks the older way.
+				if Self::operator_locks(&info) && self.lock_fits_room(t.asset, t.atoms)? {
+					let min = self.lock_min_timeout(&bitcoin["ark_info"], expiry)?;
+					take["lock"] = self.lock_request(t.asset, t.atoms, inv.payment_hash, Some(min))?;
+				}
 				let r = self.lightning_receive_under(t.asset, t.atoms, Some("btc swap"), None, Some(inv.payment_hash))?;
 				rec["invoice_x"] = r["invoice"].clone();
 			},
@@ -383,6 +398,10 @@ impl Wallet {
 				rec["invoice_btc"] = json!(invoice);
 				rec["invoice_btc_expiry"] = json!(expiry);
 				take["invoice"] = json!(invoice);
+				// Q offered to take the asset as a lock straight from the wallet.
+				if offer["lock"].is_object() {
+					rec["lock_request"] = self.lock_request_of(&offer["lock"], t.asset, t.atoms, &hex(&inv.payment_hash));
+				}
 			},
 		}
 		self.set_btc_swap(&id, rec.clone())?;
@@ -409,8 +428,21 @@ impl Wallet {
 			rec["hash"] = json!(hex(&inv.payment_hash));
 			rec["invoice_btc"] = json!(invoice);
 			rec["invoice_btc_expiry"] = json!(expiry);
+			if rec["lock_key"].is_object() {
+				let min = self.lock_min_timeout(&bitcoin["ark_info"], expiry)?;
+				let key = rec["lock_key"].clone();
+				self.lock_request_keyed(&key, t.asset, t.atoms, inv.payment_hash, Some(min))?;
+			}
 			let r = self.lightning_receive_under(t.asset, t.atoms, Some("btc swap"), None, Some(inv.payment_hash))?;
 			rec["invoice_x"] = r["invoice"].clone();
+		} else if take["lock"].is_object() {
+			// Q asks the asset as a lock straight from the wallet: under the
+			// swap's hash, for its atoms of its asset.
+			let l = &take["lock"];
+			if l["payment_hash"] != rec["hash"] || l["asset"].as_str() != Some(&t.asset.to_string()) || l["value"] != json!(t.atoms.to_string()) {
+				return Err(Error::Refused("the take's lock request is not for the swap's hash, asset and atoms".into()));
+			}
+			rec["lock_request"] = l.clone();
 		}
 		rec["state"] = json!("taken");
 		self.set_btc_swap(&id, rec.clone())?;
@@ -464,6 +496,21 @@ impl Wallet {
 		let (inv, expiry) = Self::swap_invoice(invoice, sats, ark_info, PAY_LEFT)?;
 		if hex(&inv.payment_hash) != hash {
 			return Err(Error::Refused("the swap's invoice is under another hash than its receive".into()));
+		}
+		// A lock straight from P, once it has come, is the asset leg; the
+		// receive through the operator otherwise.
+		if self.lock_row("payee", hash)?.is_some() {
+			let wall = wall_now();
+			let latest = bitcoin_latest(ark_info, expiry, wall)?;
+			let need = latest.saturating_sub(wall) + REACTION;
+			let r = self.lock_ready(hash, need)?;
+			if r["ready"] != true {
+				return Ok(Some(r["why"].as_str().unwrap_or("the lock is not held yet").to_string()));
+			}
+			if r["asset"].as_str() != rec["asset"].as_str() || r["value"] != json!(atoms.to_string()) {
+				return Err(Error::Refused(format!("the lock under {} is not the swap's: {} of {}", hash, r["value"], r["asset"])));
+			}
+			return Ok(None);
 		}
 		let (asset, value, home_in) = match self.received_held(hash)? {
 			Ok(h) => h,
@@ -569,6 +616,9 @@ impl Wallet {
 					Self::end(rec, "lapsed", "the Bitcoin invoice has too little time left to lock the asset; nothing was locked");
 					return Ok(cancel());
 				}
+				if let Some(step) = self.follow_p_lock(rec, bitcoin)? {
+					return Ok(step);
+				}
 				let st = match self.lightning_lookup(&hash) {
 					Ok(st) => st,
 					Err(Error::Server { code, .. }) if code == "unknown_payment" => {
@@ -623,6 +673,29 @@ impl Wallet {
 					},
 				}
 			},
+			"locking" if rec["leg"] == "htlc-2" => {
+				match self.lock_rec("payer", &hash)?.and_then(|l| l["state"].as_str().map(String::from)).as_deref() {
+					Some("locking") => {
+						// Still asked: answered once `sync` posts it again.
+						if self.lock_row("payer", &hash)?.is_some() {
+							rec["state"] = json!("locked");
+							return self.follow_p_locked(rec);
+						}
+						Self::note(rec, "the lock is asked and not answered yet");
+						Ok(Value::Null)
+					},
+					Some("refused") | None => {
+						rec["state"] = json!("taken");
+						rec["leg"] = json!("htlc-1");
+						self.follow_p(rec, bitcoin)
+					},
+					_ => {
+						rec["state"] = json!("locked");
+						self.follow_p_locked(rec)
+					},
+				}
+			},
+			"locked" | "claimed" | "btc_lost" if rec["leg"] == "htlc-2" => self.follow_p_locked(rec),
 			"locking" => {
 				// A restart between recording the lock and the operator's answer:
 				// the payment, if the wallet made it, is in its sends.
@@ -732,6 +805,127 @@ impl Wallet {
 		u32::try_from(t).map_err(|_| Error::Refused("a timeout past 2106".into()))
 	}
 
+	/// The earliest timeout Q takes for a lock straight from P (a median
+	/// time): the lock's home date ([`Wallet::lock_ready`]) at least
+	/// [`REACTION`] past the Bitcoin leg's latest moment, allowing
+	/// [`UNROLL`] for its lineage and ten minutes.
+	pub(crate) fn lock_min_timeout(&self, ark_info: &Value, invoice_expiry: u64) -> Result<u32, Error> {
+		let (median, wall) = (self.now()?.to_consensus_u32() as u64, wall_now());
+		let latest = bitcoin_latest(ark_info, invoice_expiry, wall)?;
+		let t = median + latest.saturating_sub(wall) + REACTION + self.exit_delay().seconds() + UNROLL + 600;
+		u32::try_from(t).map_err(|_| Error::Refused("a timeout past 2106".into()))
+	}
+
+	/// P's timeout for a lock straight to Q: Q's earliest, recomputed from
+	/// the Bitcoin leg with Q's delay, and an hour more; within the
+	/// operator's furthest.
+	fn lock_timeout(&self, req: &Value, rec: &Value, bitcoin: &Value) -> Result<u32, Error> {
+		let (median, wall) = (self.now()?.to_consensus_u32() as u64, wall_now());
+		let latest = bitcoin_latest(&bitcoin["ark_info"], rec["invoice_btc_expiry"].as_u64().unwrap_or(0), wall)?;
+		let exit_q = req["exit_delay_units"].as_u64().unwrap_or(0) * 512;
+		let need = (median + latest.saturating_sub(wall) + REACTION + exit_q + UNROLL + 600).max(req["min_timeout"].as_u64().unwrap_or(0));
+		let t = need + 3600;
+		let most = median + self.server_info()?["locks"]["max_seconds"].as_u64().unwrap_or(14 * 86400);
+		if t > most {
+			return Err(Error::Refused(format!("the swap needs the asset locked until median time {}, past the operator's furthest, {}", t, most)));
+		}
+		u32::try_from(t).map_err(|_| Error::Refused("a timeout past 2106".into()))
+	}
+
+	/// P's lock straight to Q (`htlc-2`), when Q asked for it and the
+	/// operator co-signs locks: `Some` with the step taken, `None` when the
+	/// swap takes the older path (`htlc-1` through the operator) instead.
+	fn follow_p_lock(&mut self, rec: &mut Value, bitcoin: &Value) -> Result<Option<Value>, Error> {
+		let req = rec["lock_request"].clone();
+		if !req.is_object() || rec["leg"] == "htlc-1" || !Self::operator_locks(&self.server_info()?) {
+			return Ok(None);
+		}
+		let hash = rec["hash"].as_str().unwrap_or("").to_string();
+		let invoice_btc = rec["invoice_btc"].clone();
+		let t = match self.lock_timeout(&req, rec, bitcoin) {
+			Ok(t) => t,
+			Err(e) => {
+				Self::note(rec, &format!("not locking straight to the taker: {}; locking through the operator", e));
+				rec["leg"] = json!("htlc-1");
+				return Ok(None);
+			},
+		};
+		rec["leg"] = json!("htlc-2");
+		rec["send_timeout"] = json!(t);
+		rec["state"] = json!("locking");
+		self.set_btc_swap(rec["id"].as_str().unwrap_or(""), rec.clone())?;
+		match self.lock_to(&req, t) {
+			Ok(l) => {
+				rec["state"] = json!("locked");
+				rec["lock"] = json!({"leaf_id": l["leaf_id"], "timeout": t});
+				Self::note(rec, &format!("the asset is locked straight to the taker (htlc-2) until median time {}; claiming the BTC", t));
+				Ok(Some(json!({"action": "claim", "invoice": invoice_btc})))
+			},
+			Err(e) => {
+				let standing = self.lock_rec("payer", &hash)?.is_some_and(|r| r["state"] == "locking");
+				if standing {
+					// Asked and not answered: the transfer stands, posted again by
+					// `sync`, and nothing else is locked meanwhile.
+					Self::note(rec, &format!("the lock is asked and not answered yet: {}", e));
+					return Ok(Some(Value::Null));
+				}
+				// Refused before anything was signed (no coin shallow enough, a
+				// timeout the operator does not take): the older path.
+				rec["state"] = json!("taken");
+				rec["leg"] = json!("htlc-1");
+				Self::note(rec, &format!("not locking straight to the taker: {}; locking through the operator", e));
+				Ok(None)
+			},
+		}
+	}
+
+	/// Where P's lock straight to Q stands, once made.
+	fn follow_p_locked(&mut self, rec: &mut Value) -> Result<Value, Error> {
+		let hash = rec["hash"].as_str().unwrap_or("").to_string();
+		let invoice_btc = rec["invoice_btc"].clone();
+		let cancel = json!({"action": "cancel_receive", "invoice": invoice_btc});
+		let expiry = rec["invoice_btc_expiry"].as_u64().unwrap_or(0);
+		let lock = self.lock_rec("payer", &hash)?.unwrap_or(Value::Null);
+		match (rec["state"].as_str().unwrap_or(""), lock["state"].as_str().unwrap_or("")) {
+			("claimed", "claimed") if rec["btc_settled"] == true => {
+				Self::end(rec, "done", "the BTC is claimed, and the taker claimed the lock");
+				Ok(Value::Null)
+			},
+			("claimed", _) => {
+				if rec["posted"] != true {
+					let pre = rec["preimage"].as_str().unwrap_or("").to_string();
+					match self.server.post("lock_preimage", &json!({"payment_hash": hash, "preimage": pre})) {
+						Ok(_) => rec["posted"] = json!(true),
+						Err(e) => Self::note(rec, &format!("the preimage could not be posted to the operator yet: {}", e)),
+					}
+				}
+				Self::note(rec, "the BTC is claimed; the taker claims the lock with the preimage");
+				Ok((rec["btc_settled"] != true).then(|| json!({"action": "claim", "invoice": invoice_btc})).unwrap_or(Value::Null))
+			},
+			(_, "claimed") => {
+				Self::end(rec, "done", "the taker claimed the lock with the preimage the BTC claim revealed");
+				Ok(Value::Null)
+			},
+			(_, "refunded") => {
+				Self::end(rec, "refunded", "the lock came back to the wallet from its timeout");
+				Ok(cancel)
+			},
+			("locked", _) if expiry <= wall_now() => {
+				rec["state"] = json!("btc_lost");
+				Self::note(rec, "the Bitcoin invoice expired unclaimed: the lock comes back to the wallet from its timeout");
+				Ok(cancel)
+			},
+			("locked", _) => {
+				Self::note(rec, "the asset is locked straight to the taker; claiming the BTC while the payer pays");
+				Ok(json!({"action": "claim", "invoice": invoice_btc}))
+			},
+			_ => {
+				Self::note(rec, "the BTC leg ended unclaimed; the lock comes back to the wallet from its timeout");
+				Ok(Value::Null)
+			},
+		}
+	}
+
 	/// Q: gives the BTC, gets the asset.
 	fn follow_q(&mut self, rec: &mut Value, bitcoin: &Value) -> Result<Value, Error> {
 		let hash = rec["hash"].as_str().unwrap_or("").to_string();
@@ -748,8 +942,11 @@ impl Wallet {
 				Ok(Value::Null)
 			},
 			"taken" => {
+				// A lock straight from P makes the receive through the operator
+				// moot: its failing back ends nothing.
+				let locked = self.lock_row("payee", &hash)?.is_some() || self.lock_rec("payee", &hash)?.is_some_and(|l| l["state"] != "asked");
 				match r["state"].as_str() {
-					Some("failed") => {
+					Some("failed") if !locked => {
 						Self::end(rec, "abandoned", &format!("the receive failed back before the BTC was paid: {}; nothing was paid",
 							r["reason"].as_str().unwrap_or("")));
 						return Ok(Value::Null);
@@ -760,8 +957,18 @@ impl Wallet {
 					},
 					_ => {},
 				}
+				if self.lock_rec("payee", &hash)?.is_some_and(|l| l["state"] == "claimed") {
+					Self::end(rec, "done", "the lock is claimed");
+					return Ok(Value::Null);
+				}
 				match self.btc_swap_ready(rec, &bitcoin["ark_info"]) {
 					Ok(None) => {
+						// Paying: from the lock's home date it is taken on the chain
+						// unless claimed ([`Wallet::locks_home`]).
+						if self.lock_row("payee", &hash)?.is_some() {
+							self.lock_paid(&hash)?;
+							rec["leg"] = json!("htlc-2");
+						}
 						let tries = rec["pay_tries"].as_u64().unwrap_or(0);
 						if tries >= PAY_TRIES {
 							Self::end(rec, "btc_failed", "the BTC payment did not go through; the asset leg fails back to its payer");
@@ -789,12 +996,24 @@ impl Wallet {
 			"paying" => {
 				// The preimage served by the operator (P posted it) does as well
 				// as Bark's.
-				if !r["preimage"].is_null() || matches!(r["state"].as_str(), Some("received") | Some("claiming")) {
+				let lock = self.lock_rec("payee", &hash)?.unwrap_or(Value::Null);
+				if !r["preimage"].is_null() || matches!(r["state"].as_str(), Some("received") | Some("claiming"))
+					|| !lock["preimage"].is_null() || lock["state"] == "claimed"
+				{
 					rec["state"] = json!("claiming");
 					return self.follow_q(rec, bitcoin);
 				}
 				Self::note(rec, "the BTC payment is with Bark");
 				Ok(json!({"action": "pay_status", "invoice": invoice_btc}))
+			},
+			"claiming" if rec["leg"] == "htlc-2" => {
+				let lock = self.lock_rec("payee", &hash)?.unwrap_or(Value::Null);
+				match lock["state"].as_str() {
+					Some("claimed") => Self::end(rec, "done", "the lock is claimed"),
+					Some("refunded") => Self::end(rec, "done", "the BTC was paid and the lock went back to its payer"),
+					_ => Self::note(rec, "claiming the lock with the preimage"),
+				}
+				Ok(Value::Null)
 			},
 			"claiming" => {
 				match r["state"].as_str() {
@@ -848,7 +1067,16 @@ impl Wallet {
 			(Some("Q"), Some("pay" | "pay_status"), Some("paid")) => {
 				let p = preimage.ok_or_else(|| Error::Refused("Bark paid, and named no preimage of the swap's hash".into()))?;
 				rec["preimage"] = json!(hex(&p));
-				self.lightning_receive_preimage(&hash, &p)?;
+				if rec["leg"] == "htlc-2" || self.lock_row("payee", &hash)?.is_some() {
+					rec["leg"] = json!("htlc-2");
+					// Kept, posted to the operator, and the lock claimed at once;
+					// a claim refused now is made by `sync`, or on the chain.
+					if let Err(e) = self.lock_preimage_known(&hash, p) {
+						Self::note(&mut rec, &format!("the lock's claim waits: {}", e));
+					}
+				} else {
+					self.lightning_receive_preimage(&hash, &p)?;
+				}
 				rec["state"] = json!("claiming");
 				Self::note(&mut rec, "the BTC is paid; claiming the asset leaf with the preimage");
 				self.set_btc_swap(id, rec)?;
