@@ -1222,11 +1222,11 @@ async fn a_paid_sends_leaf_is_released_by_its_sender() {
 	let sk = &c[0].held.key;
 	let d = Delegation::for_reassignment(&v, &outputs, &[hl, cl]).unwrap();
 	let req = TransferRequest { checkpoint_exit: false,
-		inputs: vec![InputRequest { leaf_id: v.id, checkpoint_value: kept,
+		inputs: vec![InputRequest { lock: None, leaf_id: v.id, checkpoint_value: kept,
 			checkpoint_sig: sign_digest(sk, &plan.checkpoint_message(0).unwrap().digest, &random32()),
 			reassignment_sig: sign_digest(sk, &plan.reassignment_message(0).unwrap().digest, &random32()),
 			delegation_sig: Some(sign_digest(sk, &d.message().digest, &random32())) }],
-		outputs: outs.iter().map(|(a, val, l)| OutputRequest { asset: *a, value: *val, leaf: *l, mailbox: None, until: None }).collect(),
+		outputs: outs.iter().map(|(a, val, l)| OutputRequest { payer_mailbox: None, asset: *a, value: *val, leaf: *l, mailbox: None, until: None }).collect(),
 	};
 	let done = r.server.cosigner.cosign_htlc(&req).await.unwrap();
 	let (htlc_id, htlc_record) = done.outputs[0].clone();

@@ -198,9 +198,12 @@ async fn a_lock_is_refunded_from_its_timeout_and_leaves_room_for_its_ending() {
 	let preimage = random32();
 	let now = mtp(&r).to_consensus_u32();
 	let t = now + exit_delay().seconds() as u32 + 3_600 + 600;
-	let (b, lock_leaf, ..) = lock_body(&r, &ca, &q, &pp, &preimage, t, 700_000);
+	let (mut b, lock_leaf, ..) = lock_body(&r, &ca, &q, &pp, &preimage, t, 700_000);
+	// The payer names its own mailbox for the lock: the one its restore reads.
+	b["outputs"][0]["lock"]["payer_mailbox"] = json!(hex(&xonly(&p).serialize()));
 	r.http.post("cosign_transfer", &b).ok();
-	let lock = received(&r, &pp, &lock_leaf);
+	let lock = received(&r, &p, &lock_leaf);
+	assert!(r.http.mailbox(&pp, &r.chain, 0).is_empty(), "nothing under the payer's key for the lock when it names its mailbox");
 	let lv = Coin { held: lock.clone(), bases: ca.bases.clone() }.valid(&r);
 	let kept = lv.value - MARGIN;
 

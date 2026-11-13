@@ -1050,6 +1050,11 @@ pub struct LockTermsJson {
 	/// The payer's key for this lock, x-only.
 	pub refunder: String,
 	pub refund_delay_units: u16,
+	/// The mailbox the lock's record goes to for the payer, beside the
+	/// payee's: the one its wallet and its restore read. The payer's key
+	/// for the lock when absent. Not part of the leaf.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub payer_mailbox: Option<String>,
 }
 
 /// `POST /v1/lock_status`: the locks under a payment hash.

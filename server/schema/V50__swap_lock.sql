@@ -10,6 +10,9 @@ CREATE TABLE swap_lock (
 	payment_hash BYTEA NOT NULL,
 	payee        BYTEA NOT NULL,
 	payer        BYTEA NOT NULL,
+	-- The mailbox the payer reads, which its restore reads too; the payer's
+	-- key for the lock when it names none.
+	payer_mailbox BYTEA NOT NULL,
 	timeout      BIGINT NOT NULL,
 	made_by      BYTEA NOT NULL,
 	state        TEXT NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'claimed', 'refunded')),

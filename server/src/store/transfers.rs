@@ -194,11 +194,12 @@ impl Store {
 				 SELECT mailbox_key, 'coin', leaf_id, $2 FROM transfer_output WHERE transfer_id = $1 AND leaf_id = $3",
 				&[&&transfer_id[..], &record, &&leaf_id[..]],
 			).await?;
-			// A lock's record goes to its payer too, under the key it draws
-			// for the lock, so that a restore of either holder finds it.
+			// A lock's record goes to its payer too, to the mailbox it names
+			// (its key for the lock when it names none), so that a restore
+			// of either holder finds it.
 			t.execute(
 				"INSERT INTO mailbox_message (mailbox_key, kind, leaf_id, payload)
-				 SELECT payer, 'coin', leaf_id, $2 FROM swap_lock WHERE made_by = $1 AND leaf_id = $3",
+				 SELECT payer_mailbox, 'coin', leaf_id, $2 FROM swap_lock WHERE made_by = $1 AND leaf_id = $3",
 				&[&&transfer_id[..], &record, &&leaf_id[..]],
 			).await?;
 		}

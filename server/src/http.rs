@@ -1094,6 +1094,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
 			until: o.until,
+			payer_mailbox: o.lock.as_ref().and_then(|l| l.payer_mailbox.as_deref()).map(key).transpose()?,
 		});
 	}
 	Ok(TransferRequest { inputs: ins, outputs, checkpoint_exit: false })

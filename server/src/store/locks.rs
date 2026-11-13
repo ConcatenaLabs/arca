@@ -57,6 +57,8 @@ pub struct NewLock {
 	pub payment_hash: [u8; 32],
 	pub payee: [u8; 32],
 	pub payer: [u8; 32],
+	/// The mailbox the lock's record goes to for the payer.
+	pub payer_mailbox: [u8; 32],
 	pub timeout: u32,
 }
 
@@ -84,9 +86,10 @@ impl Store {
 		let conn = self.conn().await?;
 		for l in locks {
 			conn.execute(
-				"INSERT INTO swap_lock (leaf_id, payment_hash, payee, payer, timeout, made_by) VALUES ($1, $2, $3, $4, $5, $6)
-				 ON CONFLICT (leaf_id) DO NOTHING",
-				&[&&l.leaf_id[..], &&l.payment_hash[..], &&l.payee[..], &&l.payer[..], &(l.timeout as i64), &&made_by[..]],
+				"INSERT INTO swap_lock (leaf_id, payment_hash, payee, payer, payer_mailbox, timeout, made_by)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (leaf_id) DO NOTHING",
+				&[&&l.leaf_id[..], &&l.payment_hash[..], &&l.payee[..], &&l.payer[..], &&l.payer_mailbox[..], &(l.timeout as i64),
+					&&made_by[..]],
 			).await?;
 		}
 		Ok(())

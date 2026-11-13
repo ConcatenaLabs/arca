@@ -984,8 +984,9 @@ only when both endings stay within reach:
   its claim and its refund can each follow it (`depth_limit`).
 
 It keeps each lock (`swap_lock`) and posts the lock's record to the payee's
-mailbox and to the payer's, under the payer's key for the lock, so a restore
-of either holder finds it. An input that gives a lock up names its ending
+mailbox and to the payer's (the mailbox the lock's `payer_mailbox` names, its
+key for the lock when it names none), so a restore of either holder finds
+it. An input that gives a lock up names its ending
 (`lock`: `{"path": "claim", "preimage"}` or `{"path": "refund"}`), signed by
 that path's holder. The operator co-signs one ending: the claim, into a
 checkpoint of the payee's, only with a preimage that opens the hash and while

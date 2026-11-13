@@ -249,7 +249,7 @@ impl FillRequest {
 				0 => None,
 				_ => Some(u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"))),
 			};
-			outputs.push(OutputRequest {
+			outputs.push(OutputRequest { payer_mailbox: None,
 				asset, value, leaf: arca_covenant::NewLeaf { lock: None, v2: false, owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None },
 				mailbox, until,
 			});

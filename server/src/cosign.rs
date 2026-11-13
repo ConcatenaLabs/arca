@@ -121,6 +121,9 @@ pub struct OutputRequest {
 	/// the request's hash, so a request posted again with it, or without it,
 	/// is the same transfer.
 	pub until: Option<u32>,
+	/// For an `htlc-2` leaf, the mailbox its record goes to for the payer
+	/// beside the payee's; the payer's key for the lock when `None`.
+	pub payer_mailbox: Option<XOnlyPublicKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -754,6 +757,7 @@ impl Cosigner {
 		// before anything is signed; a repeated request changes neither.
 		let made: Vec<crate::store::NewLock> = req.outputs.iter().zip(&new_ids).filter_map(|(o, id)| o.leaf.lock.map(|t| crate::store::NewLock {
 			leaf_id: id.0, payment_hash: t.payment_hash, payee: o.leaf.owner.serialize(), payer: t.refunder.serialize(),
+			payer_mailbox: o.payer_mailbox.unwrap_or(t.refunder).serialize(),
 			timeout: t.timeout.to_consensus_u32(),
 		})).collect();
 		if !made.is_empty() {
@@ -1334,7 +1338,7 @@ mod test {
 
 	fn output(seed: u8, htlc: Option<HtlcTerms>) -> OutputRequest {
 		let key = Keypair::from_seckey_slice(&Secp256k1::new(), &[seed; 32]).unwrap();
-		OutputRequest {
+		OutputRequest { payer_mailbox: None,
 			asset: AssetId::from_byte_array([0xff; 32]),
 			value: 1_000,
 			leaf: NewLeaf { lock: None,
@@ -1349,7 +1353,7 @@ mod test {
 
 	#[test]
 	fn an_htlc_leaf_s_terms_and_place_are_in_the_request_hash() {
-		let input = InputRequest {
+		let input = InputRequest { lock: None,
 			leaf_id: LeafId([1; 32]), checkpoint_value: 900, checkpoint_sig: Signature::from_slice(&[2; 64]).unwrap(),
 			reassignment_sig: Signature::from_slice(&[3; 64]).unwrap(), delegation_sig: None,
 		};
