@@ -10,6 +10,9 @@
 //! (SeqLN's `a` field), and coins of another asset never pay it; it is for an
 //! amount, unexpired, and in an asset the operator serves over Lightning,
 //! whose node is up; the operator's fee for it is within the wallet's bound.
+//! Every coin it spends outlives the lock ([`super::pay::lock_outlives`]: the
+//! leaf's timeout, its exit delay and the unroll), since the leaf carries the
+//! earliest expiry of its coins and its refund opens only at its timeout.
 //!
 //! The payment is then followed until the operator says how it went:
 //! `paid`, with a preimage the wallet checks against the hash (the proof of
@@ -284,14 +287,27 @@ impl Wallet {
 	/// the coins less the change), with the coins (`gives`) and the change. A program shows it, then pays with
 	/// `shown` ([`Self::lightning_pay_shown`]).
 	pub fn lightning_pay_quote(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		self.lightning_pay_quote_until(invoice, from, max_fee_ppm, None)
+	}
+
+	/// [`Self::lightning_pay_quote`] of a payment whose `htlc-1` leaf times
+	/// out at `timeout` when named ([`Self::lightning_pay_until`]): the coins
+	/// a payment may take depend on how long its lock lasts
+	/// ([`super::pay::lock_outlives`]), so a payment that names a timeout is
+	/// quoted with it. The quote names the timeout it counted (`timeout`) and
+	/// the median time its coins outlive (`coins_outlive`).
+	pub fn lightning_pay_quote_until(&mut self, invoice: &str, from: Option<AssetId>, max_fee_ppm: Option<u64>, timeout: Option<u32>)
+		-> Result<Value, Error>
+	{
 		let _quote = self.quoting();
 		let p = self.pay_checks(invoice, from, max_fee_ppm)?;
+		let at = p.timeout(timeout)?;
 		// A probe of the leaf the payment would make, for the margins: its key
 		// is derived and kept nowhere.
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
-		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: p.inv.payment_hash, timeout: p.default_timeout()?,
-			operator_delay: p.operator_delay };
+		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: p.inv.payment_hash,
+			timeout: MedianTime::from_consensus(at).map_err(|e| Error::Refused(e.to_string()))?, operator_delay: p.operator_delay };
 		let exit_delay = self.exit_delay().max(p.owner_delay);
 		let leaf = NewLeaf { v2: false, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None };
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
@@ -299,9 +315,13 @@ impl Wallet {
 		let min = Self::min_leaf(&p.info, p.asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
 		let bound = max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM);
-		let (inputs, margin, change) = self.choose_coins_alone_first(&p.info, p.asset, p.value + p.fee, &htlc_out, min, super::places::Spend::Pay)
-			.map_err(|e| invoice_short(&p.info, p.asset, bound, e))?;
-		self.quoted(Ok(Self::pay_quote_of(&p, &inputs, margin, change)))
+		let outlive = super::pay::lock_outlives(at, exit_delay);
+		let (inputs, margin, change) = self.choose_coins_alone_first(&p.info, p.asset, p.value + p.fee, &htlc_out, min, super::places::Spend::Pay,
+			outlive).map_err(|e| invoice_short(&p.info, p.asset, bound, e))?;
+		let mut quote = Self::pay_quote_of(&p, &inputs, margin, change);
+		quote["timeout"] = json!(at);
+		quote["coins_outlive"] = json!(outlive);
+		self.quoted(Ok(quote))
 	}
 
 	/// The quote of a payment as [`Self::lightning_pay_quote`] answers it.
@@ -339,15 +359,9 @@ impl Wallet {
 		shown: Option<&Value>, spend: super::places::Spend) -> Result<Value, Error>
 	{
 		let p = self.pay_checks(invoice, from, max_fee_ppm)?;
-		let PayChecks { asset, value, fee, ref hash, ref info, operator_delay, owner_delay, timeout_seconds, now, .. } = p;
+		let PayChecks { asset, value, fee, ref hash, ref info, operator_delay, owner_delay, .. } = p;
 		let inv = p.inv.clone();
-		// The timeout a little past the operator's least, well within its
-		// most, unless the caller names one.
-		let at = timeout.unwrap_or_else(|| now.saturating_add(timeout_seconds).saturating_add(600));
-		if at < now.saturating_add(timeout_seconds) || at > now.saturating_add(timeout_seconds.saturating_mul(2)) {
-			return Err(Error::Refused(format!("a timeout of median time {} is outside the operator's window for a payment, {} to {}; \
-				nothing is signed", at, now.saturating_add(timeout_seconds), now.saturating_add(timeout_seconds.saturating_mul(2)))));
-		}
+		let at = p.timeout(timeout)?;
 		let timeout = MedianTime::from_consensus(at).map_err(|e| Error::Refused(e.to_string()))?;
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
@@ -359,11 +373,14 @@ impl Wallet {
 		let htlc = Out { asset, value: value + fee, leaf, mailbox, until: None };
 		let min = Self::min_leaf(info, asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
+		// Every coin taken outlives the lock: its timeout, the leaf's exit
+		// delay and the unroll, the figure the quote counted.
+		let outlive = super::pay::lock_outlives(at, exit_delay);
 		// Proceeds a cross-chain leg may not spend are named by the
 		// selection ([`Error::SettleFirst`]); the leg's swap goes on asking
 		// until it lapses, so they go into the next round now, and it goes
 		// ahead once that round has made them the wallet's own.
-		let (inputs, margin, change) = match self.choose_coins_alone_first(info, asset, value + fee, &htlc_out, min, spend) {
+		let (inputs, margin, change) = match self.choose_coins_alone_first(info, asset, value + fee, &htlc_out, min, spend, outlive) {
 			Err(e @ Error::SettleFirst { .. }) if spend == super::places::Spend::CrossChain => {
 				self.settle_proceeds(asset)?;
 				return Err(e);
@@ -1502,9 +1519,18 @@ struct PayChecks {
 }
 
 impl PayChecks {
-	/// The timeout a payment takes unless its caller names one.
-	fn default_timeout(&self) -> Result<MedianTime, Error> {
-		MedianTime::from_consensus(self.now.saturating_add(self.timeout_seconds).saturating_add(600)).map_err(|e| Error::Refused(e.to_string()))
+	/// The median time a payment's `htlc-1` leaf times out at: `named` when
+	/// its caller names one, else a little past the operator's least and
+	/// well within its most; refused outside the operator's window for a
+	/// payment's timeout. The quote and the payment take it alike.
+	fn timeout(&self, named: Option<u32>) -> Result<u32, Error> {
+		let (least, most) = (self.now.saturating_add(self.timeout_seconds), self.now.saturating_add(self.timeout_seconds.saturating_mul(2)));
+		let at = named.unwrap_or_else(|| least.saturating_add(600));
+		if at < least || at > most {
+			return Err(Error::Refused(format!("a timeout of median time {} is outside the operator's window for a payment, {} to {}; \
+				nothing is signed", at, least, most)));
+		}
+		Ok(at)
 	}
 }
 

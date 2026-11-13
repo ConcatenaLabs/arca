@@ -431,7 +431,8 @@ and a board whose registration never reached the server, are not recovered.
   its own would cover it once a round has made them coins it can spend (at the operator's
   depth limit, which no out-of-round spend may pass; arriving; trade
   proceeds asked to pay a cross-chain leg; of the record format an older
-  build on the other side does not read; not final yet; given up in a
+  build on the other side does not read; too near their exit date for a
+  payment over Lightning, whose lock must not outlive them; not final yet; given up in a
   round of the wallet's own whose new coins it has not taken yet, or held
   under a forfeit for a round that went unbroadcast; given up by another
   device of the wallet in a round not final yet, which the operator refused
@@ -847,7 +848,11 @@ and a board whose registration never reached the server, are not recovered.
   their exit date first, so a receiver gets the longest life the wallet can
   give it. A payment over Lightning and a swap pay from one coin alone where
   one does, with at least seven days of life: a coin already at risk out of
-  round first, then the smallest (see `swap offer`).
+  round first, then the smallest (see `swap offer`). Every coin a payment
+  over Lightning takes outlives its lock: the `htlc-1` leaf's timeout, its
+  exit delay and a day for the unroll, since the leaf carries the earliest
+  expiry of its coins and its refund opens only at its timeout. A coin that
+  does not is passed over, and offered to a round when it would have paid.
 
 - **The operator's keepers.** An operator's signer may hand every head of its
   record to keepers on other machines, and answer an entry only once enough
@@ -1008,7 +1013,12 @@ raised for one payment with `--max-fee-ppm`). The payment takes one coin
 that pays it alone where one does, as a swap chooses it (a coin already at
 risk out of round first, then the smallest, with at least seven days of
 life), and otherwise the coins furthest from their exit date first, the
-largest first; `--leaf` names its coins instead. The coins then go, through
+largest first; `--leaf` names its coins instead. No coin is taken whose
+batch expires before the lock could be refunded: each outlives the leaf's
+timeout (`--timeout`, or a little past the operator's least), its exit delay
+and a day for the unroll. One that does not is passed over; named, it is
+refused; and when the payment needs it, the wallet answers that it is to be
+settled in a round first (`settle-first`), naming it. The coins then go, through
 checkpoints and a reassignment, into an `htlc-1` leaf of the wallet's own key
 locked to the invoice's payment hash, holding the amount and the operator's
 fee, and the change; the operator co-signs and pays the invoice. The wallet
@@ -2786,7 +2796,8 @@ alone, with nothing more to shape.
 node in X (`LIGHTNINGD_EXEC`): a payment under a hash between two wallets of one
 operator through the library's commands. `lightning_receive_quote` answers what
 the receiver's leaf will hold once claimed, asking the operator nothing;
-`lightning_pay_quote` answers what the payment takes in all, signing and keeping
+`lightning_pay_quote` answers what the payment takes in all (with `timeout`, for
+a lock ending then, which decides the coins it may take), signing and keeping
 nothing, and `lightning_pay` on other terms than it is refused before anything is
 signed. `lightning_receive_ready` answers not ready before the leaf's round,
 naming the round as the step it waits for with its bound in seconds, ready

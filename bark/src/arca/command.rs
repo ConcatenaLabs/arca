@@ -36,7 +36,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	by the name an order's side goes by), swap_offer {give_asset, give, want_asset, want, leaves?}, swap_read {offer, accept_near_deadline?}, \
 	swap_accept {offer, accept_near_deadline?, shown?}, swap_complete {accept, accept_near_deadline?}, swap_cancel {swap}, swaps {swaps?}, btc_swap_offer {gives, asset, atoms, sats, lapse_seconds?, bitcoin}, btc_swap_read {offer, \
 	bitcoin}, btc_swap_take {offer, bitcoin}, btc_swap_complete {take, bitcoin}, btc_swap_follow {swap?, bitcoin}, btc_swap_bitcoin \
-	{swap, result}, btc_swaps, btc_swap_cancel {swap}, lightning_pay_quote {invoice, asset?, max_fee_ppm?, leaves?}, lightning_pay {invoice, \
+	{swap, result}, btc_swaps, btc_swap_cancel {swap}, lightning_pay_quote {invoice, asset?, max_fee_ppm?, timeout?, leaves?}, lightning_pay {invoice, \
 	asset?, max_fee_ppm?, timeout?, shown?, leaves?}, lightning_payments, lightning_receive_quote {asset, amount, max_fee_ppm?}, lightning_receive \
 	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
 	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
@@ -595,13 +595,16 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		// preimage is handed in, and `lightning_receive_ready` says when its
 		// leaf is held for good enough to pay that preimage's price. `sync`
 		// moves both on.
+		// `timeout`: the median time the payment's lock ends at; a payment
+		// that names one is quoted with it, since the coins a lock may take
+		// are those that outlive it.
 		"lightning_pay_quote" => {
 			let (invoice, from, bound) = (req_str(&a["invoice"], "the invoice")?, opt_asset(&a["asset"])?, opt_u64(&a["max_fee_ppm"], "the fee bound")?);
-			w.paying_from(&leaves(a)?, |w| w.lightning_pay_quote(invoice, from, bound))
+			let timeout = timeout_of(a)?;
+			w.paying_from(&leaves(a)?, |w| w.lightning_pay_quote_until(invoice, from, bound, timeout))
 		},
 		"lightning_pay" => {
-			let timeout = opt_u64(&a["timeout"], "the timeout")?.map(|t| u32::try_from(t).map_err(|_| Error::Parse("the timeout".into())))
-				.transpose()?;
+			let timeout = timeout_of(a)?;
 			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
 			let (invoice, from, bound) = (req_str(&a["invoice"], "the invoice")?, opt_asset(&a["asset"])?, opt_u64(&a["max_fee_ppm"], "the fee bound")?);
 			w.paying_from(&leaves(a)?, |w| w.lightning_pay_shown(invoice, from, bound, timeout, shown))
@@ -751,6 +754,11 @@ fn strings(v: &Value, what: &str) -> Result<Vec<String>, Error> {
 		Value::Array(v) => v.iter().map(|l| l.as_str().map(String::from).ok_or_else(|| Error::Parse(format!("{}: a coin is not text", what)))).collect(),
 		other => Err(Error::Parse(format!("{}: {}", what, other))),
 	}
+}
+
+/// A payment's `timeout`, a median time.
+fn timeout_of(a: &Value) -> Result<Option<u32>, Error> {
+	opt_u64(&a["timeout"], "the timeout")?.map(|t| u32::try_from(t).map_err(|_| Error::Parse("the timeout".into()))).transpose()
 }
 
 fn leaves(a: &Value) -> Result<Vec<String>, Error> {
