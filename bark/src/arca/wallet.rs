@@ -613,17 +613,11 @@ pub fn check_reserve_rule(rule: arca_covenant::ReserveRule, floor_per_kvb: Optio
 /// The least reserve the wallet accepts on the path of a new leaf of a batch
 /// built by `rule`, given its node's floor in the leaf's asset now (`None`
 /// when the node does not accept the asset for fees): [`reserve_floor`],
-/// once the rule passes [`check_reserve_rule`]. One atom, whatever the rule,
-/// when `forfeited`: the wallet itself holds a forfeit it signed, for this
-/// participation's round, of every coin the participation gives up, so that
-/// taking the leaf gives up nothing it has not given up already (and it
-/// signs no forfeit but those again); refusing the leaf could only lose it.
-pub fn round_leaf_floor(rule: arca_covenant::ReserveRule, floor_per_kvb: Option<u64>, forfeited: bool)
-	-> Result<arca_covenant::ReserveFloor, String>
-{
-	if forfeited {
-		return Ok(arca_covenant::ReserveFloor::Atoms(1));
-	}
+/// once the rule passes [`check_reserve_rule`]. It bounds what the wallet
+/// signs for a leaf; a leaf it signs nothing for (in a round that is final
+/// and released) is taken whatever its reserves
+/// (`Wallet::take_unsigned`).
+pub fn round_leaf_floor(rule: arca_covenant::ReserveRule, floor_per_kvb: Option<u64>) -> Result<arca_covenant::ReserveFloor, String> {
 	check_reserve_rule(rule, floor_per_kvb)?;
 	Ok(reserve_floor(floor_per_kvb))
 }
@@ -1177,17 +1171,22 @@ impl Wallet {
 
 	/// [`Self::leaf_policy`] for a leaf of `batch`, whose published reserve
 	/// rule is checked first against the wallet's floor now
-	/// ([`check_reserve_rule`]); `forfeited` when the wallet holds a forfeit
-	/// it signed, for this round, of every coin the participation gives up:
-	/// the leaf's reserves are then held to one atom, as a coin the wallet
-	/// holds is ([`Self::followed_policy`]), and an exit that needs more takes
-	/// a fee coin ([`round_leaf_floor`]).
-	pub(crate) fn batch_leaf_policy(&self, batch: &arca_covenant::Batch, asset: AssetId, now: MedianTime, forfeited: bool)
+	/// ([`check_reserve_rule`]). It bounds a leaf the wallet signs a forfeit
+	/// for.
+	pub(crate) fn batch_leaf_policy(&self, batch: &arca_covenant::Batch, asset: AssetId, now: MedianTime)
 		-> Result<(WalletPolicy, bool, Option<u64>), Error>
 	{
 		let (policy, fee_coin, floor) = self.leaf_policy(asset, now)?;
-		let min_reserve = round_leaf_floor(batch.reserve(), floor, forfeited).map_err(Error::Refused)?;
+		let min_reserve = round_leaf_floor(batch.reserve(), floor).map_err(Error::Refused)?;
 		Ok((WalletPolicy { min_reserve, ..policy }, fee_coin, floor))
+	}
+
+	/// [`Self::leaf_policy`] with every reserve held to one atom: the checks
+	/// of a leaf the wallet takes without signing anything for it, the
+	/// published rule and every other term checked as before.
+	pub(crate) fn unsigned_leaf_policy(&self, asset: AssetId, now: MedianTime) -> Result<WalletPolicy, Error> {
+		let (policy, _, _) = self.leaf_policy(asset, now)?;
+		Ok(WalletPolicy { min_reserve: arca_covenant::ReserveFloor::Atoms(1), ..policy })
 	}
 
 	/// The policy for a coin held or received out of round, at `now`.
@@ -3852,7 +3851,7 @@ impl Wallet {
 		// what it holds, and shown apart from what it can spend now.
 		let elsewhere = self.spent_elsewhere()?;
 		for c in &held_coins {
-			if matches!(c.state.as_str(), "spent" | "exited" | "lost") {
+			if matches!(c.state.as_str(), "spent" | "exited" | "lost" | super::round::HANDED) {
 				continue;
 			}
 			let standing = if awaiting.contains(&c.leaf_id) { "awaiting_preimage" }
@@ -3885,7 +3884,7 @@ impl Wallet {
 		// claim is out is counted once, as the claim's output on the chain.
 		let mut held: BTreeMap<String, u128> = BTreeMap::new();
 		for c in &held_coins {
-			if matches!(c.state.as_str(), "spent" | "exited" | "lost") || (c.state == "exiting" && c.note.starts_with("claimed by"))
+			if matches!(c.state.as_str(), "spent" | "exited" | "lost" | super::round::HANDED) || (c.state == "exiting" && c.note.starts_with("claimed by"))
 				|| awaiting.contains(&c.leaf_id)
 			{
 				continue;

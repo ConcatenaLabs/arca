@@ -1784,6 +1784,91 @@ async fn an_operator_saying_released_gets_no_forfeit_for_a_refused_tree() {
 	let _ = std::fs::remove_dir_all(&c.dir);
 }
 
+/// A wallet restored from its mnemonic, served no forfeit of its own for a
+/// refresh the operator released in a round final at its node (the case of
+/// round db07379a on the testnet), whose node's floor in the asset has since
+/// risen two and a half times: the leaf pays the wallet's key in a final
+/// round, so it is the wallet's whatever its reserves. The wallet signs
+/// nothing for it (no forfeit, no release), takes the new leaf, and holds the
+/// coin it gave up as `handed`: counted nowhere, exitable. Its balance is
+/// the lost wallet's, the coin counted once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_wallet_takes_a_released_leaf_of_a_final_round_signing_nothing() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let c = Arca::new("F11D");
+	let url = r.url();
+	let boards = boarded(&mut r, &c, &url, &[(x, 2_000_000)]).await;
+	c.ok(&["participate", "--leaf", &boards[0]]);
+	let round = final_round(&r).await;
+	let s = c.ok(&["sync"]);
+	assert!(s["participations"].as_array().unwrap().iter().any(|p| p["state"] == "released"), "{}", s);
+	let lost = c.ok(&["balance"]);
+	println!("F11D the lost wallet's balance: {}", lost["held"]);
+	// The node's floor in X rises two and a half times.
+	common::node::list_fee_asset(&r.rt, x, 40_000_000);
+	let mnemonic = std::fs::read_to_string(c.dir.join("mnemonic")).unwrap();
+	let node = r.node_url();
+	// Restored from the operator as it is, which serves the wallet's own
+	// forfeits with the coin: whole, nothing signed.
+	let honest = Proxy::start(&r.url());
+	let d1 = Arca::new("F11D1");
+	let mut args = create_args(&honest.url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	d1.ok(&args);
+	for _ in 0..3 {
+		d1.ok(&["sync"]);
+	}
+	assert_eq!(d1.ok(&["balance"])["held"], lost["held"], "restored whole after the floor rose");
+	assert_eq!(coin_of(&d1, &boards[0])["state"], "spent", "given up under the wallet's own forfeit, served and kept");
+	assert_eq!(honest.count("/v1/forfeit_leaves") + honest.count("/v1/decline_participation"), 0, "nothing signed");
+	// Restored through an operator that serves no forfeit with the coin.
+	let proxy = Proxy::start(&r.url());
+	proxy.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/leaf_data" && status == 200 {
+			for l in v["leaves"].as_array_mut().into_iter().flatten() {
+				for g in l["given"].as_array_mut().into_iter().flatten() {
+					if g["participation"].is_object() {
+						g["participation"]["forfeits"] = json!([]);
+					}
+				}
+			}
+		}
+		None
+	})));
+	let d = Arca::new("F11D2");
+	let mut args = create_args(&proxy.url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	d.ok(&args);
+	let mut taken = None;
+	for _ in 0..4 {
+		let s = d.ok(&["sync"]);
+		if let Some(p) = s["participations"].as_array().into_iter().flatten().find(|p| p["unsigned"].is_array()) {
+			taken = Some(p.clone());
+			break;
+		}
+	}
+	let p = taken.unwrap_or_else(|| panic!("the leaf not taken unsigned: {}", d.ok(&["participations"])));
+	println!("F11D taken unsigned: {}", p);
+	assert_eq!(p["state"], "released");
+	assert_eq!(p["round"], round.txid().to_string());
+	assert!(p["unsigned"][0].as_str().unwrap().contains("keeps less than 3 times"), "{}", p);
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "no forfeit signed");
+	assert_eq!(proxy.count("/v1/release_leaves"), 0, "no release signed");
+	assert_eq!(proxy.count("/v1/decline_participation"), 0, "a final round's leaf is taken, not declined");
+	let old = coin_of(&d, &boards[0]);
+	assert_eq!(old["state"], "handed", "{}", old);
+	let new = p["new_leaves"][0]["leaf_id"].as_str().unwrap();
+	assert_eq!(coin_of(&d, new)["state"], "live");
+	assert_eq!(d.ok(&["balance"])["held"], lost["held"], "the restored balance is the lost wallet's, each coin counted once");
+	// The coin given up stays exitable.
+	let q = d.ok(&["exit", &boards[0], "--quote"]);
+	println!("F11D the handed coin's exit: {}", q);
+	for w in [&c, &d1, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// A wallet of F11 boarded in Y with its fee in X, its refresh asked while
 /// the node does not take Y: the round builds Y's tree with one-atom reserves.
 async fn reserve_case_board(r: &mut Running, c: &Arca, url: &str) -> String {

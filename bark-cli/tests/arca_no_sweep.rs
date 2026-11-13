@@ -183,13 +183,16 @@ async fn wallets_sign_before_broadcast_and_a_silent_one_is_left_out() {
 }
 
 /// A round held for its forfeits, refreshing A's coin and D's in X. D's
-/// wallet reaches the operator through a proxy that publishes the round's
-/// tree with its reserves at three times the floor, below the four every
-/// operator builds at: D's wallet refuses its leaf for its reserves, which
-/// the round cannot cure, and declines the round. The operator drops it
-/// unbroadcast there and then (no window waited out), D's participation void
-/// and its coin live again in the same sync; A's refresh runs again in the
-/// next round and completes.
+/// wallet reaches the operator through a proxy that first publishes the
+/// round's tree with its reserves at three times the floor, a rule that is
+/// not the round's: D's wallet refuses the tree for not matching the round
+/// and asks again, declining nothing, since an honest answer completes it.
+/// Then the tree is served as built, and D's node reads a floor in X two and
+/// a half times the one the round was built at: D's wallet refuses its leaf
+/// for its reserves, which the round cannot cure, and declines the round.
+/// The operator drops it unbroadcast there and then (no window waited out),
+/// D's participation void and its coin live again in the same sync; A's
+/// refresh runs again in the next round and completes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wallet_that_refuses_its_leaf_declines_and_the_round_goes_on_without_it() {
 	let mut r = Running::start_with(|c, _, _| {
@@ -241,8 +244,24 @@ async fn a_wallet_that_refuses_its_leaf_declines_and_the_round_goes_on_without_i
 	// A round held for its forfeits is answered under `held`.
 	let p = sd["held"].as_array().unwrap().iter().find(|p| !p["refused"].is_null()).cloned()
 		.unwrap_or_else(|| panic!("not refused: {}", sd));
+	println!("D refused a published rule that is not the round's: {}", p);
+	let why = p["refused"].as_str().unwrap();
+	assert!(!why.contains("holds a reserve of") && !why.contains("the batch's reserves are built at"), "refused for the record, not its \
+		reserves: {}", p);
+	assert!(p["declined"].is_null(), "{}", p);
+	assert_eq!(proxy.count("/v1/decline_participation"), 0, "nothing declined for a tree that is not the round's");
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "D signed no forfeit");
+	// The tree as built, and D's node's floor in X two and a half times the
+	// round's.
+	proxy.rewrite(None);
+	common::node::list_fee_asset(&r.rt, x, 40_000_000);
+	let sd = d.ok(&["sync"]);
+	common::node::list_fee_asset(&r.rt, x, 100_000_000);
+	let p = sd["held"].as_array().unwrap().iter().find(|p| !p["refused"].is_null()).cloned()
+		.unwrap_or_else(|| panic!("not refused: {}", sd));
 	println!("D refused and declined: {}", p);
-	assert!(p["refused"].as_str().unwrap().contains("fails the wallet's checks: the batch's reserves are built at 3 times"), "{}", p);
+	assert!(p["refused"].as_str().unwrap().contains("fails the wallet's checks: the batch's reserves are built at 4 times"), "{}", p);
+	assert!(p["refused"].as_str().unwrap().contains("keeps less than 3 times"), "{}", p);
 	assert_eq!(p["declined"], serde_json::json!(held.txid().to_string()), "{}", p);
 	assert_eq!(p["state"], "void", "{}", p);
 	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "D signed no forfeit");
