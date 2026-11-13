@@ -19,6 +19,11 @@ use common::keys::{keypair, xonly};
 use common::rounds::{accept_policy, advance_mtp, credited_board, mtp, start};
 use common::running::Running;
 
+/// The payer's delay: the payee's and the margin.
+fn refund_delay() -> arca_covenant::RelativeTime {
+	arca_covenant::RelativeTime::from_units(exit_delay().units() + arca_covenant::REFUND_DELAY_MARGIN_UNITS).unwrap()
+}
+
 /// What each step leaves for its fee.
 const MARGIN: u64 = 2_000;
 
@@ -31,7 +36,7 @@ fn lock_body(r: &Running, coin: &Coin, payee: &Keypair, refunder: &Keypair, prei
 	let (q_leaf, _) = new_leaf(payee);
 	let terms = LockTerms {
 		payment_hash: sha256(preimage), timeout: MedianTime::from_consensus(timeout).unwrap(), refunder: xonly(refunder),
-		refund_delay: exit_delay(),
+		refund_delay: refund_delay(),
 	};
 	let lock = NewLeaf { lock: Some(terms), ..q_leaf };
 	let change_key = keypair(&format!("L change {}", hex(&random32()[..4])));
@@ -95,6 +100,16 @@ async fn a_lock_is_claimed_out_of_round_and_never_refunded() {
 	refused(&r, "cosign_transfer", &b, "lock", "a payer's key that is the payee's");
 	let (b, ..) = lock_body(&r, &ca, &q, &r.s.clone(), &preimage, t, 600_000);
 	refused(&r, "cosign_transfer", &b, "lock", "a payer's key that is the operator's");
+	let short = {
+		let v = ca.valid(&r);
+		let (q_leaf, _) = new_leaf(&q);
+		let lock = NewLeaf { lock: Some(LockTerms { payment_hash: sha256(&preimage), timeout: MedianTime::from_consensus(t).unwrap(),
+			refunder: xonly(&pp), refund_delay: exit_delay() }), ..q_leaf };
+		let (change, _) = new_leaf(&keypair("L change short"));
+		transfer_body(&[(&ca.held, v.clone(), v.value - MARGIN)], &[(x, 600_000, lock), (x, v.value - 600_000 - 2 * MARGIN, change)],
+			xonly(&r.s), r.chain)
+	};
+	refused(&r, "cosign_transfer", &short, "lock", "a payer's delay no longer than the payee's");
 
 	// The lock.
 	let (b, lock_leaf, change_leaf, change_key) = lock_body(&r, &ca, &q, &pp, &preimage, t, 600_000);

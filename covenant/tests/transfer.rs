@@ -736,7 +736,8 @@ fn a_lock_between_two_holders_is_claimed_or_refunded_out_of_round() {
 	let timeout = MedianTime::from_consensus(CREATED + 3 * 86_400).unwrap();
 	let refund_key = keypair("lock refund key");
 	let terms = LockTerms {
-		payment_hash: arca_covenant::script::sha256(&preimage), timeout, refunder: xonly(&refund_key), refund_delay: delay,
+		payment_hash: arca_covenant::script::sha256(&preimage), timeout, refunder: xonly(&refund_key),
+		refund_delay: RelativeTime::from_units(delay.units() + REFUND_DELAY_MARGIN_UNITS).unwrap(),
 	};
 	let q = Party::new("lock payee", delay);
 	let lock = NewLeaf { lock: Some(terms), ..q.leaf };
@@ -775,6 +776,7 @@ fn a_lock_between_two_holders_is_claimed_or_refunded_out_of_round() {
 	f.consensus.verify_tx(&alone.prevouts, &alone.tx).unwrap();
 	println!("the payee's CLAIM alone: {} vB, verifies", alone.tx.vsize());
 	let ks = lp.refund_tx(at, x, pay, &to, &FeeSource::Reserve).unwrap();
+	assert_eq!(ks.tx.input[0].sequence.0, terms.refund_delay.to_sequence());
 	assert_eq!(ks.tx.lock_time.to_consensus_u32(), timeout.to_consensus_u32());
 	let sg = sig(&refund_key, &ks.sighash(genesis).unwrap());
 	let alone = ks.finish(vec![sg.as_ref().to_vec()]);
@@ -863,4 +865,10 @@ fn a_lock_between_two_holders_is_claimed_or_refunded_out_of_round() {
 		outputs: vec![ExplicitOutput::new(x, a_coin.value - 2 * MARGIN, shared.policy(xonly(s), chain).script_pubkey())] };
 	let e = refuse(record_for(&splan, &[&f.hops.a_base], &sign_plan(&splan, &[&f.b.a], s), 0, shared), &q);
 	assert!(matches!(e, TransferError::Spend(SpendError::Policy(arca_covenant::Error::Lock(LockError::SharedKey)))), "{}", e);
+	// A lock whose payer's delay is not the payee's and the margin more.
+	let short = NewLeaf { lock: Some(LockTerms { refund_delay: delay, ..terms }), ..q.leaf };
+	let splan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)],
+		outputs: vec![ExplicitOutput::new(x, a_coin.value - 2 * MARGIN, short.policy(xonly(s), chain).script_pubkey())] };
+	let e = refuse(record_for(&splan, &[&f.hops.a_base], &sign_plan(&splan, &[&f.b.a], s), 0, short), &q);
+	assert!(matches!(e, TransferError::Spend(SpendError::Policy(arca_covenant::Error::Lock(LockError::RefundDelay { .. })))), "{}", e);
 }

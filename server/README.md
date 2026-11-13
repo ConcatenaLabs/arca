@@ -959,6 +959,47 @@ The same record of spends answers the question `release_leaves` asks before
 it takes an owner's release of a leaf's lowest node: whether the leaf has an
 open out-of-round reassignment (`Cosigner::check_release`).
 
+### Locks between two holders
+
+A transfer's output may be an `htlc-2` leaf (its `lock` terms: the payment
+hash, the timeout `T`, the payer's key for the lock and the payer's delay): a
+payer's coin locked to a payee, who holds it at once as any coin received out
+of round, claimed by the payee with the preimage or refunded to the payer from
+`T` (`arca_covenant::lock`, `crate::locks`). It is how a seller of an asset
+locks its side of a purchase paid in BTC on a Bitcoin ark, with no round
+between and nothing fronted by the operator. The operator co-signs a lock
+only when both endings stay within reach:
+
+- payee, payer and operator are three keys, and the payer's key owns no leaf
+  and refunds no other lock (`key_reused`);
+- the leaf carries no other template's terms, and its asset is not supervised;
+- both delays lie within the exit-delay bounds, the payer's at least the
+  payee's and eight units more, so that on the chain the payee's claim opens
+  before the payer's refund however late the leaf is unrolled;
+- `T` lies at least the payee's delay and an hour out (the payee can still
+  take the coin on the chain and claim it first) and at most fourteen days
+  out, and `T`, the payer's delay and an hour fit before the earliest expiry
+  of the batches the lock rests on;
+- the lock is at most `depth_limit − 1` reassignments from a round, so that
+  its claim and its refund can each follow it (`depth_limit`).
+
+It keeps each lock (`swap_lock`) and posts the lock's record to the payee's
+mailbox and to the payer's, under the payer's key for the lock, so a restore
+of either holder finds it. An input that gives a lock up names its ending
+(`lock`: `{"path": "claim", "preimage"}` or `{"path": "refund"}`), signed by
+that path's holder. The operator co-signs one ending: the claim, into a
+checkpoint of the payee's, only with a preimage that opens the hash and while
+the chain's median time is below `T` less ten minutes; the refund, into a
+checkpoint of the payer's, only from `T`. The lock is marked ended as the
+transfer ending it is recorded (a transfer dropped before it is signed opens
+it again), and the signer co-signs one spend under the lock's salt whatever
+the database says. Every refusal of these rules is `lock`. A lock goes into
+no round, take, plan, distribution or order. `lock_status` serves the locks
+under a hash and the preimage once the operator has it; `lock_preimage` takes
+the preimage from anyone. `info.locks` publishes the bounds
+(`max_seconds`, `claim_margin_seconds`, `unroll_seconds`), and
+`templates.list` names `htlc-2` when the operator co-signs locks.
+
 ## Participations
 
 An owner takes part in a round with one request, and is never asked for
@@ -2992,7 +3033,7 @@ canonical binary form. Every object refuses a field it does not know.
 
 | Call | Does |
 |---|---|
-| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, and `channel-1` while an asset has channel leaves; an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and takes one out of its round for the owners of its coins (`decline`), and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep), and the most seconds from a participation's release to its offboard outputs' unlock being in a block (`offboards.unlock_within_seconds`, the block included; 0 when the watcher does not act on its own; see The watcher's Offboards) |
+| `GET info` | Answered from memory: what it reads from the node, the signer and the database (`floors`, `signer_record`, `bond`, `fundable`, `owed`, `in_flight`) is read again in the background once older than its period (2 s for `signer_record`, 5 s for `floors` and `owed`, 10 s for the rest), so a slow node, a busy disk or a long write makes those parts older, never the answer slower; only the first call after a start waits on them. `signer_record` is never below a head the server has handed out: such a head is shown as it went out, without acknowledgements, until the signer is asked again. The operator key, genesis hash, assets served in the configuration's order with their smallest leaf (`min_leaf`, in atoms, and `min_leaf_value` when it is set as a value), for an issuer-operated asset its mint limiter (`issuer`: the template, the token, its operator and cold keys, its allowance, window and recovery delay; see Issuer-operated assets), and their rate (`rate`: its source, the rate, its time and age, how long it is good for, whether it is stale, and why its last read failed), exit-delay bounds, depth limit, the finality rule, for a supervised asset its profile (`supervised`: the landing allowance; see Supervised assets), for an asset with channel leaves its capacity, credit window and total (`channels`; see Channel leaves), what a round can pay of each asset now (`fundable`, in atoms: what the operator's wallet can spend of it, or what an issuer-operated asset's mint limiter allows; read at most every 10 s, absent when it could not be read; a participation whose round would pay more waits until it can, so a wallet can skip a take or a refresh that would wait; less what is owed for swept coins), what is owed in each asset for coins the operator's sweeps took (`owed`: its `total` and `coins`, absent when nothing is; see Swept coins are repaid), each asset's in-flight cap and what is in flight (`in_flight_cap`, `in_flight`, read at most every 10 s, absent when no cap is set; see Rounds), the equivocation bond (`bond`, with the share of it the operator suggests as a counterparty's instant budget, `instant_budget_ppm`, and the instant limit it suggests a wallet keep, `instant_limit_value`; see The equivocation bond), what becomes of a swept coin (`swept`: `policy` `repaid`, `late_fee` `refresh`), the watchtowers a wallet that names none deposits its coins with (`watchtowers`, base URLs; see Coins are taken on the chain before the sweep), the template list and its version (every leaf template a round makes: `vtxo-1`, `vtxo-2`, `board-1`, `htlc-1`, `order-3`, `landing-1` (left out under `landing_2_only`), `landing-2`, and `channel-1` while an asset has channel leaves, and `htlc-2`, which a transfer makes rather than a round (see Locks between two holders); an `order-2` leaf resting from before `order-3` is still filled, but no round makes one), whether the operator makes `landing-2` leaves only (`landing_2_only`; see Supervised assets), the fee schedule with its free window and the bounds on a transfer's margins (`margin_multiple`, `max_margin_multiple`) and the node's floor in each asset served (`floors`), a participation's exit deadline and forfeit deadline, whether the operator takes back a pending one (`withdraw`) and takes one out of its round for the owners of its coins (`decline`), and whether it reads a participation's `forfeits_before_broadcast` (`forfeits_before_broadcast`) and its `record_formats` (`record_formats`; see Batches without a sweep) and its `arriving` (`arriving`; see Rounds), a board's dates (`boards`: its service lifetime, exit deadline and last refresh time), the signer's record's latest entry, running hash and the signer's signature over them, with the keepers' acknowledgements of it (`signer_record`, absent while the signer does not answer or is stopped), the keepers' keys and how many must hold a head (`keepers`), the request limit, and how takes of on-chain orders are bounded (`fills`: `order_margin_seconds`, `block_seconds`, `forfeit_window_seconds`, and `round_interval_seconds`, the runner's interval, 0 when it builds rounds only when asked, from which a wallet with a take waiting times its wakes), how batches are built (`batches`: `no_sweep`, whether every refresh round builds batches without a sweep and is held for its forfeits, and `collect_after_seconds`, the service horizon of such a batch; see Batches without a sweep), and the most seconds from a participation's release to its offboard outputs' unlock being in a block (`offboards.unlock_within_seconds`, the block included; 0 when the watcher does not act on its own; see The watcher's Offboards), and the bounds on `htlc-2` locks (`locks`: `max_seconds`, `claim_margin_seconds`, `unroll_seconds`) |
 | `POST operator_nonce` | A fresh operator nonce, for a board, good for an hour by default |
 | `POST challenge` | A challenge to authenticate with, good for a short while, stored nowhere |
 | `POST register_board` | Registers a board record with its transaction |
@@ -3005,6 +3046,8 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST lightning_send_release` | Takes the paid payment's sender's release of each of those nodes, naming that round |
 | `POST lightning_receive` | An invoice paid into the tree under the wallet's own payment hash (see Receiving into the tree), and the payment (`open`) |
 | `POST lightning_receive_status` | A payment into the tree by its payment hash: `open`, `accepted` with its participation and the leaf's timeout, `claimed` and whether the node has settled it, or `cancelled` with the reason |
+| `POST lock_status` | The `htlc-2` locks under a payment hash (`payment_hash`): each lock's leaf, payee, payer, timeout and state (`open`, `claimed`, `refunded`), and the preimage once the operator has it; `unknown_lock` (404) when it keeps none (see Locks between two holders) |
+| `POST lock_preimage` | Takes the preimage of a lock's hash from anyone (`payment_hash`, `preimage`), and answers as `lock_status` |
 | `POST lightning_receive_claim` | Takes the payment's preimage with the transfer of its leaf into a leaf of the owner's: settles the payment and co-signs the transfer, as `cosign_transfer` answers it (`cosigned`), with the payment (`receive`) |
 | `POST submit_participation` | Accepts a participation in a round |
 | `POST channel_update` | Co-signs a channel state its owner signed and, for a payment into another channel, signs the receiver's next note (see Channel leaves) |
@@ -4700,6 +4743,18 @@ is the salt's. And the case it guards: an attacker pays from its leaf, its
 database forgets the leaf's salt, and it makes a second leaf of its own under
 that salt and pays from it: the signer refuses the second spend under the
 salt, which would have been a signature valid on the first coin too.
+
+`tests/locks.rs` makes `htlc-2` locks between two holders. It refuses a lock
+whose timeout is too soon or too far, whose payer's key is the payee's or the
+operator's, whose payer's delay is not the payee's and the margin more, or
+whose payer's key refunds another lock; posts a lock to both holders'
+mailboxes; refuses a lock given to a round, given up with no ending named,
+claimed with a wrong preimage or under the payer's signature, or refunded
+before its timeout; co-signs the claim and serves its preimage, then refuses
+the refund (one entry under the lock's salt in the signer's record); in a
+second lock, refuses the claim past the timeout less its margin, co-signs the
+refund, then refuses the claim; and refuses a lock from a coin four
+reassignments deep while co-signing a plain transfer from it.
 
 `tests/transfer_values.rs` asks for one transfer twice, the second time with
 another checkpoint value: a coin a transfer makes is named by its inputs' ids,

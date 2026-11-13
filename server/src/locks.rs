@@ -9,7 +9,10 @@
 //!   leaf and refunds no other lock (a key the payer draws for this lock);
 //! - the leaf is no other template's too, and its asset is not supervised
 //!   (its paths pay keys a freeze cannot follow);
-//! - both delays lie within the exit-delay bounds;
+//! - both delays lie within the exit-delay bounds, the payer's at least the
+//!   payee's and [`arca_covenant::REFUND_DELAY_MARGIN_UNITS`] more, so that
+//!   on the chain the payee's claim opens before the payer's refund however
+//!   late the leaf is unrolled ([`arca_covenant::LockPolicy::check_delays`]);
 //! - the timeout `T` lies at least the payee's delay and an unroll
 //!   ([`UNROLL_SECONDS`]) out, so that the payee can still take the coin on
 //!   the chain and claim it before `T`, and at most [`LOCK_MAX_SECONDS`]
@@ -68,8 +71,8 @@ pub fn check_output(params: &Params, leaf: &NewLeaf, asset: &elements::AssetId) 
 		return Err(CosignError::OutOfBounds(format!("asset {} is supervised: no htlc-2 leaf holds it, as its paths pay keys a freeze \
 			cannot follow", asset)));
 	}
-	leaf.policy(params.operator, params.chain).lock_policy().expect("a lock").check()
-		.map_err(|e| refuse(e.to_string()))?;
+	let lock = leaf.policy(params.operator, params.chain).lock_policy().expect("a lock");
+	lock.check().and_then(|_| lock.check_delays()).map_err(|e| refuse(e.to_string()))?;
 	if !params.exit_delay_ok(terms.refund_delay) {
 		return Err(CosignError::OutOfBounds(format!("a payer's delay of {} units; the operator takes {} to {}",
 			terms.refund_delay.units(), params.min_exit_delay.units(), params.max_exit_delay.units())));
