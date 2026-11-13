@@ -672,7 +672,7 @@ impl Wallet {
 			Some(h) => self.chain.median_time_at(h)?.and_then(|t| MedianTime::from_consensus(t).ok()).map_or(now, |t| t.min(now)),
 			None => now,
 		};
-		let (policy, _, _) = self.batch_leaf_policy(&batch, record.asset(), as_of, false)?;
+		let (policy, _, _) = self.batch_leaf_policy(&batch, record.asset(), as_of)?;
 		let valid = record.validate(&round, &policy, &owner, &nonce)
 			.map_err(|e| Error::Refused(format!("the claim leaf in round {} fails the wallet's checks: {}", round_txid, e)))?;
 		// A claim-1 leaf lapses on the terms its record names, which the

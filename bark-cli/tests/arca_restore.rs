@@ -1808,3 +1808,187 @@ async fn a_history_in_slices_keeps_no_ask_waiting() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// The refreshes of a wallet's participations, each named by the start of
+/// its id with its state.
+fn states(w: &Arca) -> Vec<String> {
+	w.ok(&["participations"]).as_array().unwrap().iter()
+		.map(|p| format!("{}:{}", p["participation"].as_str().unwrap_or("?").chars().take(8).collect::<String>(), p["state"])).collect()
+}
+
+/// The participations of a wallet left half restored: in their forfeit step.
+fn half_restored(w: &Arca) -> Vec<Value> {
+	w.ok(&["participations"]).as_array().unwrap().iter().filter(|p| matches!(p["state"].as_str(), Some("forfeiting" | "issued"))).cloned().collect()
+}
+
+/// The new leaves of every participation a sync answers as released.
+fn released_leaves(s: &Value) -> Vec<String> {
+	s["participations"].as_array().unwrap().iter().filter(|p| p["state"] == "released")
+		.flat_map(|p| p["new_leaves"].as_array().cloned().unwrap_or_default()).map(|l| l["leaf_id"].as_str().unwrap().to_string()).collect()
+}
+
+/// A wallet whose history chains its refreshes, read back a coin a step:
+/// six boards refreshed one by one, their leaves in pairs, two of those
+/// together and the third alone, then one more link. Restored from the
+/// mnemonic, the history is taken a coin or two a step (every answer of the
+/// operator slowed, each step's budget a millisecond), with a sync after
+/// each step. Taking a coin completes the refresh it was given up in, whose
+/// new leaves, recovered from the published tree, are themselves coins of
+/// the history given up later: each is settled as given up in the same step.
+/// After every step a sync runs no forfeit step again, no participation is
+/// left in its forfeit step, and the balance is the lost wallet's: no spent
+/// coin is counted live (arca #879, #882, and the review of #885).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chained_history_read_a_coin_a_step_counts_no_spent_coin() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let a = Arca::new("CH1");
+	let url = r.url();
+	let b = boarded(&mut r, &a, &url, &[(x, 2_000_000); 6]).await;
+	// Round 1: each board alone.
+	for l in &b {
+		a.ok(&["participate", "--leaf", l]);
+	}
+	final_round(&r).await;
+	let n1 = released_leaves(&a.ok(&["sync"]));
+	assert_eq!(n1.len(), 6, "round 1");
+	// Round 2: pairs.
+	for p in n1.chunks(2) {
+		a.ok(&["participate", "--leaf", &p[0], "--leaf", &p[1]]);
+	}
+	final_round(&r).await;
+	let n2 = released_leaves(&a.ok(&["sync"]));
+	assert_eq!(n2.len(), 3, "round 2");
+	// Round 3: two of them together, the third alone.
+	a.ok(&["participate", "--leaf", &n2[0], "--leaf", &n2[1]]);
+	a.ok(&["participate", "--leaf", &n2[2]]);
+	final_round(&r).await;
+	let n3 = released_leaves(&a.ok(&["sync"]));
+	assert_eq!(n3.len(), 2, "round 3");
+	// Round 4: one more link.
+	a.ok(&["participate", "--leaf", &n3[0]]);
+	final_round(&r).await;
+	let n4 = released_leaves(&a.ok(&["sync"]));
+	assert_eq!(n4.len(), 1, "round 4");
+	let lost = a.ok(&["balance"]);
+	println!("CH1 the lost wallet: {}", lost["held"]);
+
+	let proxy = Proxy::start(&r.url());
+	let w = Arca::new("CH2");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let node = r.node_url();
+	let mut args = create_args(&proxy.url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	proxy.delay(std::time::Duration::from_millis(400));
+	w.ok(&args);
+	let mut bad = vec![];
+	let h = half_restored(&w);
+	println!("CH2 after the restore: half restored {} | states {:?} | balance {}", h.len(), states(&w), w.ok(&["balance"])["held"]);
+	if !h.is_empty() {
+		bad.push(format!("after the restore: half restored {:?}", h));
+	}
+	let mut steps = 0;
+	loop {
+		let hs = w.ok(&["restore-history", "--budget-ms", "1"]);
+		steps += 1;
+		let hh = half_restored(&w);
+		// A sync right after the step (it runs no re-check on start, as a
+		// program that keeps the wallet open runs none between its syncs).
+		let before = proxy.count("/v1/forfeit_leaves");
+		let s = w.ok(&["sync"]);
+		let after = proxy.count("/v1/forfeit_leaves");
+		let bal = w.ok(&["balance"])["held"].clone();
+		println!("CH2 step {}: checked {} left {} | half restored before the sync {} | forfeit_leaves {}->{} | balance {} | states {:?}", steps,
+			hs["checked"], hs["left"], hh.len(), before, after, bal, states(&w));
+		if !hh.is_empty() {
+			bad.push(format!("step {}: half restored {:?}", steps, hh.iter().map(|p| p["participation"].clone()).collect::<Vec<_>>()));
+		}
+		if after > before {
+			bad.push(format!("step {}: a forfeit step ran again: {}", steps, s["participations"]));
+		}
+		if bal != lost["held"] {
+			bad.push(format!("step {}: balance {} against the lost wallet's {}", steps, bal, lost["held"]));
+		}
+		if hs.is_null() || hs["left"] == 0 || steps > 30 {
+			break;
+		}
+	}
+	proxy.delay(std::time::Duration::ZERO);
+	for (n, x) in [("lost", &a), ("restored", &w)] {
+		for c in x.ok(&["coins"]).as_array().unwrap() {
+			if c["state"] != "spent" {
+				println!("CH coins {} {} {} {} {} {}", n, c["leaf_id"].as_str().unwrap_or("").chars().take(12).collect::<String>(), c["kind"], c["value"],
+					c["state"], c["note"]);
+			}
+		}
+	}
+	for x in [&a, &w] {
+		let _ = std::fs::remove_dir_all(&x.dir);
+	}
+	assert!(bad.is_empty(), "{:#?}", bad);
+}
+
+/// A refresh of two coins, released; restored through an operator that
+/// serves the wallet's own forfeit with one coin and none with the other,
+/// each way round. The refresh is finished: no sync runs its forfeit step
+/// again, the coin without its own forfeit is held as given (`handed`), not
+/// spent on the operator's word, and the balance is the lost wallet's
+/// (arca #886).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "arca #886: one coin's forfeit withheld at restore re-runs the forfeit step, or marks that coin spent"]
+async fn one_coins_forfeit_withheld_at_restore_is_neither_forfeited_again_nor_spent() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let a = Arca::new("FW1");
+	let url = r.url();
+	let b = boarded(&mut r, &a, &url, &[(x, 2_000_000), (x, 2_000_000)]).await;
+	a.ok(&["participate", "--leaf", &b[0], "--leaf", &b[1]]);
+	final_round(&r).await;
+	let n = released_leaves(&a.ok(&["sync"]));
+	assert_eq!(n.len(), 1);
+	let lost = a.ok(&["balance"]);
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let node = r.node_url();
+	let mut bad = vec![];
+	for (strip, kept) in [(b[0].clone(), b[1].clone()), (b[1].clone(), b[0].clone())] {
+		let proxy = Proxy::start(&r.url());
+		let s2 = strip.clone();
+		proxy.rewrite(Some(Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+			if path == "/v1/leaf_data" && status == 200 {
+				for l in v["leaves"].as_array_mut().into_iter().flatten() {
+					if l["leaf_id"].as_str() != Some(s2.as_str()) {
+						continue;
+					}
+					for g in l["given"].as_array_mut().into_iter().flatten() {
+						if g["participation"].is_object() {
+							g["participation"]["forfeits"] = json!([]);
+						}
+					}
+				}
+			}
+			None
+		})));
+		let w = Arca::new(&format!("FW{}", &strip[..6]));
+		let mut args = create_args(&proxy.url, &node);
+		args.extend(["--mnemonic", mnemonic.trim()]);
+		w.ok(&args);
+		for _ in 0..3 {
+			w.ok(&["sync"]);
+		}
+		let (sc, kc, nc) = (coin_of(&w, &strip), coin_of(&w, &kept), coin_of(&w, &n[0]));
+		println!("FW strip {}: forfeit_leaves {} | stripped {} | kept {} | new {} | balance {} | states {:?}", &strip[..8],
+			proxy.count("/v1/forfeit_leaves"), sc["state"], kc["state"], nc["state"], w.ok(&["balance"])["held"], states(&w));
+		if proxy.count("/v1/forfeit_leaves") != 0 {
+			bad.push(format!("strip {}: a forfeit step ran again", &strip[..8]));
+		}
+		if sc["state"] != "handed" {
+			bad.push(format!("strip {}: the coin without its own forfeit is {}", &strip[..8], sc["state"]));
+		}
+		if kc["state"] != "spent" || nc["state"] != "live" || w.ok(&["balance"])["held"] != lost["held"] {
+			bad.push(format!("strip {}: kept {} new {} balance {}", &strip[..8], kc["state"], nc["state"], w.ok(&["balance"])["held"]));
+		}
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+	let _ = std::fs::remove_dir_all(&a.dir);
+	assert!(bad.is_empty(), "{:#?}", bad);
+}

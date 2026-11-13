@@ -183,13 +183,16 @@ async fn wallets_sign_before_broadcast_and_a_silent_one_is_left_out() {
 }
 
 /// A round held for its forfeits, refreshing A's coin and D's in X. D's
-/// wallet reaches the operator through a proxy that publishes the round's
-/// tree with its reserves at three times the floor, below the four every
-/// operator builds at: D's wallet refuses its leaf for its reserves, which
-/// the round cannot cure, and declines the round. The operator drops it
-/// unbroadcast there and then (no window waited out), D's participation void
-/// and its coin live again in the same sync; A's refresh runs again in the
-/// next round and completes.
+/// wallet reaches the operator through a proxy that first publishes the
+/// round's tree with its reserves at three times the floor, a rule that is
+/// not the round's: D's wallet refuses the tree for not matching the round
+/// and asks again, declining nothing, since an honest answer completes it.
+/// Then the tree is served as built, and D's node reads a floor in X two and
+/// a half times the one the round was built at: D's wallet refuses its leaf
+/// for its reserves, which the round cannot cure, and declines the round.
+/// The operator drops it unbroadcast there and then (no window waited out),
+/// D's participation void and its coin live again in the same sync; A's
+/// refresh runs again in the next round and completes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wallet_that_refuses_its_leaf_declines_and_the_round_goes_on_without_it() {
 	let mut r = Running::start_with(|c, _, _| {
@@ -241,8 +244,24 @@ async fn a_wallet_that_refuses_its_leaf_declines_and_the_round_goes_on_without_i
 	// A round held for its forfeits is answered under `held`.
 	let p = sd["held"].as_array().unwrap().iter().find(|p| !p["refused"].is_null()).cloned()
 		.unwrap_or_else(|| panic!("not refused: {}", sd));
+	println!("D refused a published rule that is not the round's: {}", p);
+	let why = p["refused"].as_str().unwrap();
+	assert!(!why.contains("holds a reserve of") && !why.contains("the batch's reserves are built at"), "refused for the record, not its \
+		reserves: {}", p);
+	assert!(p["declined"].is_null(), "{}", p);
+	assert_eq!(proxy.count("/v1/decline_participation"), 0, "nothing declined for a tree that is not the round's");
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "D signed no forfeit");
+	// The tree as built, and D's node's floor in X two and a half times the
+	// round's.
+	proxy.rewrite(None);
+	common::node::list_fee_asset(&r.rt, x, 40_000_000);
+	let sd = d.ok(&["sync"]);
+	common::node::list_fee_asset(&r.rt, x, 100_000_000);
+	let p = sd["held"].as_array().unwrap().iter().find(|p| !p["refused"].is_null()).cloned()
+		.unwrap_or_else(|| panic!("not refused: {}", sd));
 	println!("D refused and declined: {}", p);
-	assert!(p["refused"].as_str().unwrap().contains("fails the wallet's checks: the batch's reserves are built at 3 times"), "{}", p);
+	assert!(p["refused"].as_str().unwrap().contains("fails the wallet's checks: the batch's reserves are built at 4 times"), "{}", p);
+	assert!(p["refused"].as_str().unwrap().contains("keeps less than 3 times"), "{}", p);
 	assert_eq!(p["declined"], serde_json::json!(held.txid().to_string()), "{}", p);
 	assert_eq!(p["state"], "void", "{}", p);
 	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "D signed no forfeit");
@@ -739,4 +758,215 @@ async fn a_wallet_that_syncs_less_often_than_the_window_keeps_its_round_by_handi
 	println!("M1's sync past the window: {}", s["participations"]);
 	assert_eq!(s["participations"][0]["state"], "void", "{}", s);
 	println!("round {} dropped: M1 synced only after the window", dropped);
+}
+
+fn create_args<'a>(server: &'a str, node: &'a str) -> Vec<&'a str> {
+	vec!["create", "--server", server, "--node-url", node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]
+}
+
+fn coin_of(w: &Arca, leaf: &str) -> Value {
+	w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf).cloned().unwrap_or(Value::Null)
+}
+
+/// The participations of `w`, each named by the start of its id with its
+/// state.
+fn states(w: &Arca) -> Vec<String> {
+	w.ok(&["participations"]).as_array().unwrap().iter()
+		.map(|p| format!("{}:{}", p["participation"].as_str().unwrap_or("?").chars().take(8).collect::<String>(), p["state"])).collect()
+}
+
+/// A no-sweep operator whose rounds hold for every forfeit (`holder_batches`
+/// 0), funded in X; wallets A and D created, each with a board of 2,000,000
+/// X credited. Returns the two boards.
+async fn held_rounds_with_two(r: &mut Running, a: &Arca, d: &Arca) -> (String, String) {
+	let x = r.x;
+	r.fund_server(x, 100_000_000).await;
+	let (url, node) = (r.url(), r.node_url());
+	a.ok(&create_args(&url, &node));
+	d.ok(&create_args(&url, &node));
+	for w in [a, d] {
+		r.pay_to(script(&w.ok(&["address"])), x, 5_000_000);
+	}
+	r.produce().await;
+	let ba = a.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	let bd = d.ok(&["board", &x.to_string(), "2000000"])["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the boards credited", || [a, d].iter().all(|w| w.ok(&["boards"])[0]["server"]["state"] == "credited")).await;
+	for w in [a, d] {
+		w.ok(&["sync"]);
+	}
+	(ba, bd)
+}
+
+/// A wallet restored in the middle of a held round: A has handed over its
+/// forfeits, and the round waits, unbroadcast, for D's. A restored now hands
+/// its forfeits over again while the round is held. Then D hands over, the
+/// round goes out and is final, and the node's floor in X rises two and a
+/// half times before the restored wallet's next sync: it completes the
+/// refresh (the leaf is the wallet's in a final round whatever its reserves),
+/// and its balance is the lost wallet's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_restored_mid_round_completes_its_refresh_once_final() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x;
+	let (a, d) = (Arca::new("MRA"), Arca::new("MRD"));
+	let (board, _) = held_rounds_with_two(&mut r, &a, &d).await;
+	let (url, node) = (r.url(), r.node_url());
+	for w in [&a, &d] {
+		w.ok(&["participate"]);
+	}
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built[0].participations, 2);
+	let round = built[0].tx.txid();
+	let sa = a.ok(&["sync"]);
+	assert!(common::cli::handed_over(&sa), "{}", sa);
+	let lost = a.ok(&["balance"]);
+	// A restored now, the round held for D's forfeits.
+	let proxy = common::proxy::Proxy::start(&url);
+	let a2 = Arca::new("MRA2");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let mut args = create_args(&proxy.url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	a2.ok(&args);
+	println!("MR after the restore: {:?}; board {}; balance {}", states(&a2), coin_of(&a2, &board)["state"], a2.ok(&["balance"])["held"]);
+	let s = a2.ok(&["sync"]);
+	println!("MR A2's sync while held: forfeit_leaves {} | participations {} | held {}", proxy.count("/v1/forfeit_leaves"), s["participations"],
+		s["held"]);
+	// D hands over; the round goes out and is final.
+	let sd = d.ok(&["sync"]);
+	assert!(common::cli::handed_over(&sd), "{}", sd);
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&round, RoundState::Final).await;
+	common::node::list_fee_asset(&r.rt, x, 40_000_000);
+	let mut done = false;
+	for i in 0..3 {
+		let s = a2.ok(&["sync"]);
+		println!("MR A2's sync {} once final (floor ×2.5): forfeit_leaves {} | participations {}", i, proxy.count("/v1/forfeit_leaves"),
+			s["participations"]);
+		if s["participations"].as_array().into_iter().flatten().any(|p| p["state"] == "released") {
+			done = true;
+			break;
+		}
+	}
+	common::node::list_fee_asset(&r.rt, x, 100_000_000);
+	println!("MR in the end: {:?}; board {}; balance {} (the lost wallet's {})", states(&a2), coin_of(&a2, &board)["state"],
+		a2.ok(&["balance"])["held"], lost["held"]);
+	assert!(done, "the restored wallet completed its refresh");
+	assert_eq!(coin_of(&a2, &board)["state"], "spent");
+	assert_eq!(a2.ok(&["balance"])["held"], lost["held"], "the restored balance is the lost wallet's");
+	for w in [&a, &d, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// One participation a restore cannot rebuild stops no other. A refreshes
+/// its board alone in round R1, final and completed, then the new leaf in
+/// round R2 with D, and hands its forfeits over; R2 waits, unbroadcast, for
+/// D's. A is restored through an operator whose status of R2's participation
+/// leaves out the held round's transaction, so the wallet cannot rebuild its
+/// new leaf (the round is not on the chain its node holds). The restore and
+/// the syncs that follow go on: R1's leaf is restored, R2's participation is
+/// answered with its reason and left in its forfeit step. Once the status is
+/// whole again, the next sync rebuilds it, hands the forfeits over again,
+/// and the refresh completes when R2 is final; the balance is the lost
+/// wallet's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_participation_it_cannot_rebuild_stops_no_other() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let (a, d) = (Arca::new("ISA"), Arca::new("ISD"));
+	let (board, _) = held_rounds_with_two(&mut r, &a, &d).await;
+	let (url, node) = (r.url(), r.node_url());
+	// R1: A's board alone.
+	a.ok(&["participate", "--leaf", &board]);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	let r1 = built[0].tx.txid();
+	assert!(common::cli::handed_over(&a.ok(&["sync"])));
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&r1, RoundState::Final).await;
+	let s = a.ok(&["sync"]);
+	let p1 = s["participations"].as_array().unwrap().iter().find(|p| p["state"] == "released").cloned()
+		.unwrap_or_else(|| panic!("R1 completed: {}", s));
+	let leaf1 = p1["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	// R2: A's new leaf, with D's board; A hands over, D not yet.
+	a.ok(&["participate", "--leaf", &leaf1]);
+	d.ok(&["participate"]);
+	let (built, _) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built[0].participations, 2);
+	let r2 = built[0].tx.txid();
+	assert!(common::cli::handed_over(&a.ok(&["sync"])));
+	let lost_now = a.ok(&["balance"]);
+	println!("IS R1 {} final, R2 {} held for D; A's balance {}", r1, r2, lost_now["held"]);
+
+	let proxy = common::proxy::Proxy::start(&url);
+	let held = r2.to_string();
+	proxy.rewrite(Some(std::sync::Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/participation_status" && status == 200 && v["round"]["txid"].as_str() == Some(held.as_str()) {
+			if let Some(o) = v["round"].as_object_mut() {
+				o.remove("tx");
+			}
+		}
+		None
+	})));
+	let a2 = Arca::new("ISA2");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let mut args = create_args(&proxy.url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	let (ok, made) = a2.run(&args);
+	println!("IS A2's restore, R2's round left out of its status: ok {} | notes {} | error {}", ok, made["restore"]["notes"],
+		made["restore"]["error"]);
+	assert!(ok && made["restore"]["error"].is_null(), "the restore goes on: {}", made);
+	println!("IS A2 holds R1's leaf: {}", coin_of(&a2, &leaf1)["state"]);
+	assert!(!coin_of(&a2, &leaf1).is_null(), "R1's leaf, given up in R2, is restored");
+	let (ok, s) = a2.run(&["sync"]);
+	println!("IS A2's sync, R2's round still left out: ok {} | participations {}", ok, s["participations"]);
+	assert!(ok, "the sync goes on: {}", s);
+	let why = s.to_string();
+	assert!(why.contains("is not on the chain the node holds"), "R2's participation is answered with its reason: {}", s);
+	assert!(states(&a2).iter().any(|p| p.ends_with("\"forfeiting\"")), "R2's participation stays in its forfeit step: {:?}", states(&a2));
+	assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "nothing handed over for a leaf the wallet could not rebuild");
+
+	// The status whole again: R2's participation is rebuilt and handed over.
+	proxy.rewrite(None);
+	let s = a2.ok(&["sync"]);
+	println!("IS A2's sync, the status whole: forfeit_leaves {} | participations {} | held {}", proxy.count("/v1/forfeit_leaves"),
+		s["participations"], s["held"]);
+	let s = a2.ok(&["sync"]);
+	println!("IS A2's next sync: forfeit_leaves {} | participations {} | held {}", proxy.count("/v1/forfeit_leaves"), s["participations"], s["held"]);
+	assert!(common::cli::handed_over(&d.ok(&["sync"])));
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&r2, RoundState::Final).await;
+	a.ok(&["sync"]);
+	let lost = a.ok(&["balance"]);
+	let mut done = false;
+	for _ in 0..3 {
+		let s = a2.ok(&["sync"]);
+		if s["participations"].as_array().into_iter().flatten().any(|p| p["state"] == "released") {
+			done = true;
+			break;
+		}
+	}
+	println!("IS in the end: {:?}; leaf1 {}; balance {} (the lost wallet's {})", states(&a2), coin_of(&a2, &leaf1)["state"],
+		a2.ok(&["balance"])["held"], lost["held"]);
+	assert!(done, "R2's refresh completed");
+	assert_eq!(coin_of(&a2, &leaf1)["state"], "spent");
+	assert_eq!(a2.ok(&["balance"])["held"], lost["held"], "the restored balance is the lost wallet's");
+	for w in [&a, &d, &a2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
 }

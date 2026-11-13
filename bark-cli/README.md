@@ -289,19 +289,24 @@ and a board whose registration never reached the server, are not recovered.
   The forfeit of each coin given up is built from the validated leaf of the
   coin's own asset and its round, and its refund delay must end before the new
   leaves' exit deadline.
-  A refusal of a new leaf's reserves is one its round cannot cure. Where the
-  operator takes declines (`participations.decline`) and the wallet signed no
-  forfeit for that round, the wallet declines the round at once
-  (`decline_participation`, each coin's key signing for that round alone),
-  says so in its refusals, and has its coins back in the same sync; the round
-  goes on for everyone else. Any other refusal is asked again at the next
-  sync, where an honest answer completes the round. Where the wallet itself
-  holds a forfeit it signed, for that round, of every coin the participation
-  gives up (a forfeit step that completed before, or a restore that found its
-  own signed forfeits), the new leaves are taken with the reserves of a coin
-  the wallet holds (one atom), and it signs no forfeit but those again:
-  taking them gives up nothing more, and refusing them could only lose them.
-  What the operator says of the participation counts for nothing there.
+  That bound on the reserves is for what the wallet signs. A leaf whose
+  reserves fall short of it is checked again with one-atom reserves and every
+  other check, so the refusal is taken as one of the reserves only once the
+  record matches the round; a published tree that is not the round's is
+  refused for that, and asked again at the next sync, where an honest answer
+  completes the round. A refusal of a new leaf's reserves in a round that is
+  not final is one the round cannot cure. Where the operator takes declines
+  (`participations.decline`) and the wallet signed no forfeit for that round,
+  the wallet declines the round at once (`decline_participation`, each coin's
+  key signing for that round alone), says so in its refusals, and has its
+  coins back in the same sync; the round goes on for everyone else.
+  In a round final at the wallet's node, a leaf that pays the wallet's key is
+  the wallet's money whatever its reserves. Once the operator has released it
+  (its published tree carries the preimage that opens the new leaves), the
+  wallet takes it and signs nothing for it: no forfeit and no release. A coin
+  given up for it of which the wallet holds its own forfeit for that round is
+  spent; any other is held as `handed`. Until the operator releases it the
+  refusal stands, and the round is declined as above.
 - **An issuer-operated asset's batch.** An operator may serve an asset
   issuer-operated: each round of it mints the refresh liquidity for its new
   batch through the asset's mint limiter, and every sweep of such a batch only
@@ -2258,7 +2263,11 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 A coin's states: `pending` (what it rests on is not final), `live`, `offered`
 (held for a swap), `sending` (in a transfer the server has not answered),
 `given` (in a participation, no forfeit signed), `forfeited` (a forfeit of it
-signed, the preimage not in hand), `paying` (the `htlc-1` leaf of a payment
+signed, the preimage not in hand), `handed` (given up in a round whose new
+leaves the wallet took without signing anything, and of which it holds no
+forfeit of its own: counted in no balance, paying nothing, and still
+exitable; should that round be lost, it is `given` to the participation's next
+run again, as every coin of it is), `paying` (the `htlc-1` leaf of a payment
 over Lightning the operator has not decided), `receiving` (the `htlc-1` leaf
 of a payment received over Lightning, not yet claimed), `spent`, `exiting`,
 `exited` and `lost`.
