@@ -5,7 +5,7 @@
 -- the refund, from the timeout. `ended_by` is the transfer that ended it; a
 -- transfer dropped before it was signed opens its lock again. The preimage
 -- is kept once anyone hands it over, and served to both holders.
-CREATE TABLE swap_lock (
+CREATE TABLE IF NOT EXISTS swap_lock (
 	leaf_id      BYTEA PRIMARY KEY,
 	payment_hash BYTEA NOT NULL,
 	payee        BYTEA NOT NULL,
@@ -21,4 +21,4 @@ CREATE TABLE swap_lock (
 	created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX swap_lock_hash ON swap_lock (payment_hash);
+CREATE INDEX IF NOT EXISTS swap_lock_hash ON swap_lock (payment_hash);
