@@ -7,7 +7,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -1991,4 +1991,288 @@ async fn one_coins_forfeit_withheld_at_restore_is_neither_forfeited_again_nor_sp
 	}
 	let _ = std::fs::remove_dir_all(&a.dir);
 	assert!(bad.is_empty(), "{:#?}", bad);
+}
+
+/// What one `sync` of a wallet behind proxy `p` asked of the operator to
+/// catch up: `leaf_data` calls, the leaves their answers carried, the held
+/// coins and leaves by id they asked about, with the sync's `catch up` step.
+fn catch_up_reads(p: &Proxy, w: &Arca) -> Value {
+	let from = p.calls().len();
+	let s = w.ok(&["sync"]);
+	let calls = p.calls();
+	let new = &calls[from..];
+	let data: Vec<&(String, Value, u16, Value)> = new.iter().filter(|c| c.0 == "/v1/leaf_data").collect();
+	let leaves: usize = data.iter().map(|c| c.3["leaves"].as_array().map_or(0, |a| a.len())).sum();
+	let count = |f: &str| -> usize { data.iter().map(|c| c.1[f].as_array().map_or(0, |a| a.len())).sum() };
+	json!({"leaf_data": data.len(), "leaves": leaves, "held": count("held"), "leaf_ids": count("leaf_ids"),
+		"step": s["cost_by_step"]["catch up"], "caught_up": s["caught_up"]})
+}
+
+/// Has each wallet of `ws` give up each of its live coins in a
+/// participation of its own, cut into fifteen leaves (fourteen of its
+/// `piece` atoms and the rest), and builds the round, made final.
+async fn split_each(r: &Running, ws: &[(&Arca, u64)]) {
+	for (w, piece) in ws {
+		let coins: Vec<String> = live(w).into_keys().collect();
+		for c in &coins {
+			w.ok(&["participate", "--leaf", c, "--piece", &piece.to_string(), "--pieces", "14", "--max-fee-ppm", "1000000"]);
+		}
+	}
+	every_round(r).await;
+	for (w, _) in ws {
+		w.ok(&["sync"]);
+	}
+}
+
+/// Builds every round that waits, each made final.
+async fn every_round(r: &Running) {
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(!built.is_empty() && failed.is_empty(), "{} built, failed: {:?}", built.len(), failed);
+	r.produce().await;
+	r.bury().await;
+	for b in &built {
+		r.round_state(&b.tx.txid(), RoundState::Final).await;
+	}
+}
+
+/// Has each wallet of `ws` give up every live coin in the next round,
+/// merged sixteen to a leaf.
+async fn merge_all(r: &Running, ws: &[&Arca]) {
+	for w in ws {
+		w.ok(&["participate", "--max-fee-ppm", "1000000"]);
+	}
+	every_round(r).await;
+	for w in ws {
+		w.ok(&["sync"]);
+	}
+}
+
+/// A wallet's catch-up between the stores of its mnemonic reads what changed
+/// since the last one, not its whole history (arca #623). Two wallets'
+/// coins are split and merged back through rounds, so the leaves the
+/// operator serves to one's mailbox key are a few, and to the other's
+/// thousands, while each holds one coin; then each catches up twice, ten
+/// minutes apart, nothing done between. The second catch-up's reads of the
+/// operator are the same at either length of history.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_reads_what_changed_not_the_whole_history() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let p = Proxy::start(&url);
+	let (short, long) = (Arca::new("CUS"), Arca::new("CUL"));
+	boarded(&mut r, &short, &p.url, &[(x, 40_000_000)]).await;
+	boarded(&mut r, &long, &p.url, &[(x, 40_000_000)]).await;
+	// The operator pays every round's batch from its own coins.
+	r.fund_server(x, 2_000_000_000).await;
+	r.produce().await;
+	r.synced().await;
+	// A short history: a board split into fifteen and merged back. A long
+	// one: split three times over (1, 15, 225, 3375 coins) and merged back
+	// to one.
+	split_each(&r, &[(&short, 1_500_000), (&long, 1_500_000)]).await;
+	merge_all(&r, &[&short]).await;
+	split_each(&r, &[(&long, 80_000)]).await;
+	split_each(&r, &[(&long, 4_000)]).await;
+	println!("CU live coins after the splits: {}", live(&long).len());
+	// A round takes so many leaves at most: merged until one coin is left.
+	for _ in 0..12 {
+		if live(&long).len() <= 1 {
+			break;
+		}
+		merge_all(&r, &[&long]).await;
+	}
+	assert_eq!(live(&long).len(), 1, "the long history ends with one coin");
+	println!("CU live coins after the merges: short {}, long {}", live(&short).len(), live(&long).len());
+	let mut seconds = vec![];
+	for (name, w) in [("short", &short), ("long", &long)] {
+		// The first catch-up reads everything made since the cursor the wallet
+		// reached while its history was made, about a second of it a sync,
+		// each sync reading on: it runs until it says no more.
+		catch_up_due(&r).await;
+		let mut first = catch_up_reads(&p, w);
+		let mut syncs = 1;
+		while first["caught_up"]["more"] == true {
+			first = catch_up_reads(&p, w);
+			syncs += 1;
+			assert!(syncs < 100, "the first catch-up ends");
+		}
+		println!("CU {} history: the first catch-up took {} syncs", name, syncs);
+		catch_up_due(&r).await;
+		let second = catch_up_reads(&p, w);
+		println!("CU {} history: {} coins held or once held; first catch-up {}; second {}", name, w.ok(&["coins"]).as_array().unwrap().len(),
+			first, second);
+		seconds.push(second);
+	}
+	let (s, l) = (&seconds[0], &seconds[1]);
+	assert!(l["caught_up"]["error"].is_null(), "{}", l["caught_up"]);
+	assert!(std::env::var_os("CU_MEASURE").is_some() || l["leaves"].as_u64() <= s["leaves"].as_u64().map(|v| v + 2),
+		"the second catch-up read {} leaves at a long history, {} at a short one", l["leaves"], s["leaves"]);
+	assert!(std::env::var_os("CU_MEASURE").is_some() || l["leaf_data"].as_u64() <= s["leaf_data"].as_u64(),
+		"the second catch-up made {} leaf_data calls at a long history, {} at a short one", l["leaf_data"], s["leaf_data"]);
+
+	// From an operator without reads past a settled cursor, over a far link
+	// (each call waits 150 ms, about a browser's round trip to the testnet's
+	// operator), the long history is read every page from the first, as a
+	// restore reads it: about a second of it a sync, every sync reading on
+	// where the last stopped, until it is read to the end.
+	p.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			v.as_object_mut().unwrap().remove("leaf_data");
+		}
+		None
+	})));
+	p.delay(std::time::Duration::from_millis(150));
+	catch_up_due(&r).await;
+	let (mut syncs, mut longest, mut read) = (0, 0u64, 0u64);
+	loop {
+		let c = catch_up_reads(&p, &long);
+		let ms = c["step"]["ms"].as_u64().unwrap();
+		println!("CU an older operator, sync {}: {}", syncs, c);
+		assert!(c["caught_up"]["error"].is_null(), "{}", c["caught_up"]);
+		assert_eq!(c["caught_up"]["read"], "every page", "{}", c);
+		read += c["caught_up"]["served"].as_u64().unwrap();
+		longest = longest.max(ms);
+		syncs += 1;
+		if c["caught_up"]["more"] != true {
+			break;
+		}
+		// A page past the budget, at most: the catch-up asks for what the pace
+		// says fits in it.
+		assert!(std::env::var_os("CU_MEASURE").is_some() || ms <= 3_000, "a sync's catch-up held the wallet {} ms: {}", ms, c);
+		assert!(syncs < 200, "the catch-up ends");
+	}
+	println!("CU an older operator: {} syncs, the longest catch-up step {} ms, {} leaves read", syncs, longest, read);
+	assert!(syncs > 1, "the long history is read over several syncs");
+	assert!(read >= 3_000, "every leaf is read: {}", read);
+	p.delay(std::time::Duration::ZERO);
+	p.rewrite(None);
+	for w in [&short, &long] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// Two stores of one mnemonic, the other acting between two catch-ups (arca
+/// #623): A2, restored from A's mnemonic, catches up once, reading from the
+/// first leaf. Then A pays B from one coin (its change made), refreshes
+/// another, and is paid by B. A2's next catch-up reads past the cursor the
+/// first reached and the coins it holds, not the whole history: it gives up
+/// the two coins A gave up and takes A's change, A's refreshed leaf and
+/// what B paid A. Then A refreshes again, and A2 catches up while that round
+/// is built and not final: the new leaf is served without its record, and
+/// A2 cannot take it yet. Once the round is final, A2's next catch-up asks
+/// for that leaf by id (its cursor is past it) and takes it. Each time both
+/// show the same coins and balance.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_learns_what_the_other_did_between_two_catch_ups() {
+	let mut r = Running::start_kept(1, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let p = Proxy::start(&url);
+	let (a, a2, b) = (Arca::new("OAA"), Arca::new("OAA2"), Arca::new("OAB"));
+	boarded(&mut r, &a, &url, &[(x, 2_000_000), (x, 2_000_000), (x, 2_000_000)]).await;
+	boarded(&mut r, &b, &url, &[(x, 1_000_000)]).await;
+	r.fund_server(x, 200_000_000).await;
+	r.produce().await;
+	r.synced().await;
+	// A's coins made round leaves first: a board given to a round is spent on
+	// the chain by its forfeit, which has a store catch up at once from its
+	// re-check, and this test is of the catch-up a sync makes when it is due.
+	for c in live(&a).into_keys() {
+		a.ok(&["participate", "--leaf", &c, "--max-fee-ppm", "1000000"]);
+	}
+	every_round(&r).await;
+	a.ok(&["sync"]);
+	assert_eq!(live(&a).len(), 3);
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&p.url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	assert!(made["restore"]["error"].is_null(), "{}", made["restore"]);
+	// The restore's history done (its end has the next catch-up read from
+	// the first leaf), A2 catches up.
+	for _ in 0..20 {
+		if a2.ok(&["balance"])["history"].is_null() {
+			break;
+		}
+		a2.ok(&["sync"]);
+	}
+	assert!(a2.ok(&["balance"])["history"].is_null(), "the history is done");
+	catch_up_due(&r).await;
+	let first = catch_up_reads(&p, &a2);
+	println!("OA A2's first catch-up: {}", first);
+	assert_eq!(first["caught_up"]["read"], "from the first leaf", "{}", first);
+	assert_eq!(live(&a2), live(&a));
+
+	// A acts: a payment to B, a refresh, a payment from B.
+	let coins: Vec<String> = live(&a).into_keys().collect();
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let sent = a.ok(&["send", &req_b, "--amount", "600000", "--asset", &xs]);
+	let paid_from = sent["inputs"][0].as_str().unwrap().to_string();
+	let refreshed = coins.iter().find(|c| **c != paid_from).unwrap().clone();
+	a.ok(&["participate", "--leaf", &refreshed, "--max-fee-ppm", "1000000"]);
+	final_round(&r).await;
+	a.ok(&["sync"]);
+	let req_a = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	b.ok(&["sync"]);
+	b.ok(&["send", &req_a, "--amount", "300000", "--asset", &xs]);
+	a.ok(&["sync"]);
+	catch_up_due(&r).await;
+	let second = catch_up_reads(&p, &a2);
+	println!("OA A2's catch-up after A acted: {}", second);
+	let c = &second["caught_up"];
+	assert!(c["error"].is_null(), "{}", c);
+	assert_eq!(c["read"], "past the settled cursor", "{}", c);
+	let gone: BTreeSet<&str> = c["given_elsewhere"].as_array().unwrap().iter().filter_map(|g| g["leaf_id"].as_str()).collect();
+	assert_eq!(gone, BTreeSet::from([paid_from.as_str(), refreshed.as_str()]), "A2 gives up the coins A gave up: {}", c);
+	assert_eq!(c["restored"].as_array().unwrap().len(), 3, "A2 takes A's change, refreshed leaf and B's payment: {}", c);
+	assert!(second["leaves"].as_u64().unwrap() < first["leaves"].as_u64().unwrap() + 4,
+		"A2 reads what changed, not the history again: {} then {}", first, second);
+	assert_eq!(live(&a2), live(&a), "the same coins after A acted");
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "the same balance after A acted");
+
+	// A refreshes again; A2 catches up while the round is built and not final.
+	let coin: String = live(&a).into_keys().next().unwrap();
+	a.ok(&["participate", "--leaf", &coin, "--max-fee-ppm", "1000000"]);
+	let built = r.server.rounds.run_round().await.unwrap().unwrap();
+	catch_up_due(&r).await;
+	let third = catch_up_reads(&p, &a2);
+	println!("OA A2's catch-up while A's round is not final: {}", third);
+	assert!(third["caught_up"]["restored"].as_array().unwrap().is_empty(), "nothing to take yet: {}", third);
+	assert!(live(&a2).contains_key(&coin), "A2 still holds the coin A gave to a round not released");
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&built.tx.txid(), RoundState::Final).await;
+	a.ok(&["sync"]);
+	catch_up_due(&r).await;
+	let fourth = catch_up_reads(&p, &a2);
+	println!("OA A2's catch-up once A's round is final: {}", fourth);
+	let asked_by_id = p.calls().iter().rev().filter(|c| c.0 == "/v1/leaf_data").take(fourth["leaf_data"].as_u64().unwrap() as usize)
+		.any(|c| c.1["leaf_ids"].as_array().is_some_and(|l| !l.is_empty()));
+	assert!(asked_by_id, "the leaf A2 could not take is asked for by id");
+	a.ok(&["sync"]);
+	assert_eq!(live(&a2), live(&a), "the same coins once A's round is final");
+	assert_eq!(tree_balance(&a2), tree_balance(&a), "the same balance once A's round is final");
+
+	// The operator's database restored from a dump (its transaction counter
+	// behind the transactions its leaves were served at): the server starts a
+	// new epoch of cursors, and A2's next catch-up reads from the first leaf,
+	// every leaf served to the mailbox key.
+	let (sql, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	sql.execute("UPDATE leaf_served SET served_xid = '9000000000000'::xid8", &[]).await.unwrap();
+	r.server.store.cursor_epoch_at_start().await.unwrap();
+	let mailbox = a2.ok(&["info"])["mailbox_key"].as_str().map(|m| m.to_string()).expect("the wallet's mailbox key");
+	let a2_served: i64 = sql.query_one("SELECT count(*) FROM leaf_served WHERE mailbox_key = decode($1, 'hex')", &[&mailbox]).await.unwrap().get(0);
+	let a2_served = a2_served as usize;
+	catch_up_due(&r).await;
+	let fifth = catch_up_reads(&p, &a2);
+	println!("OA A2's catch-up after the operator's database was restored: {}", fifth);
+	assert_eq!(fifth["caught_up"]["read"], "from the first leaf", "{}", fifth);
+	assert_eq!(fifth["leaves"].as_u64().unwrap() as usize, a2_served, "every leaf served to the mailbox key: {}", fifth);
+	assert_eq!(live(&a2), live(&a), "the same coins after the restore of the operator's database");
+	for w in [&a, &a2, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
 }

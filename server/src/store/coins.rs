@@ -270,6 +270,18 @@ pub(super) async fn insert_coin(tx: &tokio_postgres::Transaction<'_>, coin: &New
 	}
 }
 
+/// Claims, in `t`, the owner keys of every leaf it will insert or bind,
+/// all at once in the keys' order (`leaf_served_claim_all`), before it
+/// claims any one of them by inserting: a transaction that claims several
+/// keys never waits on one while holding a later one, so no two wait on each
+/// other in a cycle.
+pub(crate) async fn claim_keys(t: &tokio_postgres::Transaction<'_>, keys: Vec<Vec<u8>>) -> Result<(), StoreError> {
+	if keys.len() > 1 {
+		t.execute("SELECT leaf_served_claim_all($1)", &[&keys]).await?;
+	}
+	Ok(())
+}
+
 impl Store {
 	/// A fresh operator nonce: 32 random bytes, recorded as issued before it
 	/// is returned, so it can be taken by one leaf and never handed out again.
@@ -323,6 +335,7 @@ impl Store {
 	pub async fn insert_coins(&self, coins: &[NewCoin]) -> Result<(), StoreError> {
 		let mut conn = self.conn().await?;
 		let tx = conn.transaction().await?;
+		claim_keys(&tx, coins.iter().map(|c| c.owner_key.to_vec()).collect()).await?;
 		for c in coins {
 			insert_coin(&tx, c).await?;
 		}

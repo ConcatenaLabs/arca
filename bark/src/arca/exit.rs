@@ -2058,11 +2058,13 @@ impl Wallet {
 		// held here that they gave up given up here too. At most once every
 		// ten minutes ([`super::restore::CATCH_UP_EVERY`]), and at every sync
 		// while a coin is held out as spent elsewhere, until a catch-up
-		// settles it ([`Self::spent_elsewhere`]).
+		// settles it ([`Self::spent_elsewhere`]). About a second of it a sync
+		// ([`super::restore::SYNC_CATCH_UP_MS`]): one that reads longer reads
+		// on at the next.
 		let caught_up = if talk && catch_up && !self.spent_elsewhere()?.is_empty() {
 			self.settle_spent_elsewhere().map(|v| v.unwrap_or(Value::Null)).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else if talk && catch_up && self.catch_up_due()? {
-			self.catch_up().unwrap_or_else(|e| json!({"error": e.to_string()}))
+			self.catch_up_within(Some(super::restore::SYNC_CATCH_UP_MS)).map(|v| v.0).unwrap_or_else(|e| json!({"error": e.to_string()}))
 		} else { Value::Null };
 		steps.lap(self, "catch up");
 		self.exits_meanwhile();

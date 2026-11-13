@@ -10,7 +10,8 @@
 //! where `call` names the request it authenticates (`mailbox_read`,
 //! `leaf_data`) and `request` is what that request asks besides its proof
 //! ([`mailbox_read_request`]: the cursor and page size; nothing for a
-//! `leaf_data` that names neither). The tag keeps the signature apart from everything else a leaf
+//! `leaf_data` that names neither; [`leaf_since_request`] for one past a
+//! settled cursor). The tag keeps the signature apart from everything else a leaf
 //! key signs (rebindable messages, unroll authorisations, releases, exit
 //! claims), whose preimages never begin with `T ‖ T`; the genesis hash keeps
 //! it to one chain, the call and the request to one read, the challenge to a
@@ -44,6 +45,29 @@ pub const AUTH_TAG: &[u8] = b"Arca/auth";
 pub fn mailbox_read_request(after: u64, limit: u32) -> Vec<u8> {
 	let mut b = after.to_le_bytes().to_vec();
 	b.extend(limit.to_le_bytes());
+	b
+}
+
+/// The tag that opens what a `leaf_data` read past a settled cursor asks
+/// ([`leaf_since_request`]).
+pub const LEAF_SINCE_TAG: &[u8] = b"Arca/leaf-since";
+
+/// What a `leaf_data` read past a settled cursor asks besides its proof:
+/// the tag, the cursor (its length in one byte, then its text), the page
+/// size (four bytes), and the held coins and the leaves asked for by id,
+/// each list its count in four bytes and then its ids, little-endian. Never
+/// twelve bytes long, so never a [`mailbox_read_request`].
+pub fn leaf_since_request(since: &str, limit: u32, held: &[[u8; 32]], ids: &[[u8; 32]]) -> Vec<u8> {
+	let mut b = LEAF_SINCE_TAG.to_vec();
+	b.push(since.len().min(255) as u8);
+	b.extend(&since.as_bytes()[..since.len().min(255)]);
+	b.extend(limit.to_le_bytes());
+	for list in [held, ids] {
+		b.extend((list.len() as u32).to_le_bytes());
+		for i in list {
+			b.extend(i);
+		}
+	}
 	b
 }
 

@@ -160,6 +160,29 @@ pub fn mailbox_read_request(after: u64, limit: u32) -> Vec<u8> {
 	b
 }
 
+/// The tag that opens what a `leaf_data` read past a settled cursor asks
+/// ([`leaf_since_request`]).
+pub const LEAF_SINCE_TAG: &[u8] = b"Arca/leaf-since";
+
+/// What a `leaf_data` read past a settled cursor asks besides its proof:
+/// the tag, the cursor (its length in one byte, then its text), the page
+/// size (four bytes), and the held coins and the leaves asked for by id,
+/// each list its count in four bytes and then its ids, little-endian, as
+/// the server reads it.
+pub fn leaf_since_request(since: &str, limit: u32, held: &[[u8; 32]], ids: &[[u8; 32]]) -> Vec<u8> {
+	let mut b = LEAF_SINCE_TAG.to_vec();
+	b.push(since.len().min(255) as u8);
+	b.extend(&since.as_bytes()[..since.len().min(255)]);
+	b.extend(limit.to_le_bytes());
+	for list in [held, ids] {
+		b.extend((list.len() as u32).to_le_bytes());
+		for i in list {
+			b.extend(i);
+		}
+	}
+	b
+}
+
 /// The digest `key` signs to authenticate `call` with `challenge`, asking
 /// `request` ([`mailbox_read_request`]): `SHA256(T ‖ T ‖ genesis_hash ‖
 /// len(call) ‖ call ‖ challenge ‖ key ‖ SHA256(request))`.
@@ -577,6 +600,23 @@ impl ServerClient {
 			out.push((i, m["messages"].as_array().cloned().unwrap_or_default()));
 		}
 		Ok(out)
+	}
+
+	/// A read past the settled cursor `since` (`"0"`, or the `next` such a
+	/// read answered) of the leaves the server serves to `key`, up to
+	/// `limit`, in the order of the transactions that made them and only
+	/// those no running one can still add behind; with the state of each coin
+	/// of `held`, the whole entry of those given up for good and of the
+	/// leaves `ids` (`asked`), and the payments into the tree asked under the
+	/// key (`receives`). Only to an operator whose `info.leaf_data` says it
+	/// reads them.
+	pub fn leaf_data_since(&self, key: &Keypair, chain: &Chain, since: &str, limit: u32, held: &[[u8; 32]], ids: &[[u8; 32]])
+		-> Result<Value, Error>
+	{
+		let auth = self.auth("leaf_data", key, chain, &leaf_since_request(since, limit, held, ids))?;
+		let held: Vec<String> = held.iter().map(|h| hex(h)).collect();
+		let ids: Vec<String> = ids.iter().map(|h| hex(h)).collect();
+		self.post("leaf_data", &json!({"auth": auth, "since": since, "limit": limit, "held": held, "leaf_ids": ids}))
 	}
 
 	/// A page of the leaves the server serves to `key`, after cursor `after`,

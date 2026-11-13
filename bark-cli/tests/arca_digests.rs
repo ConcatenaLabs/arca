@@ -74,6 +74,18 @@ fn the_wallets_digests_are_the_servers() {
 		assert_ne!(auth_digest(&chain, call, &[7; 32], &k, &mailbox_read_request(0, 100)),
 			auth_digest(&chain, call, &[7; 32], &k, &mailbox_read_request(1, 100)), "the request is bound");
 	}
+	// A read past a settled cursor binds the cursor, the page size, the held
+	// coins and the leaves asked by id, and is never a paged read's request.
+	let cases: [(&str, u32, Vec<[u8; 32]>, Vec<[u8; 32]>); 4] = [("0", 100, vec![], vec![]), ("743.17", 25, vec![[1; 32], [2; 32]], vec![]),
+		("743.17", 25, vec![], vec![[1; 32], [2; 32]]), ("743.18", 25, vec![[1; 32]], vec![[2; 32]])];
+	let mut seen = std::collections::BTreeSet::new();
+	for (since, limit, held, ids) in &cases {
+		let mine = bark::arca::client::leaf_since_request(since, *limit, held, ids);
+		assert_eq!(mine, server::auth::leaf_since_request(since, *limit, held, ids));
+		assert_ne!(mine.len(), 12, "never a paged read's request");
+		assert!(seen.insert(mine.clone()), "each read past a settled cursor is bound: {:?}", (since, limit, held, ids));
+		assert_eq!(auth_digest(&chain, "leaf_data", &[7; 32], &k, &mine), server::auth::auth_digest(&chain, "leaf_data", &[7; 32], &k, &mine));
+	}
 	let s = key("operator").x_only_public_key().0;
 	let a = AssetId::from_slice(&[0x28; 32]).unwrap();
 	let d = RelativeTime::from_units(253).unwrap();

@@ -293,6 +293,7 @@ impl Store {
 	pub async fn insert_plan(&self, p: &NewPlan) -> Result<(), StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
+		super::coins::claim_keys(&t, p.steps.iter().map(|s| s.owner_key.to_vec()).collect()).await?;
 		let state: Option<String> = t.query_opt("SELECT state::text FROM leaf WHERE leaf_id = $1 FOR UPDATE", &[&&p.coin[..]]).await?
 			.map(|r| r.get(0));
 		match state.as_deref() {

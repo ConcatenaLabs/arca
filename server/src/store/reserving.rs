@@ -6,7 +6,7 @@
 //! key bound it to (`leaf_mailbox`, [`Store::bind_mailbox`]); a transfer's
 //! output also to the mailbox the transfer posted it to.
 
-use super::coins::{leaf_row, LeafKind};
+use super::coins::{leaf_row, LeafKind, LeafState};
 use super::participations::{read_participation, ParticipationRow};
 use super::{array32, LeafRow, Store, StoreError};
 
@@ -170,125 +170,319 @@ impl Store {
 	pub async fn served_leaves(&self, key: &[u8; 32], after: i64, limit: i64) -> Result<Vec<ServedLeaf>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			"SELECT l.leaf_id, l.kind::text, l.asset, l.value, l.owner_key, l.script_pubkey, l.hops,
-			        CASE WHEN l.kind = 'batch' AND NOT EXISTS (
-			            SELECT 1 FROM batch_leaf b JOIN participation p ON p.participation_id = b.participation_id
-			            WHERE b.leaf_id = l.leaf_id AND p.attempt = b.attempt AND p.state = 'released'
-			            UNION ALL
-			            SELECT 1 FROM batch_leaf b JOIN participation_attempt a
-			              ON a.participation_id = b.participation_id AND a.attempt = b.attempt
-			            WHERE b.leaf_id = l.leaf_id AND a.released)
-			        THEN ''::bytea ELSE l.record END,
-			        l.state::text, l.spent_by, l.seq
-			 FROM leaf l
-			 WHERE l.seq > $2 AND l.leaf_id IN (
-			     SELECT leaf_id FROM leaf WHERE owner_key = $1
-			     UNION SELECT x.leaf_id FROM leaf_mailbox m JOIN leaf x ON x.owner_key = m.owner_key WHERE m.mailbox_key = $1
-			     UNION SELECT leaf_id FROM transfer_output WHERE mailbox_key = $1)
-			 ORDER BY l.seq LIMIT $3",
+			&format!("SELECT {} FROM leaf l WHERE l.seq > $2 AND l.leaf_id IN ({}) ORDER BY l.seq LIMIT $3", SERVED_COLUMNS, SERVED_TO),
 			&[&&key[..], &after, &limit],
 		).await?;
-		let mut out = Vec::with_capacity(rows.len());
-		for r in &rows {
-			let leaf = leaf_row(r)?;
-			let seq: i64 = r.get(10);
-			let id = leaf.leaf_id;
-			let batch = match leaf.kind {
-				LeafKind::Batch => {
-					let b = conn.query_opt(
-						"SELECT r.txid, r.state, b.vout, b.idx, b.owner_nonce, b.participation_id, r.signer_entry, r.signer_hash, r.signer_sig
-						 FROM batch_leaf b JOIN round r ON r.round_id = b.round_id WHERE b.leaf_id = $1",
-						&[&&id[..]],
-					).await?;
-					match b {
-						Some(b) => {
-							let entry: Option<i64> = b.get(6);
-							let hash: Option<Vec<u8>> = b.get(7);
-							let sig: Option<Vec<u8>> = b.get(8);
-							let signer_head = match (entry, hash) {
-								(Some(n), Some(h)) => Some((n as u64, array32(h, "signer hash")?,
-									sig.map(|s| s.try_into().map_err(|_| StoreError::Corrupt("a round's head signature".into()))).transpose()?)),
-								_ => None,
-							};
-							Some(ServedBatch {
-								round_txid: array32(b.get(0), "txid")?,
-								round_state: b.get(1),
-								batch_vout: b.get::<_, i32>(2) as u32,
-								leaf_index: b.get::<_, i32>(3) as u32,
-								owner_nonce: array32(b.get(4), "owner nonce")?,
-								participation_id: array32(b.get(5), "participation id")?,
-								signer_head,
-							})
-						},
-						None => None,
-					}
-				},
-				_ => None,
-			};
-			let board = match leaf.kind {
-				LeafKind::Board => conn.query_opt("SELECT txid, vout, state::text FROM board WHERE leaf_id = $1", &[&&id[..]]).await?
-					.map(|b| Ok::<_, StoreError>(ServedBoard { txid: array32(b.get(0), "txid")?, vout: b.get::<_, i32>(1) as u32, state: b.get(2) }))
-					.transpose()?,
-				_ => None,
-			};
-			let made_by = match leaf.kind {
-				LeafKind::Transfer => conn.query_opt(
-					"SELECT t.transfer_id, t.signer_entry, t.signer_hash, t.signer_sig FROM transfer_output o
-					 JOIN transfer t ON t.transfer_id = o.transfer_id WHERE o.leaf_id = $1",
-					&[&&id[..]],
-				).await?.map(|t| Ok::<_, StoreError>(ServedMadeBy {
-					transfer_id: array32(t.get(0), "transfer id")?,
-					signer_head: super::transfers::head_of(t.get(1), t.get(2), t.get(3))?,
-				})).transpose()?,
-				_ => None,
-			};
-			let mut transfers = vec![];
-			for t in conn.query(
-				"SELECT t.transfer_id, t.state, i.checkpoint_value, i.checkpoint_owner_sig FROM transfer_input i
-				 JOIN transfer t ON t.transfer_id = i.transfer_id WHERE i.leaf_id = $1",
-				&[&&id[..]],
-			).await? {
-				let sig: Vec<u8> = t.get(3);
-				transfers.push(ServedTransferSpend {
-					transfer_id: array32(t.get(0), "transfer id")?,
-					signed: t.get::<_, &str>(1) == "signed",
-					checkpoint_value: t.get::<_, i64>(2) as u64,
-					checkpoint_owner_sig: sig.try_into().map_err(|_| StoreError::Corrupt("a checkpoint signature".into()))?,
-				});
-			}
-			let mut participations = vec![];
-			for p in conn.query(
-				"SELECT i.participation_id FROM participation_input i JOIN participation p ON p.participation_id = i.participation_id
-				 WHERE i.leaf_id = $1 ORDER BY p.created_at, i.participation_id",
-				&[&&id[..]],
-			).await? {
-				let pid = array32(p.get(0), "participation id")?;
-				if let Some(row) = read_participation(&*conn, &pid).await? {
-					participations.push(row);
-				}
-			}
-			let mut forfeits = vec![];
-			for f in conn.query(
-				"SELECT f.participation_id, r.txid, c.vout, f.unlock_hash, f.refund_delay_units, f.margin, f.owner_sig,
-				        f.operator_sig IS NOT NULL
-				 FROM forfeit f JOIN round r ON r.round_id = f.round_id JOIN connector_output c ON c.round_id = f.round_id
-				 WHERE f.leaf_id = $1 ORDER BY f.created_at, f.round_id",
-				&[&&id[..]],
-			).await? {
-				let sig: Vec<u8> = f.get(6);
-				forfeits.push(ServedForfeit {
-					participation_id: array32(f.get(0), "participation id")?,
-					round_txid: array32(f.get(1), "txid")?,
-					connector_vout: f.get::<_, i32>(2) as u32,
-					unlock_hash: array32(f.get(3), "unlock hash")?,
-					refund_delay_units: f.get::<_, i32>(4) as u16,
-					margin: f.get::<_, i64>(5) as u64,
-					owner_sig: sig.try_into().map_err(|_| StoreError::Corrupt("a forfeit signature".into()))?,
-					cosigned: f.get(7),
-				});
-			}
-			out.push(ServedLeaf { seq, leaf, batch, board, made_by, transfers, participations, forfeits });
-		}
-		Ok(out)
+		served_rows(&*conn, &rows).await
 	}
+
+	/// Up to `limit` leaves served to `key` past the settled cursor `since`
+	/// (a transaction and a `seq`; `(0, 0)` from the first), as
+	/// [`Store::served_leaves`] serves them, ordered by when each came to be
+	/// served to `key` (`leaf_served.served_xid`: the latest of the
+	/// transactions that made the leaf, bound its owner key to `key`, posted
+	/// it to `key`), then its `seq`: a range of one index, whatever the key's
+	/// history. Only leaves whose transaction is older than every one still
+	/// running, so none can still appear behind a cursor read past. Each with
+	/// its own settled cursor.
+	pub async fn served_since(&self, key: &[u8; 32], since: (u64, i64), limit: i64) -> Result<Vec<(ServedLeaf, (u64, i64))>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			// The cursor is compared and ordered as a transaction id, never
+			// as its text: "1000000" sorts before "999999".
+			&format!("SELECT {}, s.served_xid::text AS made_text FROM leaf_served s JOIN leaf l ON l.leaf_id = s.leaf_id
+			 WHERE s.mailbox_key = $1 AND (s.served_xid, s.seq) > ($2::text::xid8, $3)
+			   AND s.served_xid < pg_snapshot_xmin(pg_current_snapshot())
+			 ORDER BY s.served_xid, s.seq LIMIT $4", SERVED_COLUMNS),
+			&[&&key[..], &since.0.to_string(), &since.1, &limit],
+		).await?;
+		let mut made = Vec::with_capacity(rows.len());
+		for r in &rows {
+			let x: String = r.get(11);
+			made.push((x.parse::<u64>().map_err(|_| StoreError::Corrupt(format!("transaction id {}", x)))?, r.get::<_, i64>(10)));
+		}
+		Ok(served_rows(&*conn, &rows).await?.into_iter().zip(made).collect())
+	}
+
+	/// Where a read of every leaf served to a key from the first
+	/// ([`Store::served_leaves`], paged by `seq`) leaves a settled cursor
+	/// ([`Store::served_since`]) once it ends, taken before its first page:
+	/// the oldest transaction still running. Every transaction older has
+	/// ended, so each leaf it served is in every page read after this; every
+	/// leaf served from now on comes to be served at this transaction or a
+	/// later one, past the cursor `(start - 1, i64::MAX)`.
+	pub async fn settled_start(&self) -> Result<u64, StoreError> {
+		let conn = self.conn().await?;
+		let x: String = conn.query_one("SELECT pg_snapshot_xmin(pg_current_snapshot())::text", &[]).await?.get(0);
+		x.parse::<u64>().map_err(|_| StoreError::Corrupt(format!("transaction id {}", x)))
+	}
+
+	/// Keeps for `key` each leaf of `ids` it is served (a read of every leaf
+	/// from the first just served them, from the base tables) that
+	/// `leaf_served` is missing, served at this transaction, past every
+	/// cursor a wallet holds: the index is never the only source of what a
+	/// key is served. Answers how many were missing; none, unless a trigger
+	/// failed to keep one.
+	pub async fn repair_served(&self, key: &[u8; 32], ids: &[[u8; 32]]) -> Result<u64, StoreError> {
+		if ids.is_empty() {
+			return Ok(0);
+		}
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		// Inserting nothing draws no transaction id: the transaction's own is
+		// drawn by the first row it inserts.
+		Ok(conn.execute(
+			"INSERT INTO leaf_served (mailbox_key, served_xid, seq, leaf_id)
+			 SELECT $1, pg_current_xact_id(), l.seq, l.leaf_id FROM leaf l
+			 WHERE l.leaf_id = ANY($2)
+			   AND NOT EXISTS (SELECT 1 FROM leaf_served s WHERE s.mailbox_key = $1 AND s.leaf_id = l.leaf_id)
+			 ON CONFLICT DO NOTHING",
+			&[&&key[..], &ids],
+		).await?)
+	}
+
+	/// The epoch of the settled cursors ([`Store::served_since`]), drawn the
+	/// first time. Run when the server starts. It draws a new one when the
+	/// database is not the one the cursors were drawn on, since every cursor
+	/// a wallet holds might then lie past the leaves made from now on:
+	/// - its transaction counter is behind a transaction its leaves were
+	///   served at (restored from a dump, whose counter starts again): it
+	///   then also sets every served transaction to 0, so the leaves made
+	///   from now on lie past every cursor of the new epoch;
+	/// - its identity changed (the cluster's system identifier and its
+	///   timeline, [`database_identity`]): restored into another cluster,
+	///   recovered to an earlier point in time, or a standby promoted, whose
+	///   counter runs on from a point behind what the wallets read.
+	/// A wallet holding a cursor of the old epoch reads from the first leaf.
+	pub async fn cursor_epoch_at_start(&self) -> Result<[u8; 8], StoreError> {
+		let mut conn = self.conn().await?;
+		let identity = database_identity(&*conn).await;
+		let tx = conn.transaction().await?;
+		tx.batch_execute("LOCK TABLE leaf_cursor_epoch IN EXCLUSIVE MODE").await?;
+		let behind: bool = tx.query_one(
+			"SELECT pg_current_xact_id() < COALESCE((SELECT max(served_xid) FROM leaf_served), '0'::xid8)", &[]).await?.get(0);
+		let kept = tx.query_opt("SELECT epoch, identity FROM leaf_cursor_epoch", &[]).await?;
+		// An identity unread, or none kept yet, raises nothing.
+		let moved = |kept: &Option<String>| matches!((kept, &identity), (Some(k), Some(i)) if k != i);
+		let epoch = match kept {
+			Some(r) if !behind && !moved(&r.get(1)) => {
+				let e: Vec<u8> = r.get(0);
+				if identity.is_some() {
+					tx.execute("UPDATE leaf_cursor_epoch SET identity = $1", &[&identity]).await?;
+				}
+				e.try_into().map_err(|_| StoreError::Corrupt("the cursor epoch".into()))?
+			},
+			kept => {
+				let mut e = [0u8; 8];
+				rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut e);
+				if behind {
+					log::warn!("the database's transaction counter is behind its leaves' (restored from a dump?): the settled cursors start a \
+						new epoch, and every wallet reads from the first leaf at its next catch-up");
+					tx.batch_execute("UPDATE leaf_served SET served_xid = '0'::xid8 WHERE served_xid <> '0'::xid8;
+						UPDATE leaf SET made_xid = NULL WHERE made_xid IS NOT NULL;
+						UPDATE leaf_mailbox SET bound_xid = NULL WHERE bound_xid IS NOT NULL;").await?;
+				} else if let Some(k) = kept.and_then(|r| r.get::<_, Option<String>>(1)) {
+					log::warn!("the database is not the one the settled cursors were drawn on (its identity was {}, is {}: restored into \
+						another cluster, recovered to an earlier point, or a standby promoted): the settled cursors start a new epoch, and \
+						every wallet reads from the first leaf at its next catch-up", k, identity.as_deref().unwrap_or("?"));
+				}
+				tx.execute("INSERT INTO leaf_cursor_epoch (one, epoch, identity) VALUES (true, $1, $2)
+					ON CONFLICT (one) DO UPDATE SET epoch = $1, identity = COALESCE($2, leaf_cursor_epoch.identity)",
+					&[&&e[..], &identity]).await?;
+				e
+			},
+		};
+		tx.commit().await?;
+		Ok(epoch)
+	}
+
+	/// The epoch of the settled cursors now ([`Store::cursor_epoch_at_start`]).
+	pub async fn cursor_epoch(&self) -> Result<[u8; 8], StoreError> {
+		let conn = self.conn().await?;
+		match conn.query_opt("SELECT epoch FROM leaf_cursor_epoch", &[]).await? {
+			Some(r) => {
+				let e: Vec<u8> = r.get(0);
+				e.try_into().map_err(|_| StoreError::Corrupt("the cursor epoch".into()))
+			},
+			None => Ok([0u8; 8]),
+		}
+	}
+
+	/// The leaves of `ids` served to `key`, as [`Store::served_leaves`]
+	/// serves them, in the order the server learned of them.
+	pub async fn served_by_ids(&self, key: &[u8; 32], ids: &[[u8; 32]]) -> Result<Vec<ServedLeaf>, StoreError> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query(
+			&format!("SELECT {} FROM leaf l WHERE l.leaf_id = ANY($2) AND l.leaf_id IN ({}) ORDER BY l.seq", SERVED_COLUMNS, SERVED_TO),
+			&[&&key[..], &ids],
+		).await?;
+		served_rows(&*conn, &rows).await
+	}
+
+	/// Of the leaves `ids`, those served to `key`, each with its state and
+	/// whether it was given up for good: an input of a transfer the operator
+	/// co-signed, or of a participation it released.
+	pub async fn held_states(&self, key: &[u8; 32], ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], LeafState, bool)>, StoreError> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query(
+			&format!("SELECT l.leaf_id, l.state::text,
+			        EXISTS (SELECT 1 FROM transfer_input i JOIN transfer t ON t.transfer_id = i.transfer_id
+			                WHERE i.leaf_id = l.leaf_id AND t.state = 'signed')
+			        OR EXISTS (SELECT 1 FROM participation_input i JOIN participation p ON p.participation_id = i.participation_id
+			                WHERE i.leaf_id = l.leaf_id AND p.state = 'released')
+			 FROM leaf l WHERE l.leaf_id = ANY($2) AND l.leaf_id IN ({}) ORDER BY l.seq", SERVED_TO),
+			&[&&key[..], &ids],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, LeafState::parse(r.get(1))?, r.get::<_, bool>(2)))).collect()
+	}
+}
+
+/// The database's identity, `"<system identifier>/<timeline>"`: another
+/// cluster has another system identifier, and a recovery to an earlier point
+/// in time or a standby's promotion starts a new timeline. `None` where the
+/// database does not answer it (a role not allowed to read it), which leaves
+/// only the transaction counter to tell a database restored.
+async fn database_identity(conn: &tokio_postgres::Client) -> Option<String> {
+	match conn.query_one("SELECT (SELECT system_identifier FROM pg_control_system())::text || '/' ||
+		substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)", &[]).await {
+		Ok(r) => Some(r.get(0)),
+		Err(e) => {
+			log::warn!("the database's identity does not read ({}): a restore is told only by its transaction counter", e);
+			None
+		},
+	}
+}
+
+/// The leaves served to key `$1`: those it owns, those whose owner key is
+/// bound to it, and the transfer outputs posted to it.
+const SERVED_TO: &str = "SELECT leaf_id FROM leaf WHERE owner_key = $1
+	UNION SELECT x.leaf_id FROM leaf_mailbox m JOIN leaf x ON x.owner_key = m.owner_key WHERE m.mailbox_key = $1
+	UNION SELECT leaf_id FROM transfer_output WHERE mailbox_key = $1";
+
+/// A served leaf's columns, as [`served_rows`] reads them: a batch leaf's
+/// record empty until its participation's preimage went out.
+const SERVED_COLUMNS: &str = "l.leaf_id, l.kind::text, l.asset, l.value, l.owner_key, l.script_pubkey, l.hops,
+	CASE WHEN l.kind = 'batch' AND NOT EXISTS (
+	    SELECT 1 FROM batch_leaf b JOIN participation p ON p.participation_id = b.participation_id
+	    WHERE b.leaf_id = l.leaf_id AND p.attempt = b.attempt AND p.state = 'released'
+	    UNION ALL
+	    SELECT 1 FROM batch_leaf b JOIN participation_attempt a
+	      ON a.participation_id = b.participation_id AND a.attempt = b.attempt
+	    WHERE b.leaf_id = l.leaf_id AND a.released)
+	THEN ''::bytea ELSE l.record END,
+	l.state::text, l.spent_by, l.seq";
+
+/// Each leaf of `rows` ([`SERVED_COLUMNS`]) with what it rests on and every
+/// way it was given up.
+async fn served_rows(conn: &tokio_postgres::Client, rows: &[tokio_postgres::Row]) -> Result<Vec<ServedLeaf>, StoreError> {
+	let mut out = Vec::with_capacity(rows.len());
+	for r in rows {
+		let leaf = leaf_row(r)?;
+		let seq: i64 = r.get(10);
+		let id = leaf.leaf_id;
+		let batch = match leaf.kind {
+			LeafKind::Batch => {
+				let b = conn.query_opt(
+					"SELECT r.txid, r.state, b.vout, b.idx, b.owner_nonce, b.participation_id, r.signer_entry, r.signer_hash, r.signer_sig
+					 FROM batch_leaf b JOIN round r ON r.round_id = b.round_id WHERE b.leaf_id = $1",
+					&[&&id[..]],
+				).await?;
+				match b {
+					Some(b) => {
+						let entry: Option<i64> = b.get(6);
+						let hash: Option<Vec<u8>> = b.get(7);
+						let sig: Option<Vec<u8>> = b.get(8);
+						let signer_head = match (entry, hash) {
+							(Some(n), Some(h)) => Some((n as u64, array32(h, "signer hash")?,
+								sig.map(|s| s.try_into().map_err(|_| StoreError::Corrupt("a round's head signature".into()))).transpose()?)),
+							_ => None,
+						};
+						Some(ServedBatch {
+							round_txid: array32(b.get(0), "txid")?,
+							round_state: b.get(1),
+							batch_vout: b.get::<_, i32>(2) as u32,
+							leaf_index: b.get::<_, i32>(3) as u32,
+							owner_nonce: array32(b.get(4), "owner nonce")?,
+							participation_id: array32(b.get(5), "participation id")?,
+							signer_head,
+						})
+					},
+					None => None,
+				}
+			},
+			_ => None,
+		};
+		let board = match leaf.kind {
+			LeafKind::Board => conn.query_opt("SELECT txid, vout, state::text FROM board WHERE leaf_id = $1", &[&&id[..]]).await?
+				.map(|b| Ok::<_, StoreError>(ServedBoard { txid: array32(b.get(0), "txid")?, vout: b.get::<_, i32>(1) as u32, state: b.get(2) }))
+				.transpose()?,
+			_ => None,
+		};
+		let made_by = match leaf.kind {
+			LeafKind::Transfer => conn.query_opt(
+				"SELECT t.transfer_id, t.signer_entry, t.signer_hash, t.signer_sig FROM transfer_output o
+				 JOIN transfer t ON t.transfer_id = o.transfer_id WHERE o.leaf_id = $1",
+				&[&&id[..]],
+			).await?.map(|t| Ok::<_, StoreError>(ServedMadeBy {
+				transfer_id: array32(t.get(0), "transfer id")?,
+				signer_head: super::transfers::head_of(t.get(1), t.get(2), t.get(3))?,
+			})).transpose()?,
+			_ => None,
+		};
+		let mut transfers = vec![];
+		for t in conn.query(
+			"SELECT t.transfer_id, t.state, i.checkpoint_value, i.checkpoint_owner_sig FROM transfer_input i
+			 JOIN transfer t ON t.transfer_id = i.transfer_id WHERE i.leaf_id = $1",
+			&[&&id[..]],
+		).await? {
+			let sig: Vec<u8> = t.get(3);
+			transfers.push(ServedTransferSpend {
+				transfer_id: array32(t.get(0), "transfer id")?,
+				signed: t.get::<_, &str>(1) == "signed",
+				checkpoint_value: t.get::<_, i64>(2) as u64,
+				checkpoint_owner_sig: sig.try_into().map_err(|_| StoreError::Corrupt("a checkpoint signature".into()))?,
+			});
+		}
+		let mut participations = vec![];
+		for p in conn.query(
+			"SELECT i.participation_id FROM participation_input i JOIN participation p ON p.participation_id = i.participation_id
+			 WHERE i.leaf_id = $1 ORDER BY p.created_at, i.participation_id",
+			&[&&id[..]],
+		).await? {
+			let pid = array32(p.get(0), "participation id")?;
+			if let Some(row) = read_participation(&*conn, &pid).await? {
+				participations.push(row);
+			}
+		}
+		let mut forfeits = vec![];
+		for f in conn.query(
+			"SELECT f.participation_id, r.txid, c.vout, f.unlock_hash, f.refund_delay_units, f.margin, f.owner_sig,
+			        f.operator_sig IS NOT NULL
+			 FROM forfeit f JOIN round r ON r.round_id = f.round_id JOIN connector_output c ON c.round_id = f.round_id
+			 WHERE f.leaf_id = $1 ORDER BY f.created_at, f.round_id",
+			&[&&id[..]],
+		).await? {
+			let sig: Vec<u8> = f.get(6);
+			forfeits.push(ServedForfeit {
+				participation_id: array32(f.get(0), "participation id")?,
+				round_txid: array32(f.get(1), "txid")?,
+				connector_vout: f.get::<_, i32>(2) as u32,
+				unlock_hash: array32(f.get(3), "unlock hash")?,
+				refund_delay_units: f.get::<_, i32>(4) as u16,
+				margin: f.get::<_, i64>(5) as u64,
+				owner_sig: sig.try_into().map_err(|_| StoreError::Corrupt("a forfeit signature".into()))?,
+				cosigned: f.get(7),
+			});
+		}
+		out.push(ServedLeaf { seq, leaf, batch, board, made_by, transfers, participations, forfeits });
+	}
+	Ok(out)
 }
