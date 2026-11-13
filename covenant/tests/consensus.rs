@@ -1292,6 +1292,90 @@ fn htlc_cases(f: &F, book: &mut Book) {
 	assert!(send.exit_tx(fake_outpoint("htlc"), f.x, LEAF, &[to_a.clone()], &FeeSource::Reserve).is_err());
 }
 
+// htlc-2
+// ---------------------------------------------------------------------------
+
+fn htlc2_cases(f: &F, book: &mut Book) {
+	let preimage = label32("payment");
+	let timeout = MedianTime::from_consensus(f.created.to_consensus_u32() + 2 * 86_400).unwrap();
+	let lt = timeout.to_consensus_u32();
+	let pd = RelativeTime::from_units(f.delay.units() / 2).unwrap();
+	let p = keypair("htlc-2 payer");
+	let mk = |salt: &str| LockPolicy {
+		owner: xonly(&f.a), operator: xonly(&f.s), salt: label32(salt), chain: f.chain, exit_delay: f.delay,
+		terms: LockTerms { payment_hash: sha256(&preimage), timeout, refunder: xonly(&p), refund_delay: pd },
+	};
+	let lock = mk("htlc-2");
+	lock.check().unwrap();
+	assert!(LockPolicy { terms: LockTerms { refunder: xonly(&f.a), ..lock.terms }, ..lock }.check().is_err());
+	assert!(LockPolicy { terms: LockTerms { refunder: xonly(&f.s), ..lock.terms }, ..lock }.check().is_err());
+	let tx = |l: &LockPolicy, locktime: u32, seq: u32, outs: Vec<TxOut>| {
+		Spend::new(locktime).fake_input("htlc-2", explicit(f.x, LEAF, l.script_pubkey()), seq).outputs(outs)
+	};
+	let paid = |o: &ExplicitOutput| vec![o.txout(), fee(f.x, LEAF - o.value)];
+	let to_q = ExplicitOutput::new(f.x, LEAF - FEE, f.leaf(&f.a, "htlc-2 claimed").script_pubkey());
+	let to_p = ExplicitOutput::new(f.x, LEAF - FEE, f.leaf(&p, "htlc-2 refunded").script_pubkey());
+	let (qd, pdq) = (f.delay.to_sequence(), pd.to_sequence());
+
+	// Together, out of the tree: Q and S with the preimage at once; P and S
+	// from the timeout.
+	let mq = lock.collab_message(f.x, LEAF, std::slice::from_ref(&to_q)).unwrap();
+	let mp = lock.collab_message(f.x, LEAF, std::slice::from_ref(&to_p)).unwrap();
+	let claim_c = |l: &LockPolicy, ss: &Signature, sq: &Signature, pre: &[u8; 32]| {
+		let mut s = tx(l, 0, 0xffff_ffff, paid(&to_q));
+		s.witness(0, l.claim_together_witness(ss, sq, 1, pre));
+		s
+	};
+	let refund_c = |l: &LockPolicy, ss: &Signature, sp: &Signature, locktime: u32| {
+		let mut s = tx(l, locktime, 0xffff_fffe, paid(&to_p));
+		s.witness(0, l.refund_together_witness(ss, sp, 1));
+		s
+	};
+	let (sq, ssq) = (sig(&f.a, &mq.digest), sig(&f.s, &mq.digest));
+	let (sp, ssp) = (sig(&p, &mp.digest), sig(&f.s, &mp.digest));
+	book.pass("htlc-2/Q and S claim with the preimage, at once", &claim_c(&lock, &ssq, &sq, &preimage));
+	book.fail("htlc-2/neg a claim together with a wrong preimage", &claim_c(&lock, &ssq, &sq, &label32("wrong")), 0, EQUALVERIFY);
+	book.fail("htlc-2/neg a claim together signed by P in Q's place", &claim_c(&lock, &ssq, &sig(&p, &mq.digest), &preimage), 0, BAD_SIG);
+	book.fail("htlc-2/neg a claim together with S's signature twice", &claim_c(&lock, &ssq, &ssq, &preimage), 0, BAD_SIG);
+	let other = mk("another htlc-2");
+	let mo = other.collab_message(f.x, LEAF, std::slice::from_ref(&to_q)).unwrap();
+	book.fail("htlc-2/neg a claim together with a pair made for another lock's salt",
+		&claim_c(&lock, &sig(&f.s, &mo.digest), &sig(&f.a, &mo.digest), &preimage), 0, BAD_SIG);
+	book.pass("htlc-2/P and S refund from the timeout", &refund_c(&lock, &ssp, &sp, lt));
+	book.fail("htlc-2/neg a refund together with a lock time below the timeout", &refund_c(&lock, &ssp, &sp, lt - 1), 0, LOCKTIME);
+	book.fail("htlc-2/neg a refund together signed by Q in P's place", &refund_c(&lock, &ssp, &sig(&f.a, &mp.digest), lt), 0, BAD_SIG);
+	book.fail("htlc-2/neg a refund together with S's signature twice", &refund_c(&lock, &ssp, &ssp, lt), 0, BAD_SIG);
+
+	// Alone, on the chain: Q with the preimage after its delay; P from the
+	// timeout and after its own delay.
+	let claim = |key: &Keypair, pre: &[u8; 32], seq: u32| {
+		let mut s = tx(&lock, 0, seq, paid(&to_q));
+		let sg = s.sign(key, 0, &lock.claim_script(), f.genesis);
+		s.witness(0, lock.claim_witness(&sg, pre));
+		s
+	};
+	let refund = |key: &Keypair, locktime: u32, seq: u32| {
+		let mut s = tx(&lock, locktime, seq, paid(&to_p));
+		let sg = s.sign(key, 0, &lock.refund_script(), f.genesis);
+		s.witness(0, lock.refund_witness(&sg));
+		s
+	};
+	book.pass("htlc-2/Q claims alone with the preimage after its delay", &claim(&f.a, &preimage, qd));
+	book.fail("htlc-2/neg a claim one unit before Q's delay", &claim(&f.a, &preimage, qd - 1), 0, LOCKTIME);
+	book.fail("htlc-2/neg a claim with a wrong preimage", &claim(&f.a, &label32("wrong"), qd), 0, EQUALVERIFY);
+	book.fail("htlc-2/neg a claim signed by P", &claim(&p, &preimage, qd), 0, BAD_SIG);
+	book.fail("htlc-2/neg a claim signed by S", &claim(&f.s, &preimage, qd), 0, BAD_SIG);
+	book.pass("htlc-2/P refunds alone from the timeout after its delay", &refund(&p, lt, pdq));
+	book.fail("htlc-2/neg a refund with a lock time below the timeout", &refund(&p, lt - 1, pdq), 0, LOCKTIME);
+	book.fail("htlc-2/neg a refund one unit before P's delay", &refund(&p, lt, pdq - 1), 0, LOCKTIME);
+	book.fail("htlc-2/neg a refund signed by Q", &refund(&f.a, lt, pdq), 0, BAD_SIG);
+	book.fail("htlc-2/neg a refund signed by S", &refund(&f.s, lt, pdq), 0, BAD_SIG);
+
+	// S's claim pair and refund pair of one lock are two messages under one
+	// salt: the bond's evidence.
+	assert_ne!(mq.digest, mp.digest);
+}
+
 #[test]
 fn every_path_against_the_node_interpreter() {
 	let f = F::new();
@@ -1304,6 +1388,7 @@ fn every_path_against_the_node_interpreter() {
 	checkpoint_swap_cases(&f, &mut book);
 	burn_cases(&f, &mut book);
 	htlc_cases(&f, &mut book);
+	htlc2_cases(&f, &mut book);
 	builder_cases(&f, &mut book);
 	claim_batch_cases(&f, &mut book);
 	book.print();

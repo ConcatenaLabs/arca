@@ -844,6 +844,37 @@ def htlc_taptree(a_x, s_x, salt, ctag, h, timeout, exit_delay, operator_delay, r
     return tap, {"collab": collab, "claim": claim, "refund": refund}
 
 
+
+def htlc2_taptree(q_x, s_x, p_x, salt, ctag, h, timeout, claim_delay, refund_delay):
+    """htlc-2: a hash-lock between two holders, a payer P and a payee Q, which
+    the operator S can neither take nor decide alone.
+
+      claim_c   a 32-byte preimage of h, then the leaf's collaborative path
+                between Q and S under this leaf's salt
+                                          <sig_S> <sig_Q> <m> <preimage>
+      refund_c  <timeout> CLTV DROP, then the collaborative path between P
+                and S under the same salt <sig_S> <sig_P> <m>
+      claim     <claim_delay> CSV DROP, a 32-byte preimage of h, Q's
+                signature             <sig_Q> <preimage>
+      refund    <timeout> CLTV DROP <refund_delay> CSV DROP, P's signature
+                                          <sig_P>
+
+    Tree [[claim_c, refund_c], [claim, refund]]. No path spends the leaf
+    without the preimage before the timeout, and none from it on without P.
+    Both collaborative paths sign the same message under the same salt, so a
+    claim and a refund of one leaf co-signed by S are two messages S signed
+    under one salt: the bond's evidence. claim_delay is Q's exit delay,
+    refund_delay P's (CSV operands, rel_time); the timeout is a median
+    time."""
+    assert len({q_x, s_x, p_x}) == 3, "three distinct keys"
+    claim_c = CScript(hash_gate(h) + list(collab3_loop(q_x, s_x, salt, ctag, fold=True)))
+    refund_c = CScript([timeout, OP_CHECKLOCKTIMEVERIFY, OP_DROP] + list(collab3_loop(p_x, s_x, salt, ctag, fold=True)))
+    claim = CScript([claim_delay, OP_CHECKSEQUENCEVERIFY, OP_DROP] + hash_gate(h) + [q_x, OP_CHECKSIG])
+    refund = CScript([timeout, OP_CHECKLOCKTIMEVERIFY, OP_DROP, refund_delay, OP_CHECKSEQUENCEVERIFY, OP_DROP,
+                      p_x, OP_CHECKSIG])
+    tap = taproot_construct(NUMS, [[("claim_c", claim_c), ("refund_c", refund_c)], [("claim", claim), ("refund", refund)]])
+    return tap, {"claim_c": claim_c, "refund_c": refund_c, "claim": claim, "refund": refund}
+
 def node_taptree3(unroll, sweep, reclaim=None):
     """A tree node: [UNROLL, SWEEP], or for a lowest node [UNROLL, [SWEEP, RECLAIM]].
     A node of a batch without a sweep (sweep None): [UNROLL], or for a lowest
