@@ -323,6 +323,7 @@ async fn complete_swap(r: &Running, p: &Arca, q: &Arca, maker_p: bool, atoms: u6
 		// Straight to Q, out of round: the operator fronts nothing, and Q
 		// holds it with no round.
 		assert!(!receive_row(r, &hash).await.is_some_and(|x| x.state.name() == "accepted"), "the operator holds nothing inside it");
+		q.ok(&["sync"]);
 		let ready = q.ok(&["lock", "ready", &hash]);
 		println!("SWAP Q holds the lock at once: {}", ready);
 		assert_eq!(ready["ready"], true, "{}", ready);
@@ -430,6 +431,7 @@ async fn the_new_path_follows_a_bitcoin_reorganisation_of_the_btc_leg() {
 	let (id, hash) = agreed(&r, &p, &q, true, 100_000, 30_000, 1800);
 	follow_until(&p, &id, "locked", 60);
 	assert_eq!(swap_of(&p, &id)["leg"], "htlc-2");
+	q.ok(&["sync"]);
 	assert_eq!(q.ok(&["lock", "ready", &hash])["ready"], true);
 
 	// Before Q pays: the Bitcoin chain drops three blocks.
@@ -872,6 +874,8 @@ async fn a_swap_survives_a_restart_and_a_restore_of_each_party() {
 	let q_x_lost = x_row(&q, &r.x);
 	println!("RESTORE Q's device lost: its swap {} (paid, not claimed); P's {}", swap_of(&q, &id2)["state"], swap_of(&p, &id2)["state"]);
 	let q2 = dual_wallet(&r, "SWRQ2", 0, Some(&q_m));
+	// The instant limit is a setting of the device, not of the phrase.
+	older_path(&q2);
 	until_btc(&[&q2], 120, "Q's BTC restored", || spendable_sat(&q2) > 0);
 	let restored = q2.ok(&["btc-swap", "list"]);
 	println!("RESTORE Q restored: swaps {} | restored legs {}", restored["swaps"], restored["restored_legs"]);
