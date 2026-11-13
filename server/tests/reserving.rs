@@ -81,6 +81,13 @@ fn served(r: &Running, key: &Keypair, limit: u32) -> Vec<Value> {
 	}
 }
 
+/// The settled cursor of the first leaf served to `key`.
+fn first_cursor(r: &Running, key: &Keypair) -> String {
+	let request = server::auth::leaf_since_request("0", 1, &[], &[]);
+	let page = r.http.post("leaf_data", &json!({"auth": r.http.auth_for("leaf_data", key, &r.chain, &request), "since": "0", "limit": 1})).ok();
+	page["next"].as_str().unwrap().to_string()
+}
+
 fn entry<'a>(all: &'a [Value], id: &LeafId) -> &'a Value {
 	all.iter().find(|l| l["leaf_id"] == json!(id.to_string())).unwrap_or_else(|| panic!("no leaf {} in {:?}", id, all))
 }
@@ -273,6 +280,61 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	let own = r.http.post("leaf_data", &json!({"auth": r.http.auth("leaf_data", &a_new, &r.chain)})).ok();
 	assert_eq!(own["leaves"].as_array().unwrap().len(), 1);
 	assert_eq!(own["leaves"][0]["leaf_id"], json!(new_valid.leaf_id.to_string()));
+
+	// Reads past a settled cursor: the same leaves, a page at a time, each
+	// page's proof bound to its cursor, size, held coins and ids; the held
+	// coins' states, with the whole entry of one given up for good; leaves
+	// asked by id; nothing of a leaf not served to the key.
+	let info = r.http.get("info").ok();
+	assert_eq!(info["leaf_data"], json!({"page": 100, "held": 400, "leaf_ids": 100}));
+	let settled = |since: &str, limit: u32, held: &[[u8; 32]], ids: &[[u8; 32]]| {
+		let request = server::auth::leaf_since_request(since, limit, held, ids);
+		r.http.post("leaf_data", &json!({"auth": r.http.auth_for("leaf_data", &a_mailbox, &r.chain, &request), "since": since, "limit": limit,
+			"held": held.iter().map(|h| hex(h)).collect::<Vec<_>>(), "leaf_ids": ids.iter().map(|h| hex(h)).collect::<Vec<_>>()}))
+	};
+	let mut since = "0".to_string();
+	let mut paged = vec![];
+	loop {
+		let page = settled(&since, 1, &[], &[]).ok();
+		let leaves = page["leaves"].as_array().unwrap().clone();
+		if leaves.is_empty() {
+			assert!(page["next"].is_null(), "{}", page);
+			break;
+		}
+		assert_eq!(leaves.len(), 1);
+		since = page["next"].as_str().unwrap().to_string();
+		assert!(since.contains('.'), "a settled cursor names the making transaction and the seq: {}", since);
+		paged.extend(leaves);
+	}
+	assert_eq!(paged, all, "the same leaves, in the same order, past a settled cursor");
+	let stranger_leaf = [0x5a; 32];
+	let page = settled(&since, 100, &[change_id.0, new_valid.leaf_id.0, stranger_leaf], &[new_valid.leaf_id.0]).ok();
+	assert!(page["leaves"].as_array().unwrap().is_empty(), "nothing past the end: {}", page);
+	let held = page["held"].as_array().unwrap();
+	assert_eq!(held.len(), 2, "a leaf not served to the key is not answered: {}", page);
+	let of = |id: &LeafId| held.iter().find(|h| h["leaf_id"] == json!(id.to_string())).unwrap().clone();
+	assert_eq!((of(&change_id)["state"].as_str(), of(&change_id)["given"].as_bool()), (Some("spent"), Some(true)));
+	assert_eq!((of(&new_valid.leaf_id)["state"].as_str(), of(&new_valid.leaf_id)["given"].as_bool()), (Some("live"), Some(false)));
+	let asked: Vec<&Value> = page["asked"].as_array().unwrap().iter().collect();
+	assert_eq!(asked.len(), 2, "the coin given up for good and the leaf asked by id, whole: {}", page);
+	assert_eq!(*asked.iter().find(|e| e["leaf_id"] == json!(change_id.to_string())).unwrap(), entry(&all, &change_id));
+	assert_eq!(*asked.iter().find(|e| e["leaf_id"] == json!(new_valid.leaf_id.to_string())).unwrap(), entry(&all, &new_valid.leaf_id));
+	// The proof binds every part of the read.
+	let request = server::auth::leaf_since_request("0", 1, &[change_id.0], &[]);
+	let good = r.http.auth_for("leaf_data", &a_mailbox, &r.chain, &request);
+	for (since, limit, held, ids) in [("0", 2, vec![hex(&change_id.0)], vec![]), ("0", 1, vec![], vec![]), ("0", 1, vec![], vec![hex(&change_id.0)]),
+		(first_cursor(&r, &a_mailbox).as_str(), 1, vec![hex(&change_id.0)], vec![])]
+	{
+		refused(r.http.post("leaf_data", &json!({"auth": good, "since": since, "limit": limit, "held": held, "leaf_ids": ids})), 401,
+			"unauthenticated");
+	}
+	// A cursor and a settled cursor together, held coins without a settled
+	// cursor, a cursor that does not read, too many held: refused.
+	refused(r.http.post("leaf_data", &json!({"auth": good, "since": "0", "after": "0", "limit": 1})), 400, "malformed");
+	refused(r.http.post("leaf_data", &json!({"auth": good, "after": "0", "limit": 1, "held": [hex(&change_id.0)]})), 400, "malformed");
+	refused(r.http.post("leaf_data", &json!({"auth": good, "since": "seven", "limit": 1})), 400, "malformed");
+	let many: Vec<String> = (0..401u32).map(|i| hex(&[(i % 251) as u8; 32])).collect();
+	refused(r.http.post("leaf_data", &json!({"auth": good, "since": "0", "limit": 1, "held": many})), 400, "malformed");
 
 	// bind_mailbox: B's leaf, made without a binding, bound now to another
 	// mailbox of B's; a key the server knows no leaf of binds nothing; a proof

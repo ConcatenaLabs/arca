@@ -230,7 +230,9 @@ or cancelled, and follows the few still resting by their ids. `swaps` with
 offer the wallet ever made with its coins' records. `sync` with `"catch_up": false` leaves out the catch-up
 between stores of one mnemonic: a program that is the only store of its mnemonic
 (a service wallet on one machine) has no other store to catch up with, and the
-catch-up reads every coin ever served to its mailbox key to find that out. With
+catch-up reads every coin it holds and every leaf made since the last one to
+find that out (every leaf ever served to its mailbox key, from an operator
+without reads past a settled cursor). With
 `"deposits": false` it leaves out the watchtowers' step too, which the program
 runs next as the command `deposits`: a program that answers others from the
 wallet then finds it free between the two. A

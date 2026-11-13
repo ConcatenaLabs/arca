@@ -113,8 +113,19 @@ signed by the coin's own key.
 the restore again (it takes only what the wallet does not hold). Stores of
 one mnemonic kept side by side (a phone and a browser) follow each other:
 `sync` catches up, at most once every ten minutes (`caught_up` in its
-answer), with what the server serves to the mailbox key, as a restore reads
-it. It takes every coin the store does not hold under a nonce it never drew
+answer), with what the server serves to the mailbox key, checked as a
+restore checks it. From an operator that reads past a settled cursor
+(`info.leaf_data`) it reads what changed since the last catch-up, not the
+wallet's history: the leaves made since the cursor the last one reached, each
+coin the store holds live or pending by id (with the whole entry of those
+given up for good), and, for a day, each leaf it read and could not take yet
+(a round's leaf served without its record until its round is released), by
+id; once a day, at its first catch-up and once a restore's history is done,
+it reads from the first leaf (`read` says which). From an operator without
+such reads it reads every page from the first, as a restore does. A `sync`
+spends about a second on it (`SYNC_CATCH_UP_MS`) and stops after the page it
+was reading (`more`); the next `sync` reads on from there, every page's coins
+taken and given up before the next page is asked. It takes every coin the store does not hold under a nonce it never drew
 (another store's), checked as a restore checks it, and gives up every coin it holds as live that another store gave up in a
 transfer the operator co-signed or in a participation the operator released,
 on the owner's own signatures (`given_elsewhere`), so every store shows the

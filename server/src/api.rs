@@ -195,6 +195,11 @@ pub struct Info {
 	/// whose wallets read each key's mailbox with `mailbox_read`.
 	#[serde(default)]
 	pub mailbox_reads: u32,
+	/// What `leaf_data` reads past a settled cursor (`since`) take; zeros
+	/// for a server without such reads, whose wallets read every leaf served
+	/// to their mailbox key from the first page to catch up.
+	#[serde(default)]
+	pub leaf_data: LeafDataInfo,
 	/// Whether the operator co-signs a transfer or a fill whose checkpoints
 	/// carry their owners' exit (`checkpoint_exit` in the request): false
 	/// for an operator that does not, or a server that predates it.
@@ -1606,6 +1611,17 @@ pub struct MailboxMessage {
 /// key bound them to it, and the transfer outputs posted to it as a mailbox.
 /// The proof binds the cursor and the page size as a `mailbox_read`'s does;
 /// a request without them reads the first page, its proof over nothing.
+///
+/// With `since` in place of `after`, a read past a settled cursor (`"0"`,
+/// or the `next` such a read answered): the leaves in the order of the
+/// transactions that made them, only those of transactions older than every
+/// one still running, so no leaf can still appear behind the cursor
+/// (`leaf.made_xid`). It also answers, for each coin of `held` served to the
+/// key, its state, with the whole entry of each given up for good (in a
+/// transfer the operator co-signed, or a participation it released); and
+/// the whole entry of each leaf of `leaf_ids` served to the key. Its proof
+/// binds all of it (`auth::leaf_since_request`). `info.leaf_data` says how
+/// many of each a server reads; a server without it publishes zeros.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeafDataRequest {
@@ -1614,6 +1630,34 @@ pub struct LeafDataRequest {
 	pub after: Option<String>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub limit: Option<u32>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub since: Option<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub held: Vec<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub leaf_ids: Vec<String>,
+}
+
+/// A coin a `leaf_data` read past a settled cursor was asked about as held:
+/// its state at the server, and whether it was given up for good, whose
+/// whole entry the read then serves in `asked`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldLeaf {
+	pub leaf_id: String,
+	pub state: String,
+	pub given: bool,
+}
+
+/// How many of each `leaf_data` reads past a settled cursor (`since`) take:
+/// the leaves of a page, the held coins and the leaves asked for by id. All
+/// zero for a server that reads no such cursor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeafDataInfo {
+	pub page: u32,
+	pub held: u32,
+	pub leaf_ids: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1624,13 +1668,22 @@ pub struct LeafData {
 	/// absent when this page holds nothing.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub next: Option<String>,
-	/// On the first page: every payment into the tree asked under a key
-	/// bound to the authenticated key and not yet claimed or failed back
-	/// (`open` or `accepted`), with the operator's participation for its
-	/// leaf once held, so a wallet restored from its mnemonic takes the leaf
-	/// up (D70).
+	/// On the first page, and on every read past a settled cursor: every
+	/// payment into the tree asked under a key bound to the authenticated
+	/// key and not yet claimed or failed back (`open` or `accepted`), with
+	/// the operator's participation for its leaf once held, so a wallet
+	/// restored from its mnemonic takes the leaf up (D70).
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub receives: Vec<ServedReceive>,
+	/// To a read past a settled cursor: each coin of `held` the server
+	/// serves to the key.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub held: Vec<HeldLeaf>,
+	/// To a read past a settled cursor: the whole entry of each leaf of
+	/// `leaf_ids`, and of each coin of `held` given up for good, that the
+	/// server serves to the key.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub asked: Vec<LeafEntry>,
 }
 
 /// A payment into the tree as `leaf_data` serves it to the mailbox key its

@@ -932,6 +932,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		watchtowers: app.params.watchtowers.clone(),
 		batches: api::BatchesInfo { no_sweep: app.params.no_sweep, collect_after_seconds: app.params.collect_after_seconds },
 		mailbox_reads: MAX_MAILBOX_READS as u32,
+		leaf_data: api::LeafDataInfo { page: LEAF_PAGE, held: LEAF_HELD, leaf_ids: LEAF_PAGE },
 		checkpoint_exit: app.params.checkpoint_exit,
 		landing_2_only: app.params.landing_2_only,
 		offboards: api::OffboardsInfo { unlock_within_seconds: app.watcher.as_ref().map_or(0, |w| w.unlock_within_seconds()) },
@@ -1975,6 +1976,12 @@ async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<S
 {
 	let req: api::LeafDataRequest = parse(body, app.max_request)?;
 	app.reads.refusal("a read of a key's leaves", app.source(peer.ip(), &headers))?;
+	if let Some(since) = &req.since {
+		return leaf_data_since(&app, &req, since).await;
+	}
+	if !req.held.is_empty() || !req.leaf_ids.is_empty() {
+		return Err(Refusal::malformed("held coins and leaves by id are read past a settled cursor (since) only"));
+	}
 	let (after, limit, request) = match (&req.after, req.limit) {
 		(None, None) => (0i64, LEAF_PAGE, vec![]),
 		(after, limit) => {
@@ -2001,8 +2008,87 @@ async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<S
 	// D70: on the first page, the payments into the tree asked under a key
 	// bound to this one and not yet claimed: a leaf held, wanted or not yet
 	// released is taken up by a restore from them.
-	let receives = if after == 0 {
-		app.store.receives_bound_to(&k.serialize()).await?.into_iter().map(|r| api::ServedReceive {
+	let receives = if after == 0 { served_receives(&app, &k).await? } else { vec![] };
+	Ok(Json(api::LeafData { leaves, next, receives, held: vec![], asked: vec![] }))
+}
+
+/// The most held coins one `leaf_data` read past a settled cursor asks
+/// about.
+pub const LEAF_HELD: u32 = 400;
+
+/// A settled cursor as `leaf_data` serves it: `"0"` before the first leaf,
+/// else the transaction that made the last leaf read and that leaf's
+/// `seq`, `"<xid>.<seq>"`.
+fn settled_cursor(s: &str) -> Result<(u64, i64), Refusal> {
+	if s == "0" {
+		return Ok((0, 0));
+	}
+	let bad = || Refusal::malformed(format!("settled cursor {:?}: \"0\" or \"<xid>.<seq>\"", s));
+	let (x, q) = s.split_once('.').ok_or_else(bad)?;
+	let x: u64 = x.parse().map_err(|_| bad())?;
+	let q: i64 = q.parse().map_err(|_| bad())?;
+	if q < 0 {
+		return Err(bad());
+	}
+	Ok((x, q))
+}
+
+/// [`leaf_data`] past a settled cursor: see [`api::LeafDataRequest`].
+async fn leaf_data_since(app: &App, req: &api::LeafDataRequest, since: &str) -> Result<Json<api::LeafData>, Refusal> {
+	if req.after.is_some() {
+		return Err(Refusal::malformed("a read names a cursor (after) or a settled cursor (since), not both"));
+	}
+	let from = settled_cursor(since)?;
+	let limit = req.limit.unwrap_or(LEAF_PAGE);
+	if req.held.len() > LEAF_HELD as usize || req.leaf_ids.len() > LEAF_PAGE as usize {
+		return Err(Refusal::malformed(format!("at most {} held coins and {} leaves by id a read", LEAF_HELD, LEAF_PAGE)));
+	}
+	let held: Vec<[u8; 32]> = req.held.iter().map(|h| leaf_id(h).map(|l| l.0)).collect::<Result<_, _>>()?;
+	let ids: Vec<[u8; 32]> = req.leaf_ids.iter().map(|h| leaf_id(h).map(|l| l.0)).collect::<Result<_, _>>()?;
+	let k = authenticate(app, "leaf_data", &req.auth, &auth::leaf_since_request(since, limit, &held, &ids)).await?;
+	let key = k.serialize();
+	let rows = app.store.served_since(&key, from, limit.clamp(1, LEAF_PAGE) as i64).await?;
+	let mut leaves = Vec::with_capacity(rows.len());
+	let mut next = None;
+	let mut bytes = 0usize;
+	for (r, (x, q)) in rows {
+		bytes += r.leaf.record.len();
+		if !leaves.is_empty() && bytes > LEAF_PAGE_BYTES {
+			break;
+		}
+		leaves.push(served_entry(app, r).await?);
+		next = Some(format!("{}.{}", x, q));
+	}
+	// The held coins served to the key, and the whole entry of those given
+	// up for good and of the leaves asked for by id: a page's worth at most,
+	// the rest asked again by the next read.
+	let states = app.store.held_states(&key, &held).await?;
+	let mut wanted: Vec<[u8; 32]> = ids.clone();
+	for (id, _, given) in &states {
+		if *given && !wanted.contains(id) {
+			wanted.push(*id);
+		}
+	}
+	wanted.truncate(LEAF_PAGE as usize);
+	let mut asked = vec![];
+	let mut bytes = 0usize;
+	for r in app.store.served_by_ids(&key, &wanted).await? {
+		bytes += r.leaf.record.len();
+		if !asked.is_empty() && bytes > LEAF_PAGE_BYTES {
+			break;
+		}
+		asked.push(served_entry(app, r).await?);
+	}
+	let held = states.into_iter().map(|(id, state, given)| api::HeldLeaf { leaf_id: hex(&id), state: leaf_state(state).into(), given })
+		.collect();
+	Ok(Json(api::LeafData { leaves, next, receives: served_receives(app, &k).await?, held, asked }))
+}
+
+/// The payments into the tree asked under a key bound to `k` and not yet
+/// claimed or failed back (D70): a leaf held, wanted or not yet released is
+/// taken up by a restore from them.
+async fn served_receives(app: &App, k: &XOnlyPublicKey) -> Result<Vec<api::ServedReceive>, Refusal> {
+	Ok(app.store.receives_bound_to(&k.serialize()).await?.into_iter().map(|r| api::ServedReceive {
 			payment_hash: hex(&r.new.payment_hash),
 			asset: AssetId::from_byte_array(r.new.asset).to_string(),
 			amount: r.new.amount.to_string(),
@@ -2014,11 +2100,7 @@ async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<S
 			state: r.state.name().into(),
 			participation_id: r.participation_id.map(|p| hex(&p)),
 			timeout: r.timeout,
-		}).collect()
-	} else {
-		vec![]
-	};
-	Ok(Json(api::LeafData { leaves, next, receives }))
+		}).collect())
 }
 
 /// One leaf as `leaf_data` serves it.

@@ -176,6 +176,81 @@ pub(crate) const CAUGHT_UP: &str = "caught_up";
 /// How often `sync` catches up, at most (median-time seconds).
 pub(crate) const CATCH_UP_EVERY: u32 = 600;
 
+/// Where the wallet keeps how far its catch-up read what the server serves
+/// to its mailbox key ([`CatchUpRead`]).
+const CATCH_UP_READ: &str = "catch_up_read";
+
+/// Where the wallet keeps what a leaf read by a catch-up cost, in
+/// milliseconds: how many leaves a page of a catch-up cut short asks for.
+const CATCH_UP_PACE: &str = "catch_up_pace";
+
+/// The most a `sync` spends catching up, in milliseconds: past it, the
+/// catch-up stops after the page it was reading and the next `sync` reads
+/// on from there.
+pub const SYNC_CATCH_UP_MS: u64 = 1_000;
+
+/// How often a catch-up reads everything the server serves to the mailbox
+/// key again, from the first leaf, in seconds: what a read past the settled
+/// cursor cannot see (a leaf bound to the mailbox key long after it was
+/// made, a leaf left untaken longer than [`UNTAKEN_ASKED_FOR`]) is looked at
+/// then.
+const WHOLE_READ_EVERY: u64 = 86_400;
+
+/// How long a leaf a catch-up read and could not take yet is asked for again
+/// by id at every catch-up, in seconds; after that, only the read of
+/// everything ([`WHOLE_READ_EVERY`]) looks at it again.
+const UNTAKEN_ASKED_FOR: u64 = 86_400;
+
+/// How far a wallet's catch-up read, kept between catch-ups.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct CatchUpRead {
+	/// The settled cursor the last read past one reached (`leaf_data`'s
+	/// `since`): nothing can still appear behind it.
+	#[serde(default)]
+	since: Option<String>,
+	/// When the last read from the first leaf ended (Unix seconds).
+	#[serde(default)]
+	whole_at: Option<u64>,
+	/// The leaves read that the catch-up could not take yet, each with when
+	/// it was first read so (Unix seconds).
+	#[serde(default)]
+	untaken: BTreeMap<String, u64>,
+	/// A read under way, cut short by its budget.
+	#[serde(default)]
+	pass: Option<CatchUpPass>,
+}
+
+/// A catch-up's read under way.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct CatchUpPass {
+	/// Past a settled cursor: where it reads on from.
+	#[serde(default)]
+	since: Option<String>,
+	/// Whether it started from the first leaf.
+	#[serde(default)]
+	whole: bool,
+	/// A read of every page from the first, of an operator without settled
+	/// cursors: the cursor it reads on after.
+	#[serde(default)]
+	after: Option<i64>,
+	/// The held coins and the untaken leaves still to ask about.
+	#[serde(default)]
+	held: Vec<String>,
+	#[serde(default)]
+	ids: Vec<String>,
+	/// Pages read so far.
+	#[serde(default)]
+	pages: u32,
+	/// When it started (Unix seconds).
+	#[serde(default)]
+	started: u64,
+}
+
+/// The wall clock, in Unix seconds.
+fn unix_now() -> u64 {
+	web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 /// Where the wallet keeps the coins held out as spent elsewhere, each with
 /// the median time its hold ends ([`Wallet::spent_elsewhere`]).
 const SPENT_ELSEWHERE: &str = "spent_elsewhere";
@@ -941,31 +1016,223 @@ impl Wallet {
 	/// here too (`given_elsewhere`), so every store of the mnemonic shows the
 	/// same coins. `sync` runs it at most once every ten minutes; the coins
 	/// held stay as they are while it runs.
+	///
+	/// It reads what changed since the last catch-up, not the wallet's whole
+	/// history, from an operator that reads past a settled cursor
+	/// (`info.leaf_data`): the leaves made since the cursor the last one
+	/// reached; each coin this store holds live or pending, by id, with the
+	/// whole entry of those given up for good; and each leaf it read and
+	/// could not take yet, by id, for a day ([`UNTAKEN_ASKED_FOR`]). Once a
+	/// day ([`WHOLE_READ_EVERY`]), at its first catch-up, and once a
+	/// restore's history is done, it reads from the first leaf. From an
+	/// operator without such reads, every leaf every time, as a restore does.
 	pub fn catch_up(&mut self) -> Result<Value, Error> {
-		Ok(self.catch_up_served()?.0)
+		Ok(self.catch_up_within(None)?.0)
 	}
 
 	/// [`Self::catch_up`], with every coin the operator served, as it served
-	/// them.
+	/// them (from an operator that reads past a settled cursor, each held
+	/// coin's id and state).
 	pub(crate) fn catch_up_served(&mut self) -> Result<(Value, Vec<Value>), Error> {
+		self.catch_up_within(None)
+	}
+
+	/// How far the catch-up read ([`CatchUpRead`]); a record that does not
+	/// read starts again from nothing.
+	fn catch_up_read(&self) -> Result<CatchUpRead, Error> {
+		Ok(self.store.meta(CATCH_UP_READ)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
+	}
+
+	fn keep_catch_up_read(&self, r: &CatchUpRead) -> Result<(), Error> {
+		self.store.set_meta(CATCH_UP_READ, &serde_json::to_string(r).unwrap_or_default())
+	}
+
+	/// The next catch-up reads from the first leaf (a restore's history done:
+	/// what it left untaken is looked at again).
+	pub(crate) fn catch_up_from_the_start(&self) -> Result<(), Error> {
+		let mut r = self.catch_up_read()?;
+		r.whole_at = None;
+		self.keep_catch_up_read(&r)
+	}
+
+	/// Whether a catch-up cut short by its budget reads on.
+	pub(crate) fn catch_up_under_way(&self) -> Result<bool, Error> {
+		Ok(self.catch_up_read()?.pass.is_some())
+	}
+
+	/// [`Self::catch_up_served`]; with `budget_ms`, it stops after the page it
+	/// is reading once it has run that long, says `more`, and the next call
+	/// reads on from there: the leaves of each page are taken, and the coins
+	/// they show given up given up, before the next page is asked, so nothing
+	/// read waits across a call. `sync` gives it [`SYNC_CATCH_UP_MS`].
+	pub(crate) fn catch_up_within(&mut self, budget_ms: Option<u64>) -> Result<(Value, Vec<Value>), Error> {
+		let started = web_time::Instant::now();
 		let info = self.server_info()?;
-		let (entries, served_receives, read_note) = self.read_served()?;
-		let served = entries.clone();
-		// The coins a restore left to its history steps are theirs: a catch-up
-		// would otherwise check them all at once.
+		let page = info["leaf_data"]["page"].as_u64().unwrap_or(0).min(LEAF_PAGE as u64) as u32;
+		let settled = page > 0;
+		let mut read = self.catch_up_read()?;
+		let now = unix_now();
+		let mut pass = match read.pass.take() {
+			// A read started in the other way (the operator moved meanwhile)
+			// starts again.
+			Some(p) if p.since.is_some() == settled => p,
+			_ if settled => {
+				let whole = read.since.is_none() || read.whole_at.map_or(true, |w| now.saturating_sub(w) >= WHOLE_READ_EVERY);
+				let mut held: Vec<String> = self.store.coins_in_states(&["live", "pending"])?.into_iter().map(|c| c.leaf_id).collect();
+				held.sort();
+				let ids: Vec<String> = read.untaken.iter().filter(|(_, t)| now.saturating_sub(**t) < UNTAKEN_ASKED_FOR)
+					.map(|(l, _)| l.clone()).collect();
+				CatchUpPass { since: Some(if whole { "0".into() } else { read.since.clone().unwrap_or_else(|| "0".into()) }), whole, after: None,
+					held, ids, pages: 0, started: now }
+			},
+			_ => CatchUpPass { since: None, whole: true, after: Some(0), held: vec![], ids: vec![], pages: 0, started: now },
+		};
+		let held_most = (info["leaf_data"]["held"].as_u64().unwrap_or(0) as usize)
+			.min(info["max_request_bytes"].as_u64().map_or(usize::MAX, |b| (b as usize).saturating_sub(4096) / 160)).max(1);
+		let ids_most = (info["leaf_data"]["leaf_ids"].as_u64().unwrap_or(0) as usize).max(1);
 		let listed = self.history_ids()?;
-		let entries: Vec<Value> = entries.into_iter().filter(|e| !listed.contains(e["leaf_id"].as_str().unwrap_or(""))).collect();
-		let TakenServed { mut restored, not_recovered, notes, given_elsewhere } =
-			self.take_served(&info, &entries, &served_receives, true, None)?;
-		let now = self.now()?;
-		self.store.set_meta(CAUGHT_UP, &now.to_consensus_u32().to_string())?;
+		let mailbox = self.keys.mailbox()?;
+		let pace: f64 = self.store.meta(CATCH_UP_PACE)?.and_then(|v| v.parse().ok()).unwrap_or(10.0);
+		let mut new_pace = pace;
+		let (mut restored, mut not_taken, mut notes, mut given_elsewhere) = (vec![], vec![], vec![], vec![]);
+		let mut served: Vec<Value> = vec![];
+		let (mut served_count, mut pages_now) = (0usize, 0u32);
+		let mut read_note: Option<String> = None;
+		let mut more = false;
+		loop {
+			// A page cut short by the budget asks for what the pace says
+			// fits it; at least ten leaves.
+			let limit = match budget_ms {
+				Some(b) => ((b as f64 / new_pace.max(0.1)) as u32).clamp(10, LEAF_PAGE),
+				None => LEAF_PAGE,
+			};
+			let t_page = web_time::Instant::now();
+			let (entries, receives, done) = if settled {
+				let since = pass.since.clone().unwrap_or_else(|| "0".into());
+				let limit = limit.min(page);
+				let take = |q: &mut Vec<String>, n: usize| -> Vec<[u8; 32]> {
+					let n = n.min(q.len());
+					q.drain(..n).filter_map(|h| unhex32(&h).ok()).collect()
+				};
+				let held = take(&mut pass.held, held_most);
+				let ids = take(&mut pass.ids, ids_most);
+				let v = self.server.leaf_data_since(&mailbox, &self.genesis, &since, limit, &held, &ids)?;
+				let leaves = v["leaves"].as_array().cloned().unwrap_or_default();
+				let asked = v["asked"].as_array().cloned().unwrap_or_default();
+				for h in v["held"].as_array().into_iter().flatten() {
+					served.push(json!({"leaf_id": h["leaf_id"], "state": h["state"]}));
+				}
+				let mut entries = leaves.clone();
+				for a in asked {
+					if !entries.iter().any(|e| e["leaf_id"] == a["leaf_id"]) {
+						entries.push(a);
+					}
+				}
+				match v["next"].as_str() {
+					Some(n) if !leaves.is_empty() => pass.since = Some(n.to_string()),
+					_ => {},
+				}
+				// A page short of what it asked for is the last; one the
+				// server cut for its size leaves the rest to the next read
+				// past the cursor, which nothing can step behind.
+				let done = (leaves.len() < limit as usize || v["next"].as_str().is_none()) && pass.held.is_empty() && pass.ids.is_empty();
+				let receives = if pass.pages == 0 { v["receives"].as_array().cloned().unwrap_or_default() } else { vec![] };
+				(entries, receives, done)
+			} else {
+				let after = pass.after.unwrap_or(0);
+				let v = self.server.leaf_data(&mailbox, &self.genesis, after, limit)?;
+				let receives = if after == 0 { v["receives"].as_array().cloned().unwrap_or_default() } else { vec![] };
+				let leaves = v["leaves"].as_array().cloned().unwrap_or_default();
+				let cursors: Vec<i64> = leaves.iter().filter_map(|l| l["cursor"].as_str().and_then(|c| c.parse::<i64>().ok())).collect();
+				let last = cursors.iter().copied().max().unwrap_or(after);
+				let mut done = leaves.is_empty();
+				if cursors.iter().any(|c| *c <= after) {
+					read_note = Some(format!("the server serves leaves at or before the cursor asked ({}) again: the catch-up reads no further, \
+						and takes what it read", after));
+					done = true;
+				} else {
+					match v["next"].as_str().and_then(|n| n.parse::<i64>().ok()) {
+						Some(n) if n > after && n >= last => pass.after = Some(n),
+						Some(n) => {
+							read_note = Some(format!("the server names a next page at cursor {}, not past the page it served (to {}): the \
+								catch-up reads no further, and takes what it read", n, last));
+							done = true;
+						},
+						None => done = true,
+					}
+				}
+				if pass.pages as usize >= LEAF_DATA_PAGES {
+					read_note = Some(format!("the server names more than {} pages of leaves: the catch-up reads no further, and takes what it \
+						read", LEAF_DATA_PAGES));
+					done = true;
+				}
+				served.extend(leaves.iter().cloned());
+				(if read_note.is_some() && cursors.iter().any(|c| *c <= after) { vec![] } else { leaves }, receives, done)
+			};
+			pass.pages += 1;
+			pages_now += 1;
+			// The coins a restore left to its history steps are theirs: a
+			// catch-up would otherwise check them all at once.
+			let entries: Vec<Value> = entries.into_iter().filter(|e| !listed.contains(e["leaf_id"].as_str().unwrap_or(""))).collect();
+			served_count += entries.len();
+			let t = self.take_served(&info, &entries, &receives, true, None)?;
+			restored.extend(t.restored);
+			not_taken.extend(t.not_recovered);
+			notes.extend(t.notes);
+			given_elsewhere.extend(t.given_elsewhere);
+			if settled {
+				// What it could not take is asked for by id at the next
+				// catch-ups; what it took, no more.
+				for e in &entries {
+					let id = e["leaf_id"].as_str().unwrap_or("").to_string();
+					if self.store.coin(&id)?.is_some() {
+						read.untaken.remove(&id);
+					} else if !self.drew_nonce_of(e)? {
+						read.untaken.entry(id).or_insert(now);
+					}
+				}
+			}
+			if entries.len() >= 10 {
+				let ms = t_page.elapsed().as_millis() as f64 / entries.len() as f64;
+				new_pace = (new_pace + ms) / 2.0;
+			}
+			if done {
+				if settled {
+					if pass.since.as_deref().is_some_and(|s| s != "0") {
+						read.since = pass.since.clone();
+					}
+					if pass.whole {
+						read.whole_at = Some(unix_now());
+					}
+				}
+				read.pass = None;
+				self.keep_catch_up_read(&read)?;
+				self.store.set_meta(CAUGHT_UP, &self.now()?.to_consensus_u32().to_string())?;
+				break;
+			}
+			if budget_ms.is_some_and(|b| started.elapsed().as_millis() as u64 >= b) {
+				read.pass = Some(pass.clone());
+				self.keep_catch_up_read(&read)?;
+				more = true;
+				break;
+			}
+			read.pass = Some(pass.clone());
+			self.keep_catch_up_read(&read)?;
+		}
+		if new_pace != pace {
+			self.store.set_meta(CATCH_UP_PACE, &format!("{:.3}", new_pace))?;
+		}
 		for v in restored.iter_mut() {
 			if let Some(c) = self.store.coin(v["leaf_id"].as_str().unwrap_or(""))? {
 				v["state"] = json!(c.state);
 			}
 		}
-		let mut out = json!({"served": entries.len(), "restored": restored, "given_elsewhere": given_elsewhere,
-			"not_taken": not_recovered, "notes": notes});
+		let mut out = json!({"served": served_count, "restored": restored, "given_elsewhere": given_elsewhere,
+			"not_taken": not_taken, "notes": notes, "read": if !settled { "every page" } else if pass.whole { "from the first leaf" }
+				else { "past the settled cursor" }, "pages": pages_now});
+		if more {
+			out["more"] = json!(true);
+		}
 		if let Some(n) = read_note {
 			out["note"] = json!(n);
 		}
@@ -1261,6 +1528,11 @@ impl Wallet {
 		self.lower_birthday_of(new.as_ref(), &[])?;
 		self.keep_history(&rest)?;
 		self.store.set_metas(&[(HISTORY_LOOKED, looked.to_string()), (HISTORY_PACE, pace.to_string())])?;
+		// The history done, the next catch-up reads from the first leaf: what
+		// the steps left untaken is looked at again with the rest.
+		if whole {
+			self.catch_up_from_the_start()?;
+		}
 		for v in restored.iter_mut() {
 			if let Some(c) = self.store.coin(v["leaf_id"].as_str().unwrap_or(""))? {
 				v["state"] = json!(c.state);
@@ -1451,8 +1723,12 @@ impl Wallet {
 		Ok(())
 	}
 
-	/// Whether `sync` catches up now ([`CATCH_UP_EVERY`]).
+	/// Whether `sync` catches up now ([`CATCH_UP_EVERY`]), or reads on with a
+	/// catch-up cut short.
 	pub(crate) fn catch_up_due(&self) -> Result<bool, Error> {
+		if self.catch_up_under_way()? {
+			return Ok(true);
+		}
 		let now = self.now()?.to_consensus_u32();
 		let last: Option<u32> = self.store.meta(CAUGHT_UP)?.and_then(|v| v.parse().ok());
 		Ok(last.map_or(true, |l| now.saturating_sub(l) >= CATCH_UP_EVERY || now < l))

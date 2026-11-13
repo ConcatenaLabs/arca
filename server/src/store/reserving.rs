@@ -6,7 +6,7 @@
 //! key bound it to (`leaf_mailbox`, [`Store::bind_mailbox`]); a transfer's
 //! output also to the mailbox the transfer posted it to.
 
-use super::coins::{leaf_row, LeafKind};
+use super::coins::{leaf_row, LeafKind, LeafState};
 use super::participations::{read_participation, ParticipationRow};
 use super::{array32, LeafRow, Store, StoreError};
 
@@ -170,125 +170,195 @@ impl Store {
 	pub async fn served_leaves(&self, key: &[u8; 32], after: i64, limit: i64) -> Result<Vec<ServedLeaf>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			"SELECT l.leaf_id, l.kind::text, l.asset, l.value, l.owner_key, l.script_pubkey, l.hops,
-			        CASE WHEN l.kind = 'batch' AND NOT EXISTS (
-			            SELECT 1 FROM batch_leaf b JOIN participation p ON p.participation_id = b.participation_id
-			            WHERE b.leaf_id = l.leaf_id AND p.attempt = b.attempt AND p.state = 'released'
-			            UNION ALL
-			            SELECT 1 FROM batch_leaf b JOIN participation_attempt a
-			              ON a.participation_id = b.participation_id AND a.attempt = b.attempt
-			            WHERE b.leaf_id = l.leaf_id AND a.released)
-			        THEN ''::bytea ELSE l.record END,
-			        l.state::text, l.spent_by, l.seq
-			 FROM leaf l
-			 WHERE l.seq > $2 AND l.leaf_id IN (
-			     SELECT leaf_id FROM leaf WHERE owner_key = $1
-			     UNION SELECT x.leaf_id FROM leaf_mailbox m JOIN leaf x ON x.owner_key = m.owner_key WHERE m.mailbox_key = $1
-			     UNION SELECT leaf_id FROM transfer_output WHERE mailbox_key = $1)
-			 ORDER BY l.seq LIMIT $3",
+			&format!("SELECT {} FROM leaf l WHERE l.seq > $2 AND l.leaf_id IN ({}) ORDER BY l.seq LIMIT $3", SERVED_COLUMNS, SERVED_TO),
 			&[&&key[..], &after, &limit],
 		).await?;
-		let mut out = Vec::with_capacity(rows.len());
-		for r in &rows {
-			let leaf = leaf_row(r)?;
-			let seq: i64 = r.get(10);
-			let id = leaf.leaf_id;
-			let batch = match leaf.kind {
-				LeafKind::Batch => {
-					let b = conn.query_opt(
-						"SELECT r.txid, r.state, b.vout, b.idx, b.owner_nonce, b.participation_id, r.signer_entry, r.signer_hash, r.signer_sig
-						 FROM batch_leaf b JOIN round r ON r.round_id = b.round_id WHERE b.leaf_id = $1",
-						&[&&id[..]],
-					).await?;
-					match b {
-						Some(b) => {
-							let entry: Option<i64> = b.get(6);
-							let hash: Option<Vec<u8>> = b.get(7);
-							let sig: Option<Vec<u8>> = b.get(8);
-							let signer_head = match (entry, hash) {
-								(Some(n), Some(h)) => Some((n as u64, array32(h, "signer hash")?,
-									sig.map(|s| s.try_into().map_err(|_| StoreError::Corrupt("a round's head signature".into()))).transpose()?)),
-								_ => None,
-							};
-							Some(ServedBatch {
-								round_txid: array32(b.get(0), "txid")?,
-								round_state: b.get(1),
-								batch_vout: b.get::<_, i32>(2) as u32,
-								leaf_index: b.get::<_, i32>(3) as u32,
-								owner_nonce: array32(b.get(4), "owner nonce")?,
-								participation_id: array32(b.get(5), "participation id")?,
-								signer_head,
-							})
-						},
-						None => None,
-					}
-				},
-				_ => None,
-			};
-			let board = match leaf.kind {
-				LeafKind::Board => conn.query_opt("SELECT txid, vout, state::text FROM board WHERE leaf_id = $1", &[&&id[..]]).await?
-					.map(|b| Ok::<_, StoreError>(ServedBoard { txid: array32(b.get(0), "txid")?, vout: b.get::<_, i32>(1) as u32, state: b.get(2) }))
-					.transpose()?,
-				_ => None,
-			};
-			let made_by = match leaf.kind {
-				LeafKind::Transfer => conn.query_opt(
-					"SELECT t.transfer_id, t.signer_entry, t.signer_hash, t.signer_sig FROM transfer_output o
-					 JOIN transfer t ON t.transfer_id = o.transfer_id WHERE o.leaf_id = $1",
-					&[&&id[..]],
-				).await?.map(|t| Ok::<_, StoreError>(ServedMadeBy {
-					transfer_id: array32(t.get(0), "transfer id")?,
-					signer_head: super::transfers::head_of(t.get(1), t.get(2), t.get(3))?,
-				})).transpose()?,
-				_ => None,
-			};
-			let mut transfers = vec![];
-			for t in conn.query(
-				"SELECT t.transfer_id, t.state, i.checkpoint_value, i.checkpoint_owner_sig FROM transfer_input i
-				 JOIN transfer t ON t.transfer_id = i.transfer_id WHERE i.leaf_id = $1",
-				&[&&id[..]],
-			).await? {
-				let sig: Vec<u8> = t.get(3);
-				transfers.push(ServedTransferSpend {
-					transfer_id: array32(t.get(0), "transfer id")?,
-					signed: t.get::<_, &str>(1) == "signed",
-					checkpoint_value: t.get::<_, i64>(2) as u64,
-					checkpoint_owner_sig: sig.try_into().map_err(|_| StoreError::Corrupt("a checkpoint signature".into()))?,
-				});
-			}
-			let mut participations = vec![];
-			for p in conn.query(
-				"SELECT i.participation_id FROM participation_input i JOIN participation p ON p.participation_id = i.participation_id
-				 WHERE i.leaf_id = $1 ORDER BY p.created_at, i.participation_id",
-				&[&&id[..]],
-			).await? {
-				let pid = array32(p.get(0), "participation id")?;
-				if let Some(row) = read_participation(&*conn, &pid).await? {
-					participations.push(row);
-				}
-			}
-			let mut forfeits = vec![];
-			for f in conn.query(
-				"SELECT f.participation_id, r.txid, c.vout, f.unlock_hash, f.refund_delay_units, f.margin, f.owner_sig,
-				        f.operator_sig IS NOT NULL
-				 FROM forfeit f JOIN round r ON r.round_id = f.round_id JOIN connector_output c ON c.round_id = f.round_id
-				 WHERE f.leaf_id = $1 ORDER BY f.created_at, f.round_id",
-				&[&&id[..]],
-			).await? {
-				let sig: Vec<u8> = f.get(6);
-				forfeits.push(ServedForfeit {
-					participation_id: array32(f.get(0), "participation id")?,
-					round_txid: array32(f.get(1), "txid")?,
-					connector_vout: f.get::<_, i32>(2) as u32,
-					unlock_hash: array32(f.get(3), "unlock hash")?,
-					refund_delay_units: f.get::<_, i32>(4) as u16,
-					margin: f.get::<_, i64>(5) as u64,
-					owner_sig: sig.try_into().map_err(|_| StoreError::Corrupt("a forfeit signature".into()))?,
-					cosigned: f.get(7),
-				});
-			}
-			out.push(ServedLeaf { seq, leaf, batch, board, made_by, transfers, participations, forfeits });
-		}
-		Ok(out)
+		served_rows(&*conn, &rows).await
 	}
+
+	/// Up to `limit` leaves served to `key` past the settled cursor `since`
+	/// (the transaction that made a leaf and its `seq`; `(0, 0)` from the
+	/// first), in that order, as [`Store::served_leaves`] serves them: only
+	/// leaves made by transactions older than every one still running, so
+	/// none can still appear behind a cursor read past (`leaf.made_xid`).
+	/// Each with its own settled cursor.
+	pub async fn served_since(&self, key: &[u8; 32], since: (u64, i64), limit: i64) -> Result<Vec<(ServedLeaf, (u64, i64))>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			&format!("SELECT {}, COALESCE(l.made_xid, '0'::xid8)::text FROM leaf l
+			 WHERE l.leaf_id IN ({})
+			   AND (COALESCE(l.made_xid, '0'::xid8), l.seq) > ($2::text::xid8, $3)
+			   AND COALESCE(l.made_xid, '0'::xid8) < pg_snapshot_xmin(pg_current_snapshot())
+			 ORDER BY COALESCE(l.made_xid, '0'::xid8), l.seq LIMIT $4", SERVED_COLUMNS, SERVED_TO),
+			&[&&key[..], &since.0.to_string(), &since.1, &limit],
+		).await?;
+		let mut made = Vec::with_capacity(rows.len());
+		for r in &rows {
+			let x: String = r.get(11);
+			made.push((x.parse::<u64>().map_err(|_| StoreError::Corrupt(format!("transaction id {}", x)))?, r.get::<_, i64>(10)));
+		}
+		Ok(served_rows(&*conn, &rows).await?.into_iter().zip(made).collect())
+	}
+
+	/// The leaves of `ids` served to `key`, as [`Store::served_leaves`]
+	/// serves them, in the order the server learned of them.
+	pub async fn served_by_ids(&self, key: &[u8; 32], ids: &[[u8; 32]]) -> Result<Vec<ServedLeaf>, StoreError> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query(
+			&format!("SELECT {} FROM leaf l WHERE l.leaf_id = ANY($2) AND l.leaf_id IN ({}) ORDER BY l.seq", SERVED_COLUMNS, SERVED_TO),
+			&[&&key[..], &ids],
+		).await?;
+		served_rows(&*conn, &rows).await
+	}
+
+	/// Of the leaves `ids`, those served to `key`, each with its state and
+	/// whether it was given up for good: an input of a transfer the operator
+	/// co-signed, or of a participation it released.
+	pub async fn held_states(&self, key: &[u8; 32], ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], LeafState, bool)>, StoreError> {
+		if ids.is_empty() {
+			return Ok(vec![]);
+		}
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		let rows = conn.query(
+			&format!("SELECT l.leaf_id, l.state::text,
+			        EXISTS (SELECT 1 FROM transfer_input i JOIN transfer t ON t.transfer_id = i.transfer_id
+			                WHERE i.leaf_id = l.leaf_id AND t.state = 'signed')
+			        OR EXISTS (SELECT 1 FROM participation_input i JOIN participation p ON p.participation_id = i.participation_id
+			                WHERE i.leaf_id = l.leaf_id AND p.state = 'released')
+			 FROM leaf l WHERE l.leaf_id = ANY($2) AND l.leaf_id IN ({}) ORDER BY l.seq", SERVED_TO),
+			&[&&key[..], &ids],
+		).await?;
+		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, LeafState::parse(r.get(1))?, r.get::<_, bool>(2)))).collect()
+	}
+}
+
+/// The leaves served to key `$1`: those it owns, those whose owner key is
+/// bound to it, and the transfer outputs posted to it.
+const SERVED_TO: &str = "SELECT leaf_id FROM leaf WHERE owner_key = $1
+	UNION SELECT x.leaf_id FROM leaf_mailbox m JOIN leaf x ON x.owner_key = m.owner_key WHERE m.mailbox_key = $1
+	UNION SELECT leaf_id FROM transfer_output WHERE mailbox_key = $1";
+
+/// A served leaf's columns, as [`served_rows`] reads them: a batch leaf's
+/// record empty until its participation's preimage went out.
+const SERVED_COLUMNS: &str = "l.leaf_id, l.kind::text, l.asset, l.value, l.owner_key, l.script_pubkey, l.hops,
+	CASE WHEN l.kind = 'batch' AND NOT EXISTS (
+	    SELECT 1 FROM batch_leaf b JOIN participation p ON p.participation_id = b.participation_id
+	    WHERE b.leaf_id = l.leaf_id AND p.attempt = b.attempt AND p.state = 'released'
+	    UNION ALL
+	    SELECT 1 FROM batch_leaf b JOIN participation_attempt a
+	      ON a.participation_id = b.participation_id AND a.attempt = b.attempt
+	    WHERE b.leaf_id = l.leaf_id AND a.released)
+	THEN ''::bytea ELSE l.record END,
+	l.state::text, l.spent_by, l.seq";
+
+/// Each leaf of `rows` ([`SERVED_COLUMNS`]) with what it rests on and every
+/// way it was given up.
+async fn served_rows(conn: &tokio_postgres::Client, rows: &[tokio_postgres::Row]) -> Result<Vec<ServedLeaf>, StoreError> {
+	let mut out = Vec::with_capacity(rows.len());
+	for r in rows {
+		let leaf = leaf_row(r)?;
+		let seq: i64 = r.get(10);
+		let id = leaf.leaf_id;
+		let batch = match leaf.kind {
+			LeafKind::Batch => {
+				let b = conn.query_opt(
+					"SELECT r.txid, r.state, b.vout, b.idx, b.owner_nonce, b.participation_id, r.signer_entry, r.signer_hash, r.signer_sig
+					 FROM batch_leaf b JOIN round r ON r.round_id = b.round_id WHERE b.leaf_id = $1",
+					&[&&id[..]],
+				).await?;
+				match b {
+					Some(b) => {
+						let entry: Option<i64> = b.get(6);
+						let hash: Option<Vec<u8>> = b.get(7);
+						let sig: Option<Vec<u8>> = b.get(8);
+						let signer_head = match (entry, hash) {
+							(Some(n), Some(h)) => Some((n as u64, array32(h, "signer hash")?,
+								sig.map(|s| s.try_into().map_err(|_| StoreError::Corrupt("a round's head signature".into()))).transpose()?)),
+							_ => None,
+						};
+						Some(ServedBatch {
+							round_txid: array32(b.get(0), "txid")?,
+							round_state: b.get(1),
+							batch_vout: b.get::<_, i32>(2) as u32,
+							leaf_index: b.get::<_, i32>(3) as u32,
+							owner_nonce: array32(b.get(4), "owner nonce")?,
+							participation_id: array32(b.get(5), "participation id")?,
+							signer_head,
+						})
+					},
+					None => None,
+				}
+			},
+			_ => None,
+		};
+		let board = match leaf.kind {
+			LeafKind::Board => conn.query_opt("SELECT txid, vout, state::text FROM board WHERE leaf_id = $1", &[&&id[..]]).await?
+				.map(|b| Ok::<_, StoreError>(ServedBoard { txid: array32(b.get(0), "txid")?, vout: b.get::<_, i32>(1) as u32, state: b.get(2) }))
+				.transpose()?,
+			_ => None,
+		};
+		let made_by = match leaf.kind {
+			LeafKind::Transfer => conn.query_opt(
+				"SELECT t.transfer_id, t.signer_entry, t.signer_hash, t.signer_sig FROM transfer_output o
+				 JOIN transfer t ON t.transfer_id = o.transfer_id WHERE o.leaf_id = $1",
+				&[&&id[..]],
+			).await?.map(|t| Ok::<_, StoreError>(ServedMadeBy {
+				transfer_id: array32(t.get(0), "transfer id")?,
+				signer_head: super::transfers::head_of(t.get(1), t.get(2), t.get(3))?,
+			})).transpose()?,
+			_ => None,
+		};
+		let mut transfers = vec![];
+		for t in conn.query(
+			"SELECT t.transfer_id, t.state, i.checkpoint_value, i.checkpoint_owner_sig FROM transfer_input i
+			 JOIN transfer t ON t.transfer_id = i.transfer_id WHERE i.leaf_id = $1",
+			&[&&id[..]],
+		).await? {
+			let sig: Vec<u8> = t.get(3);
+			transfers.push(ServedTransferSpend {
+				transfer_id: array32(t.get(0), "transfer id")?,
+				signed: t.get::<_, &str>(1) == "signed",
+				checkpoint_value: t.get::<_, i64>(2) as u64,
+				checkpoint_owner_sig: sig.try_into().map_err(|_| StoreError::Corrupt("a checkpoint signature".into()))?,
+			});
+		}
+		let mut participations = vec![];
+		for p in conn.query(
+			"SELECT i.participation_id FROM participation_input i JOIN participation p ON p.participation_id = i.participation_id
+			 WHERE i.leaf_id = $1 ORDER BY p.created_at, i.participation_id",
+			&[&&id[..]],
+		).await? {
+			let pid = array32(p.get(0), "participation id")?;
+			if let Some(row) = read_participation(&*conn, &pid).await? {
+				participations.push(row);
+			}
+		}
+		let mut forfeits = vec![];
+		for f in conn.query(
+			"SELECT f.participation_id, r.txid, c.vout, f.unlock_hash, f.refund_delay_units, f.margin, f.owner_sig,
+			        f.operator_sig IS NOT NULL
+			 FROM forfeit f JOIN round r ON r.round_id = f.round_id JOIN connector_output c ON c.round_id = f.round_id
+			 WHERE f.leaf_id = $1 ORDER BY f.created_at, f.round_id",
+			&[&&id[..]],
+		).await? {
+			let sig: Vec<u8> = f.get(6);
+			forfeits.push(ServedForfeit {
+				participation_id: array32(f.get(0), "participation id")?,
+				round_txid: array32(f.get(1), "txid")?,
+				connector_vout: f.get::<_, i32>(2) as u32,
+				unlock_hash: array32(f.get(3), "unlock hash")?,
+				refund_delay_units: f.get::<_, i32>(4) as u16,
+				margin: f.get::<_, i64>(5) as u64,
+				owner_sig: sig.try_into().map_err(|_| StoreError::Corrupt("a forfeit signature".into()))?,
+				cosigned: f.get(7),
+			});
+		}
+		out.push(ServedLeaf { seq, leaf, batch, board, made_by, transfers, participations, forfeits });
+	}
+	Ok(out)
 }
