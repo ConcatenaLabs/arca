@@ -246,6 +246,51 @@ struct CatchUpPass {
 	started: u64,
 }
 
+/// A settled cursor as `leaf_data` names it: `"0"`, `"<epoch>:W<xid>:<seq>"`
+/// (a read from the first leaf under way) or `"<epoch>:<xid>.<seq>"`; its
+/// epoch, whether it is under way, and its transaction and `seq`.
+fn settled_position(c: &str) -> Option<(&str, bool, u64, i64)> {
+	let (e, rest) = c.split_once(':')?;
+	match rest.strip_prefix('W') {
+		Some(w) => {
+			let (x, q) = w.split_once(':')?;
+			Some((e, true, x.parse().ok()?, q.parse().ok()?))
+		},
+		None => {
+			let (x, q) = rest.split_once('.')?;
+			Some((e, false, x.parse().ok()?, q.parse().ok()?))
+		},
+	}
+}
+
+/// Whether `c` names a read from the first leaf under way.
+fn is_whole_cursor(c: &str) -> bool {
+	settled_position(c).is_some_and(|p| p.1)
+}
+
+/// Whether `next`, the cursor a read past `since` answered, is past it: any
+/// cursor after `"0"` or after one of another epoch (the operator's
+/// database restored meanwhile, a read from the first leaf again); a read
+/// from the first leaf under way on to a later `seq` of the same start, or
+/// to its end (a settled cursor); a settled cursor on to a later
+/// transaction and `seq`.
+fn settled_advances(since: &str, next: &str) -> bool {
+	let Some((ne, nw, nx, nq)) = settled_position(next) else { return false };
+	if since == "0" {
+		return true;
+	}
+	let Some((se, sw, sx, sq)) = settled_position(since) else { return true };
+	if se != ne {
+		return true;
+	}
+	match (sw, nw) {
+		(true, true) => nx == sx && nq > sq,
+		(true, false) => true,
+		(false, false) => (nx, nq) > (sx, sq),
+		(false, true) => false,
+	}
+}
+
 /// The wall clock, in Unix seconds.
 fn unix_now() -> u64 {
 	web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -1138,19 +1183,33 @@ impl Wallet {
 						entries.push(a);
 					}
 				}
-				// Taken even from a page with no leaves: the read from the
-				// first leaf ends on the settled cursor it started at.
+				// Taken even from a page with no leaves (the read from the
+				// first leaf ends on the settled cursor it started at), once it
+				// is past the one asked: a server that names a cursor that does
+				// not advance, or pages without end, is read no further.
+				let mut stop = false;
 				if let Some(n) = v["next"].as_str() {
-					pass.since = Some(n.to_string());
+					if settled_advances(&since, n) {
+						pass.since = Some(n.to_string());
+					} else {
+						read_note = Some(format!("the server names a settled cursor ({}) not past the one asked ({}): the catch-up reads no \
+							further, and takes what it read", n, since));
+						stop = true;
+					}
+				}
+				if pass.pages as usize + 1 >= LEAF_DATA_PAGES {
+					read_note = Some(format!("the server names more than {} pages of leaves: the catch-up reads no further, and takes what it \
+						read", LEAF_DATA_PAGES));
+					stop = true;
 				}
 				// A read from the first leaf reads on while its cursor says so
 				// (`"<epoch>:W…"`). Past a settled cursor, a page short of what
 				// it asked for is the last; one the server cut for its size
 				// leaves the rest to the next read past the cursor, which
 				// nothing can step behind.
-				let whole_on = v["next"].as_str().and_then(|n| n.split(':').nth(1)).is_some_and(|c| c.starts_with('W'));
-				let done = !whole_on && (leaves.len() < limit as usize || v["next"].as_str().is_none()) && pass.held.is_empty()
-					&& pass.ids.is_empty();
+				let whole_on = !stop && pass.since.as_deref().and_then(|n| n.split(':').nth(1)).is_some_and(|c| c.starts_with('W'));
+				let done = stop || (!whole_on && (leaves.len() < limit as usize || v["next"].as_str().is_none()) && pass.held.is_empty()
+					&& pass.ids.is_empty());
 				let receives = if pass.pages == 0 { v["receives"].as_array().cloned().unwrap_or_default() } else { vec![] };
 				(entries, receives, done)
 			} else {
@@ -1213,10 +1272,13 @@ impl Wallet {
 			}
 			if done {
 				if settled {
-					if pass.since.as_deref().is_some_and(|s| s != "0") {
+					// A read the server kept from ending keeps no cursor of it
+					// under way, and counts as no read from the first leaf.
+					let ended = read_note.is_none();
+					if pass.since.as_deref().is_some_and(|s| s != "0" && (ended || !is_whole_cursor(s))) {
 						read.since = pass.since.clone();
 					}
-					if pass.whole {
+					if pass.whole && ended {
 						read.whole_at = Some(unix_now());
 					}
 				}

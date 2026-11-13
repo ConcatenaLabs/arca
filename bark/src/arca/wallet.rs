@@ -214,6 +214,12 @@ pub struct Wallet {
 	/// While a step of a sliced `sync` or `deposits` runs: when the slice
 	/// ends and the step's items done ([`super::slice`]).
 	pub(crate) slice: std::cell::RefCell<Option<super::slice::Slice>>,
+	/// The operator's answers to `participation_status` the step `held`
+	/// read and did not act on, for the step `participations` of the same
+	/// call of `sync` to use rather than ask again (arca #894); emptied at
+	/// the start and the end of every call, so no slice uses one read in
+	/// another.
+	pub(crate) statuses_read: std::cell::RefCell<std::collections::HashMap<String, Value>>,
 	/// What [`CoinRecord::resolve`] answered, by the record, the transactions
 	/// it was resolved against and the policy ([`Wallet::resolve`]).
 	pub(crate) resolved: std::cell::RefCell<Resolved>,
@@ -966,7 +972,7 @@ impl Wallet {
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
-			exits_done: Default::default(), slice: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
+			exits_done: Default::default(), slice: Default::default(), statuses_read: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
 	}
 

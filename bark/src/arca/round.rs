@@ -1660,6 +1660,7 @@ impl Wallet {
 				},
 			};
 			if st["state"] != "issued" || !st["round"]["tx"].is_string() {
+				self.statuses_read.borrow_mut().insert(pid.clone(), st);
 				continue;
 			}
 			if self.handed_held(&pid, &st)? {
@@ -1770,7 +1771,8 @@ impl Wallet {
 				}
 				continue;
 			}
-			let st = match self.server.post("participation_status", &json!({"participation_id": pid})) {
+			let read = self.statuses_read.borrow_mut().remove(&pid);
+			let st = match read.map_or_else(|| self.server.post("participation_status", &json!({"participation_id": pid})), Ok) {
 				Ok(st) => st,
 				Err(e) => {
 					out.push(json!({"participation": pid, "state": state, "error": e.to_string()}));

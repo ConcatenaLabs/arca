@@ -1973,6 +1973,14 @@ impl Wallet {
 	/// restore's history ([`Self::restore_history`]): the sync that ends a
 	/// restore, which leaves the history to the syncs after it.
 	pub(crate) fn sync_with(&mut self, catch_up: bool, deposits: bool, history: bool, budget_ms: Option<u64>) -> Result<Value, Error> {
+		self.statuses_read.borrow_mut().clear();
+		let out = self.sync_slice(catch_up, deposits, history, budget_ms);
+		self.statuses_read.borrow_mut().clear();
+		out
+	}
+
+	/// [`Self::sync_with`], one call of it.
+	fn sync_slice(&mut self, catch_up: bool, deposits: bool, history: bool, budget_ms: Option<u64>) -> Result<Value, Error> {
 		let begun = web_time::Instant::now();
 		let deadline = budget_ms.map(|b| begun + std::time::Duration::from_millis(b));
 		let now = self.now()?.to_consensus_u32();
