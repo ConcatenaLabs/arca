@@ -122,12 +122,23 @@ pub(crate) struct Payer {
 	/// mempool ([`Wallet::speed_up`]). The wallet's own exits do; a
 	/// watchtower's and the operator's steps keep the reserve whole.
 	pub(crate) anchor: bool,
+	/// Whether every step must pay its fee from its own reserve: a step that
+	/// cannot is refused rather than given a fee coin, which would change
+	/// its txid. The endings a lock's watchtower holds are signed over the
+	/// leaf such steps make ([`Wallet::lock_deposit`]).
+	pub(crate) reserve_only: bool,
 }
 
 impl Payer {
 	/// A payer of fees in `asset`, when named.
 	pub(crate) fn new(asset: Option<AssetId>) -> Payer {
-		Payer { asset, moved: None, coin: None, change: None, used: vec![], min_fee: 0, anchor: false }
+		Payer { asset, moved: None, coin: None, change: None, used: vec![], min_fee: 0, anchor: false, reserve_only: false }
+	}
+
+	/// A payer whose next transaction pays at least `fee`.
+	pub(crate) fn at_least(mut self, fee: u64) -> Payer {
+		self.min_fee = fee;
+		self
 	}
 }
 
@@ -178,7 +189,7 @@ impl Wallet {
 	/// a landing leaf of a supervised asset, its landing, P2WPKH of the
 	/// wallet's landing key, the only output its exit can pay, where a freeze
 	/// of the asset binds on the chain.
-	fn claim_script(&self, coin: &ValidCoin, claim_index: u32) -> Result<Script, Error> {
+	pub(crate) fn claim_script(&self, coin: &ValidCoin, claim_index: u32) -> Result<Script, Error> {
 		match coin.leaf.landing {
 			Some(l) => Ok(l.script_pubkey()),
 			None => self.keys.onchain_script(super::keys::RECEIVE, claim_index),
@@ -193,7 +204,7 @@ impl Wallet {
 
 	/// Whether `tx`, as built, pays at least the node's floor in one asset the
 	/// node accepts.
-	fn pays_floor(&self, tx: &Transaction) -> Result<bool, Error> {
+	pub(crate) fn pays_floor(&self, tx: &Transaction) -> Result<bool, Error> {
 		let fees = txs_fee(tx);
 		if fees.len() != 1 {
 			return Ok(false);
@@ -241,6 +252,9 @@ impl Wallet {
 				}
 				return Ok(u.clone());
 			}
+		}
+		if payer.reserve_only {
+			return Err(Error::Refused("a step of the path does not pay the node's floor from its own reserve".into()));
 		}
 		let (op, coin, key) = self.fee_coin(payer)?;
 		let asset = payer.asset.expect("a fee coin has an asset");
@@ -343,7 +357,7 @@ impl Wallet {
 	/// wallet never splits its own claim. An `htlc-1` leaf of a payment out
 	/// of the tree comes home by its refund, after its timeout and its exit
 	/// delay on the chain.
-	fn claim_tx(&self, payer: &mut Payer, key: &Keypair, coin: &ValidCoin, leaf_at: OutPoint, to: &Script, after: &[Vec<u8>])
+	pub(crate) fn claim_tx(&self, payer: &mut Payer, key: &Keypair, coin: &ValidCoin, leaf_at: OutPoint, to: &Script, after: &[Vec<u8>])
 		-> Result<UnrollTx, Error>
 	{
 		let (asset, value, leaf) = (coin.asset, coin.value, coin.leaf);
@@ -470,7 +484,7 @@ impl Wallet {
 		let key = self.keys.leaf(&row.owner_nonce)?;
 		let to = self.claim_script(coin, claim_index as u32)?;
 		let after = self.claim_witness(coin, &row.owner_nonce)?;
-		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false };
+		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false, reserve_only: false };
 		let new = self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after)?;
 		let txid = self.chain.broadcast_any_fee(&new.tx).map_err(|e| Error::Refused(format!("coin {}'s output is spent in the mempool \
 			by {}, which is not the wallet's; the node refused the claim that outbids it: {}", leaf_id, other.txid(), e)))?;
@@ -536,7 +550,7 @@ impl Wallet {
 			}
 			need = need.max(b);
 		}
-		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false };
+		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false, reserve_only: false };
 		let new = match self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after) {
 			Ok(c) => c,
 			Err(e) => {
@@ -838,7 +852,7 @@ impl Wallet {
 		// that of every P2WPKH change.
 		let dummy = self.keys.onchain(CHANGE, 0)?;
 		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None,
-			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![], min_fee: 0, anchor: true };
+			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![], min_fee: 0, anchor: true, reserve_only: false };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -951,7 +965,7 @@ impl Wallet {
 			Some(a) => Some(a),
 			None => prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?,
 		};
-		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true };
+		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true, reserve_only: false };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -1604,7 +1618,7 @@ impl Wallet {
 			}
 		}
 		let fee_asset = fee_asset.or(prior["fee_asset"].as_str().and_then(|a| AssetId::from_str(a).ok()));
-		let mut payer = Payer { asset: fee_asset, moved: Some(asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true };
+		let mut payer = Payer { asset: fee_asset, moved: Some(asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true, reserve_only: false };
 		let mut path = vec![];
 		Self::path_outputs(&i.coin, &mut path);
 		path.push(cp_out.clone());

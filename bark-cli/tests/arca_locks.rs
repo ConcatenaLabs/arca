@@ -418,3 +418,182 @@ async fn locks_that_break_the_purchase_rule_or_the_depth_limit_are_refused() {
 		panic!("the test did not reach a coin too deep to lock");
 	}
 }
+
+/// A watchtower's `serve` process, its wallet of its own, stopped when
+/// dropped.
+struct Tower {
+	wallet: Arca,
+	url: String,
+	listen: String,
+	child: Option<std::process::Child>,
+}
+
+impl Tower {
+	fn new(name: &str, server: &str, node: &str) -> Tower {
+		let wallet = Arca::new(name);
+		wallet.ok(&create_args(server, node));
+		let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+		let listen = format!("127.0.0.1:{}", port);
+		let log = std::fs::File::create(wallet.dir.join("serve.log")).unwrap();
+		let child = std::process::Command::new(env!("CARGO_BIN_EXE_arca")).arg("--datadir").arg(&wallet.dir)
+			.args(["watchtower", "serve", "--listen", &listen, "--interval", "1"])
+			.env("ARCA_NODE_PASSWORD", "arca").stdout(std::process::Stdio::null()).stderr(log).spawn().unwrap();
+		let start = std::time::Instant::now();
+		while std::net::TcpStream::connect(&listen).is_err() {
+			assert!(start.elapsed() < std::time::Duration::from_secs(30), "watchtower {} did not start", name);
+			std::thread::sleep(std::time::Duration::from_millis(100));
+		}
+		Tower { wallet, url: format!("http://{}", listen), listen, child: Some(child) }
+	}
+
+	/// The lock deposit the watchtower holds under `hash`.
+	fn lock_deposit(&self, hash: &str) -> Value {
+		self.wallet.ok(&["watchtower", "deposits"]).as_array().unwrap().iter().find(|d| d["lock"]["payment_hash"] == hash).cloned()
+			.unwrap_or(Value::Null)
+	}
+}
+
+impl Drop for Tower {
+	fn drop(&mut self) {
+		if let Some(mut c) = self.child.take() {
+			let _ = c.kill();
+			let _ = c.wait();
+		}
+		let _ = &self.listen;
+	}
+}
+
+/// Both wallets are gone and the operator answers nothing; each side's
+/// watchtower ends its lock on the chain by the ending its wallet signed
+/// beforehand.
+/// - Lock A: the payee's wallet learnt the preimage (its BTC payment
+///   settled) and handed it to its watchtower and to the operator, which is
+///   down then, before it went away. At the lock's home date the payee's
+///   watchtower brings the leaf on the chain and claims it by CLAIM, the
+///   preimage in its witness, to the payee's own address.
+/// - Lock B, of another payer: never paid. The payee's watchtower, at its
+///   home date, does nothing: neither its wallet nor the operator has the preimage. The
+///   payer's watchtower, past the lock's timeout and its grace, brings the
+///   leaf and refunds it by REFUND to the payer's own address.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_sides_watchtower_ends_its_lock_with_the_wallets_gone_and_the_operator_down() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("lock tower P");
+	let p1 = Arca::new("lock tower P1");
+	let q = Arca::new("lock tower Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 3_000_000).await;
+	boarded(&mut r, &p1, xa, 1_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+	let (url, node) = (r.url(), r.node_url());
+	let tq = Tower::new("lock tower TQ", &url, &node);
+	let tp = Tower::new("lock tower TP", &url, &node);
+	// Each watchtower holds a coin of its own for the fees its steps do not
+	// pay from their reserves.
+	for t in [&tq, &tp] {
+		let s = script(&t.wallet.ok(&["address"]));
+		r.pay_to(s, xa, 2_000_000);
+	}
+	r.produce().await;
+	r.bury().await;
+	q.ok(&["watchtowers", &tq.url]);
+	p.ok(&["watchtowers", &tp.url]);
+
+	let (pre_a, pre_b) = ([0x51u8; 32], [0x52u8; 32]);
+	let ha = hex(&sha256::Hash::hash(&pre_a).to_byte_array());
+	let hb = hex(&sha256::Hash::hash(&pre_b).to_byte_array());
+	let req_a = q.ok(&["lock", "request", "--asset", &x, "--amount", "200000", "--hash", &ha]);
+	let req_b = q.ok(&["lock", "request", "--asset", &x, "--amount", "150000", "--hash", &hb]);
+	// A's payer is another wallet, with no watchtower: a watchtower that
+	// brings a payer's coin on the chain brings every lock that shares its
+	// reassignment with it, and A's leaf must come only when A's own
+	// watchtower brings it, at A's home date.
+	let lb = p.ok(&["lock", "to", &req_b.to_string(), "--timeout-in", "8000"]);
+	let la = p1.ok(&["lock", "to", &req_a.to_string(), "--timeout-in", "30000"]);
+	let (ta, tb) = (num(&la["timeout"]) as u32, num(&lb["timeout"]) as u32);
+	let s = q.ok(&["sync"]);
+	println!("Q's deposits: {}", s["deposits"]);
+	assert_eq!(q.ok(&["lock", "ready", &ha])["ready"], true);
+	let s = p.ok(&["sync"]);
+	println!("P's deposits: {}", s["deposits"]);
+	for (t, role, hs) in [(&tq, "payee", vec![&ha, &hb]), (&tp, "payer", vec![&hb])] {
+		for h in hs {
+			let d = t.lock_deposit(h);
+			println!("{} holds: {}", t.wallet.name, d);
+			assert_eq!(d["lock"]["role"], role, "{} holds the {}'s deposit of each lock: {}", t.wallet.name, role, d);
+			assert_eq!(d["state"], "held");
+		}
+	}
+	assert_eq!(tq.lock_deposit(&hb)["lock"]["preimage_known"], false);
+
+	// The operator signs nothing more, and answers nothing.
+	r.server.stop();
+	// Q's BTC payment for lock A settled: its wallet keeps the preimage and
+	// hands it on; the claim out of round cannot be made. Then Q is gone.
+	let (ok, v) = q.run(&["lock", "preimage", &ha, &hex(&pre_a)]);
+	println!("Q learns the preimage with the operator down: ok={} {}", ok, v);
+	assert!(!ok, "the operator co-signs nothing: {}", v);
+	assert_eq!(tq.lock_deposit(&ha)["lock"]["preimage_known"], true, "Q's watchtower has the preimage: {}", tq.lock_deposit(&ha));
+	assert_eq!(tq.lock_deposit(&hb)["lock"]["preimage_known"], false);
+	drop(q);
+	drop(p);
+	drop(p1);
+
+	// Time passes; only the watchtowers act.
+	let mut seen_nothing = None;
+	let mut tq_brought = None;
+	let start = std::time::Instant::now();
+	loop {
+		let (a_q, b_p, b_q) = (tq.lock_deposit(&ha), tp.lock_deposit(&hb), tq.lock_deposit(&hb));
+		println!("median {} | TQ A: {} {} | TP B: {} {} | TQ B: {} {}", common::node::median_time(&r.rt), a_q["state"], a_q["note"],
+			b_p["state"], b_p["note"], b_q["state"], b_q["note"]);
+		if b_q["note"].as_str().is_some_and(|n| n.contains("neither its wallet nor the operator has the preimage")) {
+			seen_nothing.get_or_insert(b_q.clone());
+		}
+		if a_q["state"] != "held" && tq_brought.is_none() {
+			tq_brought = Some(common::node::median_time(&r.rt));
+		}
+		if a_q["state"] == "ended" && b_p["state"] == "ended" && seen_nothing.is_some() {
+			break;
+		}
+		assert!(start.elapsed() < std::time::Duration::from_secs(900), "the watchtowers did not end both locks");
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 900));
+		r.produce().await;
+		r.bury().await;
+		tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+	}
+	let b_q = seen_nothing.unwrap();
+	assert!(b_q["broadcast"].as_array().is_none_or(|b| b.is_empty()), "without the preimage the payee's watchtower broadcasts nothing: {}", b_q);
+
+	// What each watchtower broadcast, and its ending in a block.
+	let ending = |d: &Value| -> elements::Transaction {
+		let e = d["broadcast"].as_array().unwrap().iter().find(|s| s["ending"].is_string()).unwrap_or_else(|| panic!("no ending: {}", d)).clone();
+		let t = tx(&r, e["txid"].as_str().unwrap());
+		let info: Value = r.rt.client().call("getrawtransaction", &[json!(t.txid().to_string()), json!(true)]).unwrap();
+		assert!(info["confirmations"].as_u64().unwrap_or(0) >= 1, "the ending is in a block: {}", info["confirmations"]);
+		t
+	};
+	let a_q = tq.lock_deposit(&ha);
+	println!("TQ's steps for lock A: {}", a_q["broadcast"]);
+	assert!(a_q["broadcast"].as_array().unwrap().len() >= 2, "Q's watchtower brought A's path itself, then claimed: {}", a_q);
+	let brought_at = tq_brought.expect("Q's watchtower brought A's leaf");
+	assert!(brought_at >= num(&a_q["lock"]["act_from"]) as u32, "at A's home date, not before: {} {}", brought_at, a_q["lock"]["act_from"]);
+	let claim = ending(&a_q);
+	let w = &claim.input[0].witness.script_witness;
+	assert!(w.iter().any(|i| i[..] == pre_a[..]), "CLAIM carries the preimage the watchtower put in");
+	let paid = claim.output[0].value.explicit().unwrap();
+	assert!(paid < 200_000 && paid > 190_000, "the CLAIM pays the lock less its fee: {}", paid);
+	println!("TQ's CLAIM {}: {} vB, pays {} of 200000 to {}", claim.txid(), claim.vsize(), paid, claim.output[0].script_pubkey);
+	assert!(common::node::median_time(&r.rt) < ta + 600 || claim.lock_time.to_consensus_u32() == 0, "a CLAIM needs no lock time");
+
+	let b_p = tp.lock_deposit(&hb);
+	println!("TP's steps for lock B: {}", b_p["broadcast"]);
+	let refund = ending(&b_p);
+	assert_eq!(refund.lock_time.to_consensus_u32(), tb, "REFUND's lock time is the lock's timeout");
+	assert!(!refund.input[0].witness.script_witness.iter().any(|i| i[..] == pre_b[..]));
+	let back = refund.output[0].value.explicit().unwrap();
+	assert!(back < 150_000 && back > 140_000, "the REFUND pays the lock less its fee: {}", back);
+	println!("TP's REFUND {}: {} vB, lock time {}, pays {} of 150000", refund.txid(), refund.vsize(), tb, back);
+
+}

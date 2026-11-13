@@ -176,6 +176,8 @@ CREATE INDEX IF NOT EXISTS tower_deposit_owner ON tower_deposit(owner);
 CREATE INDEX IF NOT EXISTS forfeit_participation ON forfeit(participation);
 CREATE TABLE IF NOT EXISTS tower_sealed (id TEXT PRIMARY KEY, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tower_hint (hint TEXT NOT NULL, id TEXT NOT NULL, k INTEGER NOT NULL, PRIMARY KEY (hint, id));
+CREATE TABLE IF NOT EXISTS tower_lock (id TEXT PRIMARY KEY, hash TEXT NOT NULL, body TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS tower_lock_hash ON tower_lock(hash);
 CREATE TABLE IF NOT EXISTS chain_seen (hash BLOB PRIMARY KEY, height INTEGER NOT NULL, prev BLOB NOT NULL, pays BLOB NOT NULL, spends BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS chain_seen_height ON chain_seen(height);
 ";
@@ -459,6 +461,7 @@ impl Store {
 		tx.execute("DELETE FROM tower_deposit WHERE id = ?1", params![id]).map_err(db)?;
 		tx.execute("DELETE FROM tower_sealed WHERE id = ?1", params![id]).map_err(db)?;
 		tx.execute("DELETE FROM tower_hint WHERE id = ?1", params![id]).map_err(db)?;
+		tx.execute("DELETE FROM tower_lock WHERE id = ?1", params![id]).map_err(db)?;
 		tx.commit().map_err(db)
 	}
 
@@ -512,6 +515,46 @@ impl Store {
 			None => self.conn.execute("UPDATE tower_deposit SET state = ?2, note = ?3, updated_at = ?4 WHERE id = ?1",
 				params![id, state, note, now()]),
 		}.map_err(db)?;
+		Ok(())
+	}
+
+	/// Takes or replaces a lock's deposit ([`super::tower`]): the coin as a
+	/// plain deposit, and `lock`, the lock's JSON (its side, its endings,
+	/// when the watchtower acts). A replacement keeps what the watchtower
+	/// learnt and did (`preimage`, `ending`) and its state, unless its
+	/// endings changed.
+	pub fn tower_put_lock(&self, id: &str, owner: &str, leaf_id: &str, record: &[u8], bases: &str, hash: &str, lock: &str) -> Result<(), Error> {
+		let tx = self.conn.unchecked_transaction().map_err(db)?;
+		let t = now();
+		tx.execute("INSERT INTO tower_deposit (id, owner, leaf_id, record, bases, state, note, txs, created_at, updated_at) \
+			VALUES (?1, ?2, ?3, ?4, ?5, 'held', '', '[]', ?6, ?6) ON CONFLICT(id) DO UPDATE SET bases = ?5, updated_at = ?6",
+			params![id, owner, leaf_id, record, bases, t]).map_err(db)?;
+		tx.execute("INSERT OR REPLACE INTO tower_lock (id, hash, body) VALUES (?1, ?2, ?3)", params![id, hash, lock]).map_err(db)?;
+		tx.commit().map_err(db)?;
+		Ok(())
+	}
+
+	/// The lock JSON of deposit `id`, when it is a lock's.
+	pub fn tower_lock(&self, id: &str) -> Result<Option<String>, Error> {
+		self.conn.query_row("SELECT body FROM tower_lock WHERE id = ?1", params![id], |r| r.get(0)).optional().map_err(db)
+	}
+
+	pub fn tower_set_lock(&self, id: &str, lock: &str) -> Result<(), Error> {
+		self.conn.execute("UPDATE tower_lock SET body = ?2 WHERE id = ?1", params![id, lock]).map_err(db)?;
+		Ok(())
+	}
+
+	/// Every lock deposit under payment hash `hash`: its id and lock JSON.
+	pub fn tower_locks_of(&self, hash: &str) -> Result<Vec<(String, String)>, Error> {
+		let mut st = self.conn.prepare("SELECT id, body FROM tower_lock WHERE hash = ?1 ORDER BY id").map_err(db)?;
+		let rows = st.query_map(params![hash], |r| Ok((r.get(0)?, r.get(1)?))).map_err(db)?;
+		rows.collect::<Result<Vec<_>, _>>().map_err(db)
+	}
+
+	/// Forgets which watchtowers hold `leaf_id`'s deposit: it is sent to
+	/// each again, as when its body changed.
+	pub fn delete_deposit_sent_all(&self, leaf_id: &str) -> Result<(), Error> {
+		self.conn.execute("DELETE FROM deposit_sent WHERE leaf_id = ?1", params![leaf_id]).map_err(db)?;
 		Ok(())
 	}
 

@@ -46,6 +46,7 @@ use arca_covenant::lock::{LockSpend, LockTerms, REFUND_DELAY_MARGIN_UNITS};
 use arca_covenant::{CoinRecord, MedianTime, NewLeaf, RelativeTime};
 
 use super::chain::{hex, unhex32};
+use super::exit::{Here, Payer};
 use super::pay::{In, Out};
 use super::places::{Place, Spend};
 use super::store::CoinRow;
@@ -430,6 +431,15 @@ impl Wallet {
 					it is never held; nothing is to be paid for it", hash)));
 			}
 		}
+		// A lock whose whole path is spent on the chain (in a block or the
+		// mempool) by something else, its input spent again by its payer and
+		// a signer, can never come home: never held, and nothing is paid.
+		let mut path = vec![];
+		Self::path_outputs(coin, &mut path);
+		if self.chain.locate(&path)?.iter().all(Option::is_none) {
+			return Err(Error::Refused(format!("the lock under hash {} rests on a coin spent elsewhere on the chain: it can never come \
+				home, and nothing is to be paid for it", hash)));
+		}
 		let info = self.server_info()?;
 		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
 		let home = self.lock_home(coin, block)?;
@@ -696,10 +706,158 @@ impl Wallet {
 		rec["preimage"] = json!(hex(&preimage));
 		self.set_lock("payee", hash, rec)?;
 		let _ = self.server.post("lock_preimage", &json!({"payment_hash": hash, "preimage": hex(&preimage)}));
+		// The watchtowers have it too: should the wallet be gone before the
+		// claim, a watchtower claims on the chain with it.
+		let _ = self.towers_learn_preimage(hash, &preimage);
 		match self.lock_row("payee", hash)? {
 			Some(_) => self.lock_claim(hash, preimage),
 			None => Ok(json!({"payment_hash": hash, "state": "preimage kept"})),
 		}
+	}
+}
+
+/// How long after a lock's timeout a payer's watchtower waits before it
+/// takes a lock still open home on the chain, in seconds of median time: the
+/// time the payer's wallet has to refund it out of round first.
+pub const TOWER_REFUND_GRACE: u64 = 3_600;
+
+/// The fees a lock's watchtower holds each ending at: the node's floor for
+/// the ending when its wallet signed it, and twice, four and eight times
+/// that. The watchtower broadcasts the cheapest the node takes then.
+pub const ENDING_FEE_STEPS: [u64; 4] = [1, 2, 4, 8];
+
+/// The id of the deposit of lock record `record` (binary form) for its
+/// `role`'s side: the payee's and the payer's of one lock differ.
+pub fn lock_deposit_id(record: &[u8], role: &str) -> [u8; 32] {
+	super::tower::deposit_id(&[record, b"/lock/", role.as_bytes()].concat())
+}
+
+impl Wallet {
+	/// The deposit of the lock coin `row` with a watchtower, `(id, body)`:
+	/// the coin's record and the transactions it rests on, as any deposit,
+	/// and the lock's ending signed beforehand by the key of the wallet's
+	/// side, for the watchtower to broadcast while the wallet is away: the
+	/// payee's CLAIM (its preimage left out, which the watchtower puts in
+	/// once it knows it) or the payer's REFUND, each paying to an on-chain
+	/// address of the wallet's own, at each of [`ENDING_FEE_STEPS`].
+	///
+	/// A signature commits to the outpoint it spends, so each ending is
+	/// signed over the outpoint the lock's leaf has when its path is brought
+	/// on the chain from where it rests now, each step paying its fee from
+	/// its own reserve, as a watchtower brings it. The wallet signs them
+	/// again whenever that outpoint changes (a step of the path came on the
+	/// chain another way). `None` for a lock its side no longer holds open.
+	pub(crate) fn lock_deposit(&mut self, row: &CoinRow) -> Result<Option<(String, Value)>, Error> {
+		let role = if row.state == LOCK_IN { "payee" } else { "payer" };
+		let record = Self::record_of(row)?;
+		let (terms, ..) = lock_terms(&record).ok_or_else(|| Error::Refused("the coin is no lock".into()))?;
+		let hash = hex(&terms.payment_hash);
+		let mut rec = match self.lock_rec(role, &hash)? {
+			Some(r) => r,
+			None => return Ok(None),
+		};
+		let open = match role {
+			"payee" => matches!(rec["state"].as_str(), Some("asked" | "held")),
+			_ => matches!(rec["state"].as_str(), Some("locked" | "locking")),
+		};
+		if !open {
+			return Ok(None);
+		}
+		let (_, a) = self.held(row)?;
+		let coin = a.valid;
+		let bytes = record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?;
+		let bases = self.accepted_bases(&record)?;
+		// Where the leaf comes on the chain, each step paid from its reserve.
+		let mut path = vec![];
+		Self::path_outputs(&coin, &mut path);
+		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
+		let mut payer = Payer::new(None);
+		payer.reserve_only = true;
+		payer.moved = Some(coin.asset);
+		let leaf_at = self.bring(&coin, &mut payer, &mut vec![], &here)?;
+		let preimage = rec["preimage"].as_str().map(String::from);
+		let id = hex(&lock_deposit_id(&bytes, role));
+		// Signed again only when the leaf's outpoint changed.
+		if let Some((old_id, body)) = self.store.deposit(&row.leaf_id)? {
+			let mut v: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+			if old_id == id && v["lock"]["leaf"] == leaf_at.to_string() {
+				if v["lock"]["preimage"].as_str() != preimage.as_deref() && preimage.is_some() {
+					v["lock"]["preimage"] = json!(preimage);
+				}
+				return Ok(Some((id, v)));
+			}
+		}
+		let key = self.coin_key(&row.owner_nonce)?;
+		let index = match rec["tower_claim_index"].as_u64() {
+			Some(i) => i as u32,
+			None => {
+				let i = self.store.take_index(super::keys::RECEIVE)?;
+				rec["tower_claim_index"] = json!(i);
+				self.set_lock(role, &hash, rec.clone())?;
+				i
+			},
+		};
+		let to = self.claim_script(&coin, index)?;
+		// The payee's preimage is not covered by its signature: a placeholder
+		// the watchtower replaces.
+		let after: Vec<Vec<u8>> = if role == "payee" { vec![vec![0u8; 32]] } else { vec![] };
+		let base = self.fee_for(coin.asset, 300)?;
+		let mut endings = vec![];
+		for k in ENDING_FEE_STEPS {
+			let mut payer = Payer::new(None).at_least(base.saturating_mul(k));
+			payer.reserve_only = true;
+			match self.claim_tx(&mut payer, &key, &coin, leaf_at, &to, &after) {
+				Ok(u) => endings.push(hex(&elements::encode::serialize(&u.tx))),
+				Err(_) if !endings.is_empty() => break,
+				Err(e) => return Err(e),
+			}
+		}
+		let block = self.server_info().ok().and_then(|i| i["lightning"]["receive"]["block_seconds"].as_u64()).unwrap_or(60).max(1);
+		let act_from = match role {
+			"payee" => self.lock_home(&coin, block)?,
+			_ => terms.timeout.to_consensus_u32() as u64 + TOWER_REFUND_GRACE,
+		};
+		let body = json!({"genesis_hash": self.genesis.genesis_hash().to_string(), "record": hex(&bytes),
+			"bases": bases.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(),
+			"lock": {"role": role, "payment_hash": hash, "holder": key.x_only_public_key().0.to_string(), "act_from": act_from,
+				"leaf": leaf_at.to_string(), "endings": endings, "preimage": preimage}});
+		Ok(Some((id, body)))
+	}
+
+	/// Refreshes the deposit of every lock the wallet holds open
+	/// ([`Self::lock_deposit`]): a deposit whose body changed is sent to
+	/// every watchtower again. What could not be built is said.
+	pub(crate) fn refresh_lock_deposits(&mut self) -> Result<Vec<Value>, Error> {
+		let mut out = vec![];
+		for state in [LOCK_IN, LOCK_OUT] {
+			for row in self.store.coins_in(state)? {
+				match self.lock_deposit(&row) {
+					Ok(Some((id, body))) => {
+						let text = body.to_string();
+						if self.store.deposit(&row.leaf_id)?.is_none_or(|(i, b)| i != id || b != text) {
+							self.store.put_deposit(&row.leaf_id, &id, &text)?;
+							self.store.delete_deposit_sent_all(&row.leaf_id)?;
+						}
+					},
+					Ok(None) => {},
+					Err(e) => out.push(json!({"leaf_id": row.leaf_id, "error": format!("the lock's watchtower deposit: {}", e)})),
+				}
+			}
+		}
+		Ok(out)
+	}
+
+	/// Hands the preimage of `hash` to every watchtower the wallet names, for
+	/// the locks it holds as payee under it: a watchtower that takes a lock
+	/// home on the chain claims it with it. A watchtower that does not answer
+	/// has it from the next deposit the wallet sends it.
+	pub(crate) fn towers_learn_preimage(&mut self, hash: &str, preimage: &[u8; 32]) -> Vec<Value> {
+		let named = self.tower_list().map(|(n, _)| n).unwrap_or_default();
+		let body = json!({"payment_hash": hash, "preimage": hex(preimage)});
+		named.iter().map(|t| match super::client::ServerClient::new(t).and_then(|c| c.post("lock_preimage", &body)) {
+			Ok(v) => json!({"watchtower": t, "locks": v["locks"]}),
+			Err(e) => json!({"watchtower": t, "error": e.to_string()}),
+		}).collect()
 	}
 }
 
