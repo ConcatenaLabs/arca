@@ -4,11 +4,13 @@
 //! (`lightning pay`), and the next swap pays from a coin of the maker's
 //! choosing. The maker holds working coins and a reserve of one date.
 //!
-//! A lock that names no coin pays in D58's order (furthest from its exit
-//! date, the largest of one date first), so it moves the reserve out of
-//! round, as the wallet's own change, at risk to nobody. The next swap still
-//! pays from a working coin ([`fit_order`]'s amended order), so what the
-//! maker holds at risk after it is at most a working coin, at the harness's
+//! A lock that names no coin pays from a working coin, as a swap chooses
+//! (`fit_order`: a coin already at risk first, then the smallest that pays
+//! alone). In D58's order (furthest from its exit date, the largest of one
+//! date first) it took the reserve, left the reserve's change out of round,
+//! and the next swap spent that change: 4,968,782 at risk at the testnet's
+//! settings. The next swap pays from a working coin too, so what the maker
+//! holds at risk after it is at most a working coin, at the harness's
 //! settings and at the testnet's (`ARCA_TEST_CHECKPOINT_EXIT=0`), where a
 //! trade's change is received and at risk whole. A lock that names its coin
 //! (`--leaf`, the library's `leaves`) pays from that coin alone, and one
@@ -16,8 +18,6 @@
 //! signed.
 //!
 //! Needs what the other scenarios need, and `LIGHTNINGD_EXEC`.
-//!
-//! [`fit_order`]: bark::arca
 
 mod common;
 
@@ -158,15 +158,16 @@ async fn a_lock_and_the_next_swap_leave_a_maker_at_risk_by_at_most_a_working_coi
 	let exit = q.ok(&["info"])["server_info"]["checkpoint_exit"] == true;
 	println!("SL checkpoint_exit {}; the maker's X: {:?}", exit, live(&p, &xs).iter().map(value).collect::<Vec<_>>());
 
-	// 1. A lock naming no coin: D58's order.
+	// 1. A lock naming no coin pays from a working coin, the reserve untouched.
 	let before = values(&p, &xs);
 	let l1 = lock(&r, &p, &q, 10_000, &[]);
 	let spent: Vec<u64> = l1["inputs"].as_array().unwrap().iter().map(|i| before[i.as_str().unwrap()]).collect();
 	println!("SL lock 1 (no coin named) paid from {:?}, change {}; X at risk {}", spent, l1["change"], at_risk(&p, &xs));
-	assert_eq!(spent, vec![5_000_000], "D58: the largest of one date");
+	assert_eq!(spent, vec![100_000], "a working coin, not the reserve of 5,000,000");
+	assert!(live(&p, &xs).iter().any(|c| value(c) == 5_000_000 && c["hops"] == 0), "the reserve stays in round");
 	assert_eq!(at_risk(&p, &xs), 0, "a lock's change is the wallet's own, at risk to nobody");
 
-	// 2. The next swap pays from a working coin, not the reserve's change.
+	// 2. The next swap pays from a working coin or the lock's change, never the reserve.
 	let before = values(&p, &xs);
 	let offer = library(&p, "swap_offer", json!({"give_asset": xs, "give": "20000", "want_asset": ys, "want": "20000"})).unwrap();
 	let ins: Vec<u64> = offer["details"]["inputs"].as_array().unwrap().iter().map(|i| before[i["leaf_id"].as_str().unwrap()]).collect();
@@ -176,12 +177,13 @@ async fn a_lock_and_the_next_swap_leave_a_maker_at_risk_by_at_most_a_working_coi
 	p.ok(&["mailbox"]);
 	let risk = at_risk(&p, &xs);
 	println!("SL the swap of 20,000 paid from {:?}; X at risk after it {} (Y {})", ins, risk, at_risk(&p, &ys));
-	assert_eq!(ins, vec![100_000], "a working coin, not the reserve's change out of round");
+	assert!(ins.len() == 1 && ins[0] <= 100_000, "a working coin or the lock's change, not the reserve: {:?}", ins);
 	assert!(risk <= 100_000, "at most a working coin at risk: {}", risk);
 
 	// 3. A lock naming its coin pays from that coin alone.
-	let working = live(&p, &xs).into_iter().find(|c| value(c) == 100_000).expect("the other working coin");
-	let leaf = working["leaf_id"].as_str().unwrap().to_string();
+	// It names the reserve, which the wallet would never choose by itself.
+	let reserve = live(&p, &xs).into_iter().find(|c| value(c) == 5_000_000).expect("the reserve");
+	let leaf = reserve["leaf_id"].as_str().unwrap().to_string();
 	let l3 = lock(&r, &p, &q, 10_000, &[&leaf]);
 	println!("SL lock 3 (named {}) paid from {}", leaf, l3["inputs"]);
 	assert_eq!(l3["inputs"], json!([leaf]));

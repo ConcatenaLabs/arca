@@ -288,7 +288,7 @@ impl Wallet {
 		let min = Self::min_leaf(&p.info, p.asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
 		let bound = max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM);
-		let (inputs, margin, change) = self.choose_coins(&p.info, p.asset, p.value + p.fee, &htlc_out, min)
+		let (inputs, margin, change) = self.choose_coins_alone_first(&p.info, p.asset, p.value + p.fee, &htlc_out, min, super::places::Spend::Pay)
 			.map_err(|e| invoice_short(&p.info, p.asset, bound, e))?;
 		self.quoted(Ok(Self::pay_quote_of(&p, &inputs, margin, change)))
 	}
@@ -352,7 +352,7 @@ impl Wallet {
 		// selection ([`Error::SettleFirst`]); the leg's swap goes on asking
 		// until it lapses, so they go into the next round now, and it goes
 		// ahead once that round has made them the wallet's own.
-		let (inputs, margin, change) = match self.choose_coins_for(info, asset, value + fee, &htlc_out, min, spend) {
+		let (inputs, margin, change) = match self.choose_coins_alone_first(info, asset, value + fee, &htlc_out, min, spend) {
 			Err(e @ Error::SettleFirst { .. }) if spend == super::places::Spend::CrossChain => {
 				self.settle_proceeds(asset)?;
 				return Err(e);

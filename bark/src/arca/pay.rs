@@ -551,6 +551,19 @@ impl Wallet {
 		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, Reads::ALL, spend)
 	}
 
+	/// [`Self::choose_coins_for`] for a payment over Lightning: one coin that
+	/// pays it alone first, in a swap's order ([`fit_order`]), and D58's order
+	/// only when none does. The `htlc-1` leaf it makes is the operator's to
+	/// claim, held only until its timeout, so the receiver of a direct
+	/// payment, who keeps the coin and is handed the longest life the payer
+	/// can give (D58), is not served by it; a large coin spent on a small
+	/// payment would only move its remainder out of round.
+	pub(crate) fn choose_coins_alone_first(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64,
+		spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
+	{
+		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, true, Reads::ALL, spend)
+	}
+
 	/// Runs `f` paying only from the coins `leaves` names, when it names
 	/// any: a swap offer or a payment over Lightning whose caller chooses its
 	/// coins (a maker naming a working coin, so a reserve stays in round).
@@ -609,8 +622,8 @@ impl Wallet {
 
 	/// The live coins of `asset`, furthest from their exit date first (D58:
 	/// what a receiver gets has the longest life the wallet can give it), the
-	/// largest first among those of one date, each resolved (a swap reorders
-	/// them, [`fit_order`]); a coin past its
+	/// largest first among those of one date, each resolved (a swap and a
+	/// payment over Lightning reorder them, [`fit_order`]); a coin past its
 	/// exit deadline is not paid on (the operator co-signs no spend of it,
 	/// and `sync` takes it on the chain), nor one an offline-refresh plan
 	/// names ([`super::plan`]). While a quote runs, the coins it counts in
@@ -988,7 +1001,8 @@ impl Wallet {
 		}
 	}
 
-	/// [`Self::choose`] from the coins live now. With `fit` (a swap), no coin
+	/// [`Self::choose`] from the coins live now. With `fit` (a swap, or a
+	/// payment over Lightning), no coin
 	/// at the operator's depth limit is taken (its spend could only be
 	/// refused, after the other side signed), and each coin [`fit_order`]
 	/// names is tried alone first, with its real margins: the first whose
@@ -3996,7 +4010,8 @@ pub(crate) struct FitCoin {
 	pub at_risk: bool,
 }
 
-/// The coins a swap tries alone, in order, by index into `coins`: those
+/// The coins a swap, or a payment over Lightning, tries alone, in order, by
+/// index into `coins`: those
 /// with at least [`FIT_LIFE`] left before their expiry at `now` (so the coin
 /// the other side gets lives at least that long), worth at least `paid`, in
 /// two tiers (D93, as amended for #892):
@@ -4035,7 +4050,9 @@ pub(crate) struct FitCoin {
 /// spent its own change of 848,792 (at risk to nobody) on a trade of 20,000
 /// while working coins paid it alone, and on an operator without checkpoint
 /// exits the trade's change, at risk whole, held its instant budget full
-/// until a round refreshed it (#892).
+/// until a round refreshed it (#892). A payment over Lightning taken in D58's
+/// order (the largest of the latest date first) spent a maker's reserve of
+/// 5,000,000 on a lock of 10,000, and the next swap spent the reserve's change.
 pub(crate) fn fit_order(coins: &[FitCoin], paid: u64, depth_limit: Option<usize>, now: u32) -> Vec<usize> {
 	let lives = |e: u32| e == u32::MAX || e >= now.saturating_add(FIT_LIFE);
 	let fits = |i: &usize| coins[*i].value >= paid && lives(coins[*i].expiry);

@@ -845,7 +845,9 @@ and a board whose registration never reached the server, are not recovered.
   (`Wallet::sync_exits`) takes those steps alone and asks the operator
   nothing. A payment spends the coins furthest from
   their exit date first, so a receiver gets the longest life the wallet can
-  give it.
+  give it. A payment over Lightning and a swap pay from one coin alone where
+  one does, with at least seven days of life: a coin already at risk out of
+  round first, then the smallest (see `swap offer`).
 
 - **The operator's keepers.** An operator's signer may hand every head of its
   record to keepers on other machines, and answer an entry only once enough
@@ -1002,7 +1004,11 @@ pays an invoice in another; one for no amount, or expiring within a minute;
 one it is paying or has paid already; an asset the operator does not serve,
 serves with no Lightning node, or whose node is down (`info`); and an
 operator's fee above the wallet's bound (10,000 millionths of the amount,
-raised for one payment with `--max-fee-ppm`). The coins then go, through
+raised for one payment with `--max-fee-ppm`). The payment takes one coin
+that pays it alone where one does, as a swap chooses it (a coin already at
+risk out of round first, then the smallest, with at least seven days of
+life), and otherwise the coins furthest from their exit date first, the
+largest first; `--leaf` names its coins instead. The coins then go, through
 checkpoints and a reassignment, into an `htlc-1` leaf of the wallet's own key
 locked to the invoice's payment hash, holding the amount and the operator's
 fee, and the change; the operator co-signs and pays the invoice. The wallet
