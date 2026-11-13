@@ -136,11 +136,6 @@ async fn busy_of(r: &mut Running, m: &Arca, b: &Arca, paid: usize, done: usize, 
 	}
 }
 
-/// `b` pays `m` `n` coins of 20,000 X.
-async fn pay_many(r: &mut Running, m: &Arca, b: &Arca, n: usize) {
-	pay_many_of(r, m, b, n, 20_000).await;
-}
-
 /// `b` pays `m` `n` coins of `amount` X.
 async fn pay_many_of(r: &mut Running, m: &Arca, b: &Arca, n: usize, amount: u64) {
 	let x = r.x;
