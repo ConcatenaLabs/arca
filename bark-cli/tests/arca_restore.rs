@@ -1808,3 +1808,69 @@ async fn a_history_in_slices_keeps_no_ask_waiting() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// A wallet whose history chains its refreshes, read back a step at a time:
+/// two boards given up together in one refresh, its new leaf refreshed
+/// again. Restored from the mnemonic, the history is taken a coin or two a
+/// step (every answer of the operator slowed, each step's budget a
+/// millisecond). Taking a coin completes the refresh it was given up in,
+/// whose new leaf, recovered from the published tree, is then settled as
+/// given up in the next refresh: that refresh is completed in the same step.
+/// After every step a sync runs no forfeit step again, no participation is
+/// left in its forfeit step, and the balance is the lost wallet's (arca
+/// #879, #882).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_read_a_step_at_a_time_leaves_no_refresh_half_restored() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let a = Arca::new("H1");
+	let url = r.url();
+	let boards = boarded(&mut r, &a, &url, &[(x, 2_000_000), (x, 2_000_000)]).await;
+	a.ok(&["participate", "--leaf", &boards[0], "--leaf", &boards[1]]);
+	final_round(&r).await;
+	let s = a.ok(&["sync"]);
+	let first = s["participations"].as_array().unwrap().iter().find(|p| p["state"] == "released").cloned()
+		.unwrap_or_else(|| panic!("the first refresh: {}", s));
+	let n = first["new_leaves"][0]["leaf_id"].as_str().unwrap().to_string();
+	a.ok(&["participate", "--leaf", &n]);
+	final_round(&r).await;
+	let s = a.ok(&["sync"]);
+	assert!(s["participations"].as_array().unwrap().iter().any(|p| p["state"] == "released"), "the second refresh: {}", s);
+	let lost = a.ok(&["balance"]);
+	println!("H1 the lost wallet: {}", lost["held"]);
+
+	let proxy = Proxy::start(&r.url());
+	let b = Arca::new("H2");
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let node = r.node_url();
+	let mut args = create_args(&proxy.url, &node);
+	args.extend(["--mnemonic", mnemonic.trim()]);
+	proxy.delay(std::time::Duration::from_millis(400));
+	b.ok(&args);
+	let check = |when: &str| {
+		let half: Vec<Value> = b.ok(&["participations"]).as_array().unwrap().iter()
+			.filter(|p| matches!(p["state"].as_str(), Some("forfeiting" | "issued"))).cloned().collect();
+		assert!(half.is_empty(), "{}: a refresh left in its forfeit step: {:?}", when, half);
+		assert_eq!(b.ok(&["balance"])["held"], lost["held"], "{}: the balance is the lost wallet's", when);
+	};
+	check("after the restore");
+	let mut steps = 0;
+	loop {
+		let h = b.ok(&["restore-history", "--budget-ms", "1"]);
+		steps += 1;
+		println!("H2 step {}: checked {} left {}", steps, h["checked"], h["left"]);
+		// A sync right after the step (it runs no re-check on start, as a
+		// program that keeps the wallet open runs none between its syncs):
+		// it runs no forfeit step again for a refresh the restore found.
+		let s = b.ok(&["sync"]);
+		assert_eq!(proxy.count("/v1/forfeit_leaves"), 0, "after step {}, a forfeit step run again: {}", steps, s["participations"]);
+		check(&format!("after step {}", steps));
+		if h.is_null() || h["left"] == 0 || steps > 20 {
+			break;
+		}
+	}
+	proxy.delay(std::time::Duration::ZERO);
+	for w in [&a, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

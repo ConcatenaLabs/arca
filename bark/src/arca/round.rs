@@ -1781,6 +1781,20 @@ impl Wallet {
 							},
 						}
 					}
+					// A participation a restore found in its forfeit step, on the
+					// wallet's own forfeits, whose new leaves it has not recorded yet:
+					// the restore's own pass rebuilds them from the published tree and
+					// completes it ([`Self::restore_participations`]); its forfeit
+					// step is not run again.
+					if state == "forfeiting" && self.store.participation_news(&pid)?.is_none()
+						&& serde_json::from_str::<Value>(&body).is_ok_and(|b| b["restored"] == json!(true))
+					{
+						let (mut restored, mut not_recovered) = (vec![], vec![]);
+						let now = self.now()?;
+						let notes = self.restore_participations(&mut BTreeMap::new(), now, &mut restored, &mut not_recovered)?;
+						out.push(json!({"participation": pid, "state": "forfeiting", "restored": notes, "not_recovered": not_recovered}));
+						continue;
+					}
 					if self.handed_held(&pid, &st)? {
 						out.push(Self::handed_note(&pid, &st));
 						continue;

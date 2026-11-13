@@ -1338,12 +1338,26 @@ impl Wallet {
 		}
 		let wanted: BTreeSet<[u8; 32]> = held.iter().map(|(_, c)| c.owner_nonce).collect();
 		let spenders = self.held_spenders(&wanted, &BTreeSet::new(), now)?;
+		let mut settled = 0;
 		for (e, c) in held {
 			if !matches!(c.state.as_str(), "live" | "pending" | "sending") {
 				continue;
 			}
 			let Some(coin) = self.held_valid(&c, now) else { continue };
 			notes.extend(self.restore_given(&c.leaf_id, &e, &coin, now, &spenders)?);
+			settled += 1;
+		}
+		// A coin settled here may have been given up in a participation the
+		// operator released, now followed in its forfeit step on the wallet's
+		// own forfeits: it is completed here, as a coin's pass completes it,
+		// and not left given up with no new leaves recorded until a later
+		// step, when a sync would run its forfeit step again and a quote
+		// would count its new leaves as arriving.
+		if settled > 0 {
+			let (mut restored, mut not_recovered) = (vec![], vec![]);
+			notes.extend(self.restore_participations(&mut BTreeMap::new(), now, &mut restored, &mut not_recovered)?);
+			notes.extend(restored.into_iter().map(|r| json!({"leaf_id": r["leaf_id"], "note": "recovered from the published tree", "restored": r})));
+			notes.extend(not_recovered);
 		}
 		Ok((rest, notes))
 	}
@@ -1928,6 +1942,18 @@ impl Wallet {
 		}
 		let round = current.first().map(|(f, _)| f.round.clone());
 		let note = |what: &str| json!({"leaf_id": id, "participation": pid, "state": what});
+		// A participation the wallet completed already (a coin of it taken
+		// before this one, its new leaves opened by their preimage) stays
+		// completed: this coin, given up in it under the wallet's own forfeit
+		// for that round, is spent with the others, never put back in a
+		// forfeit step whose new leaves would count as still to come.
+		if let Some((_, _, _, _, held_state, Some(_), Some(held_round))) = s.participation(&pid).map_err(|e| e.to_string())? {
+			if held_state == "released" && state == "released" && round.as_deref() == Some(held_round.as_str()) {
+				s.set_coin_spent(id, &format!("participation {}", pid)).map_err(|e| e.to_string())?;
+				s.set_forfeit_state(id, &held_round, "settled", "").map_err(|e| e.to_string())?;
+				return Ok(Some(note("released")));
+			}
+		}
 		Ok(Some(match state {
 			"pending" => {
 				s.set_participation(&pid, "pending", None, None).map_err(|e| e.to_string())?;
@@ -1984,7 +2010,7 @@ impl Wallet {
 	/// from the published tree, and said so), the coins it gave up spent.
 	/// Without the preimage the coins stay given up under their forfeits,
 	/// followed on the chain, and `sync` completes it once the preimage is out.
-	fn restore_participations(&mut self, trees: &mut BTreeMap<(String, u32), (Value, Batch)>, now: MedianTime, restored: &mut Vec<Value>,
+	pub(crate) fn restore_participations(&mut self, trees: &mut BTreeMap<(String, u32), (Value, Batch)>, now: MedianTime, restored: &mut Vec<Value>,
 		not_recovered: &mut Vec<Value>) -> Result<Vec<Value>, Error>
 	{
 		let mut notes = vec![];
