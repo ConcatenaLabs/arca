@@ -17,8 +17,9 @@
 //! 4. Every slice is a call of its own (the library opened afresh, as a
 //!    process that stopped between two slices): the pass goes on from the
 //!    store. A pass left for more than ten minutes of median time starts
-//!    again, re-check included; so does one asked with other arguments, and a
-//!    sync without a budget runs a whole pass and drops the resume point.
+//!    again, re-check included; other arguments start a pass of their own,
+//!    and a sync without a budget runs a whole pass and drops every resume
+//!    point.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -458,7 +459,7 @@ async fn a_pass_goes_on_from_the_store_and_starts_again_when_stale() {
 	println!("SL4 after 700 s: {}", again);
 	assert_eq!(again["slice"], 1, "a stale pass starts again: {}", again);
 	assert!(again["cost_by_step"].as_object().unwrap().contains_key("witness"), "{}", again);
-	// Other arguments: the pass starts again.
+	// Other arguments: a pass of their own.
 	let other = library(&m, "sync", json!({"budget_ms": 1, "deposits": false})).unwrap();
 	assert_eq!(other["slice"], 1, "{}", other);
 	// No budget: a whole pass, and no resume point left.

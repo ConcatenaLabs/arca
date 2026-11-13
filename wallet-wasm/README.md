@@ -252,9 +252,11 @@ since without the operator each step after is short. Each slice but the last ans
 whole `sync` answers, with `slices`, and each step's `cost_by_step` entry names
 the slice it ran in (`slice`): each part says what its step did then, not the
 coins as they stand now. `sync`'s `schedule` stays `due` while a pass in slices
-is under way. A pass left unfinished for ten minutes of median time, or resumed
-with other arguments, starts again from the beginning; a `sync` without
-`budget_ms` runs a whole pass at once. `deposits` with `budget_ms` answers
+is under way. Each set of arguments has a pass of its own, so two callers that
+sync in slices with other arguments each go on with theirs. A pass left
+unfinished for ten minutes of median time starts again from the beginning; a
+`sync` without `budget_ms` runs a whole pass at once and ends every pass under
+way. `deposits` with `budget_ms` answers
 `{"deposits": [...], "more": true}` until its last slice, which answers
 `{"deposits": [...]}`; without it, the list. A
 command that only reads, run as one of a burst, answers from the look at the

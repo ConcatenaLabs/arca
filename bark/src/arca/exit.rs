@@ -1987,6 +1987,7 @@ impl Wallet {
 		let args = json!([catch_up, deposits, history]);
 		let resumed = match budget_ms {
 			Some(_) => self.sync_resume(now, &args)?,
+			// A whole pass ends every pass under way.
 			None => {
 				self.store.delete_meta(super::slice::SYNC_RESUME)?;
 				None
@@ -2026,7 +2027,7 @@ impl Wallet {
 		let more = match out {
 			Ok(more) => more,
 			Err(e) => {
-				let _ = self.store.delete_meta(super::slice::SYNC_RESUME);
+				let _ = self.drop_resume(&r.args);
 				return Err(e);
 			},
 		};
@@ -2034,7 +2035,7 @@ impl Wallet {
 			self.keep_resume(&r)?;
 			return Ok(json!({"more": true, "next": next, "slice": r.slices, "cost_by_step": std::mem::take(&mut r.last)}));
 		}
-		self.store.delete_meta(super::slice::SYNC_RESUME)?;
+		self.drop_resume(&r.args)?;
 		Ok(Self::sync_answer(r, budget_ms.is_some()))
 	}
 
@@ -2265,7 +2266,7 @@ impl Wallet {
 			self.store.set_meta(super::wallet::LAST_EXITS, &now.to_consensus_u32().to_string())?;
 		}
 		// The pass is done: the schedule is not held due for it.
-		self.store.delete_meta(super::slice::SYNC_RESUME)?;
+		self.drop_resume(&r.args)?;
 		let schedule = self.sync_schedule().unwrap_or_else(|e| json!({"error": e.to_string()}));
 		r.out.insert("schedule".into(), schedule);
 		steps.lap(self, "schedule");

@@ -30,10 +30,15 @@
 //! again. A slice whose witness fails has waited out the witness's
 //! patience: it runs the rest of the pass, as one call does, so the
 //! patience is paid once a pass and the steps that take coins home when the
-//! operator cannot be reached come in every pass. A resume point older than [`RESUME_FOR`] seconds of median time,
-//! or left by a call with other arguments, is dropped: the call starts a
-//! whole pass, re-check included, and answers `more` until that pass is
-//! done. A call without `budget_ms` drops it too, and runs the whole pass.
+//! operator cannot be reached come in every pass.
+//!
+//! A resume point is kept for each set of arguments, so a caller that syncs
+//! in slices with other arguments than another (`catch_up`, `deposits`)
+//! goes on with its own pass and never drops the other's. A resume point
+//! older than [`RESUME_FOR`] seconds of median time is dropped: the next
+//! call with its arguments starts a whole pass, re-check included, and
+//! answers `more` until that pass is done. A call without `budget_ms` runs
+//! a whole pass at once and drops every resume point.
 //!
 //! **What a sliced pass answers.** Each slice but the last answers
 //! `{"more": true, "next": <step>, "slice": <n>, "cost_by_step": ...}`. The
@@ -158,29 +163,60 @@ impl Resume {
 }
 
 impl Wallet {
-	/// The resume point of a sliced `sync` with arguments `args`, at median
-	/// time `now`: `None`, and dropped, when there is none, it is older than
-	/// [`RESUME_FOR`], or another call's.
-	pub(crate) fn sync_resume(&self, now: u32, args: &Value) -> Result<Option<Resume>, Error> {
-		let Some(v) = self.store.meta(SYNC_RESUME)? else { return Ok(None) };
-		let r = serde_json::from_str::<Value>(&v).ok().and_then(|v| Resume::from_json(&v));
-		match r {
-			Some(r) if r.args == *args && now >= r.started && now - r.started <= RESUME_FOR => Ok(Some(r)),
-			_ => {
-				self.store.delete_meta(SYNC_RESUME)?;
-				Ok(None)
-			},
+	/// The resume points of the passes under way, one an argument set, as
+	/// kept: every entry, by its arguments.
+	fn resumes(&self) -> Result<serde_json::Map<String, Value>, Error> {
+		let kept = self.store.meta(SYNC_RESUME)?.and_then(|v| serde_json::from_str::<Value>(&v).ok());
+		Ok(match kept {
+			Some(Value::Object(m)) => m,
+			_ => serde_json::Map::new(),
+		})
+	}
+
+	fn keep_resumes(&self, m: &serde_json::Map<String, Value>) -> Result<(), Error> {
+		if m.is_empty() {
+			self.store.delete_meta(SYNC_RESUME)
+		} else {
+			self.store.set_meta(SYNC_RESUME, &Value::Object(m.clone()).to_string())
 		}
 	}
 
+	/// The resume point of a sliced `sync` with arguments `args`, at median
+	/// time `now`: `None` when there is none. Every resume point older than
+	/// [`RESUME_FOR`], or that cannot be read, is dropped. A pass is kept for
+	/// each argument set, so a caller never drops another's: two programs, or
+	/// two loops of one, that sync in slices with other arguments each end
+	/// their own passes.
+	pub(crate) fn sync_resume(&self, now: u32, args: &Value) -> Result<Option<Resume>, Error> {
+		let mut m = self.resumes()?;
+		let before = m.len();
+		m.retain(|_, v| Resume::from_json(v).is_some_and(|r| now >= r.started && now - r.started <= RESUME_FOR));
+		if m.len() != before {
+			self.keep_resumes(&m)?;
+		}
+		Ok(m.get(&args.to_string()).and_then(Resume::from_json))
+	}
+
 	pub(crate) fn keep_resume(&self, r: &Resume) -> Result<(), Error> {
-		self.store.set_meta(SYNC_RESUME, &r.to_json().to_string())
+		let mut m = self.resumes()?;
+		m.insert(r.args.to_string(), r.to_json());
+		self.keep_resumes(&m)
+	}
+
+	/// Drops the resume point of the pass with arguments `args`: it ended,
+	/// or failed.
+	pub(crate) fn drop_resume(&self, args: &Value) -> Result<(), Error> {
+		let mut m = self.resumes()?;
+		if m.remove(&args.to_string()).is_some() {
+			self.keep_resumes(&m)?;
+		}
+		Ok(())
 	}
 
 	/// Whether a sliced pass is under way: `sync`'s schedule is due while
 	/// one is.
 	pub(crate) fn sync_in_slices(&self) -> Result<bool, Error> {
-		Ok(self.store.meta(SYNC_RESUME)?.is_some())
+		Ok(!self.resumes()?.is_empty())
 	}
 
 	/// The next item `key` of the step under way: run, passed over (done
