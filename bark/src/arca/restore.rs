@@ -313,6 +313,11 @@ impl Wallet {
 		self.keep_history(&history)?;
 		let TakenServed { mut restored, not_recovered, mut notes, given_elsewhere: _ } =
 			self.take_served(&info, &now_entries, &served_receives, false, Some(&mut steps))?;
+		// A coin taken at once that a coin before it brought in (a refresh
+		// it completed recovered it from the published tree) was held when
+		// its turn came: how it was given up is applied now.
+		let (_, settled) = self.settle_held_history(&now_entries)?;
+		notes.extend(settled);
 		let (history, settled) = self.settle_held_history(&history)?;
 		notes.extend(settled);
 		self.keep_history(&history)?;
@@ -1225,6 +1230,12 @@ impl Wallet {
 			let t = web_time::Instant::now();
 			let TakenServed { restored: r, not_recovered: n, notes: taken_notes, given_elsewhere: _ } =
 				self.take_served(&info, &batch, &[], false, None)?;
+			// A coin of the batch that a coin before it brought in (a refresh it
+			// completed recovered it from the published tree) was held when its
+			// turn came, and the pass took it as held: how it was given up is
+			// applied now, by its own served record.
+			let (_, settled) = self.settle_held_history(&batch)?;
+			notes.extend(settled);
 			parts["take"] = json!(parts["take"].as_u64().unwrap_or(0) + t.elapsed().as_millis() as u64);
 			let per = t.elapsed().as_millis() as u64 / batch.len() as u64;
 			// The pace rises at once to a dearer coin's cost and falls by halves.
