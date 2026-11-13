@@ -1023,8 +1023,10 @@ impl Wallet {
 	/// reached; each coin this store holds live or pending, by id, with the
 	/// whole entry of those given up for good; and each leaf it read and
 	/// could not take yet, by id, for a day ([`UNTAKEN_ASKED_FOR`]). Once a
-	/// day ([`WHOLE_READ_EVERY`]), at its first catch-up, and once a
-	/// restore's history is done, it reads from the first leaf. From an
+	/// day ([`WHOLE_READ_EVERY`]), at its first catch-up, once a restore's
+	/// history is done, and when the operator's cursors start a new epoch
+	/// (`info.leaf_data.epoch`: its database restored), it reads from the
+	/// first leaf. From an
 	/// operator without such reads, every leaf every time, as a restore does.
 	pub fn catch_up(&mut self) -> Result<Value, Error> {
 		Ok(self.catch_up_within(None)?.0)
@@ -1072,12 +1074,17 @@ impl Wallet {
 		let settled = page > 0;
 		let mut read = self.catch_up_read()?;
 		let now = unix_now();
+		// The epoch of the operator's settled cursors: a cursor of another
+		// (its database restored from a dump meanwhile) reads from the first
+		// leaf.
+		let epoch = info["leaf_data"]["epoch"].as_str().unwrap_or("").to_string();
+		let of_epoch = |c: &Option<String>| c.as_deref().is_some_and(|c| c == "0" || c.split(':').next() == Some(epoch.as_str()));
 		let mut pass = match read.pass.take() {
-			// A read started in the other way (the operator moved meanwhile)
-			// starts again.
-			Some(p) if p.since.is_some() == settled => p,
+			// A read started in the other way (the operator moved meanwhile),
+			// or past a cursor of another epoch, starts again.
+			Some(p) if p.since.is_some() == settled && (!settled || of_epoch(&p.since)) => p,
 			_ if settled => {
-				let whole = read.since.is_none() || read.whole_at.map_or(true, |w| now.saturating_sub(w) >= WHOLE_READ_EVERY);
+				let whole = !of_epoch(&read.since) || read.whole_at.map_or(true, |w| now.saturating_sub(w) >= WHOLE_READ_EVERY);
 				let mut held: Vec<String> = self.store.coins_in_states(&["live", "pending"])?.into_iter().map(|c| c.leaf_id).collect();
 				held.sort();
 				let ids: Vec<String> = read.untaken.iter().filter(|(_, t)| now.saturating_sub(**t) < UNTAKEN_ASKED_FOR)

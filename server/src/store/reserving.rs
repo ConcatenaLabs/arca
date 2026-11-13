@@ -179,23 +179,21 @@ impl Store {
 	/// Up to `limit` leaves served to `key` past the settled cursor `since`
 	/// (a transaction and a `seq`; `(0, 0)` from the first), as
 	/// [`Store::served_leaves`] serves them, ordered by when each came to be
-	/// served to `key`: the later of the transaction that made the leaf and
-	/// the one that bound its owner key to `key` (`leaf.made_xid`,
-	/// `leaf_mailbox.bound_xid`), then its `seq`. Only leaves whose
-	/// transactions are older than every one still running, so none can
-	/// still appear behind a cursor read past. Each with its own settled
-	/// cursor.
+	/// served to `key` (`leaf_served.served_xid`: the latest of the
+	/// transactions that made the leaf, bound its owner key to `key`, posted
+	/// it to `key`), then its `seq`: a range of one index, whatever the key's
+	/// history. Only leaves whose transaction is older than every one still
+	/// running, so none can still appear behind a cursor read past. Each with
+	/// its own settled cursor.
 	pub async fn served_since(&self, key: &[u8; 32], since: (u64, i64), limit: i64) -> Result<Vec<(ServedLeaf, (u64, i64))>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			// The cursor is compared and ordered as a transaction id
-			// (`l.made`), never as its text: "1000000" sorts before "999999".
-			&format!("SELECT {}, l.made::text AS made_text FROM (
-			     SELECT l.*, GREATEST(COALESCE(l.made_xid, '0'::xid8), COALESCE((SELECT m.bound_xid FROM leaf_mailbox m
-			                 WHERE m.owner_key = l.owner_key AND m.mailbox_key = $1), '0'::xid8)) AS made
-			     FROM leaf l WHERE l.leaf_id IN ({})) l
-			 WHERE (l.made, l.seq) > ($2::text::xid8, $3) AND l.made < pg_snapshot_xmin(pg_current_snapshot())
-			 ORDER BY l.made, l.seq LIMIT $4", SERVED_COLUMNS, SERVED_TO),
+			// The cursor is compared and ordered as a transaction id, never
+			// as its text: "1000000" sorts before "999999".
+			&format!("SELECT {}, s.served_xid::text AS made_text FROM leaf_served s JOIN leaf l ON l.leaf_id = s.leaf_id
+			 WHERE s.mailbox_key = $1 AND (s.served_xid, s.seq) > ($2::text::xid8, $3)
+			   AND s.served_xid < pg_snapshot_xmin(pg_current_snapshot())
+			 ORDER BY s.served_xid, s.seq LIMIT $4", SERVED_COLUMNS),
 			&[&&key[..], &since.0.to_string(), &since.1, &limit],
 		).await?;
 		let mut made = Vec::with_capacity(rows.len());
@@ -204,6 +202,57 @@ impl Store {
 			made.push((x.parse::<u64>().map_err(|_| StoreError::Corrupt(format!("transaction id {}", x)))?, r.get::<_, i64>(10)));
 		}
 		Ok(served_rows(&*conn, &rows).await?.into_iter().zip(made).collect())
+	}
+
+	/// The epoch of the settled cursors ([`Store::served_since`]), drawn the
+	/// first time. Run when the server starts: a database whose transaction
+	/// counter is behind a transaction its leaves were served at was
+	/// restored from a dump (whose counter starts again), and every cursor a
+	/// wallet holds would then lie past the leaves made from now on. It then
+	/// draws a new epoch and sets every served transaction to 0, so a wallet
+	/// holding a cursor of the old epoch reads from the first leaf, and the
+	/// leaves made from now on lie past every cursor of the new one.
+	pub async fn cursor_epoch_at_start(&self) -> Result<[u8; 8], StoreError> {
+		let mut conn = self.conn().await?;
+		let tx = conn.transaction().await?;
+		tx.batch_execute("LOCK TABLE leaf_cursor_epoch IN EXCLUSIVE MODE").await?;
+		let behind: bool = tx.query_one(
+			"SELECT pg_current_xact_id() < COALESCE((SELECT max(served_xid) FROM leaf_served), '0'::xid8)", &[]).await?.get(0);
+		let kept = tx.query_opt("SELECT epoch FROM leaf_cursor_epoch", &[]).await?;
+		let epoch = match kept {
+			Some(r) if !behind => {
+				let e: Vec<u8> = r.get(0);
+				e.try_into().map_err(|_| StoreError::Corrupt("the cursor epoch".into()))?
+			},
+			_ => {
+				let mut e = [0u8; 8];
+				rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut e);
+				if behind {
+					log::warn!("the database's transaction counter is behind its leaves' (restored from a dump?): the settled cursors start a \
+						new epoch, and every wallet reads from the first leaf at its next catch-up");
+					tx.batch_execute("UPDATE leaf_served SET served_xid = '0'::xid8 WHERE served_xid <> '0'::xid8;
+						UPDATE leaf SET made_xid = NULL WHERE made_xid IS NOT NULL;
+						UPDATE leaf_mailbox SET bound_xid = NULL WHERE bound_xid IS NOT NULL;").await?;
+				}
+				tx.execute("INSERT INTO leaf_cursor_epoch (one, epoch) VALUES (true, $1) ON CONFLICT (one) DO UPDATE SET epoch = $1",
+					&[&&e[..]]).await?;
+				e
+			},
+		};
+		tx.commit().await?;
+		Ok(epoch)
+	}
+
+	/// The epoch of the settled cursors now ([`Store::cursor_epoch_at_start`]).
+	pub async fn cursor_epoch(&self) -> Result<[u8; 8], StoreError> {
+		let conn = self.conn().await?;
+		match conn.query_opt("SELECT epoch FROM leaf_cursor_epoch", &[]).await? {
+			Some(r) => {
+				let e: Vec<u8> = r.get(0);
+				e.try_into().map_err(|_| StoreError::Corrupt("the cursor epoch".into()))
+			},
+			None => Ok([0u8; 8]),
+		}
 	}
 
 	/// The leaves of `ids` served to `key`, as [`Store::served_leaves`]

@@ -2140,6 +2140,9 @@ impl Server {
 			})
 		});
 
+		// The settled cursors' epoch, a new one on a database restored from a dump
+		// ([`Store::cursor_epoch_at_start`]).
+		store.cursor_epoch_at_start().await.map_err(err("the database"))?;
 		let app = Arc::new(App {
 			store: store.clone(), params: params.clone(), boards: boards.clone(), cosigner: cosigner.clone(),
 			participations: participations.clone(), plans: plans.clone(), orders: orders.clone(), rounds: rounds.clone(), forfeits: forfeits.clone(),

@@ -121,7 +121,8 @@ coin the store holds live or pending by id (with the whole entry of those
 given up for good), and, for a day, each leaf it read and could not take yet
 (a round's leaf served without its record until its round is released), by
 id; once a day, at its first catch-up and once a restore's history is done,
-it reads from the first leaf (`read` says which). From an operator without
+it reads from the first leaf (`read` says which), and when the operator's
+cursors start a new epoch (`info.leaf_data.epoch`, its database restored). From an operator without
 such reads it reads every page from the first, as a restore does. A `sync`
 spends about a second on it (`SYNC_CATCH_UP_MS`) and stops after the page it
 was reading (`more`); the next `sync` reads on from there, every page's coins

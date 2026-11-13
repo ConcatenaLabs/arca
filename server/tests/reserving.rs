@@ -286,7 +286,7 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	// coins' states, with the whole entry of one given up for good; leaves
 	// asked by id; nothing of a leaf not served to the key.
 	let info = r.http.get("info").ok();
-	assert_eq!(info["leaf_data"], json!({"page": 100, "held": 400, "leaf_ids": 100}));
+	assert_eq!((&info["leaf_data"]["page"], &info["leaf_data"]["held"], &info["leaf_data"]["leaf_ids"]), (&json!(100), &json!(400), &json!(100)));
 	let settled = |since: &str, limit: u32, held: &[[u8; 32]], ids: &[[u8; 32]]| {
 		let request = server::auth::leaf_since_request(since, limit, held, ids);
 		r.http.post("leaf_data", &json!({"auth": r.http.auth_for("leaf_data", &a_mailbox, &r.chain, &request), "since": since, "limit": limit,
@@ -332,14 +332,13 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	// leaves made by transactions 8, 9 and 10 (in that order; "10" sorts
 	// before "8" as text) are each served once, in that order, a page of one
 	// at a time.
-	{
+	let since = {
 		let (sql, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
 		tokio::spawn(conn);
 		for (i, e) in all.iter().enumerate() {
-			sql.execute("UPDATE leaf SET made_xid = $2::text::xid8 WHERE leaf_id = decode($1, 'hex')",
-				&[&e["leaf_id"].as_str().unwrap(), &(8 + i).to_string()]).await.unwrap();
+			sql.execute("UPDATE leaf_served SET served_xid = $2::text::xid8 WHERE leaf_id = decode($1, 'hex') AND mailbox_key = $3",
+				&[&e["leaf_id"].as_str().unwrap(), &(8 + i).to_string(), &&xonly(&a_mailbox).serialize()[..]]).await.unwrap();
 		}
-		sql.execute("UPDATE leaf_mailbox SET bound_xid = '3'::xid8", &[]).await.unwrap();
 		let mut since = "0".to_string();
 		let mut read = vec![];
 		loop {
@@ -352,9 +351,32 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 		assert_eq!(read, all, "every leaf once, in order, across 9 to 10");
 		// The leaves' cursors as transactions 9 and 10 with their seq: past
 		// 9, the leaf of 10 alone.
-		let past = settled(&format!("9.{}", all[1]["cursor"].as_str().unwrap()), 100, &[], &[]).ok();
+		let epoch = info["leaf_data"]["epoch"].as_str().unwrap().to_string();
+		assert_eq!(epoch.len(), 16, "{}", info["leaf_data"]);
+		assert!(since.starts_with(&format!("{}:", epoch)), "a cursor names its epoch: {}", since);
+		let past = settled(&format!("{}:9.{}", epoch, all[1]["cursor"].as_str().unwrap()), 100, &[], &[]).ok();
 		assert_eq!(past["leaves"].as_array().unwrap().len(), 1, "{}", past);
-	}
+
+		// A database restored from a dump starts its transaction counter
+		// again: the server, starting on it, finds its counter behind the
+		// transactions its leaves were served at, and starts a new epoch, its
+		// leaves served at transaction 0. A cursor of the old epoch reads from
+		// the first leaf.
+		sql.execute("UPDATE leaf_served SET served_xid = '9000000000000'::xid8 WHERE mailbox_key = $1",
+			&[&&xonly(&a_mailbox).serialize()[..]]).await.unwrap();
+		let new_epoch = r.db.store.cursor_epoch_at_start().await.unwrap();
+		assert_ne!(hex(&new_epoch), epoch, "a new epoch");
+		assert_eq!(r.http.get("info").ok()["leaf_data"]["epoch"], json!(hex(&new_epoch)));
+		let left: i64 = sql.query_one("SELECT count(*) FROM leaf_served WHERE served_xid <> '0'::xid8", &[]).await.unwrap().get(0);
+		assert_eq!(left, 0, "every served transaction set to 0");
+		let again = settled(&since, 100, &[], &[]).ok();
+		assert_eq!(again["leaves"].as_array().unwrap().len(), all.len(), "a cursor of the old epoch reads from the first leaf: {}", again);
+		assert!(again["next"].as_str().unwrap().starts_with(&hex(&new_epoch)), "{}", again);
+		// The server starting again on it keeps the epoch.
+		assert_eq!(r.db.store.cursor_epoch_at_start().await.unwrap(), new_epoch);
+		// A's end, in the new epoch: what the late binding below reads past.
+		again["next"].as_str().unwrap().to_string()
+	};
 
 	// The proof binds every part of the read.
 	let request = server::auth::leaf_since_request("0", 1, &[change_id.0], &[]);
@@ -370,6 +392,10 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	refused(r.http.post("leaf_data", &json!({"auth": good, "since": "0", "after": "0", "limit": 1})), 400, "malformed");
 	refused(r.http.post("leaf_data", &json!({"auth": good, "after": "0", "limit": 1, "held": [hex(&change_id.0)]})), 400, "malformed");
 	refused(r.http.post("leaf_data", &json!({"auth": good, "since": "seven", "limit": 1})), 400, "malformed");
+	// A cursor longer than a cursor can be is refused, so no proof stands for
+	// a cursor longer than it binds.
+	let long = format!("{}:{}.1", "00".repeat(8), "0".repeat(60));
+	refused(r.http.post("leaf_data", &json!({"auth": good, "since": long, "limit": 1})), 400, "malformed");
 	let many: Vec<String> = (0..401u32).map(|i| hex(&[(i % 251) as u8; 32])).collect();
 	refused(r.http.post("leaf_data", &json!({"auth": good, "since": "0", "limit": 1, "held": many})), 400, "malformed");
 

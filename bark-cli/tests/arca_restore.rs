@@ -2254,6 +2254,24 @@ async fn a_store_learns_what_the_other_did_between_two_catch_ups() {
 	a.ok(&["sync"]);
 	assert_eq!(live(&a2), live(&a), "the same coins once A's round is final");
 	assert_eq!(tree_balance(&a2), tree_balance(&a), "the same balance once A's round is final");
+
+	// The operator's database restored from a dump (its transaction counter
+	// behind the transactions its leaves were served at): the server starts a
+	// new epoch of cursors, and A2's next catch-up reads from the first leaf,
+	// every leaf served to the mailbox key.
+	let (sql, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	sql.execute("UPDATE leaf_served SET served_xid = '9000000000000'::xid8", &[]).await.unwrap();
+	r.server.store.cursor_epoch_at_start().await.unwrap();
+	let mailbox = a2.ok(&["info"])["mailbox_key"].as_str().map(|m| m.to_string()).expect("the wallet's mailbox key");
+	let a2_served: i64 = sql.query_one("SELECT count(*) FROM leaf_served WHERE mailbox_key = decode($1, 'hex')", &[&mailbox]).await.unwrap().get(0);
+	let a2_served = a2_served as usize;
+	catch_up_due(&r).await;
+	let fifth = catch_up_reads(&p, &a2);
+	println!("OA A2's catch-up after the operator's database was restored: {}", fifth);
+	assert_eq!(fifth["caught_up"]["read"], "from the first leaf", "{}", fifth);
+	assert_eq!(fifth["leaves"].as_u64().unwrap() as usize, a2_served, "every leaf served to the mailbox key: {}", fifth);
+	assert_eq!(live(&a2), live(&a), "the same coins after the restore of the operator's database");
 	for w in [&a, &a2, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}

@@ -1651,14 +1651,19 @@ pub struct HeldLeaf {
 }
 
 /// How many of each `leaf_data` reads past a settled cursor (`since`) take:
-/// the leaves of a page, the held coins and the leaves asked for by id. All
-/// zero for a server that reads no such cursor.
+/// the leaves of a page, the held coins and the leaves asked for by id, and
+/// the cursors' epoch. All zero for a server that reads no such cursor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeafDataInfo {
 	pub page: u32,
 	pub held: u32,
 	pub leaf_ids: u32,
+	/// The epoch of the settled cursors (hex), which every cursor names: one
+	/// of another epoch reads from the first leaf. A database restored from
+	/// a dump starts a new one.
+	#[serde(default)]
+	pub epoch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

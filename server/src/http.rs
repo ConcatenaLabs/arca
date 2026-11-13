@@ -794,6 +794,9 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 /// answered from memory ([`InfoParts`]), whatever the node, the signer or the
 /// database are doing.
 async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
+	// Unread (the database not answering): no epoch, which no cursor names,
+	// so a wallet reads from the first leaf.
+	let cursor_epoch = app.store.cursor_epoch().await.map(|e| hex(&e)).unwrap_or_default();
 	let floors = floors(&app).await;
 	let signer_record = record_head(&app).await;
 	let bond = bond_info(&app).await;
@@ -932,7 +935,8 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		watchtowers: app.params.watchtowers.clone(),
 		batches: api::BatchesInfo { no_sweep: app.params.no_sweep, collect_after_seconds: app.params.collect_after_seconds },
 		mailbox_reads: MAX_MAILBOX_READS as u32,
-		leaf_data: api::LeafDataInfo { page: LEAF_PAGE, held: LEAF_HELD, leaf_ids: LEAF_PAGE },
+		leaf_data: api::LeafDataInfo { page: LEAF_PAGE, held: LEAF_HELD, leaf_ids: LEAF_PAGE,
+			epoch: cursor_epoch },
 		checkpoint_exit: app.params.checkpoint_exit,
 		landing_2_only: app.params.landing_2_only,
 		offboards: api::OffboardsInfo { unlock_within_seconds: app.watcher.as_ref().map_or(0, |w| w.unlock_within_seconds()) },
@@ -2016,19 +2020,33 @@ async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<S
 /// about.
 pub const LEAF_HELD: u32 = 400;
 
+/// The longest settled cursor read: a real one is at most 57 bytes. A proof
+/// binds at most 255 bytes of it ([`auth::leaf_since_request`]).
+pub const SINCE_MOST: usize = 64;
+
 /// A settled cursor as `leaf_data` serves it: `"0"` before the first leaf,
-/// else the transaction that made the last leaf read and that leaf's
-/// `seq`, `"<xid>.<seq>"`.
-fn settled_cursor(s: &str) -> Result<(u64, i64), Refusal> {
+/// else the cursors' epoch (hex), the transaction the last leaf read came to
+/// be served at and that leaf's `seq`, `"<epoch>:<xid>.<seq>"`. A cursor of
+/// another epoch than `epoch` reads from the first leaf (`(0, 0)`): the
+/// database was restored meanwhile ([`Store::cursor_epoch_at_start`]).
+fn settled_cursor(s: &str, epoch: &[u8; 8]) -> Result<(u64, i64), Refusal> {
 	if s == "0" {
 		return Ok((0, 0));
 	}
-	let bad = || Refusal::malformed(format!("settled cursor {:?}: \"0\" or \"<xid>.<seq>\"", s));
-	let (x, q) = s.split_once('.').ok_or_else(bad)?;
+	let bad = || Refusal::malformed(format!("settled cursor {:?}: \"0\" or \"<epoch>:<xid>.<seq>\", at most {} bytes", s, SINCE_MOST));
+	if s.len() > SINCE_MOST {
+		return Err(bad());
+	}
+	let (e, rest) = s.split_once(':').ok_or_else(bad)?;
+	let (x, q) = rest.split_once('.').ok_or_else(bad)?;
 	let x: u64 = x.parse().map_err(|_| bad())?;
 	let q: i64 = q.parse().map_err(|_| bad())?;
-	if q < 0 {
+	let e = unhex(e).map_err(|_| bad())?;
+	if q < 0 || e.len() != 8 {
 		return Err(bad());
+	}
+	if e[..] != epoch[..] {
+		return Ok((0, 0));
 	}
 	Ok((x, q))
 }
@@ -2038,7 +2056,8 @@ async fn leaf_data_since(app: &App, req: &api::LeafDataRequest, since: &str) -> 
 	if req.after.is_some() {
 		return Err(Refusal::malformed("a read names a cursor (after) or a settled cursor (since), not both"));
 	}
-	let from = settled_cursor(since)?;
+	let epoch = app.store.cursor_epoch().await?;
+	let from = settled_cursor(since, &epoch)?;
 	let limit = req.limit.unwrap_or(LEAF_PAGE);
 	if req.held.len() > LEAF_HELD as usize || req.leaf_ids.len() > LEAF_PAGE as usize {
 		return Err(Refusal::malformed(format!("at most {} held coins and {} leaves by id a read", LEAF_HELD, LEAF_PAGE)));
@@ -2057,7 +2076,7 @@ async fn leaf_data_since(app: &App, req: &api::LeafDataRequest, since: &str) -> 
 			break;
 		}
 		leaves.push(served_entry(app, r).await?);
-		next = Some(format!("{}.{}", x, q));
+		next = Some(format!("{}:{}.{}", hex(&epoch), x, q));
 	}
 	// The held coins served to the key, and the whole entry of those given
 	// up for good and of the leaves asked for by id. Each list is bounded on
