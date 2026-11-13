@@ -4119,7 +4119,7 @@ mod tests {
 	fn a_landing_2_leaf_written_for_another_wallet_is_malformed_to_an_older_library() {
 		let key = xonly("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap();
 		let asset = AssetId::from_str(&"07".repeat(32)).unwrap();
-		let out = |own_index: bool| Out { asset, value: 100_000, mailbox: key, until: None, leaf: NewLeaf { owner: key,
+		let out = |own_index: bool| Out { payer_mailbox: None, asset, value: 100_000, mailbox: key, until: None, leaf: NewLeaf { lock: None, owner: key,
 			owner_nonce: [1; 32], creator_nonce: [2; 32], exit_delay: RelativeTime::from_units(1).unwrap(), htlc: None, v2: false,
 			landing: Some(arca_covenant::Landing { program: [3; 20], allowance: 1_000, own_index }.terms(asset, 100_000).unwrap()) } };
 		let older = |v: &Value| arca_covenant::record_json::landing_from_json(&v["landing"]);
