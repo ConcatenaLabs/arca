@@ -495,6 +495,7 @@ impl ParticipationError {
 			Coin(CoinError::OnChain { .. }) => "on_chain",
 			Coin(CoinError::InvalidCoin { .. }) | Coin(CoinError::PastBoardDate { .. }) => "invalid_coin",
 			Coin(CoinError::Channel(_)) => "template",
+			Coin(CoinError::Lock(_)) => "lock",
 			Coin(CoinError::Lapsed { .. }) => "lapsed",
 			Coin(CoinError::Vesting { .. }) => "vesting",
 			Coin(CoinError::Store(_)) | Coin(CoinError::Internal(_)) => "internal",

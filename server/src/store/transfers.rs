@@ -194,6 +194,13 @@ impl Store {
 				 SELECT mailbox_key, 'coin', leaf_id, $2 FROM transfer_output WHERE transfer_id = $1 AND leaf_id = $3",
 				&[&&transfer_id[..], &record, &&leaf_id[..]],
 			).await?;
+			// A lock's record goes to its payer too, under the key it draws
+			// for the lock, so that a restore of either holder finds it.
+			t.execute(
+				"INSERT INTO mailbox_message (mailbox_key, kind, leaf_id, payload)
+				 SELECT payer, 'coin', leaf_id, $2 FROM swap_lock WHERE made_by = $1 AND leaf_id = $3",
+				&[&&transfer_id[..], &record, &&leaf_id[..]],
+			).await?;
 		}
 		t.execute("UPDATE transfer SET state = 'signed', signer_entry = $2, signer_hash = $3, signer_sig = $4 WHERE transfer_id = $1",
 			&[&&transfer_id[..], &head.map(|h| h.0 as i64), &head.map(|h| h.1.to_vec()), &head.map(|h| h.2.to_vec())]).await?;
@@ -243,6 +250,10 @@ impl Store {
 		// will never exist, and each coin given back may delegate again.
 		t.execute("DELETE FROM delegation WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
 		t.execute("DELETE FROM transfer WHERE transfer_id = $1", &[&&transfer_id[..]]).await?;
+		// A lock it made goes with it; one it ended is open again.
+		t.execute("DELETE FROM swap_lock WHERE made_by = $1", &[&&transfer_id[..]]).await?;
+		t.execute("UPDATE swap_lock SET state = 'open', ended_by = NULL, updated_at = now() WHERE ended_by = $1",
+			&[&&transfer_id[..]]).await?;
 		let back = t.query(
 			"UPDATE leaf SET state = 'live', spent_by = NULL, updated_at = now()
 			 WHERE leaf_id = ANY($1) AND state = 'spent' AND spent_by = $2 RETURNING leaf_id",

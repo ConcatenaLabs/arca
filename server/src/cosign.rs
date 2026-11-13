@@ -100,6 +100,11 @@ pub struct InputRequest {
 	/// it, or without it, is the same transfer. Without it the node the coin
 	/// rests on comes back only at its batch's expiry.
 	pub delegation_sig: Option<Signature>,
+	/// For a coin that is an `htlc-2` lock, the ending it is given up by:
+	/// its claim, with the preimage, or its refund ([`crate::locks`]). The
+	/// owner's signatures are then the path's holder's: the payee's for the
+	/// claim, the payer's for the refund.
+	pub lock: Option<arca_covenant::LockSpend>,
 }
 
 /// One new leaf.
@@ -211,6 +216,9 @@ pub enum CosignError {
 	/// A coin of a template no transfer spends.
 	#[error("{0}")]
 	Template(String),
+	/// A rule of `htlc-2` locks ([`crate::locks`]).
+	#[error("{0}")]
+	Lock(String),
 	#[error("the signer: {0}")]
 	Signer(#[from] SignerError),
 	#[error(transparent)]
@@ -253,6 +261,7 @@ impl CosignError {
 			RequestLapsed { .. } => "request_lapsed",
 			Htlc(_) => "htlc",
 			Template(_) => "template",
+			Lock(_) => "lock",
 			Signer(SignerError::AlreadySigned(_)) => "double_spend",
 			Signer(SignerError::Frozen(_)) => crate::supervision::FROZEN,
 			Signer(SignerError::Declined(_)) => "declined",
@@ -289,6 +298,7 @@ impl From<CoinError> for CosignError {
 			CoinError::PastBoardDate { leaf, expiry, .. } => CosignError::PastBoardDate { leaf, expiry },
 			CoinError::Channel(id) => CosignError::Template(format!("coin {} is a channel-1 coin: it pays by its channel's states, and \
 				is given up only in a round", id)),
+			e @ CoinError::Lock(_) => CosignError::Lock(e.to_string()),
 			CoinError::Lapsed { leaf, deadline } => CosignError::Lapsed(leaf, deadline),
 			CoinError::Vesting { leaf, vest } => CosignError::Vesting(leaf, vest),
 			CoinError::Store(e) => e.into(),
@@ -366,6 +376,36 @@ impl TransferRequest {
 		if self.checkpoint_exit {
 			e.input(&[0xfb, 1]);
 		}
+		// The terms of each htlc-2 leaf, the same way as htlc-1's.
+		if self.outputs.iter().any(|o| o.leaf.lock.is_some()) {
+			e.input(&[0xfa]);
+			for o in &self.outputs {
+				match &o.leaf.lock {
+					None => e.input(&[0]),
+					Some(t) => {
+						e.input(&[1]);
+						e.input(&t.payment_hash);
+						e.input(&t.timeout.to_consensus_u32().to_le_bytes());
+						e.input(&t.refunder.serialize());
+						e.input(&t.refund_delay.units().to_le_bytes());
+					},
+				}
+			}
+		}
+		// The ending each input that is a lock is given up by.
+		if self.inputs.iter().any(|i| i.lock.is_some()) {
+			e.input(&[0xf9]);
+			for i in &self.inputs {
+				match &i.lock {
+					None => e.input(&[0]),
+					Some(arca_covenant::LockSpend::Claim { preimage }) => {
+						e.input(&[1]);
+						e.input(preimage);
+					},
+					Some(arca_covenant::LockSpend::Refund) => e.input(&[2]),
+				}
+			}
+		}
 		sha256::Hash::from_engine(e).to_byte_array()
 	}
 }
@@ -399,7 +439,8 @@ impl Cosigner {
 		if let Some(why) = crate::plans::blocks_transfer(&self.store, &id.0).await? {
 			return Err(CosignError::Planned(why));
 		}
-		Ok(coins::check_plain(&self.store, &self.params.policy(now), id, transfer, coins::BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE)).await?)
+		Ok(coins::check_transfer_input(&self.store, &self.params.policy(now), id, transfer,
+			coins::BoardDates::WithinUnlessRecorded(WalletPolicy::EXIT_DEADLINE)).await?)
 	}
 
 	/// The freeze check of the supervised profile on the coins `leaves`
@@ -473,6 +514,7 @@ impl Cosigner {
 				return Err(CosignError::OutOfBounds(format!("asset {} is supervised: no htlc-1 leaf holds it, as its paths pay a key a \
 					freeze cannot follow", o.asset)));
 			}
+			crate::locks::check_output(&self.params, &o.leaf, &o.asset)?;
 			let landing = o.leaf.landing.map(|t| t.landing(o.asset, o.value)).transpose()
 				.map_err(|e| CosignError::OutOfBounds(e.to_string()))?;
 			self.params.check_landing(o.asset, o.value, landing.as_ref()).map_err(CosignError::OutOfBounds)?;
@@ -532,11 +574,19 @@ impl Cosigner {
 					owner takes it on the chain", i.leaf_id, c.coin.asset)));
 			}
 			self.check_htlc_input(&i.leaf_id, &c.coin).await?;
+			crate::locks::check_input(&self.store, &c.coin, i.lock, now, recorded, &transfer).await?;
 			checked.push(c);
 		}
 		let hops = 1 + checked.iter().map(|c| c.coin.hops).max().expect("an input");
 		if hops > self.params.depth_limit {
 			return Err(CosignError::DepthLimit { hops, limit: self.params.depth_limit });
+		}
+		// A lock leaves room for its ending, and its timeout fits.
+		if !recorded {
+			let coins: Vec<&arca_covenant::ValidCoin> = checked.iter().map(|c| &c.coin).collect();
+			for o in &req.outputs {
+				crate::locks::check_output_in(&self.store, &self.params, &o.leaf, now, hops, &coins).await?;
+			}
 		}
 
 		// The values.
@@ -567,18 +617,21 @@ impl Cosigner {
 		}
 
 		// The owners' signatures.
-		let plan = TransferPlan { locks: vec![], checkpoint_exit: req.checkpoint_exit,
+		let plan = TransferPlan { locks: req.inputs.iter().map(|i| i.lock).collect(), checkpoint_exit: req.checkpoint_exit,
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
 		let mut messages = Vec::with_capacity(n);
-		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
+		for (k, i) in req.inputs.iter().enumerate() {
 			let cp = plan.checkpoint_message(k).map_err(|e| CosignError::Internal(e.to_string()))?.digest;
 			let re = plan.reassignment_message(k).map_err(|e| CosignError::Internal(e.to_string()))?.digest;
-			if !verify_digest(&i.checkpoint_sig, &cp, &c.coin.leaf.owner) {
+			// The checkpoint's owner signs both: the coin's owner, or for a
+			// lock the holder of the path it is ended by.
+			let signer = plan.checkpoint(k).owner;
+			if !verify_digest(&i.checkpoint_sig, &cp, &signer) {
 				return Err(CosignError::BadSignature { input: k, which: "checkpoint" });
 			}
-			if !verify_digest(&i.reassignment_sig, &re, &c.coin.leaf.owner) {
+			if !verify_digest(&i.reassignment_sig, &re, &signer) {
 				return Err(CosignError::BadSignature { input: k, which: "reassignment" });
 			}
 			messages.push((cp, re));
@@ -685,7 +738,7 @@ impl Cosigner {
 				let signer_messages: Vec<SignerMessage> = checked.iter().enumerate().flat_map(|(k, c)| {
 					let cp = plan.checkpoint(k);
 					[
-						SignerMessage { owner: c.coin.leaf.owner.serialize(), salt: c.coin.leaf.salt, digest: messages[k].0, forfeit: false },
+						SignerMessage { owner: cp.owner.serialize(), salt: c.coin.leaf.salt, digest: messages[k].0, forfeit: false },
 						SignerMessage { owner: cp.owner.serialize(), salt: cp.salt, digest: messages[k].1, forfeit: false },
 					]
 				}).collect();
@@ -695,6 +748,24 @@ impl Cosigner {
 					other => other.into(),
 				})?;
 			},
+		}
+
+		// The locks it makes are kept, and those it ends marked ended by it,
+		// before anything is signed; a repeated request changes neither.
+		let made: Vec<crate::store::NewLock> = req.outputs.iter().zip(&new_ids).filter_map(|(o, id)| o.leaf.lock.map(|t| crate::store::NewLock {
+			leaf_id: id.0, payment_hash: t.payment_hash, payee: o.leaf.owner.serialize(), payer: t.refunder.serialize(),
+			timeout: t.timeout.to_consensus_u32(),
+		})).collect();
+		if !made.is_empty() {
+			self.store.insert_locks(&transfer, &made).await?;
+		}
+		for (c, i) in checked.iter().zip(&req.inputs) {
+			let Some(spend) = i.lock else { continue };
+			let (state, preimage) = crate::locks::ending(spend);
+			if !self.store.end_lock(&c.coin.id.0, state, preimage.as_ref(), &transfer).await? {
+				return Err(CosignError::Lock(format!("the lock {} was ended by another transfer: the operator co-signs one ending of a \
+					lock", c.coin.id)));
+			}
 		}
 
 		// The delegations, kept with the transfer recorded; one given again
@@ -737,7 +808,7 @@ impl Cosigner {
 		};
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
-			let owner = c.coin.leaf.owner;
+			let owner = plan.checkpoint(k).owner;
 			let cp = self.signer.rebind_recorded(&owner, &i.checkpoint_sig, &c.coin.leaf.salt, crate::signer::After::of(&c.coin.leaf),
 				c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
 			let (cp, h) = match cp {
@@ -768,7 +839,7 @@ impl Cosigner {
 		let mut records = Vec::with_capacity(m);
 		for (j, o) in req.outputs.iter().enumerate() {
 			let record = CoinRecord::Transfer(Box::new(Transfer {
-				inputs: checked.iter().zip(&req.inputs).zip(&sigs).enumerate().map(|(k, ((c, i), (cp, re)))| TransferInput { lock: None, exit: plan.exit(k),
+				inputs: checked.iter().zip(&req.inputs).zip(&sigs).enumerate().map(|(k, ((c, i), (cp, re)))| TransferInput { lock: i.lock, exit: plan.exit(k),
 					coin: c.record.clone(),
 					checkpoint_value: i.checkpoint_value,
 					checkpoint: Pair { operator: *cp, owner: i.checkpoint_sig },
@@ -854,8 +925,9 @@ impl Cosigner {
 		let first = checked[0].coin.asset;
 		let mut sized = Vec::with_capacity(checked.len());
 		for (k, (i, c)) in req.inputs.iter().zip(checked).enumerate() {
-			let vi = ValidInput { lock: None,
-				coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed(), c.coin.value),
+			// A lock's checkpoint is sized by the ending it is given up by.
+			let vi = ValidInput { lock: i.lock,
+				coin: c.coin.clone(), checkpoint: c.coin.checkpoint_spent(i.lock, req.checkpoint_exit && c.coin.exit_allowed(), c.coin.value),
 				checkpoint_value: c.coin.value,
 				checkpoint_pair: pair, reassignment_pair: pair,
 			};
@@ -1028,7 +1100,7 @@ impl Cosigner {
 		for (k, (c, i)) in checked.iter().zip(&req.inputs).enumerate() {
 			let cp_out = plan.checkpoint_output(k);
 			let checkpoint = plan.checkpoint(k);
-			let cp = self.signer.check_rebind(&c.coin.leaf.owner, &i.checkpoint_sig, &c.coin.leaf.salt,
+			let cp = self.signer.check_rebind(&checkpoint.owner, &i.checkpoint_sig, &c.coin.leaf.salt,
 				crate::signer::After::of(&c.coin.leaf), c.coin.asset, c.coin.value, std::slice::from_ref(&cp_out), alone(&c.coin)).await;
 			let asked = match cp {
 				Ok(()) => self.signer.check_rebind(&checkpoint.owner, &i.reassignment_sig, &checkpoint.salt, crate::signer::After::NONE, c.coin.asset,

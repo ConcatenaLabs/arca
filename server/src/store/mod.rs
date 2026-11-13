@@ -60,6 +60,7 @@ mod coins;
 mod delegations;
 mod distributions;
 mod lightning;
+mod locks;
 mod mailbox;
 mod nursery;
 mod orders;
@@ -81,6 +82,7 @@ pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use delegations::{DelegationRow, HolderReleaseRow, SpentBy};
 pub use distributions::{ClaimRow, DistributionRow, NewDistribution, ReturnRow};
 pub use lightning::{NewReceive, ReceiveRow, ReceiveState, SendRow, SendState};
+pub use locks::{LockRow, LockState, NewLock};
 pub use mailbox::MailboxMessage;
 pub use pool::{InFlightSlot, PoolFlow};
 pub use plans::{NewPlan, NewPlanStep, PlanRow, PlanState, PlanStepRow, StepState};
@@ -154,6 +156,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(47, include_str!("../../schema/V47__participation_arriving.sql")),
 	(48, include_str!("../../schema/V48__offboard_by_participation.sql")),
 	(49, include_str!("../../schema/V49__leaf_made_xid.sql")),
+	(50, include_str!("../../schema/V50__swap_lock.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

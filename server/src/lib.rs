@@ -33,6 +33,7 @@ pub mod http;
 pub mod issuer;
 pub mod keeper;
 pub mod lightning;
+pub mod locks;
 pub mod nursery;
 pub mod orders;
 pub mod owed;
