@@ -141,6 +141,18 @@ impl LockPolicy {
 		Ok(())
 	}
 
+	/// The check of a lock made for a purchase, the one every party runs:
+	/// three keys ([`Self::check`]) and the payer's delay the payee's and
+	/// [`REFUND_DELAY_MARGIN_UNITS`] more ([`Self::check_delays`]). The coin
+	/// record's check of every `htlc-2` leaf in a lineage runs it, so a
+	/// receiver accepts no lock without it, and so does the operator before
+	/// it co-signs one; the scripts hold for any other lock, which no
+	/// receiver accepts.
+	pub fn check_purchase(&self) -> Result<(), LockError> {
+		self.check()?;
+		self.check_delays()
+	}
+
 	/// `K` for this leaf, over its salt.
 	pub fn leaf_constant(&self) -> [u8; 32] {
 		self.chain.leaf_constant(&self.salt)

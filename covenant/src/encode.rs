@@ -606,6 +606,9 @@ impl Encoding for Policy {
 			21 => {
 				let mut p = LeafPolicy::decode_from(r)?;
 				p.lock = Some(crate::lock::LockTerms::decode_from(r)?);
+				// The keys only: a policy's encoding names any lock the
+				// scripts hold; a receiver checks a purchase's delays
+				// ([`crate::LockPolicy::check_purchase`]).
 				p.lock_policy().expect("set").check().map_err(|e| DecodeError::Policy(crate::Error::Lock(e)))?;
 				Policy::Leaf(p)
 			},

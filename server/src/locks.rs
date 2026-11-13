@@ -72,7 +72,7 @@ pub fn check_output(params: &Params, leaf: &NewLeaf, asset: &elements::AssetId) 
 			cannot follow", asset)));
 	}
 	let lock = leaf.policy(params.operator, params.chain).lock_policy().expect("a lock");
-	lock.check().and_then(|_| lock.check_delays()).map_err(|e| refuse(e.to_string()))?;
+	lock.check_purchase().map_err(|e| refuse(e.to_string()))?;
 	if !params.exit_delay_ok(terms.refund_delay) {
 		return Err(CosignError::OutOfBounds(format!("a payer's delay of {} units; the operator takes {} to {}",
 			terms.refund_delay.units(), params.min_exit_delay.units(), params.max_exit_delay.units())));

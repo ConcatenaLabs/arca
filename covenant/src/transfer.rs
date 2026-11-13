@@ -1503,7 +1503,7 @@ impl CoinRecord {
 					if t.leaf.htlc.is_some() || t.leaf.landing.is_some() || t.leaf.v2 {
 						return Err(TransferError::Template("htlc-2 with another template's terms".into()));
 					}
-					lock.check().and_then(|_| lock.check_delays()).map_err(|e| SpendError::from(crate::Error::from(e)))?;
+					lock.check_purchase().map_err(|e| SpendError::from(crate::Error::from(e)))?;
 					if !policy.exit_delay_ok(lock.terms.refund_delay) {
 						return Err(TransferError::LineageExitDelay {
 							hops: depth, delay: lock.terms.refund_delay.units(), min: policy.min_exit_delay.units(),

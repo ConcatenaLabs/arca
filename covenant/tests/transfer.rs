@@ -865,8 +865,10 @@ fn a_lock_between_two_holders_is_claimed_or_refunded_out_of_round() {
 		outputs: vec![ExplicitOutput::new(x, a_coin.value - 2 * MARGIN, shared.policy(xonly(s), chain).script_pubkey())] };
 	let e = refuse(record_for(&splan, &[&f.hops.a_base], &sign_plan(&splan, &[&f.b.a], s), 0, shared), &q);
 	assert!(matches!(e, TransferError::Spend(SpendError::Policy(arca_covenant::Error::Lock(LockError::SharedKey)))), "{}", e);
-	// A lock whose payer's delay is not the payee's and the margin more.
-	let short = NewLeaf { lock: Some(LockTerms { refund_delay: delay, ..terms }), ..q.leaf };
+	// A lock whose payer's delay is one unit short of the payee's and the
+	// margin (the lock above has exactly that, and is accepted).
+	let short = NewLeaf { lock: Some(LockTerms {
+		refund_delay: RelativeTime::from_units(delay.units() + REFUND_DELAY_MARGIN_UNITS - 1).unwrap(), ..terms }), ..q.leaf };
 	let splan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)],
 		outputs: vec![ExplicitOutput::new(x, a_coin.value - 2 * MARGIN, short.policy(xonly(s), chain).script_pubkey())] };
 	let e = refuse(record_for(&splan, &[&f.hops.a_base], &sign_plan(&splan, &[&f.b.a], s), 0, short), &q);
