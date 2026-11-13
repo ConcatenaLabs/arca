@@ -258,7 +258,7 @@ pub(crate) enum Wait {
 }
 
 impl Wait {
-	fn name(self) -> &'static str {
+	pub(crate) fn name(self) -> &'static str {
 		match self {
 			Wait::Round => "round",
 			Wait::Forfeits => "forfeits",

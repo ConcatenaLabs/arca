@@ -326,8 +326,14 @@ else's) is claimed only once `lightning_receive_preimage` hands the preimage
 over; `lightning_receive_ready` says when its leaf is held for good enough to
 pay that preimage's price: validated, its round final, and its home date at
 least `need_seconds` away (the time the other side may take to reveal the
-preimage, and the wallet to claim with it). `sync` moves every payment and
-receive on. A board and
+preimage, and the wallet to claim with it). While it is not, it names the step
+it waits for (`waiting_for`): `payment` while the payer has not paid, which no
+round bounds; else the step of the round that makes the leaf (`round`,
+`forfeits`, `block`, `certificate`, `anchor`, `release`), with
+`final_in_seconds`, the most it takes from now, and `usual_in_seconds`, what it
+usually takes, counted as `settle_first` counts them from the operator's
+published settings. A wallet states that wait rather than one of its own.
+`sync` moves every payment and receive on. A board and
 an exit work the same way: `board_quote` is the board's fee (`fee: {asset,
 amount}`), size and coins, and `board` with `shown` set to that `fee` goes ahead
 only on it; `exit_quote` is each transaction an exit would broadcast now, with

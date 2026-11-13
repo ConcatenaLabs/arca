@@ -194,6 +194,12 @@ async fn a_payment_under_a_hash_through_the_commands_moves_exactly_what_its_quot
 	let not_yet = ok(&q, "lightning_receive_ready", json!({"hash": hash, "need_seconds": 600}));
 	println!("LC before the round: {}", not_yet);
 	assert_eq!(not_yet["ready"], false);
+	// It names the step it waits for, and bounds it in seconds from the
+	// operator's published settings: the round that makes the leaf is not
+	// built, so its next round, and everything after it.
+	assert_eq!(not_yet["waiting_for"], "round", "{}", not_yet);
+	let (most, usual) = (not_yet["final_in_seconds"].as_u64(), not_yet["usual_in_seconds"].as_u64());
+	assert!(most.is_some_and(|m| m > 0) && usual.is_some_and(|u| u <= most.unwrap()), "a bound, the usual within the most: {}", not_yet);
 	leaf_round(&r).await;
 	r.synced().await;
 	ok(&q, "sync", json!({}));

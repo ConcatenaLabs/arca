@@ -236,6 +236,17 @@ fn amount_of(v: &Value) -> Result<u64, Error> {
 	amount(v, "an amount")
 }
 
+/// Why a leaf received under a hash is not held for good yet
+/// ([`Wallet::received_held`]): `why` for people; `payment` while the payer
+/// has not paid (or the wallet has not seen it paid), which no round bounds;
+/// else `round`, the round that makes the leaf, `Some(None)` for one not
+/// built yet or not read yet.
+pub(crate) struct NotHeld {
+	pub why: String,
+	pub round: Option<Option<String>>,
+	pub payment: bool,
+}
+
 impl Wallet {
 	pub(crate) fn sends(&self) -> Result<BTreeMap<String, Value>, Error> {
 		Ok(self.store.meta(SENDS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
@@ -946,22 +957,30 @@ impl Wallet {
 	}
 
 	/// The leaf the wallet receives under `hash`, as far as it holds it:
-	/// `Ok(Err(why))` while it is not held for good yet (the receive not
-	/// taken up, its round not come or not final); once it is held
+	/// `Ok(Err(not))` while it is not held for good yet (the receive not
+	/// taken up, its round not come or not final: [`NotHeld`]); once it is held
 	/// validated, its round final, an `htlc-1` receive leaf under `hash` of
 	/// the value the operator answered the receive with and the operator's
 	/// published delay, `Ok(Ok((asset, value, home_in)))`, `home_in` the
 	/// seconds of median time to its home date (the latest moment it must
 	/// start home to be claimed); `Err` when it never will be.
-	pub(crate) fn received_held(&self, hash: &str) -> Result<Result<(AssetId, u64, u64), String>, Error> {
+	pub(crate) fn received_held(&self, hash: &str) -> Result<Result<(AssetId, u64, u64), NotHeld>, Error> {
 		let r = self.receives()?.get(hash).cloned()
 			.ok_or_else(|| Error::Refused(format!("the wallet receives nothing under hash {}", hash)))?;
 		if r["state"] != "issuing" {
-			return Ok(Err(format!("the receive under hash {} is {}", hash, r["state"])));
+			// Asked for and not paid yet (or not seen paid yet): the payer's
+			// step, which no round bounds.
+			let payment = matches!(r["state"].as_str(), Some("requested") | Some("waiting"));
+			return Ok(Err(NotHeld { why: format!("the receive under hash {} is {}", hash, r["state"]),
+				round: None, payment }));
 		}
 		let nonce = super::chain::unhex32(r["nonce"].as_str().unwrap_or(""))?;
 		let Some(leaf) = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) else {
-			return Ok(Err("the received leaf's round has not come".into()));
+			// The leaf is the wallet's once the operator releases the round
+			// that makes it: that round, once the wallet has read it, else
+			// one not built yet.
+			let round = r["participation"].as_str().and_then(|p| self.store.participation(p).ok().flatten()).and_then(|p| p.6);
+			return Ok(Err(NotHeld { why: "the received leaf's round has not come".into(), round: Some(round), payment: false }));
 		};
 		let row = self.store.coin(&leaf)?.ok_or_else(|| Error::Store(format!("no coin {}", leaf)))?;
 		if row.state != "receiving" {
@@ -969,7 +988,9 @@ impl Wallet {
 		}
 		let (_, a) = self.held(&row)?;
 		if !a.all_final() {
-			return Ok(Err(format!("the received leaf's round is not final: {}", a.waiting())));
+			let round = a.bases.iter().find(|(_, f)| !f.is_final()).map(|(t, _)| t.txid().to_string());
+			return Ok(Err(NotHeld { why: format!("the received leaf's round is not final: {}", a.waiting()), round: Some(round),
+				payment: false }));
 		}
 		let coin = a.valid;
 		let t = coin.leaf.htlc.ok_or_else(|| Error::Refused("the received leaf is no htlc-1 leaf".into()))?;
@@ -997,11 +1018,35 @@ impl Wallet {
 	/// it receives under it held for good ([`Self::received_held`]), with
 	/// its home date at least `need` seconds away, the time the other side
 	/// can take to reveal the preimage and the wallet to claim with it.
-	/// `{"ready": true, "home_in"}` when it may; `{"ready": false, "why"}`
-	/// while it may not yet; refused when it never will.
+	/// `{"ready": true, "home_in"}` when it may; `{"ready": false, "why",
+	/// "waiting_for"}` while it may not yet; refused when it never will.
+	/// `waiting_for` names the step: `payment` while the payer has not paid
+	/// (or the wallet has not seen it paid), which no round bounds; else the
+	/// step of the round that makes the leaf, as `settle_first` names it
+	/// (`round`, `forfeits`, `block`, `certificate`, `anchor`, `release`),
+	/// with `final_in_seconds` the most it takes from now and
+	/// `usual_in_seconds` what it usually takes, counted from the operator's
+	/// published round interval, block time, forfeit window, pass time,
+	/// finality and anchor depth ([`Self::final_within`]). Each answer counts
+	/// again from where the round stands; one given while the operator or the
+	/// node cannot be read has no bound and no step.
 	pub fn lightning_receive_ready(&self, hash: &str, need: u64) -> Result<Value, Error> {
 		match self.received_held(hash)? {
-			Err(why) => Ok(json!({"payment_hash": hash, "ready": false, "why": why})),
+			Err(not) => {
+				let mut v = json!({"payment_hash": hash, "ready": false, "why": not.why});
+				if not.payment {
+					v["waiting_for"] = json!("payment");
+				} else if let Some(round) = not.round {
+					// Without the operator's settings or the node now, the
+					// answer stands without its bound, and the next one has it.
+					if let Ok(w) = self.server_info().and_then(|i| self.final_within(&i, round.as_deref())) {
+						v["waiting_for"] = json!(w.step.name());
+						v["final_in_seconds"] = json!(w.most);
+						v["usual_in_seconds"] = json!(w.usual);
+					}
+				}
+				Ok(v)
+			},
 			Ok((asset, value, home_in)) if home_in >= need => Ok(json!({"payment_hash": hash, "ready": true, "asset": asset.to_string(),
 				"value": value.to_string(), "home_in": home_in})),
 			Ok((_, _, home_in)) => Err(Error::Refused(format!("the leaf received under hash {} must start home in {} s, and the other \
