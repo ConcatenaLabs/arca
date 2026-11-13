@@ -296,6 +296,20 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	// cursor a read from the first under way ("<epoch>:W…"), ending on a
 	// settled cursor.
 	let whole_on = |c: &str| c.split(':').nth(1).is_some_and(|c| c.starts_with('W'));
+	// A read past a settled cursor serves only leaves of transactions older
+	// than every one running in the cluster: while another test holds one
+	// open, what is new waits for it to end. Each read that expects leaves
+	// asks again until they are settled (at most about fifteen seconds).
+	let settled_wait = |since: &str, limit: u32| -> Value {
+		for _ in 0..150 {
+			let page = settled(since, limit, &[], &[]).ok();
+			if !page["leaves"].as_array().unwrap().is_empty() {
+				return page;
+			}
+			std::thread::sleep(std::time::Duration::from_millis(100));
+		}
+		settled(since, limit, &[], &[]).ok()
+	};
 	let mut since = "0".to_string();
 	let mut paged = vec![];
 	loop {
@@ -317,7 +331,7 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	let mut past = format!("{}:0.0", epoch);
 	let mut paged = vec![];
 	loop {
-		let page = settled(&past, 1, &[], &[]).ok();
+		let page = if paged.len() < all.len() { settled_wait(&past, 1) } else { settled(&past, 1, &[], &[]).ok() };
 		let Some(l) = page["leaves"].as_array().unwrap().first().cloned() else {
 			assert!(page["next"].is_null(), "{}", page);
 			break;
@@ -447,7 +461,7 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 		assert!(ids.contains(&lost), "the read from the first leaf serves the leaf the index lost: {:?}", ids);
 		assert_eq!(ids.len(), all.len());
 		assert_eq!(rows().await, 1, "and keeps it again");
-		let repaired = settled(&before, 100, &[], &[]).ok();
+		let repaired = settled_wait(&before, 100);
 		let repaired: Vec<&str> = repaired["leaves"].as_array().unwrap().iter().filter_map(|l| l["leaf_id"].as_str()).collect();
 		assert_eq!(repaired, vec![lost.as_str()], "kept again past every cursor: a read past one taken before serves it");
 		// A's end, in the latest epoch: what the late binding below reads past.
@@ -490,7 +504,14 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	// after every leaf of A's: a read past a settled cursor reached before the
 	// binding (A's last, past B's leaf by when it was made) serves it.
 	let request = server::auth::leaf_since_request(&since, 100, &[], &[]);
-	let late = r.http.post("leaf_data", &json!({"auth": r.http.auth_for("leaf_data", &b2, &r.chain, &request), "since": since, "limit": 100})).ok();
+	let mut late = json!(null);
+	for _ in 0..150 {
+		late = r.http.post("leaf_data", &json!({"auth": r.http.auth_for("leaf_data", &b2, &r.chain, &request), "since": since, "limit": 100})).ok();
+		if !late["leaves"].as_array().unwrap().is_empty() {
+			break;
+		}
+		std::thread::sleep(std::time::Duration::from_millis(100));
+	}
 	let late: Vec<&str> = late["leaves"].as_array().unwrap().iter().filter_map(|l| l["leaf_id"].as_str()).collect();
 	assert_eq!(late.len(), 1, "a leaf bound after the cursor is read past it: {:?}", late);
 	// One owner key, one binding: an earlier one stands.

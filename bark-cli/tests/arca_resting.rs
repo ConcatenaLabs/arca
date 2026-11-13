@@ -796,10 +796,14 @@ async fn a_false_double_spend_costs_at_most_one_stated_wait_and_never_bars_the_e
 				*v = json!({"error": {"code": "double_spend", "message": format!("leaf {} is already spent", c2)}});
 				return Some(409);
 			}
+			// Wherever the operator serves the coin's state: a leaf of a page,
+			// and, past a settled cursor, a held coin and a whole entry asked.
 			if serve_spent && path == "/v1/leaf_data" {
-				for l in v["leaves"].as_array_mut().into_iter().flatten() {
-					if l["leaf_id"] == c2.as_str() {
-						l["state"] = json!("spent");
+				for list in ["leaves", "held", "asked"] {
+					for l in v[list].as_array_mut().into_iter().flatten() {
+						if l["leaf_id"] == c2.as_str() {
+							l["state"] = json!("spent");
+						}
 					}
 				}
 			}

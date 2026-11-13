@@ -28,12 +28,17 @@ fn coin(n: u8, nonce: [u8; 32]) -> NewCoin {
 }
 
 /// The newest schema.
-const SCHEMA: i32 = 48;
+const SCHEMA: i32 = 49;
 
 /// What V17 and every migration after it add, taken away again, the latest
 /// first: with it, a test makes a database of an older schema from a new
 /// one, as a server before V17 left it.
-const UNDO_V17: &str = "DROP INDEX tx_block_by_block, block_by_anchor, nursery_tx_final, board_credited, round_final;
+const UNDO_V17: &str = "DROP TABLE leaf_cursor_epoch; DROP TRIGGER leaf_served_on_leaf ON leaf; DROP TRIGGER leaf_served_on_binding ON leaf_mailbox;
+	DROP TRIGGER leaf_served_on_output ON transfer_output; DROP FUNCTION leaf_served_of_leaf(); DROP FUNCTION leaf_served_of_binding();
+	DROP FUNCTION leaf_served_of_output(); DROP TABLE leaf_served; DROP TABLE leaf_served_claim; DROP FUNCTION leaf_served_claim_done();
+	DROP FUNCTION leaf_served_claim_all(BYTEA[]); DROP FUNCTION leaf_served_claim(BYTEA);
+	ALTER TABLE leaf_mailbox DROP COLUMN bound_xid; ALTER TABLE leaf DROP COLUMN made_xid;
+	DROP INDEX tx_block_by_block, block_by_anchor, nursery_tx_final, board_credited, round_final;
 	DROP INDEX watched_outpoint_watched_for; ALTER TABLE participation_output DROP COLUMN vest; DROP INDEX batch_token_issued; ALTER TABLE batch DROP COLUMN collect_mtp;
 	ALTER TABLE batch ADD CONSTRAINT batch_token_key UNIQUE (token);
 	ALTER TABLE distribution_claim DROP COLUMN lapsed_in; ALTER TABLE participation_output DROP COLUMN claim;
