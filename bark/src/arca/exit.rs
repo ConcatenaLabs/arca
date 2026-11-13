@@ -2053,7 +2053,9 @@ impl Wallet {
 		if *ran > 0 && deadline.is_some_and(|d| web_time::Instant::now() >= d) {
 			return Err(());
 		}
-		if let Some(d) = deadline {
+		// Only a step cut between its items runs in the slice; another runs
+		// whole, a nested loop over items included.
+		if let Some(d) = deadline.filter(|_| super::slice::ITEMS.contains(&name)) {
 			*self.slice.borrow_mut() = Some(super::slice::Slice { deadline: d, done: std::mem::take(&mut r.done), ran: 0, cut: false });
 		}
 		let v = run(self);

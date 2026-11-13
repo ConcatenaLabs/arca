@@ -9,11 +9,14 @@
 //! asked. Without `budget_ms` everything runs in one call, as it always has.
 //!
 //! **Safe points.** A slice stops only between two steps of `sync`, or
-//! between two items of a long step: a participation, a coin's refresh, a
-//! coin's deposit, a coin taken home, an exit moved on, a payment over
-//! Lightning, a plan, an order. An item that has started runs to its end, so
-//! nothing is ever cut between a signature and its record, between handing
-//! over forfeits and recording it, or between a broadcast and its record.
+//! between two items of a long step ([`ITEMS`]): a participation, a coin's
+//! refresh, a coin's deposit, a coin taken home, an exit moved on, a payment
+//! over Lightning, a plan, an order. An item that has started runs to its
+//! end, so nothing is ever cut between a signature and its record, between
+//! handing over forfeits and recording it, or between a broadcast and its
+//! record; nor are the deposits a trade's coins go to at once, before the
+//! trade is reported done, which run outside the slice. Any other step runs
+//! whole in one slice and runs once a pass.
 //! Each step reads what it needs from the store and the operator when it
 //! runs: nothing read in one slice is used in another, so a command run
 //! between two slices (a payment, a refresh, a trade) is seen by every step
@@ -65,6 +68,10 @@ pub const RESUME_FOR: u32 = 600;
 pub const STEPS: [&str; 23] = ["owed deposits", "held", "boards", "transfers", "lightning", "receives", "mailbox", "catch up", "history",
 	"bound", "owed", "participations", "plans", "orders", "offboards", "resting", "receives again", "refresh", "forfeits", "deposits",
 	"home", "exits", "reboards"];
+/// The steps cut between two of their items. Every other step runs whole
+/// within one slice and is never run again in its pass, whatever it calls.
+pub const ITEMS: [&str; 13] = ["owed deposits", "held", "lightning", "receives", "participations", "plans", "orders", "resting",
+	"receives again", "refresh", "deposits", "home", "exits"];
 /// The last step, which runs in the last slice: `schedule`.
 pub const LAST: &str = "schedule";
 

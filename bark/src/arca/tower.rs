@@ -474,7 +474,11 @@ impl Wallet {
 	/// is lost then. Where none holds them, the answer says so: the trade
 	/// then rests on this wallet answering at its next sync or re-check.
 	pub(crate) fn deposit_now(&mut self, ids: &[String]) -> Value {
+		// Outside the slice of a sliced `sync`'s step under way: the trade's
+		// coins are deposited now, whatever is left of the slice.
+		let slice = self.slice.borrow_mut().take();
 		let ran = self.progress_deposits().unwrap_or_else(|e| vec![json!({"error": e.to_string()})]);
+		*self.slice.borrow_mut() = slice;
 		let (mut held, mut not) = (vec![], vec![]);
 		for id in ids {
 			match self.store.deposit_sent_to(id) {
