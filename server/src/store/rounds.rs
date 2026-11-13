@@ -357,6 +357,7 @@ impl Store {
 	pub async fn insert_round(&self, r: &NewRound) -> Result<i64, StoreError> {
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
+		super::coins::claim_keys(&t, r.batches.iter().flat_map(|b| b.leaves.iter().map(|l| l.coin.owner_key.to_vec())).collect()).await?;
 		let row = t.query_one(
 			"INSERT INTO round (txid, tx, state, fee_asset, fee, created_mtp, signer_entry, signer_hash, signer_sig)
 			 VALUES ($1, $2, 'built', $3, $4, $5, $6, $7, $8) RETURNING round_id",

@@ -292,19 +292,39 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 		r.http.post("leaf_data", &json!({"auth": r.http.auth_for("leaf_data", &a_mailbox, &r.chain, &request), "since": since, "limit": limit,
 			"held": held.iter().map(|h| hex(h)).collect::<Vec<_>>(), "leaf_ids": ids.iter().map(|h| hex(h)).collect::<Vec<_>>()}))
 	};
+	// From "0", every leaf from the base tables, a page at a time, each
+	// cursor a read from the first under way ("<epoch>:W…"), ending on a
+	// settled cursor.
+	let whole_on = |c: &str| c.split(':').nth(1).is_some_and(|c| c.starts_with('W'));
 	let mut since = "0".to_string();
 	let mut paged = vec![];
 	loop {
 		let page = settled(&since, 1, &[], &[]).ok();
 		let leaves = page["leaves"].as_array().unwrap().clone();
-		if leaves.is_empty() {
-			assert!(page["next"].is_null(), "{}", page);
+		since = page["next"].as_str().unwrap().to_string();
+		paged.extend(leaves.clone());
+		if !whole_on(&since) {
+			assert!(leaves.is_empty(), "a page of one, full, reads on: {}", page);
 			break;
 		}
-		assert_eq!(leaves.len(), 1);
-		since = page["next"].as_str().unwrap().to_string();
-		assert!(since.contains('.'), "a settled cursor names the making transaction and the seq: {}", since);
-		paged.extend(leaves);
+		assert_eq!(leaves.len(), 1, "{}", page);
+	}
+	assert!(since.contains('.'), "a read from the first leaf ends on a settled cursor: {}", since);
+	assert_eq!(paged, all, "the same leaves, in the same order, read from the first");
+	let epoch = info["leaf_data"]["epoch"].as_str().unwrap().to_string();
+	// Past the settled cursor of A's first leaf ("<epoch>:0.0"), from
+	// `leaf_served`: the same leaves.
+	let mut past = format!("{}:0.0", epoch);
+	let mut paged = vec![];
+	loop {
+		let page = settled(&past, 1, &[], &[]).ok();
+		let Some(l) = page["leaves"].as_array().unwrap().first().cloned() else {
+			assert!(page["next"].is_null(), "{}", page);
+			break;
+		};
+		past = page["next"].as_str().unwrap().to_string();
+		assert!(past.contains('.') && !whole_on(&past), "a settled cursor names the making transaction and the seq: {}", past);
+		paged.push(l);
 	}
 	assert_eq!(paged, all, "the same leaves, in the same order, past a settled cursor");
 	let stranger_leaf = [0x5a; 32];
@@ -339,7 +359,7 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 			sql.execute("UPDATE leaf_served SET served_xid = $2::text::xid8 WHERE leaf_id = decode($1, 'hex') AND mailbox_key = $3",
 				&[&e["leaf_id"].as_str().unwrap(), &(8 + i).to_string(), &&xonly(&a_mailbox).serialize()[..]]).await.unwrap();
 		}
-		let mut since = "0".to_string();
+		let mut since = format!("{}:0.0", epoch);
 		let mut read = vec![];
 		loop {
 			let page = settled(&since, 1, &[], &[]).ok();
@@ -351,7 +371,6 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 		assert_eq!(read, all, "every leaf once, in order, across 9 to 10");
 		// The leaves' cursors as transactions 9 and 10 with their seq: past
 		// 9, the leaf of 10 alone.
-		let epoch = info["leaf_data"]["epoch"].as_str().unwrap().to_string();
 		assert_eq!(epoch.len(), 16, "{}", info["leaf_data"]);
 		assert!(since.starts_with(&format!("{}:", epoch)), "a cursor names its epoch: {}", since);
 		let past = settled(&format!("{}:9.{}", epoch, all[1]["cursor"].as_str().unwrap()), 100, &[], &[]).ok();
@@ -374,8 +393,65 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 		assert!(again["next"].as_str().unwrap().starts_with(&hex(&new_epoch)), "{}", again);
 		// The server starting again on it keeps the epoch.
 		assert_eq!(r.db.store.cursor_epoch_at_start().await.unwrap(), new_epoch);
-		// A's end, in the new epoch: what the late binding below reads past.
-		again["next"].as_str().unwrap().to_string()
+
+		// The database's identity (its cluster's system identifier and its
+		// timeline) is kept beside the epoch: none kept yet (as the
+		// migration leaves it) keeps the epoch and keeps the identity; another
+		// one kept (a restore into another cluster, a recovery to an earlier
+		// point, a standby promoted) starts a new epoch.
+		let sqlr = &sql;
+		let identity = move || async move {
+			sqlr.query_one("SELECT identity FROM leaf_cursor_epoch", &[]).await.unwrap().get::<_, Option<String>>(0)
+		};
+		sql.execute("UPDATE leaf_cursor_epoch SET identity = NULL", &[]).await.unwrap();
+		assert_eq!(r.db.store.cursor_epoch_at_start().await.unwrap(), new_epoch, "no identity kept: the epoch stands");
+		let real = identity().await.expect("the identity is kept");
+		assert!(real.contains('/'), "{}", real);
+		sql.execute("UPDATE leaf_cursor_epoch SET identity = 'another cluster/00000001'", &[]).await.unwrap();
+		let third = r.db.store.cursor_epoch_at_start().await.unwrap();
+		assert_ne!(third, new_epoch, "another identity: a new epoch");
+		assert_eq!(identity().await, Some(real.clone()), "the identity kept is the database's");
+		assert_eq!(r.db.store.cursor_epoch_at_start().await.unwrap(), third, "and stands at the next start");
+		let after_move = settled(again["next"].as_str().unwrap(), 100, &[], &[]).ok();
+		assert_eq!(after_move["leaves"].as_array().unwrap().len(), all.len(), "a cursor of the epoch before reads from the first leaf");
+
+		// The read from the first leaf comes from the base tables, never from
+		// `leaf_served` alone: a row lost from it (deleted by hand) is served
+		// at the next read from the first leaf, and kept again, at that read's
+		// transaction, so a read past a cursor taken before serves it too.
+		let whole = || {
+			let mut c = "0".to_string();
+			let mut ids = vec![];
+			loop {
+				let page = settled(&c, 100, &[], &[]).ok();
+				ids.extend(page["leaves"].as_array().unwrap().iter().map(|l| l["leaf_id"].as_str().unwrap().to_string()));
+				c = page["next"].as_str().unwrap().to_string();
+				if !whole_on(&c) {
+					return (ids, c);
+				}
+			}
+		};
+		let (_, before) = whole();
+		let lost = all[0]["leaf_id"].as_str().unwrap().to_string();
+		let mailbox = xonly(&a_mailbox).serialize();
+		let (mailboxr, lostr) = (&mailbox, &lost);
+		let rows = move || async move {
+			sqlr.query_one("SELECT count(*) FROM leaf_served WHERE mailbox_key = $1 AND leaf_id = decode($2, 'hex')", &[&&mailboxr[..], lostr])
+				.await.unwrap().get::<_, i64>(0)
+		};
+		sql.execute("DELETE FROM leaf_served WHERE mailbox_key = $1 AND leaf_id = decode($2, 'hex')", &[&&mailbox[..], &lost]).await.unwrap();
+		assert_eq!(rows().await, 0);
+		let past_lost = settled(&format!("{}:0.0", hex(&third)), 100, &[], &[]).ok();
+		assert!(past_lost["leaves"].as_array().unwrap().iter().all(|l| l["leaf_id"] != json!(lost)), "the index lost it: {}", past_lost);
+		let (ids, end) = whole();
+		assert!(ids.contains(&lost), "the read from the first leaf serves the leaf the index lost: {:?}", ids);
+		assert_eq!(ids.len(), all.len());
+		assert_eq!(rows().await, 1, "and keeps it again");
+		let repaired = settled(&before, 100, &[], &[]).ok();
+		let repaired: Vec<&str> = repaired["leaves"].as_array().unwrap().iter().filter_map(|l| l["leaf_id"].as_str()).collect();
+		assert_eq!(repaired, vec![lost.as_str()], "kept again past every cursor: a read past one taken before serves it");
+		// A's end, in the latest epoch: what the late binding below reads past.
+		end
 	};
 
 	// The proof binds every part of the read.
@@ -534,7 +610,7 @@ async fn the_published_tree_lists_every_node_and_each_preimage_once_it_went_out(
 /// A leaf, and its owner key's binding to a mailbox, inserted by two
 /// transactions open at once, kept for the mailbox (`leaf_served`) whichever
 /// commits first: each trigger waits for the other's transaction on the
-/// owner key's lock, then reads its row.
+/// claim of the owner key, then reads its row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaf_and_its_binding_made_at_once_are_served_to_the_mailbox() {
 	let db = common::db::TestDb::new().await;
@@ -551,7 +627,7 @@ async fn a_leaf_and_its_binding_made_at_once_are_served_to_the_mailbox() {
 		t1.execute("INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state)
 			VALUES ($1, 'batch', $2, 1000, $3, $1, 0, '\\x00', 'live')", &[&&leaf_id[..], &&[7u8; 32][..], &&owner[..]]).await.unwrap();
 		t2.batch_execute("BEGIN").await.unwrap();
-		// The binding's trigger waits on the owner key's lock while the leaf's
+		// The binding's trigger waits on the claim of the owner key while the leaf's
 		// transaction is open: insert it in a task of its own.
 		let t2 = std::sync::Arc::new(t2);
 		let t2b = t2.clone();
@@ -602,4 +678,173 @@ async fn a_leaf_and_its_binding_made_at_once_are_served_to_the_mailbox() {
 	let n: i64 = t2.query_one("SELECT count(*) FROM leaf_served WHERE mailbox_key = $1 AND leaf_id = $2", &[&&mailbox[..], &&leaf_id[..]])
 		.await.unwrap().get(0);
 	assert_eq!(n, 1, "the leaf is kept for the mailbox its key was bound to meanwhile");
+	// Keys that are not the same never wait on each other: a transaction
+	// holding leaves open (a round's) and one binding other keys (a plan's)
+	// each go on at once, in either order.
+	t1.batch_execute("BEGIN").await.unwrap();
+	t2.batch_execute("BEGIN").await.unwrap();
+	let (asset, proof) = ([7u8; 32], [9u8; 64]);
+	for (c, i) in [(&*t1, 0x40u8), (&t2, 0x41), (&*t1, 0x42), (&t2, 0x43)] {
+		let id = [i; 32];
+		let owner = [i ^ 0x80; 32];
+		if i % 2 == 0 {
+			c.execute("INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES ($1, 'leaf', $1)", &[&&id[..]]).await.unwrap();
+			c.execute("INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state)
+				VALUES ($1, 'batch', $2, 1000, $3, $1, 0, '\\x00', 'live')", &[&&id[..], &&asset[..], &&owner[..]]).await.unwrap();
+		} else {
+			let (o, m, p) = (&owner[..], &mailbox[..], &proof[..]);
+			let params: [&(dyn tokio_postgres::types::ToSql + Sync); 3] = [&o, &m, &p];
+			let t = tokio::time::timeout(std::time::Duration::from_secs(5), c.execute(
+				"INSERT INTO leaf_mailbox (owner_key, mailbox_key, proof) VALUES ($1, $2, $3)", &params));
+			t.await.expect("a binding of another key does not wait").unwrap();
+		}
+	}
+	t1.batch_execute("COMMIT").await.unwrap();
+	t2.batch_execute("COMMIT").await.unwrap();
+}
+
+/// A transaction of 20,000 leaves and 20,000 bindings: each trigger claims
+/// its owner key with a row (`leaf_served_claim`), not a lock, so the
+/// transaction takes no slot of PostgreSQL's shared lock table for them (an
+/// advisory lock a key filled it between 12,000 and 14,000 leaves, failing with "out of
+/// shared memory"); and every leaf is kept for its key and its mailbox.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transaction_of_many_leaves_and_bindings_holds_a_bounded_number_of_locks() {
+	let db = common::db::TestDb::new().await;
+	let (c, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	c.batch_execute("BEGIN;
+		INSERT INTO arca_script (script_pubkey, kind, leaf_id)
+		SELECT decode(lpad(to_hex(i), 64, '0'), 'hex'), 'leaf', decode(lpad(to_hex(i), 64, '0'), 'hex') FROM generate_series(1, 20000) i;
+		INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state)
+		SELECT decode(lpad(to_hex(i), 64, '0'), 'hex'), 'batch', decode(repeat('07', 32), 'hex'), 1000,
+		       decode(lpad(to_hex(i + 1000000), 64, '0'), 'hex'), decode(lpad(to_hex(i), 64, '0'), 'hex'), 0, '\\x00', 'live'
+		FROM generate_series(1, 20000) i;
+		INSERT INTO leaf_mailbox (owner_key, mailbox_key, proof)
+		SELECT decode(lpad(to_hex(i + 1000000), 64, '0'), 'hex'), decode(lpad(to_hex(i % 7 + 9000000), 64, '0'), 'hex'),
+		       decode(repeat('09', 64), 'hex')
+		FROM generate_series(1, 20000) i;").await.unwrap();
+	let locks: i64 = c.query_one("SELECT count(*) FROM pg_locks WHERE pid = pg_backend_pid()", &[]).await.unwrap().get(0);
+	assert!(locks < 100, "{} locks held", locks);
+	let claims: i64 = c.query_one("SELECT count(*) FROM leaf_served_claim", &[]).await.unwrap().get(0);
+	assert_eq!(claims, 20_000, "one claim a key");
+	c.batch_execute("COMMIT").await.unwrap();
+	let kept: i64 = c.query_one("SELECT count(*) FROM leaf_served", &[]).await.unwrap().get(0);
+	assert_eq!(kept, 40_000, "each leaf kept for its key and for its mailbox");
+	let left: i64 = c.query_one("SELECT count(*) FROM leaf_served_claim", &[]).await.unwrap().get(0);
+	assert_eq!(left, 0, "each claim deleted when its transaction committed");
+	println!("20,000 leaves and 20,000 bindings in one transaction: {} locks held, {} claims, {} rows kept", locks, claims, kept);
+}
+
+/// Two transactions claiming the same two owner keys in opposite orders. One
+/// key at a time, as the triggers claim, they wait on each other and
+/// PostgreSQL aborts one (a deadlock). Every path that claims several keys
+/// claims them first, all at once in the keys' order
+/// (`leaf_served_claim_all`): the second then waits for the first to end,
+/// and both go through. A round's transaction (leaves of K2 then K1) and a
+/// plan's (bindings of K1 then K2), each claiming its keys first, both
+/// commit, and both leaves are kept for the mailbox. A thousand leaves made
+/// leave no claim behind once their transactions end.
+#[tokio::test(flavor = "multi_thread")]
+async fn claims_of_several_keys_never_wait_on_each_other_in_a_cycle_and_end_with_their_transaction() {
+	let db = common::db::TestDb::new().await;
+	let connect = || async {
+		let (c, conn) = tokio_postgres::connect(&db.url, tokio_postgres::NoTls).await.unwrap();
+		tokio::spawn(conn);
+		std::sync::Arc::new(c)
+	};
+	let (k1, k2) = ([0x71u8; 32], [0x72u8; 32]);
+	let claim = |c: std::sync::Arc<tokio_postgres::Client>, keys: Vec<[u8; 32]>| tokio::spawn(async move {
+		let keys: Vec<&[u8]> = keys.iter().map(|k| &k[..]).collect();
+		c.execute("SELECT leaf_served_claim_all($1)", &[&keys]).await.map(|_| ())
+	});
+	let one = |c: std::sync::Arc<tokio_postgres::Client>, k: [u8; 32]| tokio::spawn(async move {
+		c.execute("SELECT leaf_served_claim($1)", &[&&k[..]]).await.map(|_| ())
+	});
+	let wait = std::time::Duration::from_millis(300);
+
+	// One key at a time, in opposite orders: a deadlock, one aborted.
+	let (t1, t2) = (connect().await, connect().await);
+	t1.batch_execute("BEGIN").await.unwrap();
+	t2.batch_execute("BEGIN").await.unwrap();
+	one(t1.clone(), k2).await.unwrap().unwrap();
+	one(t2.clone(), k1).await.unwrap().unwrap();
+	let a = one(t1.clone(), k1);
+	tokio::time::sleep(wait).await;
+	let b = one(t2.clone(), k2);
+	let (a, b) = (a.await.unwrap(), b.await.unwrap());
+	let aborted: Vec<String> = [&a, &b].iter().filter_map(|r| r.as_ref().err())
+		.map(|e| e.as_db_error().map(|d| format!("{} {}", d.code().code(), d.message())).unwrap_or_default()).collect();
+	assert_eq!(aborted.len(), 1, "one of the two aborted: {:?}", aborted);
+	assert!(aborted[0].starts_with("40P01 deadlock detected"), "{:?}", aborted);
+	println!("one key at a time, opposite orders: {}", aborted[0]);
+	t1.batch_execute("ROLLBACK").await.unwrap();
+	t2.batch_execute("ROLLBACK").await.unwrap();
+
+	// All at once, in the keys' order: the second waits, then goes through.
+	t1.batch_execute("BEGIN").await.unwrap();
+	t2.batch_execute("BEGIN").await.unwrap();
+	claim(t1.clone(), vec![k2, k1]).await.unwrap().unwrap();
+	let b = claim(t2.clone(), vec![k1, k2]);
+	tokio::time::sleep(wait).await;
+	assert!(!b.is_finished(), "the second waits for the first");
+	t1.batch_execute("COMMIT").await.unwrap();
+	b.await.unwrap().expect("no deadlock: the second goes through once the first ends");
+	t2.batch_execute("COMMIT").await.unwrap();
+
+	// A round's transaction and a plan's, interleaved, each claiming its keys
+	// first: the round inserts leaves of K2 then K1, the plan binds K1 then K2.
+	let mailbox = [0x7fu8; 32];
+	let (round, plan) = (connect().await, connect().await);
+	round.batch_execute("BEGIN").await.unwrap();
+	plan.batch_execute("BEGIN").await.unwrap();
+	claim(round.clone(), vec![k2, k1]).await.unwrap().unwrap();
+	let p = {
+		let plan = plan.clone();
+		tokio::spawn(async move {
+			let keys: Vec<&[u8]> = vec![&k1[..], &k2[..]];
+			plan.execute("SELECT leaf_served_claim_all($1)", &[&keys]).await?;
+			for k in [k1, k2] {
+				plan.execute("INSERT INTO leaf_mailbox (owner_key, mailbox_key, proof) VALUES ($1, $2, $3)",
+					&[&&k[..], &&mailbox[..], &&[9u8; 64][..]]).await?;
+			}
+			Ok::<_, tokio_postgres::Error>(())
+		})
+	};
+	for (i, k) in [(0x81u8, k2), (0x82, k1)] {
+		let id = [i; 32];
+		round.execute("INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES ($1, 'leaf', $1)", &[&&id[..]]).await.unwrap();
+		round.execute("INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state)
+			VALUES ($1, 'batch', $2, 1000, $3, $1, 0, '\\x00', 'live')", &[&&id[..], &&[7u8; 32][..], &&k[..]]).await.unwrap();
+	}
+	tokio::time::sleep(wait).await;
+	assert!(!p.is_finished(), "the plan waits for the round");
+	round.batch_execute("COMMIT").await.unwrap();
+	p.await.unwrap().expect("the plan's bindings go through once the round ends");
+	plan.batch_execute("COMMIT").await.unwrap();
+	let kept: i64 = round.query_one("SELECT count(*) FROM leaf_served WHERE mailbox_key = $1", &[&&mailbox[..]]).await.unwrap().get(0);
+	assert_eq!(kept, 2, "both leaves kept for the mailbox");
+
+	// A thousand leaves, each in its own transaction, and a thousand more in
+	// one: no claim left once they end.
+	let c = connect().await;
+	for i in 0..1000u32 {
+		c.batch_execute(&format!("INSERT INTO arca_script (script_pubkey, kind, leaf_id) VALUES (decode(lpad(to_hex({i} + 5000000), 64, '0'), 'hex'), 'leaf',
+			decode(lpad(to_hex({i} + 5000000), 64, '0'), 'hex'));
+			INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state)
+			VALUES (decode(lpad(to_hex({i} + 5000000), 64, '0'), 'hex'), 'batch', decode(repeat('07', 32), 'hex'), 1000,
+			decode(lpad(to_hex({i} + 6000000), 64, '0'), 'hex'), decode(lpad(to_hex({i} + 5000000), 64, '0'), 'hex'), 0, '\\x00', 'live')")).await.unwrap();
+	}
+	c.batch_execute("BEGIN;
+		INSERT INTO arca_script (script_pubkey, kind, leaf_id)
+		SELECT decode(lpad(to_hex(i + 7000000), 64, '0'), 'hex'), 'leaf', decode(lpad(to_hex(i + 7000000), 64, '0'), 'hex') FROM generate_series(1, 1000) i;
+		INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state)
+		SELECT decode(lpad(to_hex(i + 7000000), 64, '0'), 'hex'), 'batch', decode(repeat('07', 32), 'hex'), 1000,
+		       decode(lpad(to_hex(i + 8000000), 64, '0'), 'hex'), decode(lpad(to_hex(i + 7000000), 64, '0'), 'hex'), 0, '\\x00', 'live'
+		FROM generate_series(1, 1000) i;
+		COMMIT;").await.unwrap();
+	let made: i64 = c.query_one("SELECT count(*) FROM leaf", &[]).await.unwrap().get(0);
+	let left: i64 = c.query_one("SELECT count(*) FROM leaf_served_claim", &[]).await.unwrap().get(0);
+	assert_eq!((made, left), (2002, 0), "no claim outlives its transaction");
+	println!("{} leaves made, {} claims left", made, left);
 }

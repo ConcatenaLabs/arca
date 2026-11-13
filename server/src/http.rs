@@ -2020,35 +2020,60 @@ async fn leaf_data(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<S
 /// about.
 pub const LEAF_HELD: u32 = 400;
 
-/// The longest settled cursor read: a real one is at most 57 bytes. A proof
+/// The longest settled cursor read: a real one is at most 58 bytes. A proof
 /// binds at most 255 bytes of it ([`auth::leaf_since_request`]).
 pub const SINCE_MOST: usize = 64;
 
-/// A settled cursor as `leaf_data` serves it: `"0"` before the first leaf,
-/// else the cursors' epoch (hex), the transaction the last leaf read came to
-/// be served at and that leaf's `seq`, `"<epoch>:<xid>.<seq>"`. A cursor of
-/// another epoch than `epoch` reads from the first leaf (`(0, 0)`): the
-/// database was restored meanwhile ([`Store::cursor_epoch_at_start`]).
-fn settled_cursor(s: &str, epoch: &[u8; 8]) -> Result<(u64, i64), Refusal> {
+/// Where a `leaf_data` read past a settled cursor reads on from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Since {
+	/// Every leaf served to the key, from the base tables, paged by `seq`:
+	/// the read from the first leaf. `start` is the settled cursor's
+	/// transaction it ends at ([`Store::settled_start`]), taken at its first
+	/// page; `after` the `seq` its last page ended at.
+	Whole { start: Option<u64>, after: i64 },
+	/// Past a settled cursor: a transaction and a `seq`, read from
+	/// `leaf_served` ([`Store::served_since`]).
+	Past(u64, i64),
+}
+
+/// A settled cursor as `leaf_data` serves it, at most [`SINCE_MOST`] bytes:
+/// - `"0"`: every leaf, from the first;
+/// - `"<epoch>:W<start>:<seq>"`: such a read under way, past `seq`;
+/// - `"<epoch>:<xid>.<seq>"`: past the leaf served at transaction `xid`
+///   with that `seq`.
+///
+/// The epoch is the cursors' (hex). A cursor of another epoch than `epoch`
+/// reads from the first leaf: the database was restored meanwhile
+/// ([`Store::cursor_epoch_at_start`]).
+fn settled_cursor(s: &str, epoch: &[u8; 8]) -> Result<Since, Refusal> {
 	if s == "0" {
-		return Ok((0, 0));
+		return Ok(Since::Whole { start: None, after: 0 });
 	}
-	let bad = || Refusal::malformed(format!("settled cursor {:?}: \"0\" or \"<epoch>:<xid>.<seq>\", at most {} bytes", s, SINCE_MOST));
+	let bad = || Refusal::malformed(format!("settled cursor {:?}: \"0\", \"<epoch>:<xid>.<seq>\" or \"<epoch>:W<xid>:<seq>\", at most {} bytes",
+		s, SINCE_MOST));
 	if s.len() > SINCE_MOST {
 		return Err(bad());
 	}
 	let (e, rest) = s.split_once(':').ok_or_else(bad)?;
-	let (x, q) = rest.split_once('.').ok_or_else(bad)?;
-	let x: u64 = x.parse().map_err(|_| bad())?;
-	let q: i64 = q.parse().map_err(|_| bad())?;
 	let e = unhex(e).map_err(|_| bad())?;
-	if q < 0 || e.len() != 8 {
+	let since = match rest.strip_prefix('W') {
+		Some(w) => {
+			let (x, q) = w.split_once(':').ok_or_else(bad)?;
+			Since::Whole { start: Some(x.parse().map_err(|_| bad())?), after: q.parse().map_err(|_| bad())? }
+		},
+		None => {
+			let (x, q) = rest.split_once('.').ok_or_else(bad)?;
+			Since::Past(x.parse().map_err(|_| bad())?, q.parse().map_err(|_| bad())?)
+		},
+	};
+	if e.len() != 8 || matches!(since, Since::Whole { start: Some(0), .. } | Since::Whole { after: i64::MIN..=-1, .. } | Since::Past(_, i64::MIN..=-1)) {
 		return Err(bad());
 	}
 	if e[..] != epoch[..] {
-		return Ok((0, 0));
+		return Ok(Since::Whole { start: None, after: 0 });
 	}
-	Ok((x, q))
+	Ok(since)
 }
 
 /// [`leaf_data`] past a settled cursor: see [`api::LeafDataRequest`].
@@ -2066,17 +2091,57 @@ async fn leaf_data_since(app: &App, req: &api::LeafDataRequest, since: &str) -> 
 	let ids: Vec<[u8; 32]> = req.leaf_ids.iter().map(|h| leaf_id(h).map(|l| l.0)).collect::<Result<_, _>>()?;
 	let k = authenticate(app, "leaf_data", &req.auth, &auth::leaf_since_request(since, limit, &held, &ids)).await?;
 	let key = k.serialize();
-	let rows = app.store.served_since(&key, from, limit.clamp(1, LEAF_PAGE) as i64).await?;
-	let mut leaves = Vec::with_capacity(rows.len());
+	let limit = limit.clamp(1, LEAF_PAGE) as i64;
+	let mut leaves = vec![];
 	let mut next = None;
-	let mut bytes = 0usize;
-	for (r, (x, q)) in rows {
-		bytes += r.leaf.record.len();
-		if !leaves.is_empty() && bytes > LEAF_PAGE_BYTES {
-			break;
-		}
-		leaves.push(served_entry(app, r).await?);
-		next = Some(format!("{}:{}.{}", hex(&epoch), x, q));
+	match from {
+		Since::Past(x, q) => {
+			let mut bytes = 0usize;
+			for (r, (x, q)) in app.store.served_since(&key, (x, q), limit).await? {
+				bytes += r.leaf.record.len();
+				if !leaves.is_empty() && bytes > LEAF_PAGE_BYTES {
+					break;
+				}
+				leaves.push(served_entry(app, r).await?);
+				next = Some(format!("{}:{}.{}", hex(&epoch), x, q));
+			}
+		},
+		// The read from the first leaf comes from the base tables, as the
+		// paged `after` read does, never from `leaf_served` alone: what that
+		// index lacks is served all the same, and kept in it again. It ends
+		// at the settled cursor taken before its first page: every leaf
+		// served at an older transaction is in one of its pages, and every
+		// leaf served from then on lies past that cursor.
+		Since::Whole { start, after } => {
+			let start = match start {
+				Some(s) => s,
+				None => app.store.settled_start().await?,
+			};
+			let rows = app.store.served_leaves(&key, after, limit).await?;
+			let full = rows.len() as i64 >= limit;
+			let mut bytes = 0usize;
+			let mut cut = false;
+			let (mut last, mut read) = (after, vec![]);
+			for r in rows {
+				bytes += r.leaf.record.len();
+				if !leaves.is_empty() && bytes > LEAF_PAGE_BYTES {
+					cut = true;
+					break;
+				}
+				last = r.seq;
+				read.push(r.leaf.leaf_id);
+				leaves.push(served_entry(app, r).await?);
+			}
+			let missing = app.store.repair_served(&key, &read).await?;
+			if missing > 0 {
+				log::warn!("{} leaves served to mailbox key {} were missing from leaf_served: kept again", missing, hex(&key));
+			}
+			next = Some(if full || cut {
+				format!("{}:W{}:{}", hex(&epoch), start, last)
+			} else {
+				format!("{}:{}.{}", hex(&epoch), start - 1, i64::MAX)
+			});
+		},
 	}
 	// The held coins served to the key, and the whole entry of those given
 	// up for good and of the leaves asked for by id. Each list is bounded on

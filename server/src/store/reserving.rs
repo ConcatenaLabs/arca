@@ -204,27 +204,75 @@ impl Store {
 		Ok(served_rows(&*conn, &rows).await?.into_iter().zip(made).collect())
 	}
 
+	/// Where a read of every leaf served to a key from the first
+	/// ([`Store::served_leaves`], paged by `seq`) leaves a settled cursor
+	/// ([`Store::served_since`]) once it ends, taken before its first page:
+	/// the oldest transaction still running. Every transaction older has
+	/// ended, so each leaf it served is in every page read after this; every
+	/// leaf served from now on comes to be served at this transaction or a
+	/// later one, past the cursor `(start - 1, i64::MAX)`.
+	pub async fn settled_start(&self) -> Result<u64, StoreError> {
+		let conn = self.conn().await?;
+		let x: String = conn.query_one("SELECT pg_snapshot_xmin(pg_current_snapshot())::text", &[]).await?.get(0);
+		x.parse::<u64>().map_err(|_| StoreError::Corrupt(format!("transaction id {}", x)))
+	}
+
+	/// Keeps for `key` each leaf of `ids` it is served (a read of every leaf
+	/// from the first just served them, from the base tables) that
+	/// `leaf_served` is missing, served at this transaction, past every
+	/// cursor a wallet holds: the index is never the only source of what a
+	/// key is served. Answers how many were missing; none, unless a trigger
+	/// failed to keep one.
+	pub async fn repair_served(&self, key: &[u8; 32], ids: &[[u8; 32]]) -> Result<u64, StoreError> {
+		if ids.is_empty() {
+			return Ok(0);
+		}
+		let conn = self.conn().await?;
+		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		// Inserting nothing draws no transaction id: the transaction's own is
+		// drawn by the first row it inserts.
+		Ok(conn.execute(
+			"INSERT INTO leaf_served (mailbox_key, served_xid, seq, leaf_id)
+			 SELECT $1, pg_current_xact_id(), l.seq, l.leaf_id FROM leaf l
+			 WHERE l.leaf_id = ANY($2)
+			   AND NOT EXISTS (SELECT 1 FROM leaf_served s WHERE s.mailbox_key = $1 AND s.leaf_id = l.leaf_id)
+			 ON CONFLICT DO NOTHING",
+			&[&&key[..], &ids],
+		).await?)
+	}
+
 	/// The epoch of the settled cursors ([`Store::served_since`]), drawn the
-	/// first time. Run when the server starts: a database whose transaction
-	/// counter is behind a transaction its leaves were served at was
-	/// restored from a dump (whose counter starts again), and every cursor a
-	/// wallet holds would then lie past the leaves made from now on. It then
-	/// draws a new epoch and sets every served transaction to 0, so a wallet
-	/// holding a cursor of the old epoch reads from the first leaf, and the
-	/// leaves made from now on lie past every cursor of the new one.
+	/// first time. Run when the server starts. It draws a new one when the
+	/// database is not the one the cursors were drawn on, since every cursor
+	/// a wallet holds might then lie past the leaves made from now on:
+	/// - its transaction counter is behind a transaction its leaves were
+	///   served at (restored from a dump, whose counter starts again): it
+	///   then also sets every served transaction to 0, so the leaves made
+	///   from now on lie past every cursor of the new epoch;
+	/// - its identity changed (the cluster's system identifier and its
+	///   timeline, [`database_identity`]): restored into another cluster,
+	///   recovered to an earlier point in time, or a standby promoted, whose
+	///   counter runs on from a point behind what the wallets read.
+	/// A wallet holding a cursor of the old epoch reads from the first leaf.
 	pub async fn cursor_epoch_at_start(&self) -> Result<[u8; 8], StoreError> {
 		let mut conn = self.conn().await?;
+		let identity = database_identity(&*conn).await;
 		let tx = conn.transaction().await?;
 		tx.batch_execute("LOCK TABLE leaf_cursor_epoch IN EXCLUSIVE MODE").await?;
 		let behind: bool = tx.query_one(
 			"SELECT pg_current_xact_id() < COALESCE((SELECT max(served_xid) FROM leaf_served), '0'::xid8)", &[]).await?.get(0);
-		let kept = tx.query_opt("SELECT epoch FROM leaf_cursor_epoch", &[]).await?;
+		let kept = tx.query_opt("SELECT epoch, identity FROM leaf_cursor_epoch", &[]).await?;
+		// An identity unread, or none kept yet, raises nothing.
+		let moved = |kept: &Option<String>| matches!((kept, &identity), (Some(k), Some(i)) if k != i);
 		let epoch = match kept {
-			Some(r) if !behind => {
+			Some(r) if !behind && !moved(&r.get(1)) => {
 				let e: Vec<u8> = r.get(0);
+				if identity.is_some() {
+					tx.execute("UPDATE leaf_cursor_epoch SET identity = $1", &[&identity]).await?;
+				}
 				e.try_into().map_err(|_| StoreError::Corrupt("the cursor epoch".into()))?
 			},
-			_ => {
+			kept => {
 				let mut e = [0u8; 8];
 				rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut e);
 				if behind {
@@ -233,9 +281,14 @@ impl Store {
 					tx.batch_execute("UPDATE leaf_served SET served_xid = '0'::xid8 WHERE served_xid <> '0'::xid8;
 						UPDATE leaf SET made_xid = NULL WHERE made_xid IS NOT NULL;
 						UPDATE leaf_mailbox SET bound_xid = NULL WHERE bound_xid IS NOT NULL;").await?;
+				} else if let Some(k) = kept.and_then(|r| r.get::<_, Option<String>>(1)) {
+					log::warn!("the database is not the one the settled cursors were drawn on (its identity was {}, is {}: restored into \
+						another cluster, recovered to an earlier point, or a standby promoted): the settled cursors start a new epoch, and \
+						every wallet reads from the first leaf at its next catch-up", k, identity.as_deref().unwrap_or("?"));
 				}
-				tx.execute("INSERT INTO leaf_cursor_epoch (one, epoch) VALUES (true, $1) ON CONFLICT (one) DO UPDATE SET epoch = $1",
-					&[&&e[..]]).await?;
+				tx.execute("INSERT INTO leaf_cursor_epoch (one, epoch, identity) VALUES (true, $1, $2)
+					ON CONFLICT (one) DO UPDATE SET epoch = $1, identity = COALESCE($2, leaf_cursor_epoch.identity)",
+					&[&&e[..], &identity]).await?;
 				e
 			},
 		};
@@ -289,6 +342,22 @@ impl Store {
 			&[&&key[..], &ids],
 		).await?;
 		rows.iter().map(|r| Ok((array32(r.get(0), "leaf id")?, LeafState::parse(r.get(1))?, r.get::<_, bool>(2)))).collect()
+	}
+}
+
+/// The database's identity, `"<system identifier>/<timeline>"`: another
+/// cluster has another system identifier, and a recovery to an earlier point
+/// in time or a standby's promotion starts a new timeline. `None` where the
+/// database does not answer it (a role not allowed to read it), which leaves
+/// only the transaction counter to tell a database restored.
+async fn database_identity(conn: &tokio_postgres::Client) -> Option<String> {
+	match conn.query_one("SELECT (SELECT system_identifier FROM pg_control_system())::text || '/' ||
+		substr(pg_walfile_name(pg_current_wal_lsn()), 1, 8)", &[]).await {
+		Ok(r) => Some(r.get(0)),
+		Err(e) => {
+			log::warn!("the database's identity does not read ({}): a restore is told only by its transaction counter", e);
+			None
+		},
 	}
 }
 

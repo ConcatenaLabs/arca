@@ -1138,14 +1138,19 @@ impl Wallet {
 						entries.push(a);
 					}
 				}
-				match v["next"].as_str() {
-					Some(n) if !leaves.is_empty() => pass.since = Some(n.to_string()),
-					_ => {},
+				// Taken even from a page with no leaves: the read from the
+				// first leaf ends on the settled cursor it started at.
+				if let Some(n) = v["next"].as_str() {
+					pass.since = Some(n.to_string());
 				}
-				// A page short of what it asked for is the last; one the
-				// server cut for its size leaves the rest to the next read
-				// past the cursor, which nothing can step behind.
-				let done = (leaves.len() < limit as usize || v["next"].as_str().is_none()) && pass.held.is_empty() && pass.ids.is_empty();
+				// A read from the first leaf reads on while its cursor says so
+				// (`"<epoch>:W…"`). Past a settled cursor, a page short of what
+				// it asked for is the last; one the server cut for its size
+				// leaves the rest to the next read past the cursor, which
+				// nothing can step behind.
+				let whole_on = v["next"].as_str().and_then(|n| n.split(':').nth(1)).is_some_and(|c| c.starts_with('W'));
+				let done = !whole_on && (leaves.len() < limit as usize || v["next"].as_str().is_none()) && pass.held.is_empty()
+					&& pass.ids.is_empty();
 				let receives = if pass.pages == 0 { v["receives"].as_array().cloned().unwrap_or_default() } else { vec![] };
 				(entries, receives, done)
 			} else {

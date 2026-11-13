@@ -307,6 +307,7 @@ pub(crate) async fn record_transfer_in<F>(t: &tokio_postgres::Transaction<'_>, t
 where
 	F: FnOnce(&[(Vec<u8>, Vec<u8>)]) -> Result<(), String>,
 {
+	super::coins::claim_keys(t, outputs.iter().map(|o| o.coin.owner_key.to_vec()).collect()).await?;
 	// One reassignment at a time per output 0: two that could be merged
 	// always agree there.
 	let lock = i64::from_le_bytes(reassignment.first_output[..8].try_into().expect("8 bytes"));

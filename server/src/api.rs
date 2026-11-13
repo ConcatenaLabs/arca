@@ -1613,7 +1613,10 @@ pub struct MailboxMessage {
 /// a request without them reads the first page, its proof over nothing.
 ///
 /// With `since` in place of `after`, a read past a settled cursor (`"0"`,
-/// or the `next` such a read answered): the leaves in the order they came
+/// or the `next` such a read answered). From `"0"` (or a cursor of another
+/// epoch) it reads every leaf from the base tables in `seq` order, as the
+/// `after` read does, its cursor `"<epoch>:W<xid>:<seq>"` while it reads on,
+/// and ends on a settled cursor. Past a settled cursor: the leaves in the order they came
 /// to be served to the key (the later of the transaction that made the leaf
 /// and the one that bound its owner key to the key), only those of
 /// transactions older than every one still running, so no leaf can still
