@@ -2788,7 +2788,8 @@ operator through the library's commands. `lightning_receive_quote` answers what
 the receiver's leaf will hold once claimed, asking the operator nothing;
 `lightning_pay_quote` answers what the payment takes in all, signing and keeping
 nothing, and `lightning_pay` on other terms than it is refused before anything is
-signed. `lightning_receive_ready` answers not ready before the leaf's round, ready
+signed. `lightning_receive_ready` answers not ready before the leaf's round,
+naming the round as the step it waits for with its bound in seconds, ready
 after it, and refuses a wait longer than the leaf's home date allows. The claim
 then leaves exactly the quoted amount and the payer's coins fall by exactly the
 quoted amount.

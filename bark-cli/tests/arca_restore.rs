@@ -2276,3 +2276,93 @@ async fn a_store_learns_what_the_other_did_between_two_catch_ups() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// A catch-up reads no further than the operator lets it end: an operator
+/// whose read past a settled cursor names, with a full page of leaves, a
+/// cursor that is not past the one asked is read no further at once (a
+/// note says so); one that names pages of a read from the first leaf
+/// without end is read for at most `LEAF_DATA_PAGES` pages, across the syncs
+/// that carry the read on. Each time the next sync ends, with what it read
+/// taken, and the cursor of the read the operator kept from ending is not
+/// kept: once the operator is honest again, the wallet reads on past the
+/// last settled cursor it gave. Without these guards both reads would go on
+/// in every sync for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_reads_no_further_than_a_hostile_operator_lets_it_end() {
+	let mut r = Running::start_kept(1, None).await;
+	let url = r.url();
+	let x = r.x;
+	let p = Proxy::start(&url);
+	let w = Arca::new("HOC");
+	boarded(&mut r, &w, &p.url, &[(x, 40_000_000)]).await;
+	// The wallet's first catch-up, honest: a read from the first leaf.
+	catch_up_due(&r).await;
+	let mut first = catch_up_reads(&p, &w);
+	while first["caught_up"]["more"] == true {
+		first = catch_up_reads(&p, &w);
+	}
+	let leaf = p.calls().iter().filter(|c| c.0 == "/v1/leaf_data")
+		.find_map(|c| c.3["leaves"].as_array().and_then(|l| l.first().cloned())).expect("a leaf served");
+
+	// Past its settled cursor: a full page, and the cursor asked again.
+	let l = leaf.clone();
+	p.rewrite(Some(Arc::new(move |path: &str, req: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/leaf_data" && status == 200 && req["since"].as_str().is_some_and(|s| s != "0") {
+			let n = req["limit"].as_u64().unwrap_or(100) as usize;
+			v["leaves"] = json!(vec![l.clone(); n]);
+			v["next"] = req["since"].clone();
+		}
+		None
+	})));
+	catch_up_due(&r).await;
+	let (mut syncs, mut s) = (0, json!(null));
+	loop {
+		s = catch_up_reads(&p, &w);
+		syncs += 1;
+		if s["caught_up"]["more"] != true || syncs >= 20 {
+			break;
+		}
+	}
+	println!("HOC a cursor that does not advance: {} sync(s), {}", syncs, s);
+	assert_eq!(syncs, 1, "the read ends in one sync: {}", s);
+	assert!(s["caught_up"]["note"].as_str().is_some_and(|n| n.contains("not past the one asked")), "{}", s);
+	assert!(s["leaf_data"].as_u64().unwrap() <= 2, "{}", s);
+
+	// A read from the first leaf (the operator's epoch changed) whose pages
+	// never end: each names a cursor a page further on.
+	p.rewrite(Some(Arc::new(move |path: &str, req: &Value, status: u16, v: &mut Value| {
+		if path == "/v1/info" && status == 200 {
+			v["leaf_data"]["epoch"] = json!("ffffffffffffffff");
+		}
+		if path == "/v1/leaf_data" && status == 200 {
+			let asked = req["since"].as_str().unwrap_or("0");
+			let q = asked.rsplit(':').next().and_then(|q| q.parse::<u64>().ok()).filter(|_| asked.contains(":W")).unwrap_or(0);
+			v["leaves"] = json!([]);
+			v["next"] = json!(format!("ffffffffffffffff:W7:{}", q + 1));
+		}
+		None
+	})));
+	catch_up_due(&r).await;
+	let (mut syncs, mut pages) = (0, 0u64);
+	loop {
+		s = catch_up_reads(&p, &w);
+		syncs += 1;
+		pages += s["leaf_data"].as_u64().unwrap();
+		if s["caught_up"]["more"] != true || syncs >= 400 {
+			break;
+		}
+	}
+	println!("HOC pages without end: {} sync(s), {} pages, {}", syncs, pages, s["caught_up"]);
+	assert!(s["caught_up"]["more"] != true, "the read ends: {}", s);
+	assert!(s["caught_up"]["note"].as_str().is_some_and(|n| n.contains("pages of leaves")), "{}", s);
+	assert!(pages <= 1_000, "at most a thousand pages: {}", pages);
+	// The next catch-up, of an honest operator again, goes on past the last
+	// settled cursor the honest operator gave: neither read the operator kept
+	// from ending left a cursor of its own behind.
+	p.rewrite(None);
+	catch_up_due(&r).await;
+	let next = catch_up_reads(&p, &w);
+	assert_eq!(next["caught_up"]["read"], json!("past the settled cursor"), "{}", next);
+	assert!(next["caught_up"]["note"].is_null() && next["caught_up"]["more"].is_null(), "{}", next);
+	let _ = std::fs::remove_dir_all(&w.dir);
+}

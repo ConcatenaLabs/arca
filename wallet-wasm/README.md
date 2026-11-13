@@ -148,7 +148,7 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 amount?, channels?}` (`channels: false` names none of the wallet's channels), `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
 `mailbox`, `restore {at_once?}`, `restore_history {budget_ms?}`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_quote {asset,
-value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
+value, expiry}`, `sync {catch_up?, deposits?, budget_ms?}`, `deposits {budget_ms?}`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?, leaves?}` (`leaves`: those coins alone), `refresh_needed {idle_seconds?}` (whether what the wallet received out
@@ -235,7 +235,32 @@ find that out (every leaf ever served to its mailbox key, from an operator
 without reads past a settled cursor). With
 `"deposits": false` it leaves out the watchtowers' step too, which the program
 runs next as the command `deposits`: a program that answers others from the
-wallet then finds it free between the two. A
+wallet then finds it free between the two.
+
+`sync` and `deposits` also run in slices, for a program that must answer others
+while they run (a maker's firm offer, a person's trade): with `"budget_ms": n`
+the command stops at the first safe point past `n` milliseconds and answers
+`"more": true`; the program runs whatever it was asked meanwhile and calls the
+command again with the same arguments, which goes on where it stopped, until an
+answer comes without `more`. A safe point lies between two steps of `sync`, or
+between two items of a long step (a participation, a coin's refresh, deposit,
+journey home or exit, a payment over Lightning, a plan, an order); an item that
+has started runs to its end. A slice in which the operator cannot be reached
+waits out the witness's patience once and then runs the rest of the pass,
+since without the operator each step after is short. Each slice but the last answers
+`{"more": true, "next", "slice", "cost_by_step", "recheck"}`: `recheck` is
+the re-check against the chain the slice took at its start, as every other
+command does, since the chain may have moved since the last slice; the last answers what a
+whole `sync` answers, with `slices`, and each step's `cost_by_step` entry names
+the slice it ran in (`slice`): each part says what its step did then, not the
+coins as they stand now. `sync`'s `schedule` stays `due` while a pass in slices
+is under way. Each set of arguments has a pass of its own, so two callers that
+sync in slices with other arguments each go on with theirs. A pass left
+unfinished for ten minutes of median time starts again from the beginning; a
+`sync` without `budget_ms` runs a whole pass at once and ends every pass under
+way. `deposits` with `budget_ms` answers
+`{"deposits": [...], "more": true}` until its last slice, which answers
+`{"deposits": [...]}`; without it, the list. A
 command that only reads, run as one of a burst, answers from the look at the
 chain another made within three seconds when asked with `"shared_view": true`.
 
@@ -301,8 +326,14 @@ else's) is claimed only once `lightning_receive_preimage` hands the preimage
 over; `lightning_receive_ready` says when its leaf is held for good enough to
 pay that preimage's price: validated, its round final, and its home date at
 least `need_seconds` away (the time the other side may take to reveal the
-preimage, and the wallet to claim with it). `sync` moves every payment and
-receive on. A board and
+preimage, and the wallet to claim with it). While it is not, it names the step
+it waits for (`waiting_for`): `payment` while the payer has not paid, which no
+round bounds; else the step of the round that makes the leaf (`round`,
+`forfeits`, `block`, `certificate`, `anchor`, `release`), with
+`final_in_seconds`, the most it takes from now, and `usual_in_seconds`, what it
+usually takes, counted as `settle_first` counts them from the operator's
+published settings. A wallet states that wait rather than one of its own.
+`sync` moves every payment and receive on. A board and
 an exit work the same way: `board_quote` is the board's fee (`fee: {asset,
 amount}`), size and coins, and `board` with `shown` set to that `fee` goes ahead
 only on it; `exit_quote` is each transaction an exit would broadcast now, with

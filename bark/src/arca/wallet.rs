@@ -215,6 +215,15 @@ pub struct Wallet {
 	/// ([`Wallet::exits_meanwhile`]), and what those steps did.
 	pub(crate) exit_watch: std::cell::RefCell<Option<u32>>,
 	pub(crate) exits_done: std::cell::RefCell<(Vec<Value>, Vec<Value>)>,
+	/// While a step of a sliced `sync` or `deposits` runs: when the slice
+	/// ends and the step's items done ([`super::slice`]).
+	pub(crate) slice: std::cell::RefCell<Option<super::slice::Slice>>,
+	/// The operator's answers to `participation_status` the step `held`
+	/// read and did not act on, for the step `participations` of the same
+	/// call of `sync` to use rather than ask again (arca #894); emptied at
+	/// the start and the end of every call, so no slice uses one read in
+	/// another.
+	pub(crate) statuses_read: std::cell::RefCell<std::collections::HashMap<String, Value>>,
 	/// What [`CoinRecord::resolve`] answered, by the record, the transactions
 	/// it was resolved against and the policy ([`Wallet::resolve`]).
 	pub(crate) resolved: std::cell::RefCell<Resolved>,
@@ -967,7 +976,7 @@ impl Wallet {
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), pay_from: Default::default(), exit_watch: Default::default(),
-			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
+			exits_done: Default::default(), slice: Default::default(), statuses_read: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
 	}
 
@@ -1846,6 +1855,11 @@ impl Wallet {
 			if !Self::homeward(&c.state) || (c.state == "forfeited" && given_up.contains(&c.leaf_id)) {
 				continue;
 			}
+			match self.slice_item(&c.leaf_id) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			let dates = CoinDates::of(c.expiry);
 			let by = dates.map(|d| d.exit_by);
 			let claim_home = claims.get(&c.leaf_id).filter(|h| now >= **h as u64).copied();
@@ -2082,6 +2096,11 @@ impl Wallet {
 			if planned.contains(&c.leaf_id) {
 				continue;
 			}
+			match self.slice_item(&c.leaf_id) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			let Some(d) = CoinDates::of(c.expiry) else { continue };
 			if (now < d.refresh_from && !uncovered.contains(&c.leaf_id)) || now >= d.home_from {
 				continue;
@@ -2105,6 +2124,11 @@ impl Wallet {
 			out.push(refresh_entry(&c.leaf_id, asked.map(|v| v["participations"][0].clone()).map_err(|e| e.to_string())));
 		}
 		for coins in together.into_values() {
+			match self.slice_item(&format!("together {}", coins.first().map(|c| c.0.as_str()).unwrap_or(""))) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			if coins.iter().all(|(_, waits)| *waits) {
 				continue;
 			}
@@ -2291,6 +2315,12 @@ impl Wallet {
 		if last_sync.is_none() && !stopped {
 			next = Some(now);
 			out["why"] = json!(NEVER_SYNCED_NOTE);
+		}
+		// A sync in slices under way is due until its last slice
+		// ([`super::slice`]).
+		if self.sync_in_slices()? {
+			next = Some(now);
+			out["why"] = json!("a sync in slices is under way: the next call goes on where the last stopped");
 		}
 		let plans = self.plans()?["plans"].clone();
 		if plans.as_array().is_some_and(|p| !p.is_empty()) {

@@ -1646,6 +1646,11 @@ impl Wallet {
 			if given.iter().any(|l| self.store.coin(l).ok().flatten().is_some_and(|c| c.state == "exiting")) {
 				continue;
 			}
+			match self.slice_item(&pid) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			let st = match self.server.post("participation_status", &json!({"participation_id": pid})) {
 				Ok(st) => st,
 				Err(e @ Error::Unreachable(_)) => return Err(e),
@@ -1655,6 +1660,7 @@ impl Wallet {
 				},
 			};
 			if st["state"] != "issued" || !st["round"]["tx"].is_string() {
+				self.statuses_read.borrow_mut().insert(pid.clone(), st);
 				continue;
 			}
 			if self.handed_held(&pid, &st)? {
@@ -1714,6 +1720,11 @@ impl Wallet {
 		// those whose news holds releases not sent are read, not every
 		// participation a wallet ever completed.
 		for pid in self.store.released_with_releases_unsent()? {
+			match self.slice_item(&format!("releases {}", pid)) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			if let Some(r) = self.send_releases(&pid)? {
 				out.push(json!({"participation": pid, "state": "released", "released": r}));
 			}
@@ -1740,6 +1751,11 @@ impl Wallet {
 			out.push(json!({"participations": rebuilt, "state": "forfeiting", "restored": notes, "not_recovered": not_recovered}));
 		}
 		for (pid, body, given, wanted, state, _, _) in self.store.participations_not_in(&UNDONE)? {
+			match self.slice_item(&pid) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
 			if state == "released" {
 				continue;
@@ -1755,7 +1771,8 @@ impl Wallet {
 				}
 				continue;
 			}
-			let st = match self.server.post("participation_status", &json!({"participation_id": pid})) {
+			let read = self.statuses_read.borrow_mut().remove(&pid);
+			let st = match read.map_or_else(|| self.server.post("participation_status", &json!({"participation_id": pid})), Ok) {
 				Ok(st) => st,
 				Err(e) => {
 					out.push(json!({"participation": pid, "state": state, "error": e.to_string()}));

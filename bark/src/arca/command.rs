@@ -28,7 +28,7 @@ use super::{Config, Error, Wallet};
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, brief?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?, channels?}, forget_request {owner}, send {request, amount?, route?, \
 	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore {at_once?}, restore_history {budget_ms?}, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
-	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?}, deposits, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
+	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?, budget_ms?}, deposits {budget_ms?}, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
 	refresh_received {max_fee_ppm?, leaves?}, refresh_needed {idle_seconds?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
 	rate_den, min_lot?, expiry, maker_prog?, max_fee_ppm?}, order_place {sell, amount, want, rate_num, rate_den, min_lot?, expiry, \
@@ -439,8 +439,9 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		// mnemonic ([`super::Wallet::sync_catching_up`]).
 		// `"deposits": false` leaves the watchtowers' step to the command
 		// `deposits` ([`super::Wallet::sync_parts`]).
-		"sync" => w.sync_parts(a["catch_up"].as_bool() != Some(false), a["deposits"].as_bool() != Some(false)),
-		"deposits" => w.progress_deposits().map(Value::Array),
+		"sync" => w.sync_sliced(a["catch_up"].as_bool() != Some(false), a["deposits"].as_bool() != Some(false),
+			opt_u64(&a["budget_ms"], "the budget")?),
+		"deposits" => w.deposits_within(opt_u64(&a["budget_ms"], "the budget")?),
 		"hand_over_forfeits" => w.hand_over_forfeits(),
 		"schedule" => w.sync_schedule(),
 		"recheck" => w.recheck(),

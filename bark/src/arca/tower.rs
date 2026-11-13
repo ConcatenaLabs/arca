@@ -474,7 +474,11 @@ impl Wallet {
 	/// is lost then. Where none holds them, the answer says so: the trade
 	/// then rests on this wallet answering at its next sync or re-check.
 	pub(crate) fn deposit_now(&mut self, ids: &[String]) -> Value {
+		// Outside the slice of a sliced `sync`'s step under way: the trade's
+		// coins are deposited now, whatever is left of the slice.
+		let slice = self.slice.borrow_mut().take();
 		let ran = self.progress_deposits().unwrap_or_else(|e| vec![json!({"error": e.to_string()})]);
+		*self.slice.borrow_mut() = slice;
 		let (mut held, mut not) = (vec![], vec![]);
 		for id in ids {
 			match self.store.deposit_sent_to(id) {
@@ -498,7 +502,7 @@ impl Wallet {
 	/// [`Self::progress_deposits`], for a program: what it did, a line a coin
 	/// and watchtower (the command `deposits`).
 	pub fn deposits(&mut self) -> Result<Value, Error> {
-		self.progress_deposits().map(Value::Array)
+		self.deposits_within(None)
 	}
 
 	/// Every live coin resting on a batch deposited with each watchtower the
@@ -532,6 +536,12 @@ impl Wallet {
 				let todo: Vec<&String> = towers.iter().filter(|t| !sent.contains(t)).collect();
 				if todo.is_empty() {
 					continue;
+				}
+				// In slices: a coin at a time; what was made is sent below.
+				match self.slice_item(&row.leaf_id) {
+					super::slice::Item::Go => {},
+					super::slice::Item::Skip => continue,
+					super::slice::Item::Stop => break,
 				}
 				let body = match self.store.deposit(&row.leaf_id)? {
 					Some((_, b)) => b,
@@ -576,6 +586,11 @@ impl Wallet {
 					Err(e) => out.push(json!({"leaf_id": leaf, "watchtower": t, "error": e.to_string()})),
 				}
 			}
+		}
+		// A slice that stopped before every coin leaves the withdrawals and
+		// the restore's note to the slice that reaches the end.
+		if self.slice_cut() {
+			return Ok(out);
 		}
 		// Withdrawals: every deposit whose coin is no longer the wallet's,
 		// signed first, then sent in as few requests as each watchtower takes.

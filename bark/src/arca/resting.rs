@@ -404,6 +404,11 @@ impl Wallet {
 	pub(crate) fn progress_resting(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
 		for r in self.store.restings()? {
+			match self.slice_item(&r.id) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			if r.state != "participating" {
 				continue;
 			}
