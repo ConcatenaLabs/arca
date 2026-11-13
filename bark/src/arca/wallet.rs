@@ -206,6 +206,10 @@ pub struct Wallet {
 	/// trade's to pay with, each its participation and coins
 	/// ([`Wallet::free_refreshes`]).
 	pub(crate) quote_frees: std::cell::RefCell<Vec<(String, Vec<String>)>>,
+	/// While a payment or a swap offer named the coins it pays from
+	/// ([`Wallet::paying_from`]): their leaf ids. No other coin is spendable
+	/// meanwhile ([`Wallet::spendable`]).
+	pub(crate) pay_from: std::cell::RefCell<Option<std::collections::BTreeSet<String>>>,
 	/// While `sync` asks the operator: the median time the exit steps were
 	/// last taken at, so one whose date comes meanwhile is taken at once
 	/// ([`Wallet::exits_meanwhile`]), and what those steps did.
@@ -962,7 +966,7 @@ impl Wallet {
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
-			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
+			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), pay_from: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
 	}

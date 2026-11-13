@@ -1,6 +1,7 @@
 //! Which coins a swap pays from (arca #703 to #706 and #709, review RV28 of
 //! #702 and #708): the coin of the latest date that pays it alone with its
-//! real margins, change already out of round first and then a fresh coin,
+//! real margins, coins already at risk first and then the smallest of the
+//! rest (a fresh coin or the wallet's own out of round, #892),
 //! each the smallest first; never a coin at
 //! the operator's depth limit; a coin over the wallet's margin bound passed
 //! over like one that does not hold it; and a swap whose new coins would be
@@ -273,4 +274,130 @@ async fn a_giant_coin_newer_than_the_rest_is_not_the_only_one_tried() {
 	let read = library(&b, "swap_read", json!({"offer": offer["offer"]})).unwrap();
 	let acc = library(&b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap();
 	library(&a, "swap_complete", json!({"accept": acc["accept"]})).unwrap();
+}
+
+/// What the wallet holds at risk out of round in `asset`: the coins
+/// `coin_places` marks `at_risk`, summed.
+fn at_risk(w: &Arca, asset: &str) -> u64 {
+	let p = library(w, "coin_places", json!({})).unwrap();
+	p["coins"].as_array().unwrap().iter().filter(|c| c["asset"] == asset && c["at_risk"] == true).map(value).sum()
+}
+
+/// Whether the operator co-signs checkpoints with their owners' exit: a
+/// trade's change is then at risk to nobody, and otherwise received, at risk
+/// whole until a round refreshes it.
+fn checkpoint_exit(w: &Arca) -> bool {
+	w.ok(&["info"])["server_info"]["checkpoint_exit"] == true
+}
+
+/// The wallet pays itself `amount` of `asset` out of round: a coin of its own
+/// lineage, at risk to nobody, one reassignment deep; its leaf id.
+fn pay_self(w: &Arca, asset: &str, amount: u64) -> String {
+	let req = w.ok(&["receive"]);
+	w.ok(&["send", req["request"].as_str().unwrap(), "--amount", &amount.to_string(), "--asset", asset]);
+	w.ok(&["mailbox"]);
+	coins(w, "live", asset).iter().find(|c| value(c) == amount && c["kind"] == "transfer")
+		.map(|c| c["leaf_id"].as_str().unwrap().to_string()).expect("the coin paid to itself")
+}
+
+/// One swap of `give` of X for as much Y, offered by `a` (from `leaves` when
+/// named) and taken by `b`: the values of the maker's inputs.
+fn swap_once(a: &Arca, b: &Arca, x: &str, y: &str, give: u64, leaves: &[String]) -> Vec<u64> {
+	let offer = library(a, "swap_offer", json!({"give_asset": x, "give": give.to_string(), "want_asset": y, "want": give.to_string(),
+		"leaves": leaves})).unwrap_or_else(|e| panic!("offer refused: {}", e));
+	let ins = inputs_of(a, x, &offer);
+	let read = library(b, "swap_read", json!({"offer": offer["offer"]})).unwrap_or_else(|e| panic!("read refused: {}", e));
+	let acc = library(b, "swap_accept", json!({"offer": offer["offer"], "shown": read})).unwrap_or_else(|e| panic!("accept refused: {}", e));
+	library(a, "swap_complete", json!({"accept": acc["accept"]})).unwrap_or_else(|e| panic!("complete refused: {}", e));
+	b.ok(&["mailbox"]);
+	a.ok(&["mailbox"]);
+	ins
+}
+
+/// #892: a maker holding its own change of 848,792 out of round (at risk to
+/// nobody) beside working coins of 100,000 pays a trade of 20,000 from a
+/// working coin, never from the large coin: what it holds at risk after the
+/// trade is at most that working coin, on an operator with checkpoint exits
+/// and on one without (ARCA_TEST_CHECKPOINT_EXIT=0, the testnet's), where
+/// the trade's change is received and at risk whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_trade_pays_from_a_working_coin_not_a_large_own_coin_out_of_round() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	// Its change from paying itself 848,792 out of 860,000 is about 10,000,
+	// too small for the trade: the large own coin and the working coins pay it.
+	let (a, b) = setup(&mut r, "SCW", &[860_000, 100_000, 100_000], &[1_000_000]).await;
+	let own = pay_self(&a, &x, 848_792);
+	let held: Vec<(u64, String, Value)> = coins(&a, "live", &x).iter().map(|c| (value(c), c["kind"].as_str().unwrap().to_string(), c["hops"].clone())).collect();
+	println!("W892 maker's X (value, kind, hops): {:?}; checkpoint_exit {}", held, checkpoint_exit(&a));
+	assert_eq!(at_risk(&a, &x), 0, "its own coins are at risk to nobody");
+	let ins = swap_once(&a, &b, &x, &y, 20_000, &[]);
+	let risk = at_risk(&a, &x);
+	println!("W892 the trade of 20,000 paid from {:?}; the maker's X at risk after it: {}, Y at risk {}", ins, risk, at_risk(&a, &y));
+	assert_eq!(ins, vec![100_000], "a working coin, not the own coin of 848,792");
+	assert!(coins(&a, "live", &x).iter().any(|c| c["leaf_id"] == own.as_str()), "the own coin untouched");
+	assert!(risk <= 100_000, "at most the working coin's value at risk: {}", risk);
+	// A second trade: the other working coin, or the first one's change, never the large coin.
+	let ins = swap_once(&a, &b, &x, &y, 20_000, &[]);
+	let risk = at_risk(&a, &x);
+	println!("W892 the second trade paid from {:?}; X at risk {}", ins, risk);
+	assert!(ins.iter().all(|v| *v <= 100_000), "{:?}", ins);
+	assert!(risk <= 200_000, "{}", risk);
+}
+
+/// A wallet whose only coin that pays the trade alone is its large own coin
+/// still trades from it, and what it then holds at risk is that coin's
+/// change on an operator without checkpoint exits, nothing with them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_whose_only_paying_coin_is_large_still_trades() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	// Its change from paying itself 848,792 out of 860,000 is about 10,000:
+	// no coin but the large one pays a trade of 20,000.
+	let (a, b) = setup(&mut r, "SCL", &[860_000, 10_000], &[1_000_000]).await;
+	pay_self(&a, &x, 848_792);
+	println!("WLARGE the maker's X: {:?}", coins(&a, "live", &x).iter().map(value).collect::<Vec<_>>());
+	let ins = swap_once(&a, &b, &x, &y, 20_000, &[]);
+	let change: u64 = coins(&a, "live", &x).iter().filter(|c| c["kind"] == "transfer" && value(c) > 800_000).map(value).sum();
+	let risk = at_risk(&a, &x);
+	println!("WLARGE paid from {:?}; its change {}; X at risk {} (checkpoint_exit {})", ins, change, risk, checkpoint_exit(&a));
+	assert_eq!(ins, vec![848_792], "the only coin that pays it alone");
+	assert_eq!(risk, if checkpoint_exit(&a) { 0 } else { change }, "its change, received, at risk whole without checkpoint exits");
+}
+
+/// A swap offer names the coins it pays from (`leaves`): it pays from those
+/// alone, even where the wallet would choose another; a named coin the
+/// wallet cannot pay from now (held by an offer, or no coin of the asset)
+/// is refused before anything is held; one that does not cover it is
+/// refused, nothing held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_swap_offer_pays_from_the_coins_it_names() {
+	let mut r = Running::start().await;
+	let (x, y) = (r.x.to_string(), r.y.to_string());
+	let (a, b) = setup(&mut r, "SCF", &[1_000_000, 100_000, 300_000], &[1_000_000]).await;
+	let leaf_of = |v: u64| coins(&a, "live", &x).iter().find(|c| value(c) == v).map(|c| c["leaf_id"].as_str().unwrap().to_string()).unwrap();
+	let (big, mid, small) = (leaf_of(1_000_000), leaf_of(300_000), leaf_of(100_000));
+	let ins = swap_once(&a, &b, &x, &y, 20_000, &[mid.clone()]);
+	println!("NAMED the 300,000 coin: paid from {:?}", ins);
+	assert_eq!(ins, vec![300_000], "the named coin, not the smaller one the wallet would choose");
+	let held = library(&a, "swap_offer", json!({"give_asset": x, "give": "20000", "want_asset": y, "want": "20000", "leaves": [big]})).unwrap();
+	let e = library(&a, "swap_offer", json!({"give_asset": x, "give": "20000", "want_asset": y, "want": "20000", "leaves": [big]})).unwrap_err();
+	println!("NAMED a coin held by an offer: {}", e);
+	assert!(e.contains("must each be a live coin") && e.contains(&big), "{}", e);
+	library(&a, "swap_cancel", json!({"swap": held["swap"]})).unwrap();
+	let ghost = "00".repeat(32);
+	let e = library(&a, "swap_offer", json!({"give_asset": x, "give": "20000", "want_asset": y, "want": "20000", "leaves": [ghost]})).unwrap_err();
+	println!("NAMED no coin of the wallet's: {}", e);
+	assert!(e.contains("must each be a live coin") && e.contains(&ghost), "{}", e);
+	let e = library(&a, "swap_offer", json!({"give_asset": x, "give": "500000", "want_asset": y, "want": "20000", "leaves": [small]})).unwrap_err();
+	println!("NAMED a coin short of the trade: {}", e);
+	assert!(coins(&a, "offered", &x).is_empty(), "nothing held");
+	let ins = swap_once(&a, &b, &x, &y, 20_000, &[]);
+	println!("UNNAMED: paid from {:?}", ins);
+	// Unnamed, the wallet chooses: without checkpoint exits the first trade's
+	// change (279,272) is received, at risk already, and goes first, adding
+	// nothing at risk; with them it is at risk to nobody, and the smallest
+	// coin that pays goes.
+	let want = if checkpoint_exit(&a) { 100_000 } else { 279_272 };
+	assert_eq!(ins, vec![want], "unnamed, the wallet chooses");
 }
