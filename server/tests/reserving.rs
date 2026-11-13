@@ -88,6 +88,16 @@ fn first_cursor(r: &Running, key: &Keypair) -> String {
 	page["next"].as_str().unwrap().to_string()
 }
 
+/// The leaves `leaf_served` keeps for `mailbox` past the settled cursor
+/// `since` (`<epoch>:<transaction>.<seq>`), in the order a read past it
+/// serves them once each is settled.
+async fn kept_past(sql: &tokio_postgres::Client, mailbox: &Keypair, since: &str) -> Vec<String> {
+	let (x, q) = since.split(':').nth(1).and_then(|p| p.split_once('.')).unwrap_or_else(|| panic!("a settled cursor: {}", since));
+	sql.query("SELECT encode(leaf_id, 'hex') FROM leaf_served WHERE mailbox_key = $1 AND (served_xid, seq) > ($2::text::xid8, $3)
+		ORDER BY served_xid, seq", &[&&xonly(mailbox).serialize()[..], &x, &q.parse::<i64>().unwrap()]).await.unwrap()
+		.iter().map(|r| r.get(0)).collect()
+}
+
 fn entry<'a>(all: &'a [Value], id: &LeafId) -> &'a Value {
 	all.iter().find(|l| l["leaf_id"] == json!(id.to_string())).unwrap_or_else(|| panic!("no leaf {} in {:?}", id, all))
 }
@@ -296,10 +306,16 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	// cursor a read from the first under way ("<epoch>:W…"), ending on a
 	// settled cursor.
 	let whole_on = |c: &str| c.split(':').nth(1).is_some_and(|c| c.starts_with('W'));
-	// A read past a settled cursor serves only leaves of transactions older
-	// than every one running in the cluster: while another test holds one
-	// open, what is new waits for it to end. Each read that expects leaves
-	// asks again until they are settled (at most about fifteen seconds).
+	// A read past a settled cursor serves a leaf only once it is settled:
+	// once every transaction older than the one it came to be served at (the
+	// one that made it, bound its owner key, posted it) has ended, anywhere
+	// in the cluster. While one still runs (another test's, here) the read
+	// serves what is settled, and when nothing is, no leaves and no `next`:
+	// the same answer as at the end. So the answer alone does not tell "not
+	// settled yet" from "nothing past the cursor": the end is no leaves AND
+	// nothing kept past the cursor (`leaf_served`), which the test reads
+	// from the database ([`kept_past`]). A read that expects leaves asks
+	// again until they are settled (at most about fifteen seconds).
 	let settled_wait = |since: &str, limit: u32| -> Value {
 		for _ in 0..150 {
 			let page = settled(since, limit, &[], &[]).ok();
@@ -310,6 +326,30 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 		}
 		settled(since, limit, &[], &[]).ok()
 	};
+	// Past `since`, the leaves kept past it (`want`, from the database), a
+	// page of `limit` at a time, each page ending on a settled cursor; then
+	// the end: past the last, no leaves and no `next`, nothing more being
+	// kept.
+	let read_past = |since: &str, limit: u32, want: &[String]| -> Vec<Value> {
+		let (mut read, mut c) = (vec![], since.to_string());
+		while read.len() < want.len() {
+			let page = settled_wait(&c, limit);
+			let leaves = page["leaves"].as_array().unwrap();
+			assert!(!leaves.is_empty(), "the leaves kept past {} were not settled within fifteen seconds: {:?}", c, want);
+			c = page["next"].as_str().unwrap().to_string();
+			assert!(c.contains('.') && !whole_on(&c), "a settled cursor names the making transaction and the seq: {}", c);
+			read.extend(leaves.iter().cloned());
+		}
+		let ids: Vec<&str> = read.iter().map(|l| l["leaf_id"].as_str().unwrap()).collect();
+		assert_eq!(ids, want, "the leaves kept past {}, in order", since);
+		let end = settled(&c, limit, &[], &[]).ok();
+		assert!(end["leaves"].as_array().unwrap().is_empty() && end["next"].is_null(), "nothing past the last leaf kept: {}", end);
+		read
+	};
+	// The database, read beside the server.
+	let (sql, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	let all_ids: Vec<String> = all.iter().map(|l| l["leaf_id"].as_str().unwrap().to_string()).collect();
 	let mut since = "0".to_string();
 	let mut paged = vec![];
 	loop {
@@ -328,22 +368,25 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	let epoch = info["leaf_data"]["epoch"].as_str().unwrap().to_string();
 	// Past the settled cursor of A's first leaf ("<epoch>:0.0"), from
 	// `leaf_served`: the same leaves.
-	let mut past = format!("{}:0.0", epoch);
-	let mut paged = vec![];
-	loop {
-		let page = if paged.len() < all.len() { settled_wait(&past, 1) } else { settled(&past, 1, &[], &[]).ok() };
-		let Some(l) = page["leaves"].as_array().unwrap().first().cloned() else {
-			assert!(page["next"].is_null(), "{}", page);
-			break;
-		};
-		past = page["next"].as_str().unwrap().to_string();
-		assert!(past.contains('.') && !whole_on(&past), "a settled cursor names the making transaction and the seq: {}", past);
-		paged.push(l);
-	}
-	assert_eq!(paged, all, "the same leaves, in the same order, past a settled cursor");
+	let first = format!("{}:0.0", epoch);
+	let kept = kept_past(&sql, &a_mailbox, &first).await;
+	assert_eq!(kept, all_ids, "leaf_served keeps every leaf served to the key, in the order served");
+	assert_eq!(read_past(&first, 1, &kept), all, "the same leaves, in the same order, past a settled cursor");
+	// Past the end of the read from the first leaf, no leaf that read did
+	// not serve. Its end is the settled cursor taken before its first page,
+	// just before the oldest transaction then running: a leaf that came to
+	// be served at that transaction or later is served again past it. None,
+	// unless a transaction (another test's) was running from before A's
+	// leaves were served until that read began; below, one is held open on
+	// purpose.
+	let again = kept_past(&sql, &a_mailbox, &since).await;
+	assert!(again.iter().all(|l| all_ids.contains(l)), "nothing past the end that the read from the first leaf did not serve: {:?}", again);
+	read_past(&since, 100, &again);
+	println!("past the end of the read from the first leaf: {} of its {} leaves served again", again.len(), all.len());
 	let stranger_leaf = [0x5a; 32];
 	let page = settled(&since, 100, &[change_id.0, new_valid.leaf_id.0, stranger_leaf], &[new_valid.leaf_id.0]).ok();
-	assert!(page["leaves"].as_array().unwrap().is_empty(), "nothing past the end: {}", page);
+	let past: Vec<&str> = page["leaves"].as_array().unwrap().iter().map(|l| l["leaf_id"].as_str().unwrap()).collect();
+	assert_eq!(past, again, "past the end, only what the read from the first leaf served again: {}", page);
 	let held = page["held"].as_array().unwrap();
 	assert_eq!(held.len(), 2, "a leaf not served to the key is not answered: {}", page);
 	let of = |id: &LeafId| held.iter().find(|h| h["leaf_id"] == json!(id.to_string())).unwrap().clone();
@@ -362,13 +405,49 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	assert!(asked.contains(&change_id.to_string().as_str()) && asked.contains(&new_valid.leaf_id.to_string().as_str()),
 		"the coin given up for good and the leaf by id, with a hundred ids asked: {:?}", asked);
 
+	// A transaction running across a read from the first leaf holds that
+	// read's end back to before it. A leaf that comes to be served while it
+	// runs (here A's last, served again as a binding made then would serve
+	// it) is served by the read from the first leaf, which reads the base
+	// tables; past the read's end it is not served while that transaction
+	// runs (when nothing is, the answer is the end's, though a leaf is kept
+	// past it); once the transaction ends it is served past the end, again.
+	let (hold, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(conn);
+	hold.batch_execute("BEGIN").await.unwrap();
+	let held_at: u64 = hold.query_one("SELECT pg_current_xact_id()::text", &[]).await.unwrap().get::<_, String>(0).parse().unwrap();
+	let last = all_ids.last().unwrap().clone();
+	sql.execute("UPDATE leaf_served SET served_xid = pg_current_xact_id() WHERE mailbox_key = $1 AND leaf_id = decode($2, 'hex')",
+		&[&&xonly(&a_mailbox).serialize()[..], &last]).await.unwrap();
+	let (mut end, mut whole) = ("0".to_string(), vec![]);
+	loop {
+		let page = settled(&end, 100, &[], &[]).ok();
+		whole.extend(page["leaves"].as_array().unwrap().iter().map(|l| l["leaf_id"].as_str().unwrap().to_string()));
+		end = page["next"].as_str().unwrap().to_string();
+		if !whole_on(&end) {
+			break;
+		}
+	}
+	assert_eq!(whole, all_ids, "the read from the first leaf serves every leaf");
+	let end_at: u64 = end.split(':').nth(1).and_then(|p| p.split_once('.')).unwrap().0.parse().unwrap();
+	assert!(end_at < held_at, "the read ends before the transaction running: {} at {}", end, held_at);
+	let page = settled(&end, 100, &[], &[]).ok();
+	let leaves = page["leaves"].as_array().unwrap();
+	assert!(leaves.iter().all(|l| l["leaf_id"] != json!(last)), "not served past the end while the transaction runs: {}", page);
+	assert!(!leaves.is_empty() || page["next"].is_null(), "nothing settled: no leaves and no next, as at the end: {}", page);
+	assert!(kept_past(&sql, &a_mailbox, &end).await.contains(&last), "though it is kept past the end");
+	hold.batch_execute("COMMIT").await.unwrap();
+	let again = kept_past(&sql, &a_mailbox, &end).await;
+	assert!(again.contains(&last) && again.iter().all(|l| all_ids.contains(l)), "{:?}", again);
+	read_past(&end, 100, &again);
+	println!("a read from the first leaf across a transaction running ends before it ({}, the transaction {}): a leaf served meanwhile is \
+		served past that end again once the transaction ends", end, held_at);
+
 	// The settled cursor orders and compares transaction ids as numbers: A's
 	// leaves made by transactions 8, 9 and 10 (in that order; "10" sorts
 	// before "8" as text) are each served once, in that order, a page of one
 	// at a time.
 	let since = {
-		let (sql, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
-		tokio::spawn(conn);
 		for (i, e) in all.iter().enumerate() {
 			sql.execute("UPDATE leaf_served SET served_xid = $2::text::xid8 WHERE leaf_id = decode($1, 'hex') AND mailbox_key = $3",
 				&[&e["leaf_id"].as_str().unwrap(), &(8 + i).to_string(), &&xonly(&a_mailbox).serialize()[..]]).await.unwrap();
@@ -461,9 +540,12 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 		assert!(ids.contains(&lost), "the read from the first leaf serves the leaf the index lost: {:?}", ids);
 		assert_eq!(ids.len(), all.len());
 		assert_eq!(rows().await, 1, "and keeps it again");
-		let repaired = settled_wait(&before, 100);
-		let repaired: Vec<&str> = repaired["leaves"].as_array().unwrap().iter().filter_map(|l| l["leaf_id"].as_str()).collect();
-		assert_eq!(repaired, vec![lost.as_str()], "kept again past every cursor: a read past one taken before serves it");
+		// Past `before`, the leaf kept again, and nothing else unless that
+		// read's end was held back by a transaction running (as above).
+		let repaired = kept_past(&sql, &a_mailbox, &before).await;
+		assert!(repaired.contains(&lost) && repaired.iter().all(|l| all_ids.contains(l)),
+			"kept again past every cursor: a read past one taken before serves it: {:?}", repaired);
+		read_past(&before, 100, &repaired);
 		// A's end, in the latest epoch: what the late binding below reads past.
 		end
 	};
