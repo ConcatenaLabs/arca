@@ -289,9 +289,10 @@ fn skip() -> bool {
 /// One complete swap between `p` (gives X) and `q` (gives BTC), the maker
 /// `maker_p` or not, from the offer to both legs done. Checks each side's
 /// books. Returns the swap's id.
-async fn complete_swap(r: &Running, p: &Arca, q: &Arca, maker_p: bool, atoms: u64, sats: u64) -> String {
+async fn complete_swap(r: &Running, p: &Arca, q: &Arca, maker_p: bool, atoms: u64, sats: u64, leg: &str) -> String {
 	let xs = r.x.to_string();
 	refill_pool();
+	let rounds0 = rounds(r).await;
 	let (p_x0, q_x0, p_btc0, q_btc0) = (x_row(p, &r.x), x_row(q, &r.x), spendable_sat(p), spendable_sat(q));
 	let (maker, taker) = if maker_p { (p, q) } else { (q, p) };
 	let give = if maker_p { "asset" } else { "btc" };
@@ -306,19 +307,26 @@ async fn complete_swap(r: &Running, p: &Arca, q: &Arca, maker_p: bool, atoms: u6
 	let hash = swap_of(p, &id)["hash"].as_str().unwrap().to_string();
 	assert_eq!(swap_of(q, &id)["hash"].as_str(), Some(hash.as_str()), "one hash on both sides");
 
-	// P locks its X; the operator holds the payment inside it.
 	follow_until(p, &id, "locked", 60);
-	let t0 = Instant::now();
-	while !receive_row(r, &hash).await.is_some_and(|x| x.state.name() == "accepted") {
-		assert!(t0.elapsed() < Duration::from_secs(60), "the operator never held the payment");
-		tokio::time::sleep(Duration::from_millis(300)).await;
+	println!("SWAP P locked by {}: {}", swap_of(p, &id)["leg"], swap_of(p, &id)["notes"]);
+	assert_eq!(swap_of(p, &id)["leg"], leg, "P locks by {}", leg);
+	if leg == "htlc-1" {
+		// The operator holds the payment inside it.
+		until_held(r, &hash).await;
+		let row = receive_row(r, &hash).await.unwrap();
+		println!("SWAP the operator holds it inside: held_by_send {} send_timeout {:?} timeout {:?} (median time {})", row.held_by_send,
+			row.send_timeout, row.timeout, mtp(r));
+		assert!(row.held_by_send);
+		// Q's leaf, in the next round, final.
+		leaf_round(r).await;
+	} else {
+		// Straight to Q, out of round: the operator fronts nothing, and Q
+		// holds it with no round.
+		assert!(!receive_row(r, &hash).await.is_some_and(|x| x.state.name() == "accepted"), "the operator holds nothing inside it");
+		let ready = q.ok(&["lock", "ready", &hash]);
+		println!("SWAP Q holds the lock at once: {}", ready);
+		assert_eq!(ready["ready"], true, "{}", ready);
 	}
-	let row = receive_row(r, &hash).await.unwrap();
-	println!("SWAP the operator holds it inside: held_by_send {} send_timeout {:?} timeout {:?} (median time {})", row.held_by_send,
-		row.send_timeout, row.timeout, mtp(r));
-	assert!(row.held_by_send);
-	// Q's leaf, in the next round, final.
-	leaf_round(r).await;
 	// P claims while Q pays.
 	let pf = follow_in_background(p, 150);
 	follow_until(q, &id, "done", 150);
@@ -329,15 +337,39 @@ async fn complete_swap(r: &Running, p: &Arca, q: &Arca, maker_p: bool, atoms: u6
 	println!("SWAP books: P's X {} -> {} ({}), Q's X {} -> {} (+{}), P's BTC {} -> {} (+{}), Q's BTC {} -> {} ({})", p_x0, p_x1,
 		p_x1 as i64 - p_x0 as i64, q_x0, q_x1, q_x1 as i64 - q_x0 as i64, p_btc0, p_btc1, p_btc1 as i64 - p_btc0 as i64, q_btc0, q_btc1,
 		q_btc1 as i64 - q_btc0 as i64);
-	let op_fee = (atoms * 1_000).div_ceil(1_000_000);
+	// The operator's Lightning fee is the older path's alone: a lock straight
+	// to Q costs its transfers' margins only.
+	let op_fee = if leg == "htlc-1" { (atoms * 1_000).div_ceil(1_000_000) } else { 0 };
 	assert!(p_x0 - p_x1 >= atoms + op_fee && p_x0 - p_x1 <= atoms + op_fee + 2_000, "P gave the atoms and the operator's fee, and margins");
 	assert!(q_x1 - q_x0 <= atoms - op_fee && q_x1 - q_x0 + 2_000 >= atoms - op_fee, "Q got the atoms less the fee and the claim's margins");
 	assert_eq!(p_btc1 - p_btc0, sats - (100 + sats * 2_000 / 1_000_000), "P got the satoshis less Bark's receive fee");
 	assert!(q_btc0 - q_btc1 > sats && q_btc0 - q_btc1 < sats + 1_000, "Q gave the satoshis and Bark's send fee");
 	let pre = swap_of(p, &id)["preimage"].as_str().unwrap().to_string();
 	assert_eq!(swap_of(q, &id)["preimage"].as_str(), Some(pre.as_str()), "one preimage");
-	assert_eq!(receive_row(r, &hash).await.unwrap().state.name(), "claimed");
+	if leg == "htlc-1" {
+		assert_eq!(receive_row(r, &hash).await.unwrap().state.name(), "claimed");
+	} else {
+		let lock = |w: &Arca| w.ok(&["lock", "list"]).as_array().unwrap().iter().find(|l| l["hash"] == hash.as_str()).cloned().unwrap();
+		assert_eq!(lock(q)["state"], "claimed", "{}", lock(q));
+		p.ok(&["sync"]);
+		assert_eq!(lock(p)["state"], "claimed", "{}", lock(p));
+		assert_eq!(rounds(r).await, rounds0, "no round between P's lock and Q's claim");
+		println!("SWAP by htlc-2: {} rounds made between the lock and the claim", rounds(r).await - rounds0);
+	}
 	id
+}
+
+/// How many rounds the operator has made.
+async fn rounds(r: &Running) -> usize {
+	r.server.store.rounds_page(0, 10_000).await.unwrap().len()
+}
+
+/// Keeps `q` on the older path: an instant limit with no bond posted leaves
+/// it no room for a lock received out of round, so it asks none, and P locks
+/// through the operator (`htlc-1`), as for a buyer whose wallet predates
+/// locks between two holders.
+fn older_path(q: &Arca) {
+	q.ok(&["instant-limit", "1000000000000"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -350,10 +382,89 @@ async fn a_swap_of_btc_for_an_asset_completes_in_each_direction() {
 	let p = dual_wallet(&r, "SWP", 0, None);
 	let q = dual_wallet(&r, "SWQ", 600_000, None);
 	fund_x(&mut r, &p, 2_000_000).await;
-	// The maker gives the asset.
-	complete_swap(&r, &p, &q, true, 100_000, 30_000).await;
-	// The maker gives the BTC.
-	complete_swap(&r, &p, &q, false, 120_000, 25_000).await;
+	// The maker gives the asset: P locks straight to Q.
+	complete_swap(&r, &p, &q, true, 100_000, 30_000, "htlc-2").await;
+	// The maker gives the BTC: Q offers its lock key with the offer.
+	complete_swap(&r, &p, &q, false, 120_000, 25_000, "htlc-2").await;
+	// A buyer that asks no lock: P falls back to the older path.
+	older_path(&q);
+	complete_swap(&r, &p, &q, true, 90_000, 20_000, "htlc-1").await;
+	q.ok(&["instant-limit", "off"]);
+	drop(ox);
+	for w in [&p, &q] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// Rolls the Bitcoin ark's chain back `depth` blocks and mines `depth + 1`
+/// in their place: every transaction of the dropped blocks goes back to the
+/// mempool, to be mined again. Returns the dropped tip.
+fn bitcoin_reorg(depth: u32) -> String {
+	let tip: u64 = ark(&["btc", "getblockcount"]).parse().unwrap();
+	let from = ark(&["btc", "getblockhash", &(tip + 1 - depth as u64).to_string()]);
+	let old_tip = ark(&["btc", "getbestblockhash"]);
+	ark(&["btc", "invalidateblock", &from]);
+	mine(depth + 1);
+	assert_ne!(ark(&["btc", "getbestblockhash"]), old_tip, "a new tip");
+	old_tip
+}
+
+/// The BTC leg reorganised, on the new path (`htlc-2`): a Bitcoin
+/// reorganisation of the Bitcoin ark's chain while P's lock is held by Q and
+/// Q has not paid, and another once the swap is done. Nothing changes on the
+/// Sequentia side: the lock stays held, Q pays once it is held and P claims,
+/// the preimage once out stays out, and after the second each side holds
+/// what the swap gave it, nobody both legs.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_new_path_follows_a_bitcoin_reorganisation_of_the_btc_leg() {
+	if skip() {
+		return;
+	}
+	let Some(lnd) = lightningd("the_new_path_follows_a_bitcoin_reorganisation_of_the_btc_leg") else { return };
+	let (mut r, ox) = operator(&lnd, "sw5").await;
+	let p = dual_wallet(&r, "SBP", 0, None);
+	let q = dual_wallet(&r, "SBQ", 600_000, None);
+	fund_x(&mut r, &p, 2_000_000).await;
+	refill_pool();
+	let (p_x0, q_x0, p_btc0, q_btc0) = (x_row(&p, &r.x), x_row(&q, &r.x), spendable_sat(&p), spendable_sat(&q));
+	let (id, hash) = agreed(&r, &p, &q, true, 100_000, 30_000, 1800);
+	follow_until(&p, &id, "locked", 60);
+	assert_eq!(swap_of(&p, &id)["leg"], "htlc-2");
+	assert_eq!(q.ok(&["lock", "ready", &hash])["ready"], true);
+
+	// Before Q pays: the Bitcoin chain drops three blocks.
+	let dropped = bitcoin_reorg(3);
+	maintain(&p);
+	maintain(&q);
+	println!("REORG before: dropped tip {}; Q's lock {}", dropped, q.ok(&["lock", "ready", &hash]));
+	assert_eq!(q.ok(&["lock", "ready", &hash])["ready"], true, "the Sequentia side is untouched");
+	assert_eq!(spendable_sat(&q), q_btc0, "no BTC moved");
+
+	let pf = follow_in_background(&p, 150);
+	follow_until(&q, &id, "done", 150);
+	let _ = pf.join();
+	follow_until(&p, &id, "done", 120);
+	until_btc(&[&p, &q], 60, "the BTC settled", || spendable_sat(&p) > p_btc0);
+	let books = |w: &Arca| (x_row(w, &r.x), spendable_sat(w));
+	let (pb, qb) = (books(&p), books(&q));
+	println!("REORG the swap done: P {:?} (was {} X, {} sat), Q {:?} (was {} X, {} sat)", pb, p_x0, p_btc0, qb, q_x0, q_btc0);
+
+	// After: three blocks dropped again, past the swap.
+	let dropped = bitcoin_reorg(3);
+	for _ in 0..3 {
+		maintain(&p);
+		maintain(&q);
+		mine(1);
+	}
+	p.ok(&["sync"]);
+	q.ok(&["sync"]);
+	println!("REORG after: dropped tip {}; P {:?}, Q {:?}", dropped, books(&p), books(&q));
+	assert_eq!(books(&p), pb, "P holds the BTC it was paid and what it kept of X");
+	assert_eq!(books(&q), qb, "Q holds the X it claimed and what it kept of BTC");
+	assert!(pb.1 > p_btc0 && qb.0 > q_x0, "each holds the other's leg");
+	assert!(pb.0 < p_x0 && qb.1 < q_btc0, "and gave its own");
+	let pre = swap_of(&p, &id)["preimage"].as_str().unwrap().to_string();
+	assert_eq!(swap_of(&q, &id)["preimage"].as_str(), Some(pre.as_str()), "the preimage once out stays out");
 	drop(ox);
 	for w in [&p, &q] {
 		let _ = std::fs::remove_dir_all(&w.dir);
@@ -419,6 +530,8 @@ async fn each_abandoned_swap_leaves_every_leg_with_one_party() {
 	let xs = r.x.to_string();
 	let p = dual_wallet(&r, "SAP", 0, None);
 	let q = dual_wallet(&r, "SAQ", 800_000, None);
+	// The rows of the older path (htlc-1), which a buyer asking no lock takes.
+	older_path(&q);
 	fund_x(&mut r, &p, 3_000_000).await;
 	let (p_x0, q_x0, q_btc0) = (x_row(&p, &r.x), x_row(&q, &r.x), spendable_sat(&q));
 
@@ -609,6 +722,8 @@ async fn the_sequentia_leg_follows_an_anchor_driven_rollback_before_and_after_th
 	let (mut r, ox) = operator(&lnd, "sw3").await;
 	let p = dual_wallet(&r, "SRP", 0, None);
 	let q = dual_wallet(&r, "SRQ", 400_000, None);
+	// The rows of the older path (htlc-1), which a buyer asking no lock takes.
+	older_path(&q);
 	fund_x(&mut r, &p, 2_000_000).await;
 	refill_pool();
 	let q_btc0 = spendable_sat(&q);
@@ -708,6 +823,8 @@ async fn a_swap_survives_a_restart_and_a_restore_of_each_party() {
 	let q_m = fresh_mnemonic("SWRQ");
 	let p = dual_wallet(&r, "SWRP", 0, Some(&p_m));
 	let q = dual_wallet(&r, "SWRQ", 500_000, Some(&q_m));
+	// The rows of the older path (htlc-1), which a buyer asking no lock takes.
+	older_path(&q);
 	fund_x(&mut r, &p, 2_000_000).await;
 
 	// Q killed while Bark pays; started again.
