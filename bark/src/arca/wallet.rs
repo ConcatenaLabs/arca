@@ -198,6 +198,9 @@ pub struct Wallet {
 	/// owner nonce the store does not hold is taken when its key is the one
 	/// the mnemonic derives from that nonce, as the lost store would have.
 	pub(crate) adopting: std::cell::Cell<bool>,
+	/// While a lock chooses its coins ([`Wallet::lock_to`]): only coins with
+	/// room under the depth limit for the lock and its claim or refund.
+	pub(crate) locking: std::cell::Cell<bool>,
 	/// While a quote runs ([`Wallet::quoting`]): it signs, asks and stores
 	/// nothing, so it takes back no refresh that waits
 	/// ([`Wallet::withdraw_refreshes`]) when the live coins fall short.
@@ -962,7 +965,7 @@ impl Wallet {
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
-			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
+			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), locking: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
 	}

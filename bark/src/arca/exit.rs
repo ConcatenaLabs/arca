@@ -2054,6 +2054,13 @@ impl Wallet {
 		let mailbox = if talk || gone { self.mailbox().unwrap_or_else(|e| json!({"error": e.to_string()})) } else { waiting() };
 		steps.lap(self, "mailbox");
 		self.exits_meanwhile();
+		// Locks between two holders: a held one claimed once its preimage is
+		// known, one the wallet made marked paid once claimed, or refunded
+		// from its timeout.
+		let locks = if talk { self.progress_locks().map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()})) }
+			else { Value::Array(vec![]) };
+		steps.lap(self, "locks");
+		self.exits_meanwhile();
 		// What other stores of the mnemonic did: coins they made taken, coins
 		// held here that they gave up given up here too. At most once every
 		// ten minutes ([`super::restore::CATCH_UP_EVERY`]), and at every sync
@@ -2204,6 +2211,9 @@ impl Wallet {
 		}
 		if lightning.as_array().is_none_or(|l| !l.is_empty()) {
 			out["lightning"] = lightning;
+		}
+		if locks.as_array().is_none_or(|l| !l.is_empty()) {
+			out["locks"] = locks;
 		}
 		if offboards.as_array().is_none_or(|o| !o.is_empty()) {
 			out["offboards"] = offboards;

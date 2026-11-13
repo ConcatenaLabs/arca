@@ -286,7 +286,7 @@ impl Out {
 		})
 	}
 
-	fn explicit(&self, w: &Wallet) -> ExplicitOutput {
+	pub(crate) fn explicit(&self, w: &Wallet) -> ExplicitOutput {
 		ExplicitOutput::new(self.asset, self.value, self.leaf.policy(w.operator, w.genesis).script_pubkey())
 	}
 }
@@ -478,7 +478,7 @@ impl Wallet {
 		Ok(out)
 	}
 
-	fn check_chain(&self, v: &Value, what: &str) -> Result<(), Error> {
+	pub(crate) fn check_chain(&self, v: &Value, what: &str) -> Result<(), Error> {
 		if v["genesis_hash"].as_str() != Some(&self.genesis.genesis_hash().to_string()) {
 			return Err(Error::Refused(format!("the {} is for the chain of genesis {}, not this wallet's", what, v["genesis_hash"])));
 		}
@@ -924,7 +924,7 @@ impl Wallet {
 	/// quote takes nothing back and chooses from those coins as the trade
 	/// would.
 	#[allow(clippy::too_many_arguments)]
-	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
+	pub(crate) fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize, fit: bool, reads: Reads, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		// A spend that waits only for a round ([`Error::SettleFirst`]) takes
@@ -994,6 +994,11 @@ impl Wallet {
 		// operator refuses it (#689). A round refreshes it.
 		if let Some(limit) = depth_limit(info) {
 			candidates.retain(|c| c.coin.hops < limit);
+			// A lock is followed by its claim or its refund, each one more
+			// reassignment: it is made only from a coin with room for both.
+			if self.locking.get() {
+				candidates.retain(|c| c.coin.hops + 2 <= limit);
+			}
 		}
 		if fit {
 			let now = self.now()?.to_consensus_u32();
@@ -1526,7 +1531,7 @@ impl Wallet {
 				for o in answer["outputs"].as_array().cloned().unwrap_or_default() {
 					let bytes = unhex(o["record"].as_str().unwrap_or(""))?;
 					let record = CoinRecord::from_bytes(&bytes).map_err(|e| Error::Refused(e.to_string()))?;
-					let (_, nonce) = owner_of(&record);
+					let (_, nonce, _) = self.holder_of(&record)?;
 					if self.store.nonce(&nonce)?.is_some() {
 						match self.accept_coin(&bytes, o["leaf_id"].as_str().unwrap_or(""), "transfer answer") {
 							Ok(v) => {
@@ -1710,7 +1715,10 @@ impl Wallet {
 		} else {
 			Error::Refused(format!("the record does not decode: {}", e))
 		})?;
-		let (owner, nonce) = owner_of(&record);
+		// The key that holds the coin: its owner's, or the wallet's key for
+		// the refund of a lock it made ([`super::lock`]).
+		let (owner, nonce, payer) = self.holder_of(&record)?;
+		let (record_owner, record_nonce) = owner_of(&record);
 		let row = match self.store.nonce(&nonce)? {
 			Some(row) => row,
 			// A restore takes a coin paid to a key of the mnemonic that the
@@ -1737,15 +1745,15 @@ impl Wallet {
 		// still holds its path: the operator sweeps a batch only once its
 		// token has waited the notice. It is refused once the sweep that cut
 		// its path is final.
-		let (a, late, expired): (Assessed, bool, bool) = match self.assess(&record, &policy, Some((&owner, &nonce))) {
+		let (a, late, expired): (Assessed, bool, bool) = match self.assess(&record, &policy, Some((&record_owner, &record_nonce))) {
 			Ok(a) => (a, false, false),
-			Err(e) => match self.assess(&record, &WalletPolicy { horizon: 0, ..policy }, Some((&owner, &nonce))) {
+			Err(e) => match self.assess(&record, &WalletPolicy { horizon: 0, ..policy }, Some((&record_owner, &record_nonce))) {
 				Ok(a) => (a, true, false),
 				Err(_) => {
 					let as_of = first_expiry(&record).filter(|t| *t < now.to_consensus_u32())
 						.and_then(|t| arca_covenant::MedianTime::from_consensus(t).ok());
 					let Some(as_of) = as_of else { return Err(self.unkept(e, &record, claimed)) };
-					match self.assess(&record, &WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) }, Some((&owner, &nonce))) {
+					match self.assess(&record, &WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) }, Some((&record_owner, &record_nonce))) {
 						Ok(a) => (a, true, true),
 						Err(_) => return Err(self.unkept(e, &record, claimed)),
 					}
@@ -1858,6 +1866,14 @@ impl Wallet {
 			}
 		}
 		let (state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		// A lock is held apart from the spendable coins: by its payee until
+		// it claims it with the preimage, by its payer until its payee claims
+		// it or it comes back from its timeout ([`super::lock`]).
+		let state = match (record.is_lock(), payer) {
+			(true, false) => super::lock::LOCK_IN,
+			(true, true) => super::lock::LOCK_OUT,
+			_ => state,
+		};
 		// A coin received out of round from an operator with no keeper rests
 		// on the operator's machine alone until it is refreshed.
 		if matches!(record, CoinRecord::Transfer(_)) && self.keepers()?.0.is_empty() {
@@ -1885,7 +1901,8 @@ impl Wallet {
 			};
 			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
 		}
-		let coin = self.row(&record, &a, state, &note)?;
+		let mut coin = self.row(&record, &a, state, &note)?;
+		coin.owner_nonce = nonce;
 		// The wallet's own coins this transfer spent (a swap's side).
 		let mut spent: Vec<String> = match &record {
 			CoinRecord::Transfer(t) => t.inputs.iter().filter_map(|i| {
