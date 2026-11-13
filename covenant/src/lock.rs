@@ -12,18 +12,28 @@
 //! | REFUND | `<T> CLTV DROP <P's delay> CSV DROP <P> CHECKSIG` | `<sig_P>` |
 //!
 //! The tree is `[[CLAIM-C, REFUND-C], [CLAIM, REFUND]]`. No path spends the
-//! leaf without the preimage before `T`, and none from `T` on without the
-//! preimage or `P`. Unlike `htlc-1` ([`crate::htlc`]) the leaf has no
+//! leaf without the preimage before `T`; from `T` on, the refunds open
+//! beside the claims, which stay open with the preimage. On the chain, for
+//! a leaf confirmed at `C`, CLAIM opens at `C + d_Q` and REFUND at
+//! `max(T, C + d_P)`. Unlike `htlc-1` ([`crate::htlc`]) the leaf has no
 //! collaborative path without a condition: one of `Q` and `S` would take the
 //! coin without the preimage, and `P`'s refund would rest on them.
 //!
+//! A lock's payer's delay is at least its payee's and
+//! [`REFUND_DELAY_MARGIN_UNITS`] more ([`LockPolicy::check_delays`]): however late
+//! the leaf reaches the chain, CLAIM opens that margin before REFUND, so a
+//! payee holding the preimage is never beaten to the coin by the payer's
+//! unilateral refund.
+//!
 //! Both collaborative paths sign the message the leaf's collaborative path
-//! signs ([`crate::leaf`]), under the leaf's one constant `K`. A claim pair
-//! and a refund pair of one lock are then two different messages `S` signed
-//! under one salt, the evidence the bond slashes ([`crate::bond`]): the
-//! operator decides a lock one way only. `S`'s signature of one ending, set
-//! beside the other ending's holder's, pays only the outputs that pair
-//! committed to, so it moves nothing the first ending did not.
+//! signs ([`crate::leaf`]), under the leaf's one constant `K`, over the
+//! outputs they commit to and not over the path. A claim pair and a refund
+//! pair of one lock over different outputs are two different messages `S`
+//! signed under one salt, the evidence the bond slashes ([`crate::bond`]),
+//! so the operator decides a lock one way only; over the same outputs they
+//! are one message, and one outcome whichever lands. `S`'s signature of one
+//! ending, set beside the other ending's holder's, pays only the outputs
+//! that pair committed to, so it moves nothing the first ending did not.
 //!
 //! The owner of the leaf is `Q`; its exit delay is `Q`'s delay on the chain.
 //! `regtest/t29_htlc2_lock.py` proves every path and refusal on a node, and
@@ -44,6 +54,10 @@ use crate::{Error, ExplicitOutput};
 use crate::script::BuilderExt;
 use crate::taptree::TapOutput;
 use crate::time::{MedianTime, RelativeTime};
+
+/// What a lock's payer's delay exceeds its payee's by, at least: eight
+/// 512-second units (4,096 s), an hour to react with the units' rounding.
+pub const REFUND_DELAY_MARGIN_UNITS: u16 = 8;
 
 /// The paths of an `htlc-2` leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -93,6 +107,10 @@ pub enum LockError {
 	/// The payee, the payer and the operator must be three keys.
 	#[error("an htlc-2 leaf names three distinct keys: payee, payer and operator")]
 	SharedKey,
+	/// The payer's delay is shorter than the payee's and the margin.
+	#[error("an htlc-2 leaf's payer's delay of {refund} units is shorter than its payee's delay of {claim} units and {margin} more: \
+		a late unroll would let the payer's refund open before the payee's claim")]
+	RefundDelay { refund: u16, claim: u16, margin: u16 },
 }
 
 impl LockPolicy {
@@ -102,6 +120,20 @@ impl LockPolicy {
 		let (q, s, p) = (self.owner, self.operator, self.terms.refunder);
 		if q == s || q == p || s == p {
 			return Err(LockError::SharedKey);
+		}
+		Ok(())
+	}
+
+	/// Refuses a lock whose payer's delay `d_P` is not at least its payee's
+	/// `d_Q` and [`REFUND_DELAY_MARGIN_UNITS`]: on the chain CLAIM opens at
+	/// `C + d_Q` and REFUND at `max(T, C + d_P)` for a leaf confirmed at
+	/// `C`, so with it a payee holding the preimage claims before the
+	/// payer's refund opens however late the leaf is unrolled. The scripts
+	/// hold without it; a lock made for a purchase is checked with it.
+	pub fn check_delays(&self) -> Result<(), LockError> {
+		let (refund, claim, margin) = (self.terms.refund_delay.units(), self.exit_delay.units(), REFUND_DELAY_MARGIN_UNITS);
+		if (refund as u32) < claim as u32 + margin as u32 {
+			return Err(LockError::RefundDelay { refund, claim, margin });
 		}
 		Ok(())
 	}
@@ -202,4 +234,34 @@ fn join(a: &Script, b: &Script) -> Script {
 	let mut v = a.as_bytes().to_vec();
 	v.extend_from_slice(b.as_bytes());
 	Script::from(v)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use elements::hashes::Hash;
+	use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey};
+
+	fn key(b: u8) -> XOnlyPublicKey {
+		Keypair::from_secret_key(&Secp256k1::new(), &SecretKey::from_slice(&[b; 32]).unwrap()).x_only_public_key().0
+	}
+
+	/// A payer's delay below the payee's and the margin is refused: a late
+	/// unroll would open REFUND before CLAIM.
+	#[test]
+	fn the_payer_waits_longer_than_the_payee() {
+		let at = |d_q: u16, d_p: u16| LockPolicy {
+			owner: key(1), operator: key(2), salt: [3; 32], chain: Chain::new(elements::BlockHash::all_zeros()),
+			exit_delay: RelativeTime::from_units(d_q).unwrap(),
+			terms: LockTerms {
+				payment_hash: [4; 32], timeout: MedianTime::from_consensus(1_800_000_000).unwrap(), refunder: key(5),
+				refund_delay: RelativeTime::from_units(d_p).unwrap(),
+			},
+		};
+		assert_eq!(at(254, 262).check_delays(), Ok(()));
+		assert_eq!(at(254, 338).check_delays(), Ok(()));
+		assert_eq!(at(254, 261).check_delays(), Err(LockError::RefundDelay { refund: 261, claim: 254, margin: 8 }));
+		assert_eq!(at(254, 254).check_delays(), Err(LockError::RefundDelay { refund: 254, claim: 254, margin: 8 }));
+		assert!(at(254, 127).check_delays().is_err());
+	}
 }

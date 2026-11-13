@@ -152,7 +152,8 @@ class T29(Ark3, ArkBase, BitcoinTestFramework):
     def refunded_alone(self):
         """P refunds alone from the timeout and after its delay; Q and S
         cannot; the refund in the block that creates the output past the
-        timeout is refused, so Q has P's delay to claim."""
+        timeout is refused: REFUND opens at max(timeout, confirmation + P's
+        delay), CLAIM at confirmation + Q's delay."""
         timeout = self.mtp() + 6 * H
         tap, lv, _ = self.lock("refund", timeout)
         u = self.fund(tap.scriptPubKey, V, self.X)

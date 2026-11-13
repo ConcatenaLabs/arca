@@ -926,17 +926,28 @@ is co-signed, with no round between, and the seller's refund rests on script.
 | CLAIM | `<d_Q> CSV DROP`, the hash gate, `<Q> CHECKSIG` | `Q` alone on the chain, `d_Q` (the leaf's exit delay) after the leaf confirms |
 | REFUND | `<T> CLTV DROP <d_P> CSV DROP <P> CHECKSIG` | `P` alone on the chain, from `T` and `d_P` after the leaf confirms |
 
-No path spends the leaf without the preimage before `T`, and none from `T` on
-without the preimage or `P`. The leaf has no collaborative path without a
+No path spends the leaf without the preimage before `T`; from `T` on the
+refunds open beside the claims, which stay open with the preimage. On the
+chain, for a leaf confirmed at `C`, CLAIM opens at `C + d_Q` and REFUND at
+`max(T, C + d_P)`. A lock made for a purchase has `d_P ≥ d_Q` plus
+`REFUND_DELAY_MARGIN_UNITS` (eight units, 4,096 s; `LockPolicy::check_delays`), so
+however late the leaf is unrolled, CLAIM opens before REFUND and a payee
+holding the preimage is never beaten to the coin; it costs the payer that
+much longer only on its refund alone on the chain, and only when the leaf
+reaches the chain later than `T − d_P`. The leaf has no collaborative path without a
 condition, as `htlc-1` has: one would let `Q` and the operator take the coin
 without the preimage, and the payer's refund would rest on them. `Q`, `P` and
 `S` are three distinct keys (`LockPolicy::check`), `P` a key the payer draws
 for the lock. Both collaborative paths sign a `vtxo-1` leaf's message under the
-leaf's one `K` (`collab_message`). A claim pair and a refund pair of one lock
-are therefore two different messages the operator signed under one salt, the
-evidence the bond slashes, so the operator decides a lock one way only; and
-its signature of one ending beside the other ending's holder pays only the
-outputs that pair committed to. Measured on the node (`regtest/t29_htlc2_lock.py`):
+leaf's one `K` (`collab_message`), over the outputs they commit to and not
+over the path. A claim pair and a refund pair of one lock over different
+outputs are therefore two different messages the operator signed under one
+salt, the evidence the bond slashes (`rebind_signed_in` reads either ending
+from the chain, the claim's preimage among its witness items), so the
+operator decides a lock one way only; over the same outputs they are one
+message, and one outcome whichever lands. Its signature of one ending
+beside the other ending's holder pays only the outputs that pair committed
+to. Measured on the node (`regtest/t29_htlc2_lock.py`):
 the claim together 307 vB, the refund together 290 vB, the claim alone 245 vB,
 the refund alone 229 vB, each into one output with a reserve fee.
 

@@ -860,10 +860,14 @@ def htlc2_taptree(q_x, s_x, p_x, salt, ctag, h, timeout, claim_delay, refund_del
                                           <sig_P>
 
     Tree [[claim_c, refund_c], [claim, refund]]. No path spends the leaf
-    without the preimage before the timeout, and none from it on without P.
-    Both collaborative paths sign the same message under the same salt, so a
-    claim and a refund of one leaf co-signed by S are two messages S signed
-    under one salt: the bond's evidence. claim_delay is Q's exit delay,
+    without the preimage before the timeout; from it on the refunds open
+    beside the claims, which stay open with the preimage. For a leaf
+    confirmed at C, claim opens at C + claim_delay and refund at
+    max(timeout, C + refund_delay). Both collaborative paths sign the same
+    form of message under the same salt, over the outputs and not the path:
+    a claim and a refund of one leaf co-signed by S over different outputs
+    are two messages S signed under one salt, the bond's evidence; over the
+    same outputs they are one message and one outcome. claim_delay is Q's exit delay,
     refund_delay P's (CSV operands, rel_time); the timeout is a median
     time."""
     assert len({q_x, s_x, p_x}) == 3, "three distinct keys"

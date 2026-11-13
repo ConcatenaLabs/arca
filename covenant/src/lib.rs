@@ -161,7 +161,7 @@ pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPath, HtlcTerms};
 pub use landing::{Landing, LandingError, LandingTerms};
 pub use leaf::LeafPolicy;
-pub use lock::{LockError, LockPath, LockPolicy, LockTerms};
+pub use lock::{LockError, LockPath, LockPolicy, LockTerms, REFUND_DELAY_MARGIN_UNITS};
 pub use limiter::{LimiterError, LimiterParams, LimiterSpend, LimiterState};
 pub use message::{Chain, CsfsMessage};
 pub use node::{NodePolicy, ReleaseTree};
