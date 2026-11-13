@@ -377,11 +377,14 @@ and a board whose registration never reached the server, are not recovered.
   checkpoint of the trade has its owner's exit, since the coin it gave comes
   home should the trade die; and so does a coin it gives into a swap whose
   checkpoint has its owner's exit. A coin given to a round (a refresh, an
-  offboard, an order, a take) counts as it does while it is live: until the
-  round is final the wallet signs nothing that spends it, and then only its
-  forfeit, which the operator can claim only by publishing what opens the
-  wallet's new coin. `coin-places` marks each coin counted (`at_risk`). A
-  wallet sets no budget unless its owner sets one.
+  offboard, an order, a take) counts as it does while it is live: the one
+  thing the wallet signs that spends it is its forfeit, to the operator
+  alone, which the operator can claim only with that round's connector and
+  by publishing what opens the wallet's new coin, whether the wallet signed
+  it once the round was final or before the round was broadcast (for an
+  operator that asks for forfeits before broadcast). `coin-places` marks
+  each coin counted (`at_risk`). A wallet sets no budget unless its owner
+  sets one.
 - **Where each coin stands, and an instant limit.** `coin-places` places each
   coin the wallet holds: `settled` (of its own lineage: a round's or a
   board's coin, its own change from paying out of one), `proceeds` (what a
@@ -1343,9 +1346,10 @@ order would be refused, and an amount whose full price is no whole number of
 atoms, which SeqDEX's relay does not list.
 
 `order place` then waits (`--wait`, an hour unless named, 0 not at all),
-syncing every few seconds: once the operator's round is final the wallet
-hands over its forfeits and takes the preimage; the operator unlocks the
-round's offboard output into the order's address, and the wallet unlocks it
+syncing every few seconds: the wallet hands over its forfeits once the
+operator's round is final (or before it is broadcast, for an operator that
+asks for forfeits before broadcast) and takes the preimage; the operator
+unlocks the round's offboard output into the order's address, and the wallet unlocks it
 itself when the operator has not within ten minutes of median time. It
 answers where the order rests (the unlock's output 0, holding exactly the
 amount) once that is final, with its terms in the relay's JSON form
