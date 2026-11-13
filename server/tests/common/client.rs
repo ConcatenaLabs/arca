@@ -185,7 +185,7 @@ pub struct Held {
 /// fresh for this leaf.
 pub fn new_leaf(key: &Keypair) -> (NewLeaf, [u8; 32]) {
 	let nonce = random32();
-	(NewLeaf { v2: false, owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
+	(NewLeaf { lock: None, v2: false, owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
 }
 
 /// Resolves `held` under `policy` against `bases`, as its owner would before
@@ -207,7 +207,7 @@ pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64
 pub fn transfer_body_with(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64, NewLeaf)], operator: XOnlyPublicKey, chain: Chain,
 	checkpoint_exit: bool) -> Value
 {
-	let plan = TransferPlan { checkpoint_exit,
+	let plan = TransferPlan { locks: vec![], checkpoint_exit,
 		inputs: coins.iter().map(|(_, c, v)| (c.clone(), *v)).collect(),
 		outputs: outputs.iter().map(|(a, v, l)| ExplicitOutput::new(*a, *v, l.policy(operator, chain).script_pubkey())).collect(),
 	};

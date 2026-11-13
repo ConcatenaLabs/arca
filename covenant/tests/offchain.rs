@@ -157,7 +157,7 @@ fn pair(f: &Forfeit, owner: &Keypair, operator: &Keypair) -> Pair {
 
 /// A leaf funded directly (as a board pays it), its id the board form's.
 fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str) -> (LeafPolicy, Coin, LeafId) {
-	let leaf = LeafPolicy { claim: None,
+	let leaf = LeafPolicy { lock: None, claim: None,
 		owner: xonly(owner), operator: xonly(s),
 		salt: arca_covenant::leaf::leaf_salt(&label32(&format!("{} owner nonce", label)), &label32(&format!("{} operator nonce", label))),
 		chain: net.chain, exit_delay: delay(),

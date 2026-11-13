@@ -2039,7 +2039,7 @@ impl Wallet {
 				// Into a checkpoint with or without its owner's exit: the pair
 				// names the checkpoint's output, so one of the two verifies.
 				let signed = [false, true].into_iter().any(|checkpoint_exit| {
-					let plan = TransferPlan { checkpoint_exit, inputs: vec![(coin.clone(), cpv)], outputs: vec![] };
+					let plan = TransferPlan { locks: vec![], checkpoint_exit, inputs: vec![(coin.clone(), cpv)], outputs: vec![] };
 					plan.checkpoint_message(0).ok().zip(signature(&t["checkpoint_sig"]))
 						.is_some_and(|(m, s)| arca_covenant::sign::verify_digest(&s, &m.digest, &owner))
 				});

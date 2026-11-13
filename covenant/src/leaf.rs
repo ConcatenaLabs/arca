@@ -78,6 +78,7 @@ use crate::channel::{ChannelPolicy, ChannelTerms};
 use crate::claim::LapseTerms;
 use crate::collab::Collab2;
 use crate::htlc::{HtlcPath, HtlcTerms};
+use crate::lock::{LockPolicy, LockTerms};
 use crate::landing::LandingTerms;
 use crate::message::{rebind_message, Chain, CsfsMessage};
 use crate::script::{BuilderExt, ExplicitOutput};
@@ -184,6 +185,9 @@ pub struct LeafPolicy {
 	/// `claim-1`'s lapse: after the distribution's deadline, the leaf pays its
 	/// return script ([`crate::claim`]); `None` otherwise.
 	pub claim: Option<LapseTerms>,
+	/// `htlc-2`'s terms: the leaf is a hash-lock between two holders, the
+	/// owner the payee ([`crate::lock`]); `None` otherwise.
+	pub lock: Option<LockTerms>,
 }
 
 impl LeafPolicy {
@@ -281,6 +285,9 @@ impl LeafPolicy {
 	/// `vtxo-2`: `[[arca/collab-2, data], exit]` ([`crate::collab`]).
 	/// `claim-1` and `vest-1`: `[collab, [exit, lapse]]` ([`crate::claim`]).
 	pub fn taproot(&self) -> TapOutput {
+		if let Some(l) = self.lock_policy() {
+			return l.taproot();
+		}
 		if let Some(c) = self.channel_policy() {
 			return c.taproot(&c.opening());
 		}
@@ -311,7 +318,9 @@ impl LeafPolicy {
 	/// The template it follows: `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3` (or
 	/// `order-2`), `landing-1`, `landing-2`, `channel-1`, `claim-1` or `vest-1`.
 	pub fn template(&self) -> crate::Template {
-		if self.vest().is_some() {
+		if self.lock.is_some() {
+			crate::Template::Htlc2
+		} else if self.vest().is_some() {
 			crate::Template::Vest1
 		} else if self.claim.is_some() {
 			crate::Template::Claim1
@@ -333,6 +342,13 @@ impl LeafPolicy {
 	/// The channel a `channel-1` leaf opens; `None` for any other template.
 	pub fn channel_policy(&self) -> Option<ChannelPolicy> {
 		self.channel.map(|terms| ChannelPolicy {
+			owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay, terms,
+		})
+	}
+
+	/// The hash-lock an `htlc-2` leaf is; `None` for any other template.
+	pub fn lock_policy(&self) -> Option<LockPolicy> {
+		self.lock.map(|terms| LockPolicy {
 			owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay, terms,
 		})
 	}

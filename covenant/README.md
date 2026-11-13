@@ -965,6 +965,19 @@ settles, so a claim never waits on the seller posting it. `Q` then claims by
 CLAIM-C into a leaf of its own, received lineage until a round. Nothing is
 fronted by the operator, and the Bitcoin side sees only the invoice under `h`.
 
+**Its record and its endings.** An `htlc-2` leaf is made only by a
+reassignment, never in a round: a round's leaf record naming it is refused. The
+coin record's tag 10 carries it (`transfer`): the payee's key, the two nonces,
+the payee's delay and the terms (`h`, `T`, `P` and `d_P`). An input that spends
+it names its path (`LockSpend`): the claim, with the preimage, moves it into a
+checkpoint of `Q`'s; the refund moves it into a checkpoint of `P`'s, by a
+transaction whose lock time is `T`. Neither checkpoint has an exit, and the
+record carries the preimage of a claim, so whoever holds the coin can bring it
+on-chain. A record whose input names a path for a coin that is no lock, none
+for one that is, or a preimage that does not open `h` is refused
+(`TransferError::LockSpend`). On the chain, `LockPolicy::claim_tx` and
+`refund_tx` build CLAIM and REFUND for the payee and the payer to sign.
+
 **The timeout.** `P` sets `T` at least `L_B + ρ + u + d_Q + 3,600` seconds out:
 `L_B` the latest moment the Bitcoin leg can reveal the preimage or return the
 BTC (the invoice's expiry or, later, `(δ + 6) · 1,200` seconds for the Bitcoin

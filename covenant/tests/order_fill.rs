@@ -76,7 +76,7 @@ struct Taker {
 
 fn taker(label: &str) -> Taker {
 	let key = keypair(&format!("order-fill taker {}", label));
-	let leaf = |what: &str| NewLeaf {
+	let leaf = |what: &str| NewLeaf { lock: None,
 		owner: xonly(&key), owner_nonce: label32(&format!("order-fill taker {} {} owner nonce", label, what)),
 		creator_nonce: label32(&format!("order-fill taker {} {} creator nonce", label, what)), exit_delay: delay(), htlc: None,
 		landing: None, v2: false,
@@ -112,7 +112,7 @@ fn make_fill(order_rec: &CoinRecord, order: &ValidCoin, coin_rec: &CoinRecord, c
 		order: order_rec.clone(),
 		signature: sig(s, &digest),
 		partial: plan.rest.is_some(),
-		inputs: vec![TransferInput { exit: false,
+		inputs: vec![TransferInput { lock: None, exit: false,
 			coin: coin_rec.clone(), checkpoint_value: coin.value,
 			checkpoint: Pair { operator: sig(s, &m_cp.digest), owner: sig(payer, &m_cp.digest) },
 			reassignment: Pair { operator: sig(s, &m_f.digest), owner: sig(payer, &m_f.digest) },

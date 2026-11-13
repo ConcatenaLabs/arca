@@ -567,7 +567,7 @@ impl Cosigner {
 		}
 
 		// The owners' signatures.
-		let plan = TransferPlan { checkpoint_exit: req.checkpoint_exit,
+		let plan = TransferPlan { locks: vec![], checkpoint_exit: req.checkpoint_exit,
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
@@ -768,7 +768,7 @@ impl Cosigner {
 		let mut records = Vec::with_capacity(m);
 		for (j, o) in req.outputs.iter().enumerate() {
 			let record = CoinRecord::Transfer(Box::new(Transfer {
-				inputs: checked.iter().zip(&req.inputs).zip(&sigs).enumerate().map(|(k, ((c, i), (cp, re)))| TransferInput { exit: plan.exit(k),
+				inputs: checked.iter().zip(&req.inputs).zip(&sigs).enumerate().map(|(k, ((c, i), (cp, re)))| TransferInput { lock: None, exit: plan.exit(k),
 					coin: c.record.clone(),
 					checkpoint_value: i.checkpoint_value,
 					checkpoint: Pair { operator: *cp, owner: i.checkpoint_sig },
@@ -854,7 +854,7 @@ impl Cosigner {
 		let first = checked[0].coin.asset;
 		let mut sized = Vec::with_capacity(checked.len());
 		for (k, (i, c)) in req.inputs.iter().zip(checked).enumerate() {
-			let vi = ValidInput {
+			let vi = ValidInput { lock: None,
 				coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed(), c.coin.value),
 				checkpoint_value: c.coin.value,
 				checkpoint_pair: pair, reassignment_pair: pair,
@@ -1265,7 +1265,7 @@ mod test {
 		OutputRequest {
 			asset: AssetId::from_byte_array([0xff; 32]),
 			value: 1_000,
-			leaf: NewLeaf {
+			leaf: NewLeaf { lock: None,
 				owner: key.x_only_public_key().0, owner_nonce: [seed; 32], creator_nonce: [seed; 32],
 				exit_delay: RelativeTime::from_units(254).unwrap(), htlc,
 				landing: None, v2: false,

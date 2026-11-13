@@ -177,7 +177,7 @@ fn fill_body(r: &Running, st: &Value, p: &OrderPolicy, paid: (&Coin, ValidCoin),
 	outputs.extend(plan.rest.clone());
 	outputs.push(ExplicitOutput::new(p.terms().asset_a, taker_value, leaves.0.policy(s, r.chain).script_pubkey()));
 	outputs.push(ExplicitOutput::new(paid.1.asset, change, leaves.1.policy(s, r.chain).script_pubkey()));
-	let tplan = TransferPlan { checkpoint_exit: false, inputs: vec![(paid.1.clone(), kept)], outputs };
+	let tplan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(paid.1.clone(), kept)], outputs };
 	let cp = sign_digest(signer, &tplan.checkpoint_message(0).unwrap().digest, &random32());
 	let re = sign_digest(signer, &tplan.reassignment_message(0).unwrap().digest, &random32());
 	let leaf_json = |asset: elements::AssetId, v: u64, l: &NewLeaf| json!({

@@ -259,7 +259,7 @@ impl Out {
 		Ok(Out {
 			asset,
 			value,
-			leaf: NewLeaf {
+			leaf: NewLeaf { lock: None,
 				owner: XOnlyPublicKey::from_slice(&unhex(v["owner"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
 				owner_nonce: unhex32(v["owner_nonce"].as_str().unwrap_or(""))?,
 				creator_nonce: unhex32(v["creator_nonce"].as_str().unwrap_or(""))?,
@@ -480,7 +480,7 @@ impl Wallet {
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
-		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None,
+		Ok(NewLeaf { lock: None, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None,
 			v2: self.asks_vtxo2() })
 	}
 
@@ -514,7 +514,7 @@ impl Wallet {
 	/// key of the wallet's and with nothing stored: to price a coin before
 	/// it is made.
 	fn leaf_traded_probe(&self, info: &Value, asset: AssetId, value: u64, other_reads: bool) -> Result<NewLeaf, Error> {
-		let mut leaf = NewLeaf { owner: self.operator, owner_nonce: [0; 32], creator_nonce: [0; 32], exit_delay: self.exit_delay(), htlc: None,
+		let mut leaf = NewLeaf { lock: None, owner: self.operator, owner_nonce: [0; 32], creator_nonce: [0; 32], exit_delay: self.exit_delay(), htlc: None,
 			landing: None, v2: self.asks_vtxo2() };
 		leaf.landing = self.landing_rule(info, asset)?.map(|l| l.terms(asset, value)).transpose().map_err(|e| Error::Refused(e.to_string()))?;
 		leaf.v2 &= leaf.landing.is_none();
@@ -747,7 +747,7 @@ impl Wallet {
 	/// The checkpoint margin of `coin`, and the reassignment's of `inputs`
 	/// into `outputs`, each as the operator bounds them ([`Margins`]).
 	fn checkpoint_margin(&self, coin: &ValidCoin, m: &Margins) -> Result<u64, Error> {
-		let vi = ValidInput {
+		let vi = ValidInput { lock: None,
 			coin: coin.clone(), checkpoint: coin.checkpoint(), checkpoint_value: coin.value,
 			checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
 		};
@@ -771,7 +771,7 @@ impl Wallet {
 		let vis: Vec<ValidInput> = inputs.iter().map(|c| {
 			let mut coin = (*c).clone();
 			coin.asset = asset;
-			ValidInput {
+			ValidInput { lock: None,
 				checkpoint: coin.checkpoint(), checkpoint_value: coin.value, coin,
 				checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
 			}
@@ -1314,7 +1314,7 @@ impl Wallet {
 		};
 		let to = Out {
 			asset, value,
-			leaf: NewLeaf {
+			leaf: NewLeaf { lock: None,
 				owner: xonly(req["owner"].as_str().unwrap_or(""))?,
 				owner_nonce: unhex32(req["owner_nonce"].as_str().unwrap_or(""))?,
 				// Drawn fresh for this leaf: two payments to one request make
@@ -1409,7 +1409,7 @@ impl Wallet {
 		// Nothing is signed for the operator without a witness of its
 		// signer's record, whatever entry point led here.
 		self.witnessed_now()?;
-		let plan = TransferPlan { checkpoint_exit,
+		let plan = TransferPlan { locks: vec![], checkpoint_exit,
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
@@ -3338,7 +3338,7 @@ impl Wallet {
 		let n = theirs.len();
 		let mut inputs = theirs;
 		inputs.extend(mine);
-		let plan = TransferPlan { checkpoint_exit,
+		let plan = TransferPlan { locks: vec![], checkpoint_exit,
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
@@ -3837,7 +3837,7 @@ impl Wallet {
 	/// its fee, before anything is signed: `(asset, value, fee)`.
 	pub(crate) fn respend_quote(&mut self, rows: Vec<CoinRow>) -> Result<(AssetId, u64, u64), Error> {
 		let n = random32();
-		let leaf = NewLeaf { v2: false, owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None };
+		let leaf = NewLeaf { lock: None, v2: false, owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None };
 		let held: u64 = rows.iter().map(|r| r.value).sum();
 		let (asset, _, value) = self.respend_plan(rows, &leaf)?;
 		Ok((asset, value, held.saturating_sub(value)))

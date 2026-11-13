@@ -543,6 +543,9 @@ impl LeafPolicy {
 		if self.htlc.is_some() {
 			return Err(Error::HtlcHasNoExit.into());
 		}
+		if self.lock.is_some() {
+			return Err(Error::LockHasNoExit.into());
+		}
 		if let Some(l) = &self.landing {
 			l.check_outputs(0, outputs).map_err(SpendError::Landing)?;
 		}
@@ -622,6 +625,34 @@ impl LeafPolicy {
 		let seq = Sequence(t.refund_delay(self.exit_delay).to_sequence());
 		let lock = LockTime::from_consensus(t.timeout.to_consensus_u32());
 		KeySpend::build_at(lock, self.taproot(), self.refund_script()?, vec![(coin, spent, seq)], outputs, fee)
+	}
+}
+
+impl crate::lock::LockPolicy {
+	/// CLAIM of `coin`, this `htlc-2` leaf on-chain holding `value` of
+	/// `asset`, into `outputs`: input 0's sequence is the payee's delay. The
+	/// payee signs [`KeySpend::sighash`], which does not cover the preimage,
+	/// and finishes it with its signature and the preimage
+	/// ([`crate::LockPolicy::claim_witness`]'s items): a watchtower holds it
+	/// signed and adds the preimage once it is out.
+	pub fn claim_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
+		-> Result<KeySpend, SpendError>
+	{
+		let spent = explicit_txout(asset, value, self.script_pubkey());
+		KeySpend::build(self.taproot(), self.claim_script(), vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))], outputs, fee)
+	}
+
+	/// REFUND of `coin`, this `htlc-2` leaf on-chain holding `value` of
+	/// `asset`, into `outputs`: its lock time is the timeout and input 0's
+	/// sequence the payer's delay. The payer signs [`KeySpend::sighash`] and
+	/// finishes it with its signature.
+	pub fn refund_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
+		-> Result<KeySpend, SpendError>
+	{
+		let spent = explicit_txout(asset, value, self.script_pubkey());
+		let seq = Sequence(self.terms.refund_delay.to_sequence());
+		let lock = LockTime::from_consensus(self.terms.timeout.to_consensus_u32());
+		KeySpend::build_at(lock, self.taproot(), self.refund_script(), vec![(coin, spent, seq)], outputs, fee)
 	}
 }
 

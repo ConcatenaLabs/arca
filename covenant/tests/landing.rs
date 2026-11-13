@@ -213,7 +213,7 @@ fn a_supervised_asset_lands_where_its_freeze_binds() {
 	let landing = Landing { program, allowance: ALLOWANCE, own_index: false };
 	let land_spk = landing.script_pubkey();
 	let (chain, genesis) = (net.chain, net.genesis);
-	let leaf = |salt: &str| LeafPolicy { claim: None,
+	let leaf = |salt: &str| LeafPolicy { lock: None, claim: None,
 		owner: xonly(&a), operator: xonly(&s), salt: label32(salt), chain, exit_delay: delay(), htlc: None, order: None,
 		landing: Some(landing.terms(sup.z, V).unwrap()),
 		channel: None, v2: false,
@@ -389,7 +389,7 @@ fn a_landing_2_coin_lands_at_its_own_index_where_its_freeze_binds() {
 	let landing = Landing { program, allowance: ALLOWANCE, own_index: true };
 	let land_spk = landing.script_pubkey();
 	let (chain, genesis) = (net.chain, net.genesis);
-	let leaf = |salt: &str| LeafPolicy { claim: None,
+	let leaf = |salt: &str| LeafPolicy { lock: None, claim: None,
 		owner: xonly(&a), operator: xonly(&s), salt: label32(salt), chain, exit_delay: delay(), htlc: None, order: None,
 		landing: Some(landing.terms(sup.z, V).unwrap()),
 		channel: None, v2: false,

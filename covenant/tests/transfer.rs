@@ -185,7 +185,7 @@ fn two_coins_of_one_reassignment_are_spent_together() {
 	let (b1, ch) = (h.b1_record.resolve(&f.rounds, p).unwrap(), h.a_change_record.resolve(&f.rounds, p).unwrap());
 	let e = Party::new("E, paid both", h.d.leaf.exit_delay);
 	let pay_both = |records: [&CoinRecord; 2], coins: [&ValidCoin; 2], keys: [&elements::secp256k1_zkp::Keypair; 2], to: &Party| {
-		let plan = TransferPlan { checkpoint_exit: false,
+		let plan = TransferPlan { locks: vec![], checkpoint_exit: false,
 			inputs: coins.iter().map(|c| ((*c).clone(), c.value - MARGIN)).collect(),
 			outputs: vec![ExplicitOutput::new(coins[0].asset, coins[0].value + coins[1].value - 3 * MARGIN,
 				to.leaf.policy(xonly(s), p.chain).script_pubkey())],
@@ -193,7 +193,7 @@ fn two_coins_of_one_reassignment_are_spent_together() {
 		CoinRecord::Transfer(Box::new(Transfer {
 			inputs: (0..2).map(|i| {
 				let (cp, re) = (plan.checkpoint_message(i).unwrap().digest, plan.reassignment_message(i).unwrap().digest);
-				TransferInput { exit: false, coin: records[i].clone(), checkpoint_value: plan.inputs[i].1,
+				TransferInput { lock: None, exit: false, coin: records[i].clone(), checkpoint_value: plan.inputs[i].1,
 					checkpoint: Pair { operator: sig(s, &cp), owner: sig(keys[i], &cp) },
 					reassignment: Pair { operator: sig(s, &re), owner: sig(keys[i], &re) } }
 			}).collect(),
@@ -314,14 +314,14 @@ fn each_bad_record_is_refused() {
 	let (k1, k2) = (x1.resolve(&f.rounds, p).unwrap(), x2.resolve(&f.rounds, p).unwrap());
 	assert_eq!(k1.output(), k2.output());
 	let next = Party::new("after the promised leaf", d.leaf.exit_delay);
-	let plan = TransferPlan { checkpoint_exit: false,
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false,
 		inputs: vec![(k1.clone(), k1.value - MARGIN), (k2.clone(), k2.value - MARGIN)],
 		outputs: vec![ExplicitOutput::new(k1.asset, k1.value + k2.value - 3 * MARGIN, next.leaf.policy(xonly(s), p.chain).script_pubkey())],
 	};
 	let m = CoinRecord::Transfer(Box::new(Transfer {
 		inputs: [&x1, &x2].iter().enumerate().map(|(i, r)| {
 			let (cp, re) = (plan.checkpoint_message(i).unwrap().digest, plan.reassignment_message(i).unwrap().digest);
-			TransferInput { exit: false, coin: (*r).clone(), checkpoint_value: plan.inputs[i].1,
+			TransferInput { lock: None, exit: false, coin: (*r).clone(), checkpoint_value: plan.inputs[i].1,
 				checkpoint: Pair { operator: sig(s, &cp), owner: sig(&twice.key, &cp) },
 				reassignment: Pair { operator: sig(s, &re), owner: sig(&twice.key, &re) } }
 		}).collect(),
@@ -372,13 +372,13 @@ fn each_bad_record_is_refused() {
 	for h in 0..3 {
 		let coin = r.resolve(&f.rounds, p).unwrap();
 		let next = Party::new(&format!("self payment {}", h), d.leaf.exit_delay);
-		let plan = TransferPlan { checkpoint_exit: false,
+		let plan = TransferPlan { locks: vec![], checkpoint_exit: false,
 			inputs: vec![(coin.clone(), coin.value - MARGIN)],
 			outputs: vec![ExplicitOutput::new(coin.asset, coin.value - 2 * MARGIN, next.leaf.policy(xonly(s), p.chain).script_pubkey())],
 		};
 		let (cp, re) = (plan.checkpoint_message(0).unwrap().digest, plan.reassignment_message(0).unwrap().digest);
 		r = CoinRecord::Transfer(Box::new(Transfer {
-			inputs: vec![TransferInput { exit: false, coin: r, checkpoint_value: coin.value - MARGIN,
+			inputs: vec![TransferInput { lock: None, exit: false, coin: r, checkpoint_value: coin.value - MARGIN,
 				checkpoint: Pair { operator: sig(s, &cp), owner: sig(&owner.key, &cp) },
 				reassignment: Pair { operator: sig(s, &re), owner: sig(&owner.key, &re) } }],
 			outputs: plan.outputs.clone(), index: 0, leaf: next.leaf,
@@ -452,12 +452,12 @@ fn the_operator_cosigns_no_two_reassignments_one_transaction_could_satisfy() {
 	assert!(matches!(seen.check(&ins1, &[]).unwrap_err(), TransferError::Outputs(0)));
 
 	// The plan the sender builds is what the operator admits.
-	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(coin_of(&f, &h.a_base), 1_000)], outputs: outs1.clone() };
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(coin_of(&f, &h.a_base), 1_000)], outputs: outs1.clone() };
 	assert!(matches!(plan.admit(&mut seen).unwrap_err(), TransferError::Mergeable));
 	let mut fresh = Party::new("B1", f.hops.b1.leaf.exit_delay).leaf;
 	fresh.creator_nonce = label32("another creator nonce");
 	let fresh_out = vec![ExplicitOutput::new(outs1[0].asset, outs1[0].value, fresh.policy(xonly(&f.b.s), f.policy.chain).script_pubkey())];
-	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(coin_of(&f, &h.a_base), 1_000)], outputs: fresh_out };
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(coin_of(&f, &h.a_base), 1_000)], outputs: fresh_out };
 	plan.admit(&mut seen).unwrap();
 	println!("the same receiver, key and nonce, with another creator nonce: admitted");
 }
@@ -502,13 +502,13 @@ fn every_one_byte_change_of_a_record_is_refused() {
 fn pay(prev: &CoinRecord, coin: &ValidCoin, owner: &elements::secp256k1_zkp::Keypair, s: &elements::secp256k1_zkp::Keypair,
 	to: NewLeaf, chain: Chain) -> CoinRecord
 {
-	let plan = TransferPlan { checkpoint_exit: false,
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false,
 		inputs: vec![(coin.clone(), coin.value - MARGIN)],
 		outputs: vec![ExplicitOutput::new(coin.asset, coin.value - 2 * MARGIN, to.policy(xonly(s), chain).script_pubkey())],
 	};
 	let (cp, re) = (plan.checkpoint_message(0).unwrap().digest, plan.reassignment_message(0).unwrap().digest);
 	CoinRecord::Transfer(Box::new(Transfer {
-		inputs: vec![TransferInput { exit: false, coin: prev.clone(), checkpoint_value: coin.value - MARGIN,
+		inputs: vec![TransferInput { lock: None, exit: false, coin: prev.clone(), checkpoint_value: coin.value - MARGIN,
 			checkpoint: Pair { operator: sig(s, &cp), owner: sig(owner, &cp) },
 			reassignment: Pair { operator: sig(s, &re), owner: sig(owner, &re) } }],
 		outputs: plan.outputs.clone(), index: 0, leaf: to,
@@ -599,7 +599,7 @@ fn an_htlc_1_coin_paid_out_and_returned() {
 		operator_delay: RelativeTime::from_units(delay.units() / 3).unwrap(),
 	};
 	let htlc_key = keypair("htlc payer key");
-	let htlc = NewLeaf {
+	let htlc = NewLeaf { lock: None,
 		owner: xonly(&htlc_key), owner_nonce: label32("htlc owner nonce"), creator_nonce: label32("htlc creator nonce"),
 		exit_delay: delay, htlc: Some(terms),
 		landing: None, v2: false,
@@ -610,7 +610,7 @@ fn an_htlc_1_coin_paid_out_and_returned() {
 		ExplicitOutput::new(x, pay, htlc.policy(xonly(s), chain).script_pubkey()),
 		ExplicitOutput::new(x, a_coin.value - pay - 2 * MARGIN, change.leaf.policy(xonly(s), chain).script_pubkey()),
 	];
-	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)], outputs };
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)], outputs };
 	let pairs = sign_plan(&plan, &[&f.b.a], s);
 	let rec = record_for(&plan, &[&f.hops.a_base], &pairs, 0, htlc);
 	let bytes = rec.to_bytes().unwrap();
@@ -643,7 +643,7 @@ fn an_htlc_1_coin_paid_out_and_returned() {
 
 	// The payment failed: back into a new leaf of A's, by both.
 	let back = Party::new("htlc returned", delay);
-	let plan = TransferPlan { checkpoint_exit: false,
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false,
 		inputs: vec![(coin.clone(), coin.value - MARGIN)],
 		outputs: vec![ExplicitOutput::new(x, coin.value - 2 * MARGIN, back.leaf.policy(xonly(s), chain).script_pubkey())],
 	};
@@ -662,7 +662,7 @@ fn an_htlc_1_coin_paid_out_and_returned() {
 
 	// Terms the leaf cannot carry.
 	let bad = NewLeaf { htlc: Some(HtlcTerms { operator_delay: delay, ..terms }), ..htlc };
-	let plan = TransferPlan { checkpoint_exit: false,
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false,
 		inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)],
 		outputs: vec![ExplicitOutput::new(x, a_coin.value - 2 * MARGIN, bad.policy(xonly(s), chain).script_pubkey())],
 	};
@@ -717,4 +717,150 @@ fn a_coin_carries_every_message_the_operator_signed_down_its_lineage() {
 	let again = bond::Signed { signature: arca_covenant::sign::sign_digest(&f.b.s, &p.digest_of(&all[0].salt, &all[0].signed), &[9; 32]),
 		..all[0].signed.clone() };
 	assert_eq!(p.check(&bond::Evidence { salt: all[0].salt, a: all[0].signed.clone(), b: again }), Err(BondError::SameDigest));
+}
+
+/// An `htlc-2` lock between two holders, made out of round: the payer's coin
+/// locked to the payee, claimed by the payee with the preimage into a coin of
+/// its own, or refunded to the payer from the timeout, each brought on-chain
+/// from its record; every input that names the wrong path, a preimage that
+/// does not open the hash, or a pair of the other holder's, refused.
+#[test]
+fn a_lock_between_two_holders_is_claimed_or_refunded_out_of_round() {
+	let f = fx();
+	let s = &f.b.s;
+	let chain = f.policy.chain;
+	let delay = RelativeTime::from_seconds_ceil(36 * 3600).unwrap();
+	let a_coin = f.hops.a_base.resolve(&f.rounds, &f.policy).unwrap();
+	let x = a_coin.asset;
+	let preimage = label32("lock payment");
+	let timeout = MedianTime::from_consensus(CREATED + 3 * 86_400).unwrap();
+	let refund_key = keypair("lock refund key");
+	let terms = LockTerms {
+		payment_hash: arca_covenant::script::sha256(&preimage), timeout, refunder: xonly(&refund_key), refund_delay: delay,
+	};
+	let q = Party::new("lock payee", delay);
+	let lock = NewLeaf { lock: Some(terms), ..q.leaf };
+	let change = Party::new("lock change", delay);
+	let pay = 3_000_000;
+	let outputs = vec![
+		ExplicitOutput::new(x, pay, lock.policy(xonly(s), chain).script_pubkey()),
+		ExplicitOutput::new(x, a_coin.value - pay - 2 * MARGIN, change.leaf.policy(xonly(s), chain).script_pubkey()),
+	];
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)], outputs };
+	let pairs = sign_plan(&plan, &[&f.b.a], s);
+	let rec = record_for(&plan, &[&f.hops.a_base], &pairs, 0, lock);
+	let bytes = rec.to_bytes().unwrap();
+	assert_eq!(bytes[1], 10, "a coin whose leaf is htlc-2 has tag 10");
+	assert_eq!(CoinRecord::from_bytes(&bytes).unwrap(), rec);
+	assert!(rec.is_lock());
+	let coin = rec.validate(&f.rounds, &f.policy, &q.leaf.owner, &q.leaf.owner_nonce).unwrap();
+	assert_eq!((coin.leaf.lock, coin.leaf.template(), coin.hops), (Some(terms), Template::Htlc2, 1));
+	assert!(!coin.exit_allowed(), "a lock's checkpoint never has an exit");
+	assert_eq!(coin.leaf.script_pubkey(), coin.leaf.lock_policy().unwrap().script_pubkey());
+	let mut txs = vec![];
+	let at = bring(&coin, &mut txs);
+	for (name, u) in &txs {
+		f.consensus.verify_tx(&u.prevouts, &u.tx).unwrap_or_else(|(i, e)| panic!("{}: input {}: {}", name, i, e));
+	}
+	// On the chain, the payee's CLAIM with the preimage and the payer's
+	// REFUND from T take it alone; it has no exit.
+	let lp = coin.leaf.lock_policy().unwrap();
+	let genesis = chain.genesis_hash();
+	let to = [ExplicitOutput::new(x, pay - 1_500, op_true().script_pubkey())];
+	assert!(coin.leaf.exit_tx(at, x, pay, &to, &FeeSource::Reserve).is_err(), "htlc-2 has no exit");
+	let ks = lp.claim_tx(at, x, pay, &to, &FeeSource::Reserve).unwrap();
+	assert_eq!(ks.tx.input[0].sequence.0, delay.to_sequence());
+	let sg = sig(&q.key, &ks.sighash(genesis).unwrap());
+	let alone = ks.finish(vec![sg.as_ref().to_vec(), preimage.to_vec()]);
+	f.consensus.verify_tx(&alone.prevouts, &alone.tx).unwrap();
+	println!("the payee's CLAIM alone: {} vB, verifies", alone.tx.vsize());
+	let ks = lp.refund_tx(at, x, pay, &to, &FeeSource::Reserve).unwrap();
+	assert_eq!(ks.tx.lock_time.to_consensus_u32(), timeout.to_consensus_u32());
+	let sg = sig(&refund_key, &ks.sighash(genesis).unwrap());
+	let alone = ks.finish(vec![sg.as_ref().to_vec()]);
+	f.consensus.verify_tx(&alone.prevouts, &alone.tx).unwrap();
+	println!("the payer's REFUND alone: {} vB, verifies", alone.tx.vsize());
+	println!("the lock's record: {} bytes; its leaf {} vB to bring on-chain with its lineage", bytes.len(), txs.last().unwrap().1.tx.vsize());
+
+	// The claim: the payee and the operator, with the preimage, into a coin of the payee's.
+	let q2 = Party::new("lock claimed", delay);
+	let claim = Some(LockSpend::Claim { preimage });
+	let cplan = TransferPlan { locks: vec![claim], checkpoint_exit: true,
+		inputs: vec![(coin.clone(), coin.value - MARGIN)],
+		outputs: vec![ExplicitOutput::new(x, coin.value - 2 * MARGIN, q2.leaf.policy(xonly(s), chain).script_pubkey())],
+	};
+	assert!(!cplan.exit(0), "no exit for a lock's checkpoint, even where the plan asks");
+	assert_eq!(cplan.checkpoint(0).owner, q.leaf.owner, "the claim's checkpoint is the payee's");
+	let cpairs = sign_plan(&cplan, &[&q.key], s);
+	let claimed = record_for(&cplan, &[&rec], &cpairs, 0, q2.leaf);
+	let cbytes = claimed.to_bytes().unwrap();
+	assert_eq!(CoinRecord::from_bytes(&cbytes).unwrap(), claimed);
+	let ccoin = claimed.validate(&f.rounds, &f.policy, &q2.leaf.owner, &q2.leaf.owner_nonce).unwrap();
+	assert_eq!((ccoin.hops, ccoin.leaf.lock), (2, None));
+	let mut txs = vec![];
+	bring(&ccoin, &mut txs);
+	for (name, u) in &txs {
+		f.consensus.verify_tx(&u.prevouts, &u.tx).unwrap_or_else(|(i, e)| panic!("{}: input {}: {}", name, i, e));
+		f.standard.verify_tx(&u.prevouts, &u.tx).unwrap_or_else(|(i, e)| panic!("{}: input {} (standard): {}", name, i, e));
+	}
+	let (name, u) = txs.iter().rev().nth(1).unwrap();
+	assert_eq!(u.tx.lock_time.to_consensus_u32(), 0);
+	println!("{}: the claim's checkpoint, {} vB, verifies", name, u.tx.vsize());
+
+	// The refund: the payer and the operator, from the timeout, into a coin of the payer's.
+	let p2 = Party::new("lock refunded", delay);
+	let rplan = TransferPlan { locks: vec![Some(LockSpend::Refund)], checkpoint_exit: false,
+		inputs: vec![(coin.clone(), coin.value - MARGIN)],
+		outputs: vec![ExplicitOutput::new(x, coin.value - 2 * MARGIN, p2.leaf.policy(xonly(s), chain).script_pubkey())],
+	};
+	assert_eq!(rplan.checkpoint(0).owner, xonly(&refund_key), "the refund's checkpoint is the payer's");
+	let rpairs = sign_plan(&rplan, &[&refund_key], s);
+	let refunded = record_for(&rplan, &[&rec], &rpairs, 0, p2.leaf);
+	assert_eq!(CoinRecord::from_bytes(&refunded.to_bytes().unwrap()).unwrap(), refunded);
+	let rcoin = refunded.validate(&f.rounds, &f.policy, &p2.leaf.owner, &p2.leaf.owner_nonce).unwrap();
+	let mut txs = vec![];
+	bring(&rcoin, &mut txs);
+	for (name, u) in &txs {
+		f.consensus.verify_tx(&u.prevouts, &u.tx).unwrap_or_else(|(i, e)| panic!("{}: input {}: {}", name, i, e));
+	}
+	let (name, u) = txs.iter().rev().nth(1).unwrap();
+	assert_eq!(u.tx.lock_time.to_consensus_u32(), timeout.to_consensus_u32(), "the refund's checkpoint waits for T");
+	assert_ne!(u.tx.input[0].sequence.0, 0xffff_ffff, "and its lock time is enforced");
+	println!("{}: the refund's checkpoint, {} vB, verifies", name, u.tx.vsize());
+	// Below T, the refund's checkpoint fails its script.
+	let mut early = u.clone();
+	early.tx.lock_time = elements::LockTime::from_consensus(timeout.to_consensus_u32() - 1);
+	let (i, e) = f.consensus.verify_tx(&early.prevouts, &early.tx).unwrap_err();
+	assert!(i == 0 && format!("{:?}", e).contains("Locktime requirement not satisfied"), "{:?}", e);
+	println!("the refund's checkpoint below T: {:?}", e);
+
+	// What the records refuse.
+	let refuse = |r: CoinRecord, owner: &Party| r.validate(&f.rounds, &f.policy, &owner.leaf.owner, &owner.leaf.owner_nonce).unwrap_err();
+	// A preimage that does not open the hash.
+	let wrong = TransferPlan { locks: vec![Some(LockSpend::Claim { preimage: label32("not it") })], ..cplan.clone() };
+	let e = refuse(record_for(&wrong, &[&rec], &cpairs, 0, q2.leaf), &q2);
+	assert!(matches!(e, TransferError::LockSpend(0)), "{}", e);
+	// The claim's pair, the record naming the refund.
+	let swapped = TransferPlan { locks: vec![Some(LockSpend::Refund)], ..cplan.clone() };
+	let e = refuse(record_for(&swapped, &[&rec], &cpairs, 0, q2.leaf), &q2);
+	assert!(matches!(e, TransferError::Pair { pair: "checkpoint", .. }), "{}", e);
+	// The payee signing the refund in the payer's place.
+	let by_q = sign_plan(&rplan, &[&q.key], s);
+	let e = refuse(record_for(&rplan, &[&rec], &by_q, 0, p2.leaf), &p2);
+	assert!(matches!(e, TransferError::Pair { pair: "checkpoint", .. }), "{}", e);
+	// A lock spent with no path named: refused when written and when read.
+	let none = TransferPlan { locks: vec![], ..cplan.clone() };
+	let bare = record_for(&none, &[&rec], &cpairs, 0, q2.leaf);
+	assert!(matches!(bare.to_bytes(), Err(TransferError::LockSpend(_))));
+	assert!(matches!(refuse(bare, &q2), TransferError::LockSpend(0)));
+	// A path named for a coin that is no lock.
+	let plain = TransferPlan { locks: vec![Some(LockSpend::Refund)], ..plan.clone() };
+	let e = refuse(record_for(&plain, &[&f.hops.a_base], &pairs, 1, change.leaf), &change);
+	assert!(matches!(e, TransferError::LockSpend(0)), "{}", e);
+	// A lock whose refunder is its payee.
+	let shared = NewLeaf { lock: Some(LockTerms { refunder: q.leaf.owner, ..terms }), ..q.leaf };
+	let splan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(a_coin.clone(), a_coin.value - MARGIN)],
+		outputs: vec![ExplicitOutput::new(x, a_coin.value - 2 * MARGIN, shared.policy(xonly(s), chain).script_pubkey())] };
+	let e = refuse(record_for(&splan, &[&f.hops.a_base], &sign_plan(&splan, &[&f.b.a], s), 0, shared), &q);
+	assert!(matches!(e, TransferError::Spend(SpendError::Policy(arca_covenant::Error::Lock(LockError::SharedKey)))), "{}", e);
 }
