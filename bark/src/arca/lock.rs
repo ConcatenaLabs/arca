@@ -291,6 +291,21 @@ impl Wallet {
 		self.locking.set(true);
 		let chosen = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, true, reads, spend);
 		self.locking.set(false);
+		// Refused only for the depth bound: said so, rather than what the
+		// shallower coins alone fall short of.
+		let chosen = match chosen {
+			Err(e) => {
+				let _quote = self.quoting();
+				match self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, true, reads, spend) {
+					Ok(_) => Err(Error::Refused(format!("the wallet's coins that cover this lock are too deep: a lock from them could not \
+						be followed by both its claim and its refund under the operator's depth limit of {} reassignments; a round \
+						refreshes them, and the payment can go through the operator meanwhile; nothing was signed",
+						super::pay::depth_limit(&info).unwrap_or(0)))),
+					Err(_) => Err(e),
+				}
+			},
+			ok => ok,
+		};
 		let (inputs, margin, change) = chosen?;
 		self.store.put_nonce(&rn, &refunder.serialize(), "lock refund")?;
 		let mut outs = vec![to];

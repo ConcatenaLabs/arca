@@ -13,7 +13,13 @@
 //! - **The hash is P's.** Bark makes every invoice's preimage itself and
 //!   takes no hash, so `H` is the hash of P's Bark invoice, and Q asks its
 //!   Arca receive under it ([`Wallet::lightning_receive_under`]).
-//! - **P locks first, on the Sequentia side** ([`Wallet::lightning_pay_until`]),
+//! - **P locks first, straight to Q when Q asked for it** and the operator
+//!   co-signs locks ([`super::lock`]): an `htlc-2` leaf of Q's, out of
+//!   round, held by Q at once ([`Wallet::lock_ready`]), its timeout an hour
+//!   past Q's earliest ([`Wallet::lock_min_timeout`]); nothing waits for a
+//!   round and the operator fronts nothing. Q still asks the receive below,
+//!   for a P that locks the older way.
+//! - **Otherwise P locks through the operator** ([`Wallet::lightning_pay_until`]),
 //!   with a send leaf timing out at `t_S` ([`send_timeout`]) late enough that
 //!   Q can take `R` home after the latest moment the Bitcoin leg can reveal
 //!   the preimage or give Q its BTC back ([`bitcoin_latest`]); the operator

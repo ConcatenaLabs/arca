@@ -307,3 +307,114 @@ async fn a_restore_from_the_phrase_in_mid_swap_finds_each_side_its_locks() {
 	assert_eq!(held(&q2, &x, "lock_in"), 0);
 	println!("after the restore: Q2 claimed {} of 120000, P2 refunded {} of 80000", q_live, back);
 }
+
+/// The payee refuses a lock that is not the one it asked, and the operator
+/// refuses one that names a key twice; the payer locks only from a coin
+/// whose lock can still be followed by its claim and its refund.
+/// - A seller strips the payee's earliest timeout from the request and locks
+///   below it: the payee holds the lock and never calls it held, so the
+///   buyer never pays (`lock ready` refuses, naming the timeout).
+/// - A seller locks less than asked: refused the same way, naming the value.
+/// - A lock past the payee's instant limit is never held: a lock goes into
+///   no round.
+/// - A request whose payee key is the operator's: the operator refuses it
+///   (`lock`), nothing is signed into a lock, and the payer's coins are live.
+/// - A payer whose only coin that covers the lock is four reassignments
+///   deep (the depth limit is five) cannot lock it, while it can still pay
+///   it to another holder.
+#[tokio::test(flavor = "multi_thread")]
+async fn locks_that_break_the_purchase_rule_or_the_depth_limit_are_refused() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("lock refuse P");
+	let q = Arca::new("lock refuse Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 3_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+	let now = common::node::median_time(&r.rt);
+
+	// --- A timeout below the payee's earliest ---
+	let h1 = hex(&sha256::Hash::hash(&[0x41u8; 32]).to_byte_array());
+	let min = (now + 40_000).to_string();
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "60000", "--hash", &h1, "--min-timeout", &min]);
+	let why = p.refused(&["lock", "to", &req.to_string(), "--timeout-in", "20000"], "before the payee's earliest");
+	println!("an honest payer: {}", why);
+	let mut stripped = req.clone();
+	stripped.as_object_mut().unwrap().remove("min_timeout");
+	p.ok(&["lock", "to", &stripped.to_string(), "--timeout-in", "20000"]);
+	q.ok(&["sync"]);
+	assert_eq!(held(&q, &x, "lock_in"), 60_000, "the lock arrives and is held apart");
+	let why = q.refused(&["lock", "ready", &h1], "before the earliest asked");
+	println!("T too near: {}", why);
+
+	// --- Less than asked ---
+	let h2 = hex(&sha256::Hash::hash(&[0x42u8; 32]).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "70000", "--hash", &h2]);
+	let mut less = req.clone();
+	less["value"] = json!("65000");
+	p.ok(&["lock", "to", &less.to_string(), "--timeout-in", "20000"]);
+	q.ok(&["sync"]);
+	let why = q.refused(&["lock", "ready", &h2], "is not the one asked");
+	println!("less than asked: {}", why);
+
+	// --- Past the payee's instant limit ---
+	// With no bond posted the limit taken is zero: a lock is never held, and
+	// the buyer never pays for it.
+	let h5 = hex(&sha256::Hash::hash(&[0x45u8; 32]).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "50000", "--hash", &h5]);
+	q.ok(&["instant-limit", "1000000000000"]);
+	p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "20000"]);
+	q.ok(&["sync"]);
+	let why = q.refused(&["lock", "ready", &h5], "past the wallet's instant limit");
+	println!("past the instant limit: {}", why);
+	q.ok(&["instant-limit", "off"]);
+
+	// --- A key named twice ---
+	let h3 = hex(&sha256::Hash::hash(&[0x43u8; 32]).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "50000", "--hash", &h3]);
+	let mut twice = req.clone();
+	let operator = q.ok(&["info"])["operator"].as_str().map(String::from)
+		.unwrap_or_else(|| p.ok(&["info"])["server"]["operator"].as_str().unwrap().to_string());
+	twice["owner"] = json!(operator);
+	let before = held(&p, &x, "live");
+	let (ok, v) = p.run(&["lock", "to", &twice.to_string(), "--timeout-in", "20000"]);
+	println!("payee key = operator key: ok={} {}", ok, v["error"]);
+	assert!(!ok, "{}", v);
+	assert_eq!(held(&p, &x, "live"), before, "nothing was locked");
+
+	// --- The depth limit ---
+	let depth = |w: &Arca| -> Vec<(u64, u64)> {
+		w.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "live" && c["asset"] == x.as_str())
+			.map(|c| (c["hops"].as_u64().unwrap(), num(&c["value"]))).collect()
+	};
+	// P pays its largest coin around to itself until it is four
+	// reassignments deep; each change it leaves is far smaller than the lock.
+	for _ in 0..8 {
+		let mut live = depth(&p);
+		live.sort_by_key(|c| std::cmp::Reverse(c.1));
+		if live[0].0 >= 4 {
+			break;
+		}
+		let own = p.ok(&["receive", "--asset", &x])["request"].as_str().unwrap().to_string();
+		p.ok(&["send", &own, "--amount", &(live[0].1 - 30_000).to_string()]);
+		p.ok(&["sync"]);
+	}
+	println!("P's live coins (hops, value): {:?}", depth(&p));
+	let h4 = hex(&sha256::Hash::hash(&[0x44u8; 32]).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "200000", "--hash", &h4]);
+	// Only the deep coin covers the lock: the changes together hold less.
+	let deep = depth(&p).iter().filter(|(h, _)| *h + 2 <= 5).map(|(_, v)| v).sum::<u64>() < 200_000
+		&& depth(&p).iter().any(|(h, v)| *h == 4 && *v > 200_000);
+	if deep {
+		let (ok, v) = p.run(&["lock", "to", &req.to_string(), "--timeout-in", "20000"]);
+		println!("a lock from coins too deep: ok={} {}", ok, v["error"]);
+		assert!(!ok, "a lock from a coin with no room for its ending: {}", v);
+		assert!(v["error"]["message"].as_str().unwrap().contains("depth limit of 5"), "the refusal names the depth limit: {}", v);
+		let other = q.ok(&["receive", "--asset", &x])["request"].as_str().unwrap().to_string();
+		let sent = p.ok(&["send", &other, "--amount", "200000"]);
+		println!("the same coins pay a plain payment: {}", sent["inputs"]);
+	} else {
+		println!("P holds a coin with room for a lock: the depth case did not form ({:?})", depth(&p));
+		panic!("the test did not reach a coin too deep to lock");
+	}
+}

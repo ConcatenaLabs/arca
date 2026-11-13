@@ -1212,7 +1212,17 @@ running `follow`, which moves its swaps on and runs Bark as each needs.
 - The hash is P's: Bark makes every invoice's preimage itself and takes no
   hash, so P's Bark invoice for the BTC names it, and Q asks the operator to
   receive the asset under it (`lightning receive --hash`).
-- P locks first: its asset goes into an `htlc-1` leaf paying the operator's
+- P locks first, straight to Q when it can (see Locks between two holders):
+  Q asks for that in its take (or, as the maker giving BTC, by a key in its
+  offer) when the operator co-signs `htlc-2` locks and the atoms fit Q's
+  instant room. P locks its atoms into an `htlc-2` leaf of Q's, out of
+  round, timing out an hour past Q's earliest: Q's home date (the timeout
+  less the lock's unroll, Q's exit delay and ten minutes) an hour past the
+  Bitcoin leg's latest moment. Q holds it at once and pays once it is held;
+  nothing waits for a round and the operator fronts nothing. Q still asks
+  the operator to receive under the hash, so a P that does not lock this way
+  pays as below, and a P whose coins are too deep for a lock does too.
+- Otherwise P's asset goes into an `htlc-1` leaf paying the operator's
   invoice for Q's receive, settled inside the operator. The leaf times out
   late enough that Q's leaf, which the operator times out its
   `internal_gap_seconds` earlier, keeps a home date an hour past the latest
@@ -1257,6 +1267,45 @@ failed back. `btc-swap list` shows every swap with its state (`offered`,
 `taken`, `locked`, `paying`, `claimed`, `claiming`, then `done`, or `lapsed`,
 `abandoned`, `btc_failed`, `refunded`, `cancelled`) and what happened when;
 `btc-swap cancel` ends one before the wallet has locked anything.
+
+### Locks between two holders
+
+`arca lock` locks a coin to another holder of the same operator under a
+payment hash, out of round (`htlc-2`, `covenant/README.md`): the payee holds
+it at once, claims it with the preimage, and the payer gets it back from the
+lock's timeout. It is the asset leg of a swap for BTC (above), and works
+alone:
+
+    arca lock request --asset X --amount 100000 --hash H   # the payee: prints REQUEST
+    arca lock to REQUEST --timeout-in 7200                 # the payer
+    arca lock ready H --need 3600                          # the payee: held?
+    arca lock claim H PREIMAGE                             # the payee
+    arca lock refund H                                     # the payer, from the timeout
+    arca lock list
+
+- The request carries the payee's key and nonce for the lock, its mailbox and
+  exit delay, the asset, the amount, the hash and, with `--min-timeout`, the
+  earliest timeout (a median time) the payee takes.
+- The payer locks the amount from coins with room under the operator's depth
+  limit for the lock and its claim or refund (two reassignments), and
+  refuses, naming that limit, when only deeper coins cover it. Its key for
+  the refund is drawn from the leaf itself, so a restore from the phrase
+  finds the lock. Its delay is the payee's and eight units more, at least.
+- Each side holds the lock apart from its spendable coins: the payee as
+  `lock_in`, counted against its instant limit as a coin received; the payer
+  as `lock_out`, its own by script.
+- `lock ready` says a lock is held once it is the one asked (asset, amount,
+  hash, a timeout no earlier than asked), its rounds final, inside the
+  instant limit, and its home date at least `--need` seconds away; it refuses
+  one that never will be (a lock goes into no round, so one past the instant
+  limit is never held).
+- `sync` moves locks on: the payee claims as soon as it has the preimage
+  (`lock preimage H P` hands it one learnt elsewhere, or the operator serves
+  it once the payer posted it); the payer learns the claim, or refunds an
+  open lock from its timeout. Where the operator co-signs nothing, each
+  side takes its lock on the chain (`exit`, or `sync` by itself): the payee
+  by CLAIM with the preimage from its home date, once it holds the preimage
+  or has paid for it, the payer by REFUND from the timeout.
 
 ### Paying an address on the chain
 
@@ -2275,6 +2324,8 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `btc-swap offer --give btc\|asset --asset A --atoms N --sats S [--lapse-seconds L]` | Offers a swap of native BTC for an asset with another wallet of the operator (see Swapping BTC for an asset); giving the asset, makes the Bitcoin invoice the taker pays. The offer's text and what the wallet gives and gets, with every fee; nothing locked |
 | `btc-swap read OFFER`, `btc-swap take OFFER`, `btc-swap complete TAKE` | What taking an offer gives and gets, with every fee; the take (asking the operator to receive under the offer's hash, or making the Bitcoin invoice), its text for the maker; the maker's completion |
 | `btc-swap follow [SWAP] [--wait S] [--claim-slice C]` | Moves the wallet's swaps on, running Bark as each needs (lock, claim, payment, claim of the leaf), for `S` seconds; one pass when 0 |
+| `lock request --asset A --amount N --hash H [--min-timeout T]`, `lock to REQUEST --timeout T \| --timeout-in S` | A lock between two holders (see Locks between two holders): the payee's request; the payer's lock of it, out of round |
+| `lock ready H [--need S]`, `lock claim H PREIMAGE`, `lock preimage H PREIMAGE`, `lock refund H`, `lock status H`, `lock list` | Whether the payee's lock is held; its claim; a preimage learnt elsewhere, kept and claimed with; the payer's refund from the timeout; the operator's word on the hash; every lock |
 | `btc-swap list`, `btc-swap cancel SWAP` | Every swap with its state and log, and the legs a restore found; cancels a swap the wallet has locked nothing of |
 | `refusals` | Every refusal the wallet made, with its reason |
 | `bitcoin create (--testnet4 \| --mainnet \| --signet \| --mutinynet \| --regtest) --ark URL (--bitcoind URL (--bitcoind-cookie F \| --bitcoind-user U) \| --esplora URL) [--birthday-height H]` | Makes the wallet's Bitcoin ark wallet from its own mnemonic, through Bark's daemon (see The Bitcoin side): the network, the ark, the chain source (no password), the height it scans from and what the ark's server says of itself |
@@ -2722,6 +2773,13 @@ mnemonic holds the same; a refresh; and an exit alone, its leaves claimed to
 the on-chain wallet. It needs the harness running (`ARCA_TEST_BITCOIN_ARK`,
 the harness script with its environment) and the patched `bark` and `barkd`
 (`ARCA_BARK_EXEC`, `ARCA_BARKD_EXEC`), and is skipped without them.
+
+`tests/arca_locks.rs` runs locks between two holders: a lock held at once,
+claimed with the preimage and another refunded from its timeout, with no
+round made; each side's ending on the chain while the operator signs
+nothing; a restore of both sides from their phrases in mid-swap; and the
+refusals (a timeout below the payee's earliest, less than asked, past the
+instant limit, a key named twice, coins too deep for a lock).
 
 `tests/arca_btc_swap.rs` runs the swap of BTC for an asset (`btc-swap`) with
 both: a whole Arca server with its SeqLN node in X (`LIGHTNINGD_EXEC`) and the
