@@ -726,6 +726,11 @@ impl Wallet {
 			HashMap::new()
 		};
 		for (id, _, body, state, _) in rows {
+			match self.slice_item(&id) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			let st = match listed.get(&id).cloned().map(Ok).unwrap_or_else(|| self.server.post("plan_status", &json!({"plan_id": id}))) {
 				Ok(s) => s,
 				Err(e) => {

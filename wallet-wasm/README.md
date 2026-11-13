@@ -148,7 +148,7 @@ arguments in `command::COMMANDS` (`bark/src/arca/command.rs`): `info`, `address`
 amount?, channels?}` (`channels: false` names none of the wallet's channels), `forget_request {owner}`, `send {request, amount?, asset?, route?}`,
 `mailbox`, `restore {at_once?}`, `restore_history {budget_ms?}`, `quote {leaves?, max_fee_ppm?, piece?, pieces?}`, `participate {leaves?,
 not_before?, max_fee_ppm?, piece?, pieces?, shown}`, `participations`, `settle_quote {asset,
-value, expiry}`, `sync {catch_up?, deposits?}`, `deposits`, `hand_over_forfeits`, `schedule`,
+value, expiry}`, `sync {catch_up?, deposits?, budget_ms?}`, `deposits {budget_ms?}`, `hand_over_forfeits`, `schedule`,
 `recheck`, `exit_quote {leaf_id, fee_asset?}`, `exit {leaf_id, fee_asset?,
 shown?}`, `speed_up {txid, fee_asset?, rate?, max_fee?}`, `refresh_received
 {max_fee_ppm?, leaves?}` (`leaves`: those coins alone), `refresh_needed {idle_seconds?}` (whether what the wallet received out
@@ -235,7 +235,26 @@ find that out (every leaf ever served to its mailbox key, from an operator
 without reads past a settled cursor). With
 `"deposits": false` it leaves out the watchtowers' step too, which the program
 runs next as the command `deposits`: a program that answers others from the
-wallet then finds it free between the two. A
+wallet then finds it free between the two.
+
+`sync` and `deposits` also run in slices, for a program that must answer others
+while they run (a maker's firm offer, a person's trade): with `"budget_ms": n`
+the command stops at the first safe point past `n` milliseconds and answers
+`"more": true`; the program runs whatever it was asked meanwhile and calls the
+command again with the same arguments, which goes on where it stopped, until an
+answer comes without `more`. A safe point lies between two steps of `sync`, or
+between two items of a long step (a participation, a coin's refresh, deposit,
+journey home or exit, a payment over Lightning, a plan, an order); an item that
+has started runs to its end. Each slice but the last answers
+`{"more": true, "next", "slice", "cost_by_step"}`; the last answers what a
+whole `sync` answers, with `slices`, and each step's `cost_by_step` entry names
+the slice it ran in (`slice`): each part says what its step did then, not the
+coins as they stand now. `sync`'s `schedule` stays `due` while a pass in slices
+is under way. A pass left unfinished for ten minutes of median time, or resumed
+with other arguments, starts again from the beginning; a `sync` without
+`budget_ms` runs a whole pass at once. `deposits` with `budget_ms` answers
+`{"deposits": [...], "more": true}` until its last slice, which answers
+`{"deposits": [...]}`; without it, the list. A
 command that only reads, run as one of a burst, answers from the look at the
 chain another made within three seconds when asked with `"shared_view": true`.
 

@@ -515,6 +515,11 @@ impl Wallet {
 	pub(crate) fn progress_lightning(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
 		for (hash, rec) in self.sends()? {
+			match self.slice_item(&format!("send {}", hash)) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			let state = rec["state"].as_str().unwrap_or("").to_string();
 			if state == "paid" && rec["released"] != true {
 				out.push(self.release_paid(&hash).unwrap_or_else(|e| json!({"payment_hash": hash, "state": "paid", "error": e.to_string()})));
@@ -1062,6 +1067,11 @@ impl Wallet {
 	pub(crate) fn progress_receives(&mut self) -> Result<Vec<Value>, Error> {
 		let mut out = vec![];
 		for (hash, rec) in self.receives()? {
+			match self.slice_item(&format!("receive {}", hash)) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			let state = rec["state"].as_str().unwrap_or("").to_string();
 			let step = match state.as_str() {
 				"requested" => match self.server.post("lightning_receive", &rec["request"]) {

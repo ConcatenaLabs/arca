@@ -446,7 +446,7 @@ impl Wallet {
 		if !at_once {
 			self.store.set_meta(super::tower::DEPOSITS_OWED, &now.to_consensus_u32().to_string())?;
 		}
-		let sync = self.sync_with(true, at_once, false)?;
+		let sync = self.sync_with(true, at_once, false, None)?;
 		steps.lap(self, "sync");
 		let left = self.history_left()?;
 		let mut out = json!({

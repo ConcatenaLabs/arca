@@ -391,6 +391,11 @@ impl Wallet {
 		let mut out = vec![];
 		let now = self.now()?.to_consensus_u32();
 		for (id, terms, _, amount, placed_at, unlock_after) in self.store.orders()? {
+			match self.slice_item(&id) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
 			let Some((_, _, _, _, state, preimage, _)) = self.store.participation(&id)? else { continue };
 			let Some(at) = placed_at else {
 				if state == "released" {
