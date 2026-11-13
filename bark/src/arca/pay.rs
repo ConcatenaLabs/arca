@@ -1588,9 +1588,22 @@ impl Wallet {
 						}
 					}
 				}
+				// A lock's coin goes back to its side's lock, never live: its
+				// payee holds it apart until claimed, its payer until refunded.
+				let mut lock_back: BTreeMap<String, &str> = BTreeMap::new();
+				for l in mine {
+					let Some(c) = self.store.coin(l)? else { continue };
+					let Ok(r) = Self::record_of(&c) else { continue };
+					if super::lock::lock_terms(&r).is_some() {
+						let refund = self.holder_of(&r)?.2;
+						lock_back.insert(l.clone(), if refund { super::lock::LOCK_OUT } else { super::lock::LOCK_IN });
+					}
+				}
 				self.store.atomically(|s| {
 					for l in mine {
-						if Some(l) == forfeited.as_ref() {
+						if let Some(b) = lock_back.get(l) {
+							s.set_coin_state(l, b, "")?;
+						} else if Some(l) == forfeited.as_ref() {
 							s.set_coin_state(l, "forfeited", &held_note)?;
 						} else if let Some(sid) = for_swap.get(l) {
 							s.set_coin_state(l, "offered", &format!("swap {}", sid))?;

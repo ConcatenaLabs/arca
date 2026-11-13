@@ -597,3 +597,99 @@ async fn each_sides_watchtower_ends_its_lock_with_the_wallets_gone_and_the_opera
 	println!("TP's REFUND {}: {} vB, lock time {}, pays {} of 150000", refund.txid(), refund.vsize(), tb, back);
 
 }
+
+/// A parent block of the Sequentia chain's own, which the next Sequentia
+/// blocks anchor to: its height.
+async fn own_anchor(r: &Running) -> u64 {
+	tokio::task::block_in_place(|| {
+		r.rt.mine_parent(1).unwrap();
+		r.rt.anchor_to_parent_tip().unwrap();
+	});
+	r.rt.parent.client().block_count().unwrap()
+}
+
+fn confirmations(r: &Running, txid: &elements::Txid) -> i64 {
+	let v: Value = r.rt.client().call("getrawtransaction", &[json!(txid.to_string()), json!(true)]).unwrap_or(Value::Null);
+	v["confirmations"].as_i64().unwrap_or(0)
+}
+
+/// The round under a lock rolled back through its Bitcoin anchor, past
+/// finality, and back; then one ending of the lock asked twice.
+/// - P's coin comes from a round anchored to a parent block of its own; P
+///   locks it to Q, and Q holds the lock. The parent chain drops that block
+///   and the two above it: the round leaves the chain, and Q does not call
+///   the lock held while it is out. The operator's round comes back with the
+///   same txid, final again, and Q holds the same lock and claims it with
+///   the preimage, out of round.
+/// - Past the lock's timeout, P, which has not yet learnt of the claim, asks
+///   the operator to co-sign the refund of the same lock: refused, one
+///   ending a lock. P then learns of the claim.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_follows_its_round_rolled_back_and_takes_one_ending() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("lock rollback P");
+	let q = Arca::new("lock rollback Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 2_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+
+	// P's coin, refreshed into a round anchored to a parent block of its own.
+	p.ok(&["refresh"]);
+	let p1 = own_anchor(&r).await;
+	let round = r.server.rounds.run_round().await.unwrap().expect("a round").tx.txid();
+	p.ok(&["sync"]);
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&round, server::store::RoundState::Final).await;
+	p.ok(&["sync"]);
+	let live: Vec<Value> = p.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "live").cloned().collect();
+	println!("P's coins after the round {}: {:?}", round, live.iter().map(|c| (c["kind"].clone(), c["value"].clone())).collect::<Vec<_>>());
+
+	// The lock, held by Q.
+	let preimage = [0x71u8; 32];
+	let hash = hex(&sha256::Hash::hash(&preimage).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "300000", "--hash", &hash]);
+	let locked = p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "8000"]);
+	let t = num(&locked["timeout"]) as u32;
+	q.ok(&["sync"]);
+	assert_eq!(q.ok(&["lock", "ready", &hash])["ready"], true);
+	let leaf = locked["leaf_id"].clone();
+
+	// The round's anchor and two blocks above it orphaned, past finality.
+	let gone = tokio::task::block_in_place(|| r.rt.orphan_parent_from(p1)).unwrap();
+	r.synced().await;
+	println!("ROLLBACK: parent blocks orphaned {:?}; the round has {} confirmations", gone, confirmations(&r, &round));
+	assert!(gone.len() >= 3, "past finality: {:?}", gone);
+	assert!(confirmations(&r, &round) < 1, "the round left the chain with its anchor");
+	let (ok, v) = q.run(&["lock", "ready", &hash]);
+	println!("ROLLBACK: Q's lock while its round is out: ok={} {}", ok, v);
+	assert!(v["ready"] != true, "Q does not call the lock held while its round is out of the chain: {}", v);
+
+	// Back, the same round.
+	own_anchor(&r).await;
+	r.produce().await;
+	r.bury().await;
+	r.round_state(&round, server::store::RoundState::Final).await;
+	println!("ROLLBACK: the round back ({} confirmations)", confirmations(&r, &round));
+	q.ok(&["sync"]);
+	let ready = q.ok(&["lock", "ready", &hash]);
+	assert_eq!(ready["ready"], true, "{}", ready);
+	assert_eq!(ready["leaf_id"], leaf, "the same lock");
+	let c = q.ok(&["lock", "claim", &hash, &hex(&preimage)]);
+	assert_eq!(c["state"], "claimed", "{}", c);
+	println!("ROLLBACK: Q claims the same lock: {}", c["transfer"]["outputs"]);
+
+	// One ending: P, not yet aware, asks for the refund past T.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, t - common::node::median_time(&r.rt) + 1));
+	r.bury().await;
+	r.synced().await;
+	let (ok, v) = p.run(&["lock", "refund", &hash]);
+	println!("a refund of a claimed lock, asked of the operator: ok={} {}", ok, v["error"]);
+	assert!(!ok, "{}", v);
+	assert_eq!(v["error"]["code"], "double_spend", "the operator co-signs one ending a lock: {}", v);
+	p.ok(&["sync"]);
+	assert_eq!(lock(&p, &hash)["state"], "claimed", "{}", lock(&p, &hash));
+	assert_eq!(held(&p, &x, "lock_out"), 0);
+}
