@@ -2191,9 +2191,11 @@ impl Wallet {
 		step!("resting", |w: &mut Self| if talk { arr(w.progress_resting()) } else { json!([]) });
 		// A leaf received over Lightning that those participations brought
 		// in is claimed at once.
-		step!("receives again", |w: &mut Self| match w.progress_receives() {
-			Ok(v) if talk => Value::Array(v.into_iter().filter(|s| s["state"] == "received" || s["state"] == "failed").collect()),
-			_ => json!([]),
+		// Only while a witness succeeds: the operator is asked nothing about a
+		// payment received while none does.
+		step!("receives again", |w: &mut Self| match if talk { w.progress_receives() } else { Ok(vec![]) } {
+			Ok(v) => Value::Array(v.into_iter().filter(|s| s["state"] == "received" || s["state"] == "failed").collect()),
+			Err(_) => json!([]),
 		});
 		// D57: the refresh of every live coin in its refresh window, asked for
 		// by the wallet itself.
