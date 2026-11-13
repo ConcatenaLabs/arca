@@ -248,7 +248,9 @@ journey home or exit, a payment over Lightning, a plan, an order); an item that
 has started runs to its end. A slice in which the operator cannot be reached
 waits out the witness's patience once and then runs the rest of the pass,
 since without the operator each step after is short. Each slice but the last answers
-`{"more": true, "next", "slice", "cost_by_step"}`; the last answers what a
+`{"more": true, "next", "slice", "cost_by_step", "recheck"}`: `recheck` is
+the re-check against the chain the slice took at its start, as every other
+command does, since the chain may have moved since the last slice; the last answers what a
 whole `sync` answers, with `slices`, and each step's `cost_by_step` entry names
 the slice it ran in (`slice`): each part says what its step did then, not the
 coins as they stand now. `sync`'s `schedule` stays `due` while a pass in slices

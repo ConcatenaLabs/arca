@@ -1993,9 +1993,24 @@ impl Wallet {
 				None
 			},
 		};
+		let mut again = Value::Null;
 		let mut r = match resumed {
 			Some(mut r) => {
 				r.slices += 1;
+				// The re-check every other command runs at its start, as the
+				// chain may have moved since the last slice: the lineage watch
+				// while the tip is the one the last complete re-check ran at,
+				// the whole re-check when it is not. Its changes join the
+				// pass's.
+				again = match self.tip_rechecked()? {
+					Some(_) => self.recheck_lineages()?,
+					None => self.recheck()?,
+				};
+				if let (Some(all), Some(new)) = (r.out.get_mut("recheck").and_then(|v| v["changes"].as_array_mut()),
+					again["changes"].as_array())
+				{
+					all.extend(new.iter().cloned());
+				}
 				r
 			},
 			None => {
@@ -2005,6 +2020,7 @@ impl Wallet {
 				// date has come, before the operator is asked anything, and the
 				// steps again whenever one comes while it is.
 				let recheck = self.recheck()?;
+				again = recheck.clone();
 				let (home, exits) = self.exit_steps();
 				let mut r = super::slice::Resume::new(args, now);
 				r.out.insert("recheck".into(), recheck);
@@ -2033,7 +2049,11 @@ impl Wallet {
 		};
 		if let Some(next) = more {
 			self.keep_resume(&r)?;
-			return Ok(json!({"more": true, "next": next, "slice": r.slices, "cost_by_step": std::mem::take(&mut r.last)}));
+			let mut v = json!({"more": true, "next": next, "slice": r.slices, "cost_by_step": std::mem::take(&mut r.last)});
+			if !again.is_null() {
+				v["recheck"] = again;
+			}
+			return Ok(v);
 		}
 		self.drop_resume(&r.args)?;
 		Ok(Self::sync_answer(r, budget_ms.is_some()))

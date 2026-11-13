@@ -29,11 +29,14 @@
 //! slice goes on from the slice before, and each step it runs again finds
 //! its finished items finished in the store. A resumed slice takes the
 //! witness of the operator's signer's record again before it asks the
-//! operator anything, and does not take the re-check against the chain
-//! again. A slice whose witness fails has waited out the witness's
-//! patience: it runs the rest of the pass, as one call does, so the
-//! patience is paid once a pass and the steps that take coins home when the
-//! operator cannot be reached come in every pass.
+//! operator anything, and the re-check every other command takes at its
+//! start: the lineage watch while the chain's tip is the one the last
+//! complete re-check ran at, the whole re-check when it is not, so no slice
+//! acts on a tip it has not looked at (its changes join the pass's). A
+//! slice whose witness fails has waited out the witness's patience: it runs
+//! the rest of the pass, as one call does, so the patience is paid once a
+//! pass and the steps that take coins home when the operator cannot be
+//! reached come in every pass.
 //!
 //! A resume point is kept for each set of arguments, so a caller that syncs
 //! in slices with other arguments than another (`catch_up`, `deposits`)
@@ -44,7 +47,8 @@
 //! a whole pass at once and drops every resume point.
 //!
 //! **What a sliced pass answers.** Each slice but the last answers
-//! `{"more": true, "next": <step>, "slice": <n>, "cost_by_step": ...}`. The
+//! `{"more": true, "next": <step>, "slice": <n>, "cost_by_step": ...,
+//! "recheck": ...}`, `recheck` being the re-check that slice ran. The
 //! last answers what one whole `sync` answers, and `slices`: each part is
 //! what its step did, in the slice named in `cost_by_step.<step>.slice`;
 //! it reports what was done then, not the coins as they stand now, which
