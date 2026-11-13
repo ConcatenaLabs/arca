@@ -19,6 +19,11 @@
 //! 6. A restore from the mnemonic alone gives the same places.
 //! 7. An anchor rollback under the coins: every coin not final again
 //!    arrives, and counts again once final.
+//! 17. A coin given to a round participation the operator holds back at its
+//!    in-flight cap counts against the bond and the instant budget as it
+//!    does while live: the wallet's own change nothing, a payment received
+//!    its whole value; `coin_places` marks each coin counted (`at_risk`),
+//!    and the marks sum to the bond's `out_of_round`.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -1155,6 +1160,140 @@ async fn proceeds_placed_while_no_rate_is_read_wait_for_one_and_no_cap_of_zero_i
 	assert_eq!(place_of(&p, &third), "arriving");
 	assert!(held <= limit, "coins counted at once are worth {} > the limit {}", held, limit);
 	for w in [&a, &c, &s, &s2] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 17. A coin given to a round is judged by its own lineage.
+// ---------------------------------------------------------------------------
+
+/// The bond answer's `out_of_round` and the coins `coin_places` marks
+/// `at_risk`, each by asset: the two must agree.
+fn risk_views(w: &Arca) -> (std::collections::BTreeMap<String, u64>, std::collections::BTreeMap<String, u64>) {
+	let bond = library(w, "bond", json!({})).unwrap();
+	let held = bond["out_of_round"].as_array().unwrap().iter()
+		.map(|e| (e["asset"].as_str().unwrap().to_string(), e["value"].as_str().unwrap().parse::<u64>().unwrap())).collect();
+	let mut marked: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+	for c in places(w)["coins"].as_array().unwrap() {
+		assert!(c["at_risk"].is_boolean(), "coin_places names at_risk for every coin: {}", c);
+		if c["at_risk"] == true {
+			*marked.entry(c["asset"].as_str().unwrap().to_string()).or_default() += c["value"].as_str().unwrap().parse::<u64>().unwrap();
+		}
+	}
+	(held, marked)
+}
+
+/// `from` pays `to` `amount` of `asset` out of round on a request naming
+/// both, so the payee's bond and budget weigh it as it asks; the coin `to`
+/// holds.
+fn pay_named(from: &Arca, to: &Arca, asset: AssetId, amount: u64) -> String {
+	let (a, v) = (asset.to_string(), amount.to_string());
+	let req = to.ok(&["receive", "--asset", &a, "--amount", &v])["request"].as_str().unwrap().to_string();
+	from.ok(&["send", &req, "--amount", &v, "--asset", &a]);
+	let mb = to.ok(&["mailbox"]);
+	mb["accepted"].as_array().unwrap().iter().find(|c| c["value"].as_str() == Some(&v))
+		.and_then(|c| c["leaf_id"].as_str()).expect("the payee holds the coin").to_string()
+}
+
+fn coin_line(w: &Arca, leaf: &str) -> Value {
+	places(w)["coins"].as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf).cloned()
+		.unwrap_or_else(|| panic!("coin_places names {}", leaf))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_coin_given_to_a_round_held_at_the_cap_counts_as_its_lineage_does() {
+	// The watcher off: the nodes of coins given up do not come back, so what
+	// is fronted stays in flight and the cap holds the next refresh.
+	let mut r = Running::start_with(|c, _, _| {
+		c.assets[0].in_flight_cap = Some("1500000".into());
+		c.watcher.enabled = false;
+	}).await;
+	let x = r.x;
+	post_bond(&mut r, None).await;
+	let (s, a, c, h) = (Arca::new("GR S"), Arca::new("GR A"), Arca::new("GR C"), Arca::new("GR H"));
+	boarded(&mut r, &s, &[(x, 6_000_000)]).await;
+	boarded(&mut r, &a, &[(x, 3_000_000)]).await;
+	create(&r, &c);
+	create(&r, &h);
+	for w in [&s, &a] {
+		w.ok(&["participate"]);
+	}
+	rounds_final(&r).await;
+	for w in [&s, &a] {
+		w.ok(&["sync"]);
+	}
+	println!("GR: in flight {} of a cap of 1500000", in_flight(&r, x));
+	// A pays C out of its round's coin and holds its own change: of its own
+	// lineage, kind transfer.
+	pay(&a, &c, x, 300_000);
+	let change = a.ok(&["coins"]).as_array().unwrap().iter()
+		.find(|k| k["state"] == "live" && k["kind"] == "transfer").expect("A's change")["leaf_id"].as_str().unwrap().to_string();
+	let line = coin_line(&a, &change);
+	println!("GR: A's change while live: {}", line);
+	assert_eq!((line["lineage"].as_str(), line["at_risk"].as_bool()), (Some("own"), Some(false)), "{}", line);
+	let change_value: u64 = line["value"].as_str().unwrap().parse().unwrap();
+	// An instant budget below the change: a fiftieth of the bond, worth
+	// 1,000,000 X.
+	library(&a, "instant_budget", json!({"share": "0.02"})).unwrap();
+	let budget = library(&a, "bond", json!({})).unwrap()["instant_budget"].clone();
+	println!("GR: A's budget {}", budget);
+	assert_eq!(budget["value"], worth(&r, x, 1_000_000).to_string(), "{}", budget);
+	assert!(change_value > 1_000_000, "the change is past the budget: {}", change_value);
+
+	// H's refresh of a payment from S goes first and puts value in flight;
+	// A gives its change to a refresh after it, which the cap holds back, as
+	// the testnet's operator held the maker's.
+	pay(&s, &h, x, 500_000);
+	let hp = h.ok(&["refresh-received"])["participations"][0]["participation"].as_str().unwrap().to_string();
+	let ap = a.ok(&["participate", "--leaf", &change])["participations"][0]["participation"].as_str().unwrap().to_string();
+	let (built, errs) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(errs.is_empty(), "{:?}", errs);
+	let (hs, st) = (server_state(&r, &hp), server_state(&r, &ap));
+	println!("GR: {} round(s) built; H's refresh: {}; A's refresh of its own change: {} ({})", built.len(), hs["state"], st["state"],
+		st["waiting"]);
+	assert_ne!(hs["state"], "pending", "{}", hs);
+	assert_eq!(st["state"], "pending", "the cap holds the refresh: {}", st);
+	assert!(st["waiting"].as_str().unwrap_or("").contains("in flight"), "{}", st);
+	let line = coin_line(&a, &change);
+	println!("GR: A's change given to the pending refresh: {}", line);
+	assert_eq!((line["state"].as_str(), line["lineage"].as_str()), (Some("given"), Some("own")), "{}", line);
+	assert_eq!(line["at_risk"], false, "an own coin given to a round is at risk to nobody: {}", line);
+	let (held, marked) = risk_views(&a);
+	println!("GR: out_of_round {:?}; coin_places at_risk {:?}", held, marked);
+	assert!(held.is_empty(), "nothing of A's counts out of round: {:?}", held);
+	assert_eq!(held, marked);
+
+	// A payment that fits the budget without the change is taken.
+	let got = pay_named(&s, &a, x, 500_000);
+	let line = coin_line(&a, &got);
+	println!("GR: S's payment to A, taken beside the pending refresh: {}", line);
+	assert_eq!((line["lineage"].as_str(), line["at_risk"].as_bool()), (Some("received"), Some(true)), "{}", line);
+	let (held, marked) = risk_views(&a);
+	assert_eq!(held.get(&x.to_string()).copied(), Some(500_000), "{:?}", held);
+	assert_eq!(held, marked);
+
+	// The payment received, given to a refresh that waits too (no round is
+	// built for it): counted at its whole value, as before.
+	let rp = a.ok(&["participate", "--leaf", &got])["participations"][0]["participation"].as_str().unwrap().to_string();
+	let st = server_state(&r, &rp);
+	println!("GR: A's refresh of the payment received: {} ({})", st["state"], st["waiting"]);
+	assert_eq!(st["state"], "pending", "{}", st);
+	let line = coin_line(&a, &got);
+	println!("GR: the payment received, given to the pending refresh: {}", line);
+	assert_eq!((line["state"].as_str(), line["at_risk"].as_bool()), (Some("given"), Some(true)), "{}", line);
+	let (held, marked) = risk_views(&a);
+	println!("GR: out_of_round {:?}; coin_places at_risk {:?}", held, marked);
+	assert_eq!(held.get(&x.to_string()).copied(), Some(500_000), "{:?}", held);
+	assert_eq!(held, marked);
+	// 500,000 counted: 600,000 more passes the budget, 400,000 fits.
+	let why = a.refused(&["receive", "--asset", &x.to_string(), "--amount", "600000"], "past its instant budget");
+	println!("GR: 600,000 more refused: {}", why);
+	pay_named(&s, &a, x, 400_000);
+	let (held, marked) = risk_views(&a);
+	assert_eq!(held.get(&x.to_string()).copied(), Some(900_000), "{:?}", held);
+	assert_eq!(held, marked);
+	for w in [&s, &a, &c, &h] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

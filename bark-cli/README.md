@@ -364,8 +364,12 @@ and a board whose registration never reached the server, are not recovered.
   board's coins counts nothing; so does what a trade paid it when every
   checkpoint of the trade has its owner's exit, since the coin it gave comes
   home should the trade die; and so does a coin it gives into a swap whose
-  checkpoint has its owner's exit. A wallet sets no budget unless its owner
-  sets one.
+  checkpoint has its owner's exit. A coin given to a round (a refresh, an
+  offboard, an order, a take) counts as it does while it is live: until the
+  round is final the wallet signs nothing that spends it, and then only its
+  forfeit, which the operator can claim only by publishing what opens the
+  wallet's new coin. `coin-places` marks each coin counted (`at_risk`). A
+  wallet sets no budget unless its owner sets one.
 - **Where each coin stands, and an instant limit.** `coin-places` places each
   coin the wallet holds: `settled` (of its own lineage: a round's or a
   board's coin, its own change from paying out of one), `proceeds` (what a
@@ -2182,7 +2186,7 @@ registry for both commands.
 | `bond` | The operator's equivocation bond as the wallet checks it on its own node (`state`: `none`, `bonded`, `noticed` or `missing`, and `why`), its coin, asset and value, when it can be withdrawn while in notice, whether the wallet requires one (`required`), what the wallet holds out of round, whether the bond covers it (`covers`), and the instant budget when one is set (`instant_budget`) |
 | `instant-budget SHARE` | Sets the share of the bond's value the wallet holds out of round at most (`0.1`, or `off`): a counterparty's instant budget |
 | `instant-limit ATOMS` | Sets the wallet's instant limit, in atoms of the reference unit (or `off`): of coins received out of round, the most it counts as its own at once |
-| `coin-places` | Each coin's place (`settled`, `proceeds`, `counted`, `arriving`), the totals of each place by asset, what is spendable now, and the instant limit |
+| `coin-places` | Each coin's place (`settled`, `proceeds`, `counted`, `arriving`) and whether it counts at risk against the bond and the instant budget (`at_risk`), the totals of each place by asset, what is spendable now, and the instant limit |
 | `settle-first [--coin LEAF]… [--asset ASSET] [--max-fee-ppm N] [--spread]` | Puts through the next round the coins a `settle_first` refusal named (or every coin of the asset that waits for a round): what it gave up now (`settling`), what already waits for its round (`waiting`), what is through and spendable (`done`), what the operator would not take now (`left`), `ready` once nothing named settles or waits, and while not, `final_in_seconds`, the most it should still take, `usual_in_seconds`, what it usually takes, and `waiting_for`, the step it waits for |
 | `bond-evidence` | Every message the operator key signed that the wallet's coins rest on, as evidence lines (`lines`): what the wallet hands a watcher |
 | `watch-bond [--evidence FILE]… [--fee-asset ASSET]` | Compares the wallet's evidence and every file's under each salt, reads the chain and the mempool for spends of the coins they name, and burns the operator's bond on two different messages under one salt: what it counted (`evidence`), what it read (`scanned`), the `conflicts`, the slash it sent (`slashed`), and each slash sent before again until final (`resent`). What each coin's lineage yields is read once and kept, as a coin's record never changes, and a run reads coins not kept yet and blocks for about five seconds at most; what is left (`evidence.unread`, `scanned.more`) is read at the next run |
