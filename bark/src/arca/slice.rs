@@ -27,7 +27,10 @@
 //! its finished items finished in the store. A resumed slice takes the
 //! witness of the operator's signer's record again before it asks the
 //! operator anything, and does not take the re-check against the chain
-//! again. A resume point older than [`RESUME_FOR`] seconds of median time,
+//! again. A slice whose witness fails has waited out the witness's
+//! patience: it runs the rest of the pass, as one call does, so the
+//! patience is paid once a pass and the steps that take coins home when the
+//! operator cannot be reached come in every pass. A resume point older than [`RESUME_FOR`] seconds of median time,
 //! or left by a call with other arguments, is dropped: the call starts a
 //! whole pass, re-check included, and answers `more` until that pass is
 //! done. A call without `budget_ms` drops it too, and runs the whole pass.

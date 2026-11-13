@@ -245,7 +245,9 @@ command again with the same arguments, which goes on where it stopped, until an
 answer comes without `more`. A safe point lies between two steps of `sync`, or
 between two items of a long step (a participation, a coin's refresh, deposit,
 journey home or exit, a payment over Lightning, a plan, an order); an item that
-has started runs to its end. Each slice but the last answers
+has started runs to its end. A slice in which the operator cannot be reached
+waits out the witness's patience once and then runs the rest of the pass,
+since without the operator each step after is short. Each slice but the last answers
 `{"more": true, "next", "slice", "cost_by_step"}`; the last answers what a
 whole `sync` answers, with `slices`, and each step's `cost_by_step` entry names
 the slice it ran in (`slice`): each part says what its step did then, not the

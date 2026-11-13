@@ -2085,13 +2085,30 @@ impl Wallet {
 	/// each step of the pass `r` not done yet, until the slice ends at
 	/// `deadline`. `Some(next step)` when it stopped before the end.
 	fn sync_asking(&mut self, r: &mut super::slice::Resume, catch_up: bool, with_deposits: bool, with_history: bool,
-		deadline: Option<web_time::Instant>) -> Result<Option<String>, Error>
+		mut deadline: Option<web_time::Instant>) -> Result<Option<String>, Error>
 	{
 		// What each step cost (milliseconds, and requests of the node and of
 		// the operator): `cost_by_step`, for a program that logs a slow sync.
 		let mut steps = Steps::start(self);
 		let mut ran = 0usize;
-		// The witness first, patiently, in every slice: after a rollback of the
+		let err = |e: Error| json!({"error": e.to_string()});
+		let arr = |v: Result<Vec<Value>, Error>| v.map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
+		macro_rules! step {
+			($name:expr, $run:expr) => {
+				if self.step(r, &mut ran, deadline, &mut steps, $name, $run).is_err() {
+					r.add_cost(steps.done());
+					return Ok(Some(r.next.clone()));
+				}
+			};
+		}
+		// Deposits a restore left owed, before anything else: the coins it
+		// took are safe with a watchtower only once they are made, and none of
+		// them waits on the operator ([`super::tower::DEPOSITS_OWED`]).
+		step!("owed deposits", |w: &mut Self| {
+			if with_deposits && w.store.meta(super::tower::DEPOSITS_OWED).ok().flatten().is_some() { arr(w.progress_deposits()) }
+			else { Value::Null }
+		});
+		// The witness, patiently, in every slice: after a rollback of the
 		// operator's signer's record the wallet does only what it does on the
 		// chain, and while no witness succeeds it takes no coin and signs no
 		// spend through the operator.
@@ -2100,6 +2117,15 @@ impl Wallet {
 		self.exits_meanwhile();
 		let witnessed = witness.is_ok();
 		let failed = witness.as_ref().err().map(|e| e.to_string());
+		// A slice whose witness or `info` failed has waited out the patience:
+		// it runs the rest of the pass, as one call does, rather than leave
+		// it to slices that would each wait the patience again. Without the
+		// operator every step after is the wallet's own and short, and the
+		// steps that take coins home when the operator cannot be reached
+		// (`home`, D57) come in every pass.
+		if failed.is_some() || info_failed.is_some() {
+			deadline = None;
+		}
 		let mut witness = witness.unwrap_or_else(|e| json!({"error": e.to_string()}));
 		if tries > 1 {
 			witness["tries"] = json!(tries);
@@ -2109,8 +2135,6 @@ impl Wallet {
 		let talk = witnessed && !gone;
 		let waiting = || json!({"note": "the witness of the operator's signer's record did not succeed: the wallet takes no coin and \
 			signs no spend through the operator until one does"});
-		let err = |e: Error| json!({"error": e.to_string()});
-		let arr = |v: Result<Vec<Value>, Error>| v.map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		// What a slice may spend of the catch-up and the history: what is left
 		// of it, at most their usual second.
 		let within = |most: u64| -> u64 {
@@ -2119,22 +2143,6 @@ impl Wallet {
 				None => most,
 			}
 		};
-		macro_rules! step {
-			($name:expr, $run:expr) => {
-				if self.step(r, &mut ran, deadline, &mut steps, $name, $run).is_err() {
-					r.add_cost(steps.done());
-					return Ok(Some(r.next.clone()));
-				}
-			};
-		}
-		// Deposits a restore left owed, before anything else that asks the
-		// operator: the coins it took are safe with a watchtower only once
-		// they are made, and none of them waits on the operator
-		// ([`super::tower::DEPOSITS_OWED`]).
-		step!("owed deposits", |w: &mut Self| {
-			if with_deposits && w.store.meta(super::tower::DEPOSITS_OWED).ok().flatten().is_some() { arr(w.progress_deposits()) }
-			else { Value::Null }
-		});
 		// The forfeits of every round the operator holds for them, first: a
 		// held round is dropped when they do not come within its window, and
 		// nothing after this needs them.
