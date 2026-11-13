@@ -69,6 +69,15 @@
 //! second finds them built and adds only its own part. Nothing a pass does
 //! needs the operator, so a watchtower acts while the operator is down.
 //!
+//! **Locks** ([`super::lock`]). A lock must be ended, not only kept: its
+//! payee claims before its timeout, its payer refunds after. The holder of
+//! each side deposits, in the clear, the lock's record and its ending signed
+//! beforehand ([`Wallet::lock_deposit`]), and the watchtower acts by time
+//! ([`Wallet::tower_lock_one`]): the payee's from the lock's home date, and
+//! only with the preimage (its wallet's, [`Wallet::tower_lock_preimage`], or
+//! the operator's); the payer's an hour past the timeout while the lock is
+//! open. It brings the leaf as for any coin and broadcasts the ending.
+//!
 //! A deposit cannot move a coin anywhere else: its signatures authorise the
 //! unroll of the coin's own nodes into their pinned children, its preimage
 //! opens the entry into the coin's own leaf, and the pairs a coin paid out of

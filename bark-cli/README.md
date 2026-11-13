@@ -1306,6 +1306,12 @@ alone:
   side takes its lock on the chain (`exit`, or `sync` by itself): the payee
   by CLAIM with the preimage from its home date, once it holds the preimage
   or has paid for it, the payer by REFUND from the timeout.
+- With a watchtower named, each side's ending is deposited with it at every
+  `sync`, so the lock is ended on the chain while the wallet is away (see
+  Watchtowers).
+- `lock ready` refuses a lock whose whole path is spent elsewhere on the
+  chain (its payer and a signer spent its input again): it can never come
+  home, and nothing is to be paid for it.
 
 ### Paying an address on the chain
 
@@ -1813,9 +1819,40 @@ from an on-chain coin of the watchtower wallet's. Coins on one branch share
 its nodes, whoever built them. It needs only its node, never the operator.
 `arca watchtower deposits` lists what it holds (`sealed`, naming no coin
 until a block or the mempool shows its trigger; `held`, `brought`,
-`on_chain`, `gone`, or `invalid` when what opened does not check) and what
-it broadcast for each; `arca watchtower pass`
+`on_chain`, `ending`, `ended`, `gone`, or `invalid` when what opened does
+not check) and what it broadcast for each, and for a lock its side, when it
+acts and whether it knows the preimage (`lock`); `arca watchtower pass`
 runs one pass.
+
+**Locks.** A lock between two holders (see Locks between two holders) must
+be ended by its holder, not only kept: its payee must claim it before its
+timeout, and its payer gets it back only by a refund. So for each lock it
+holds open the wallet deposits, in the clear, the lock's record and its
+ending signed in advance by its own key: the payee's CLAIM, its preimage
+left out (no signature covers it), or the payer's REFUND, each paying to an
+address of the wallet's own, at four fees (the node's floor when signed,
+and twice, four and eight times it). The watchtower checks each ending's
+signature against the lock's payee or refunder key, and acts by time:
+
+- the payee's, from the lock's home date (its timeout less its exit delay
+  and the unroll of its path), or as soon as the lock's leaf is on the
+  chain, and only with the preimage: the one the wallet hands it (`POST
+  /v1/lock_preimage`, `{"payment_hash", "preimage"}`, sent by `lock
+  preimage` and by a BTC swap whose payment settled), or the one the
+  operator serves (`lock_status`). While neither has it, the watchtower does
+  nothing, and says so: the payee was not paid against;
+- the payer's, an hour past the lock's timeout, while the lock is open;
+- neither, for a lock the operator records as claimed or refunded.
+
+It brings the lock's path on the chain as for any coin, then broadcasts the
+cheapest ending the node takes, once the leaf is in a block and the
+ending's time locks allow. A signature commits to the outpoint it spends, so
+the endings are signed over the leaf as its path comes when each step pays
+its fee from its own reserve, the way a watchtower brings it; `sync` signs
+them again whenever that changes. A path brought another way (a step paid
+from a fee coin, by anyone) leaves the watchtower unable to end the lock
+until the wallet's next `sync`; it says so (`on_chain`, naming both
+outpoints).
 
 ### Swept coins
 
