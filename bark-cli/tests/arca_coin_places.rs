@@ -19,7 +19,7 @@
 //! 6. A restore from the mnemonic alone gives the same places.
 //! 7. An anchor rollback under the coins: every coin not final again
 //!    arrives, and counts again once final.
-//! 16. A coin given to a round participation the operator holds back at its
+//! 17. A coin given to a round participation the operator holds back at its
 //!    in-flight cap counts against the bond and the instant budget as it
 //!    does while live: the wallet's own change nothing, a payment received
 //!    its whole value; `coin_places` marks each coin counted (`at_risk`),
@@ -1165,7 +1165,7 @@ async fn proceeds_placed_while_no_rate_is_read_wait_for_one_and_no_cap_of_zero_i
 }
 
 // ---------------------------------------------------------------------------
-// 16. A coin given to a round is judged by its own lineage.
+// 17. A coin given to a round is judged by its own lineage.
 // ---------------------------------------------------------------------------
 
 /// The bond answer's `out_of_round` and the coins `coin_places` marks
@@ -1211,7 +1211,7 @@ async fn a_coin_given_to_a_round_held_at_the_cap_counts_as_its_lineage_does() {
 	}).await;
 	let x = r.x;
 	post_bond(&mut r, None).await;
-	let (s, a, c, h) = (Arca::new("CP16 S"), Arca::new("CP16 A"), Arca::new("CP16 C"), Arca::new("CP16 H"));
+	let (s, a, c, h) = (Arca::new("GR S"), Arca::new("GR A"), Arca::new("GR C"), Arca::new("GR H"));
 	boarded(&mut r, &s, &[(x, 6_000_000)]).await;
 	boarded(&mut r, &a, &[(x, 3_000_000)]).await;
 	create(&r, &c);
@@ -1223,21 +1223,21 @@ async fn a_coin_given_to_a_round_held_at_the_cap_counts_as_its_lineage_does() {
 	for w in [&s, &a] {
 		w.ok(&["sync"]);
 	}
-	println!("CP16: in flight {} of a cap of 1500000", in_flight(&r, x));
+	println!("GR: in flight {} of a cap of 1500000", in_flight(&r, x));
 	// A pays C out of its round's coin and holds its own change: of its own
 	// lineage, kind transfer.
 	pay(&a, &c, x, 300_000);
 	let change = a.ok(&["coins"]).as_array().unwrap().iter()
 		.find(|k| k["state"] == "live" && k["kind"] == "transfer").expect("A's change")["leaf_id"].as_str().unwrap().to_string();
 	let line = coin_line(&a, &change);
-	println!("CP16: A's change while live: {}", line);
+	println!("GR: A's change while live: {}", line);
 	assert_eq!((line["lineage"].as_str(), line["at_risk"].as_bool()), (Some("own"), Some(false)), "{}", line);
 	let change_value: u64 = line["value"].as_str().unwrap().parse().unwrap();
 	// An instant budget below the change: a fiftieth of the bond, worth
 	// 1,000,000 X.
 	library(&a, "instant_budget", json!({"share": "0.02"})).unwrap();
 	let budget = library(&a, "bond", json!({})).unwrap()["instant_budget"].clone();
-	println!("CP16: A's budget {}", budget);
+	println!("GR: A's budget {}", budget);
 	assert_eq!(budget["value"], worth(&r, x, 1_000_000).to_string(), "{}", budget);
 	assert!(change_value > 1_000_000, "the change is past the budget: {}", change_value);
 
@@ -1250,24 +1250,24 @@ async fn a_coin_given_to_a_round_held_at_the_cap_counts_as_its_lineage_does() {
 	let (built, errs) = r.server.rounds.run_rounds().await.unwrap();
 	assert!(errs.is_empty(), "{:?}", errs);
 	let (hs, st) = (server_state(&r, &hp), server_state(&r, &ap));
-	println!("CP16: {} round(s) built; H's refresh: {}; A's refresh of its own change: {} ({})", built.len(), hs["state"], st["state"],
+	println!("GR: {} round(s) built; H's refresh: {}; A's refresh of its own change: {} ({})", built.len(), hs["state"], st["state"],
 		st["waiting"]);
 	assert_ne!(hs["state"], "pending", "{}", hs);
 	assert_eq!(st["state"], "pending", "the cap holds the refresh: {}", st);
 	assert!(st["waiting"].as_str().unwrap_or("").contains("in flight"), "{}", st);
 	let line = coin_line(&a, &change);
-	println!("CP16: A's change given to the pending refresh: {}", line);
+	println!("GR: A's change given to the pending refresh: {}", line);
 	assert_eq!((line["state"].as_str(), line["lineage"].as_str()), (Some("given"), Some("own")), "{}", line);
 	assert_eq!(line["at_risk"], false, "an own coin given to a round is at risk to nobody: {}", line);
 	let (held, marked) = risk_views(&a);
-	println!("CP16: out_of_round {:?}; coin_places at_risk {:?}", held, marked);
+	println!("GR: out_of_round {:?}; coin_places at_risk {:?}", held, marked);
 	assert!(held.is_empty(), "nothing of A's counts out of round: {:?}", held);
 	assert_eq!(held, marked);
 
 	// A payment that fits the budget without the change is taken.
 	let got = pay_named(&s, &a, x, 500_000);
 	let line = coin_line(&a, &got);
-	println!("CP16: S's payment to A, taken beside the pending refresh: {}", line);
+	println!("GR: S's payment to A, taken beside the pending refresh: {}", line);
 	assert_eq!((line["lineage"].as_str(), line["at_risk"].as_bool()), (Some("received"), Some(true)), "{}", line);
 	let (held, marked) = risk_views(&a);
 	assert_eq!(held.get(&x.to_string()).copied(), Some(500_000), "{:?}", held);
@@ -1277,18 +1277,18 @@ async fn a_coin_given_to_a_round_held_at_the_cap_counts_as_its_lineage_does() {
 	// built for it): counted at its whole value, as before.
 	let rp = a.ok(&["participate", "--leaf", &got])["participations"][0]["participation"].as_str().unwrap().to_string();
 	let st = server_state(&r, &rp);
-	println!("CP16: A's refresh of the payment received: {} ({})", st["state"], st["waiting"]);
+	println!("GR: A's refresh of the payment received: {} ({})", st["state"], st["waiting"]);
 	assert_eq!(st["state"], "pending", "{}", st);
 	let line = coin_line(&a, &got);
-	println!("CP16: the payment received, given to the pending refresh: {}", line);
+	println!("GR: the payment received, given to the pending refresh: {}", line);
 	assert_eq!((line["state"].as_str(), line["at_risk"].as_bool()), (Some("given"), Some(true)), "{}", line);
 	let (held, marked) = risk_views(&a);
-	println!("CP16: out_of_round {:?}; coin_places at_risk {:?}", held, marked);
+	println!("GR: out_of_round {:?}; coin_places at_risk {:?}", held, marked);
 	assert_eq!(held.get(&x.to_string()).copied(), Some(500_000), "{:?}", held);
 	assert_eq!(held, marked);
 	// 500,000 counted: 600,000 more passes the budget, 400,000 fits.
 	let why = a.refused(&["receive", "--asset", &x.to_string(), "--amount", "600000"], "past its instant budget");
-	println!("CP16: 600,000 more refused: {}", why);
+	println!("GR: 600,000 more refused: {}", why);
 	pay_named(&s, &a, x, 400_000);
 	let (held, marked) = risk_views(&a);
 	assert_eq!(held.get(&x.to_string()).copied(), Some(900_000), "{:?}", held);
