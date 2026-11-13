@@ -61,6 +61,12 @@
 //! final before the operator does and waits for its release, as on an
 //! operator whose pass over the rounds is slow.
 //!
+//! With `ARCA_OPERATOR_DELEGATED_RECLAIM=1`, the operator builds new
+//! batches with RECLAIM-D on their lowest nodes, as the testnet's operator
+//! does: a node whose coins were paid on out of round comes back once every
+//! coin they became is refreshed, and `/settle` runs the watcher pass that
+//! reclaims it.
+//!
 //! With `ARCA_OPERATOR_SUPERVISED` set, the chain issues an asset Z under
 //! the supervision descriptor (pause allowed, listed for fees at 1:1), and
 //! the operator serves it under the supervised profile, its signer reading
@@ -760,10 +766,15 @@ fn bitcoin_handle(side: &Option<BitcoinSide>, path: &str, b: &Value) -> Option<R
 	}
 }
 
-/// `ARCA_OPERATOR_FINALITY_POLL_MS`, when set.
+/// `ARCA_OPERATOR_FINALITY_POLL_MS`, when set; and `ARCA_OPERATOR_DELEGATED_RECLAIM=1`, new
+/// batches with RECLAIM-D on their lowest nodes, as a live operator builds them, so that a node
+/// whose coins were paid on out of round comes back once every coin they became is refreshed.
 fn finality_knobs(c: &mut server::server::Config) {
 	if let Ok(ms) = std::env::var("ARCA_OPERATOR_FINALITY_POLL_MS") {
 		c.finality.poll_interval_ms = ms.trim().parse().expect("ARCA_OPERATOR_FINALITY_POLL_MS is milliseconds");
+	}
+	if std::env::var("ARCA_OPERATOR_DELEGATED_RECLAIM").is_ok_and(|v| v.trim() == "1") {
+		c.batches.delegated_reclaim = true;
 	}
 }
 
