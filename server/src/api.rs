@@ -1613,10 +1613,11 @@ pub struct MailboxMessage {
 /// a request without them reads the first page, its proof over nothing.
 ///
 /// With `since` in place of `after`, a read past a settled cursor (`"0"`,
-/// or the `next` such a read answered): the leaves in the order of the
-/// transactions that made them, only those of transactions older than every
-/// one still running, so no leaf can still appear behind the cursor
-/// (`leaf.made_xid`). It also answers, for each coin of `held` served to the
+/// or the `next` such a read answered): the leaves in the order they came
+/// to be served to the key (the later of the transaction that made the leaf
+/// and the one that bound its owner key to the key), only those of
+/// transactions older than every one still running, so no leaf can still
+/// appear behind the cursor (`leaf.made_xid`, `leaf_mailbox.bound_xid`). It also answers, for each coin of `held` served to the
 /// key, its state, with the whole entry of each given up for good (in a
 /// transfer the operator co-signed, or a participation it released); and
 /// the whole entry of each leaf of `leaf_ids` served to the key. Its proof

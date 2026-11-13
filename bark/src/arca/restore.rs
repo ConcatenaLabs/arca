@@ -1097,6 +1097,7 @@ impl Wallet {
 		let (mut restored, mut not_taken, mut notes, mut given_elsewhere) = (vec![], vec![], vec![], vec![]);
 		let mut served: Vec<Value> = vec![];
 		let (mut served_count, mut pages_now) = (0usize, 0u32);
+		let (mut asked_held, mut asked_ids) = (0usize, 0usize);
 		let mut read_note: Option<String> = None;
 		let mut more = false;
 		loop {
@@ -1116,6 +1117,8 @@ impl Wallet {
 				};
 				let held = take(&mut pass.held, held_most);
 				let ids = take(&mut pass.ids, ids_most);
+				asked_held += held.len();
+				asked_ids += ids.len();
 				let v = self.server.leaf_data_since(&mailbox, &self.genesis, &since, limit, &held, &ids)?;
 				let leaves = v["leaves"].as_array().cloned().unwrap_or_default();
 				let asked = v["asked"].as_array().cloned().unwrap_or_default();
@@ -1230,6 +1233,9 @@ impl Wallet {
 		let mut out = json!({"served": served_count, "restored": restored, "given_elsewhere": given_elsewhere,
 			"not_taken": not_taken, "notes": notes, "read": if !settled { "every page" } else if pass.whole { "from the first leaf" }
 				else { "past the settled cursor" }, "pages": pages_now});
+		if settled {
+			out["asked"] = json!({"held": asked_held, "untaken": asked_ids});
+		}
 		if more {
 			out["more"] = json!(true);
 		}

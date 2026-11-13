@@ -177,19 +177,23 @@ impl Store {
 	}
 
 	/// Up to `limit` leaves served to `key` past the settled cursor `since`
-	/// (the transaction that made a leaf and its `seq`; `(0, 0)` from the
-	/// first), in that order, as [`Store::served_leaves`] serves them: only
-	/// leaves made by transactions older than every one still running, so
-	/// none can still appear behind a cursor read past (`leaf.made_xid`).
-	/// Each with its own settled cursor.
+	/// (a transaction and a `seq`; `(0, 0)` from the first), as
+	/// [`Store::served_leaves`] serves them, ordered by when each came to be
+	/// served to `key`: the later of the transaction that made the leaf and
+	/// the one that bound its owner key to `key` (`leaf.made_xid`,
+	/// `leaf_mailbox.bound_xid`), then its `seq`. Only leaves whose
+	/// transactions are older than every one still running, so none can
+	/// still appear behind a cursor read past. Each with its own settled
+	/// cursor.
 	pub async fn served_since(&self, key: &[u8; 32], since: (u64, i64), limit: i64) -> Result<Vec<(ServedLeaf, (u64, i64))>, StoreError> {
 		let conn = self.conn().await?;
 		let rows = conn.query(
-			&format!("SELECT {}, COALESCE(l.made_xid, '0'::xid8)::text FROM leaf l
-			 WHERE l.leaf_id IN ({})
-			   AND (COALESCE(l.made_xid, '0'::xid8), l.seq) > ($2::text::xid8, $3)
-			   AND COALESCE(l.made_xid, '0'::xid8) < pg_snapshot_xmin(pg_current_snapshot())
-			 ORDER BY COALESCE(l.made_xid, '0'::xid8), l.seq LIMIT $4", SERVED_COLUMNS, SERVED_TO),
+			&format!("SELECT {}, made::text FROM (
+			     SELECT l.*, GREATEST(COALESCE(l.made_xid, '0'::xid8), COALESCE((SELECT m.bound_xid FROM leaf_mailbox m
+			                 WHERE m.owner_key = l.owner_key AND m.mailbox_key = $1), '0'::xid8)) AS made
+			     FROM leaf l WHERE l.leaf_id IN ({})) l
+			 WHERE (made, l.seq) > ($2::text::xid8, $3) AND made < pg_snapshot_xmin(pg_current_snapshot())
+			 ORDER BY made, l.seq LIMIT $4", SERVED_COLUMNS, SERVED_TO),
 			&[&&key[..], &since.0.to_string(), &since.1, &limit],
 		).await?;
 		let mut made = Vec::with_capacity(rows.len());

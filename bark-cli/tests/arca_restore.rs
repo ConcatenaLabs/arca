@@ -1994,19 +1994,17 @@ async fn one_coins_forfeit_withheld_at_restore_is_neither_forfeited_again_nor_sp
 }
 
 /// What one `sync` of a wallet behind proxy `p` asked of the operator to
-/// catch up: `leaf_data` and `leaf_status` calls, the leaves the
-/// `leaf_data` answers carried, and the ids `leaf_status` was asked about,
-/// with the sync's `catch up` step.
+/// catch up: `leaf_data` calls, the leaves their answers carried, the held
+/// coins and leaves by id they asked about, with the sync's `catch up` step.
 fn catch_up_reads(p: &Proxy, w: &Arca) -> Value {
 	let from = p.calls().len();
 	let s = w.ok(&["sync"]);
 	let calls = p.calls();
 	let new = &calls[from..];
 	let data: Vec<&(String, Value, u16, Value)> = new.iter().filter(|c| c.0 == "/v1/leaf_data").collect();
-	let status: Vec<&(String, Value, u16, Value)> = new.iter().filter(|c| c.0 == "/v1/leaf_status").collect();
 	let leaves: usize = data.iter().map(|c| c.3["leaves"].as_array().map_or(0, |a| a.len())).sum();
-	let asked: usize = status.iter().map(|c| c.1["leaf_ids"].as_array().map_or(0, |a| a.len())).sum();
-	json!({"leaf_data": data.len(), "leaves": leaves, "leaf_status": status.len(), "status_ids": asked,
+	let count = |f: &str| -> usize { data.iter().map(|c| c.1[f].as_array().map_or(0, |a| a.len())).sum() };
+	json!({"leaf_data": data.len(), "leaves": leaves, "held": count("held"), "leaf_ids": count("leaf_ids"),
 		"step": s["cost_by_step"]["catch up"], "caught_up": s["caught_up"]})
 }
 
@@ -2077,9 +2075,14 @@ async fn a_catch_up_reads_what_changed_not_the_whole_history() {
 	split_each(&r, &[(&long, 80_000)]).await;
 	split_each(&r, &[(&long, 4_000)]).await;
 	println!("CU live coins after the splits: {}", live(&long).len());
-	for _ in 0..3 {
+	// A round takes so many leaves at most: merged until one coin is left.
+	for _ in 0..12 {
+		if live(&long).len() <= 1 {
+			break;
+		}
 		merge_all(&r, &[&long]).await;
 	}
+	assert_eq!(live(&long).len(), 1, "the long history ends with one coin");
 	println!("CU live coins after the merges: short {}, long {}", live(&short).len(), live(&long).len());
 	let mut seconds = vec![];
 	for (name, w) in [("short", &short), ("long", &long)] {

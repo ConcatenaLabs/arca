@@ -347,6 +347,13 @@ async fn a_wallets_leaves_are_served_to_its_mailbox_key_with_how_each_was_given_
 	assert_eq!(bound["bound"][0]["mailbox"], hex(&xonly(&b2).serialize()));
 	assert!(bound["bound"][1]["mailbox"].is_null(), "{}", bound);
 	assert_eq!(served(&r, &b2, 100).len(), 1);
+	// B's leaf came to be served to B's second mailbox with its binding, made
+	// after every leaf of A's: a read past a settled cursor reached before the
+	// binding (A's last, past B's leaf by when it was made) serves it.
+	let request = server::auth::leaf_since_request(&since, 100, &[], &[]);
+	let late = r.http.post("leaf_data", &json!({"auth": r.http.auth_for("leaf_data", &b2, &r.chain, &request), "since": since, "limit": 100})).ok();
+	let late: Vec<&str> = late["leaves"].as_array().unwrap().iter().filter_map(|l| l["leaf_id"].as_str()).collect();
+	assert_eq!(late.len(), 1, "a leaf bound after the cursor is read past it: {:?}", late);
 	// One owner key, one binding: an earlier one stands.
 	let again = r.http.post("bind_mailbox", &json!({"bindings": [
 		{"owner": hex(&xonly(&b_key).serialize()), "mailbox": hex(&xonly(&stranger).serialize()), "proof": proof(&r, &b_key, &xonly(&stranger))},
