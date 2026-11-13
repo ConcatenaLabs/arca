@@ -129,8 +129,13 @@ was reading (`more`); the next `sync` reads on from there, every page's coins
 taken and given up before the next page is asked. It takes every coin the store does not hold under a nonce it never drew
 (another store's), checked as a restore checks it, and gives up every coin it holds as live that another store gave up in a
 transfer the operator co-signed or in a participation the operator released,
-on the owner's own signatures (`given_elsewhere`), so every store shows the
-same coins after its next catch-up, and shows what it held until then. Two
+on the owner's own signatures (`given_elsewhere`). A leaf of a payment over
+Lightning out of the tree that it holds as live with no record of paying it
+(another store paid, and this one took the leaf as a coin) is given up as the
+payment stands at the operator: spent once the operator shows it paid with a
+preimage that opens the leaf's hash, followed as paying otherwise. So every
+store shows the same coins after its next catch-up, and shows what it held
+until then. Two
 things make it catch up at once: a spend the operator refuses because a coin
 of the wallet's is spent already, and a re-check that finds a live board coin's
 board spent on the chain by nothing this store did (another
@@ -188,7 +193,10 @@ that serves pages without end is read no further, and the restore says so in
   wallet holds the claim's coin. A restore past the leaf's home date or its
   timeout says on the coin that it came too late to be sure its claim
   wins, and `sync` takes the leaf home at once. A restore
-  never credits a leaf the operator may claim with a preimage it has. A leaf
+  never credits a leaf the operator may claim with a preimage it has. The
+  leaf of a payment out of the tree that the mailbox brings (another store of
+  the mnemonic paid after the restore read what the server serves), or that
+  the store held as live from before, stands as its payment does too. A leaf
   received over Lightning is bound to the mailbox key when it is made (the
   request names the key), so the restore finds it before it is claimed;
 - a payment received over Lightning whose leaf the wallet does not hold yet

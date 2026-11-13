@@ -51,7 +51,11 @@
 //! follows the other by catching up ([`Wallet::catch_up`], from `sync`),
 //! which reads what the server serves as a restore does: it takes what the
 //! store does not hold, and gives up what the other store gave up on the
-//! owner's own signatures, so both show the same coins. A restore that stops
+//! owner's own signatures, so both show the same coins. The leaf of a
+//! payment over Lightning out of the tree that one store made, which the
+//! other took as a coin, stands as the payment does at the operator
+//! (`settle_unrecorded_sends`, after a restore's mailbox read and at the end
+//! of a catch-up). A restore that stops
 //! at an error keeps what it took before it, and a later restore takes the
 //! rest. A take whose round is held for its takes' forfeits, unbroadcast, is
 //! restored from the round its status serves (its txid the round's), as
@@ -450,6 +454,12 @@ impl Wallet {
 		self.adopting.set(false);
 		let mailbox_read = mailbox_read.unwrap_or_else(|e| json!({"error": e.to_string()}));
 		steps.lap(self, "mailbox");
+		// A leaf of a payment over Lightning another store of the mnemonic
+		// made, which the mailbox brought as a coin (made after the leaves
+		// served were read), or a store held from before: as the payment
+		// stands, never counted (arca #907).
+		notes.extend(self.settle_unrecorded_sends()?);
+		steps.lap(self, "unrecorded_sends");
 
 		// The chain is read from the oldest base on, the history's included
 		// (as the server names them; each step lowers it again from the
@@ -1299,6 +1309,17 @@ impl Wallet {
 		if new_pace != pace {
 			self.store.set_meta(CATCH_UP_PACE, &format!("{:.3}", new_pace))?;
 		}
+		// A leaf of a payment over Lightning another store of the mnemonic
+		// made, held as a coin here: given up as the payment stands
+		// (arca #907).
+		if !more {
+			for n in self.settle_unrecorded_sends()? {
+				if n["state"] != "live" {
+					given_elsewhere.push(json!({"leaf_id": n["leaf_id"], "asset": n["asset"], "value": n["value"], "state": n["state"]}));
+				}
+				notes.push(n);
+			}
+		}
 		for v in restored.iter_mut() {
 			if let Some(c) = self.store.coin(v["leaf_id"].as_str().unwrap_or(""))? {
 				v["state"] = json!(c.state);
@@ -1902,46 +1923,7 @@ impl Wallet {
 	fn restore_htlc(&mut self, id: &str, coin: &ValidCoin, h: arca_covenant::HtlcTerms, info: &Value, now: MedianTime) -> Result<Value, Error> {
 		let hash = hex(&h.payment_hash);
 		match h.direction {
-			arca_covenant::HtlcDirection::Send => {
-				let p = self.server.post("lightning_send_status", &json!({"payment_hash": hash}));
-				let state = p.as_ref().ok().and_then(|p| p["state"].as_str().map(str::to_string)).unwrap_or_default();
-				let pre = p.as_ref().ok().and_then(|p| p["preimage"].as_str().and_then(|x| unhex32(x).ok()));
-				let opens = pre.is_some_and(|x| arca_covenant::script::sha256(&x) == h.payment_hash);
-				let mut rec = json!({"htlc_leaf_id": id, "asset": coin.asset.to_string(), "restored": true});
-				if let Ok(p) = &p {
-					for k in ["amount", "fee"] {
-						rec[k] = p[k].clone();
-					}
-				}
-				let note = match (state.as_str(), opens) {
-					("paid", true) => {
-						let pre = hex(&pre.expect("checked"));
-						self.store.set_coin_spent(id, &format!("the payment over Lightning of hash {}, paid (preimage {})", hash, pre))?;
-						rec["state"] = json!("paid");
-						rec["preimage"] = json!(pre);
-						"paid: the operator's, its preimage checked against the leaf's hash".to_string()
-					},
-					("failed", _) => {
-						self.store.set_coin_state(id, "paying", &format!("the htlc-1 leaf of the payment of hash {}: failed, taken back by sync", hash))?;
-						rec["state"] = json!("failed");
-						rec["reason"] = p.as_ref().map(|p| p["reason"].clone()).unwrap_or(Value::Null);
-						"failed: sync takes the leaf back".to_string()
-					},
-					(s, _) => {
-						self.store.set_coin_state(id, "paying", &format!("the htlc-1 leaf of the payment of hash {}: the operator is paying the \
-							invoice", hash))?;
-						rec["state"] = json!("paying");
-						match p {
-							Err(e) => format!("the operator does not say how it stands ({}): followed as paying", e),
-							Ok(_) if s == "paid" => "the operator says paid with a preimage that does not open the leaf's hash: followed as paying"
-								.to_string(),
-							Ok(_) => "paying: followed by sync".to_string(),
-						}
-					},
-				};
-				self.set_send(&hash, rec)?;
-				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": format!("a payment over Lightning out of the tree: {}", note)}))
-			},
+			arca_covenant::HtlcDirection::Send => self.restore_htlc_send(id, &coin.asset.to_string(), h),
 			arca_covenant::HtlcDirection::Receive => {
 				let row = self.store.coin(id)?.ok_or_else(|| Error::Store(format!("no coin {}", id)))?;
 				let nonce = row.owner_nonce;
@@ -1991,6 +1973,81 @@ impl Wallet {
 				Ok(json!({"leaf_id": id, "payment_hash": hash, "note": note}))
 			},
 		}
+	}
+
+	/// The `htlc-1` leaf `id` of a payment out of the tree, in `asset`, of
+	/// terms `h`, as the payment stands at the operator
+	/// ([`Self::restore_htlc`]): spent by a payment it reports paid with a
+	/// preimage that opens the leaf's hash, followed as `paying` otherwise.
+	fn restore_htlc_send(&mut self, id: &str, asset: &str, h: arca_covenant::HtlcTerms) -> Result<Value, Error> {
+		let hash = hex(&h.payment_hash);
+		let p = self.server.post("lightning_send_status", &json!({"payment_hash": hash}));
+		let state = p.as_ref().ok().and_then(|p| p["state"].as_str().map(str::to_string)).unwrap_or_default();
+		let pre = p.as_ref().ok().and_then(|p| p["preimage"].as_str().and_then(|x| unhex32(x).ok()));
+		let opens = pre.is_some_and(|x| arca_covenant::script::sha256(&x) == h.payment_hash);
+		let mut rec = json!({"htlc_leaf_id": id, "asset": asset, "restored": true});
+		if let Ok(p) = &p {
+			for k in ["amount", "fee"] {
+				rec[k] = p[k].clone();
+			}
+		}
+		let note = match (state.as_str(), opens) {
+			("paid", true) => {
+				let pre = hex(&pre.expect("checked"));
+				self.store.set_coin_spent(id, &format!("the payment over Lightning of hash {}, paid (preimage {})", hash, pre))?;
+				rec["state"] = json!("paid");
+				rec["preimage"] = json!(pre);
+				"paid: the operator's, its preimage checked against the leaf's hash".to_string()
+			},
+			("failed", _) => {
+				self.store.set_coin_state(id, "paying", &format!("the htlc-1 leaf of the payment of hash {}: failed, taken back by sync", hash))?;
+				rec["state"] = json!("failed");
+				rec["reason"] = p.as_ref().map(|p| p["reason"].clone()).unwrap_or(Value::Null);
+				"failed: sync takes the leaf back".to_string()
+			},
+			(s, _) => {
+				self.store.set_coin_state(id, "paying", &format!("the htlc-1 leaf of the payment of hash {}: the operator is paying the \
+					invoice", hash))?;
+				rec["state"] = json!("paying");
+				match p {
+					Err(e) => format!("the operator does not say how it stands ({}): followed as paying", e),
+					Ok(_) if s == "paid" => "the operator says paid with a preimage that does not open the leaf's hash: followed as paying"
+						.to_string(),
+					Ok(_) => "paying: followed by sync".to_string(),
+				}
+			},
+		};
+		self.set_send(&hash, rec)?;
+		Ok(json!({"leaf_id": id, "payment_hash": hash, "note": format!("a payment over Lightning out of the tree: {}", note)}))
+	}
+
+	/// arca #907: each `htlc-1` leaf of a payment out of the tree the store
+	/// holds `live` or `pending` with no record of that payment, as the
+	/// payment stands at the operator ([`Self::restore_htlc_send`]). The
+	/// store that pays records the payment before its leaf is made, and
+	/// holds the leaf `paying`; such a leaf is another store's payment, made
+	/// from the same mnemonic, that this store took as a coin (from the
+	/// mailbox a restore reads, or a catch-up). It is spent once the operator
+	/// shows the payment paid with a preimage that opens the leaf's hash,
+	/// followed as `paying` otherwise, so the sync settles it; it is never
+	/// counted. A restore runs it after its mailbox read, and a catch-up
+	/// once it has read to the end.
+	fn settle_unrecorded_sends(&mut self) -> Result<Vec<Value>, Error> {
+		let sends = self.sends()?;
+		let mut notes = vec![];
+		for c in self.store.coins_in_states(&["live", "pending"])? {
+			let Ok(record) = Self::record_of(&c) else { continue };
+			let Some(h) = super::wallet::htlc_terms_of(&record) else { continue };
+			if h.direction != arca_covenant::HtlcDirection::Send || sends.contains_key(&hex(&h.payment_hash)) {
+				continue;
+			}
+			let mut n = self.restore_htlc_send(&c.leaf_id, &c.asset, h)?;
+			n["state"] = json!(self.store.coin(&c.leaf_id)?.map(|c| c.state).unwrap_or_default());
+			n["asset"] = json!(c.asset);
+			n["value"] = json!(c.value.to_string());
+			notes.push(n);
+		}
+		Ok(notes)
 	}
 
 	/// D70: a payment into the tree the server serves (`r`, from `leaf_data`)

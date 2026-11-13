@@ -687,10 +687,15 @@ pub(crate) fn owner_of(record: &CoinRecord) -> (XOnlyPublicKey, [u8; 32]) {
 
 /// The direction of a coin's `htlc-1` leaf, when it is one.
 pub(crate) fn htlc_of(record: &CoinRecord) -> Option<arca_covenant::HtlcDirection> {
+	htlc_terms_of(record).map(|t| t.direction)
+}
+
+/// The terms of a coin's `htlc-1` leaf, when it is one.
+pub(crate) fn htlc_terms_of(record: &CoinRecord) -> Option<arca_covenant::HtlcTerms> {
 	match record {
-		CoinRecord::Leaf { record, .. } => record.htlc.map(|t| t.direction),
-		CoinRecord::Accumulator { record, .. } => record.htlc.map(|t| t.direction),
-		CoinRecord::Transfer(t) => t.leaf.htlc.map(|t| t.direction),
+		CoinRecord::Leaf { record, .. } => record.htlc,
+		CoinRecord::Accumulator { record, .. } => record.htlc,
+		CoinRecord::Transfer(t) => t.leaf.htlc,
 		CoinRecord::Board(_) | CoinRecord::Fill(_) => None,
 	}
 }
