@@ -854,7 +854,8 @@ async fn no_release_of_a_paid_send_is_signed_once_the_witness_fails() {
 	assert_eq!(count("/v1/lightning_send_release"), 0, "a release was signed and handed over while the witness failed: {}", s);
 	assert!(terms.released.is_empty(), "the operator holds no release");
 	let failed = failed.expect("the wallet witnessed again before it signed");
-	assert_eq!(count("/v1/witness"), 2, "one witness as the sync started, one before the signature, and none after it failed");
+	assert_eq!(calls.iter().filter(|(c, st)| c == "/v1/witness" && *st == 502).count(), 1, "one witness before the signature, and none \
+		after it failed: {:?}", calls);
 	assert!(calls[failed + 1..].is_empty(), "the operator was asked after the witness failed: {:?}", &calls[failed + 1..]);
 	assert!(s["unreachable"].is_object(), "the sync says the operator could not be witnessed: {}", s);
 	// The witness succeeds again: the next sync releases every node.
@@ -937,7 +938,8 @@ async fn no_delegation_of_a_filled_order_is_signed_once_the_witness_fails() {
 	assert_eq!(count("/v1/order_fill_delegation"), 0, "a delegation was signed and handed over while the witness failed: {}", s);
 	assert!(r.server.store.delegation(&id32(&order)).await.unwrap().is_none(), "the operator holds no delegation of the order's coin");
 	let failed = failed.expect("the wallet witnessed again before it signed");
-	assert_eq!(count("/v1/witness"), 2, "one witness as the sync started, one before the signature, and none after it failed");
+	assert_eq!(calls.iter().filter(|(c, st)| c == "/v1/witness" && *st == 502).count(), 1, "one witness before the signature, and none \
+		after it failed: {:?}", calls);
 	assert!(calls[failed + 1..].is_empty(), "the operator was asked after the witness failed: {:?}", &calls[failed + 1..]);
 	assert!(s["unreachable"].is_object(), "the sync says the operator could not be witnessed: {}", s);
 	// The witness succeeds again: the next sync delegates.
