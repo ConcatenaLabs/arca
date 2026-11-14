@@ -841,6 +841,115 @@ async fn d63_a_restore_meets_leaves_that_went_over_lightning() {
 	}
 }
 
+/// arca #907: two stores of one mnemonic, one of them paying over Lightning.
+/// A2 is restored from A's mnemonic while A pays an invoice out of the tree:
+/// the restore read the leaves served to the mailbox key before the
+/// payment's `htlc-1` leaf was made (the proxy serves it a list without the
+/// leaf), and the mailbox it reads after brings the leaf, which A2 takes as
+/// a coin of its own. The payment is paid, so the leaf is the operator's: A2
+/// never counts it, from its restore on, through its syncs, its catch-up and
+/// a restore run again, and pays out the whole of what it shows. A store
+/// that holds such a leaf live already (one an older wallet left) is put
+/// right by its next restore, and by its next catch-up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_store_never_counts_a_lightning_payment_the_first_made() {
+	let Some(lnd) = lightningd("a_second_store_never_counts_a_lightning_payment_the_first_made") else { return };
+	let mut r = short_delays().await;
+	let x = r.x;
+	let xs = x.to_string();
+	let (ox, px) = leg_in_x(&lnd, &mut r, "n907").await;
+	let url = r.url();
+	let a = wallet_at("N907A", &url, &r);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &xs, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	a.ok(&["sync"]);
+	let (inv, _) = invoice(&px, x, 100_000, "n907-paid");
+	let paid = a.ok(&["lightning", "pay", &inv]);
+	assert_eq!(paid["payment"]["state"], "paid", "{}", paid);
+	let htlc = paid["payment"]["htlc_leaf_id"].as_str().unwrap().to_string();
+	a.ok(&["sync"]);
+	let bal_a = held_in(&a, &x);
+	println!("N907 A's balance in X: {} | its paid leaf {}", bal_a, coin_of(&a, &htlc));
+
+	// A2's restore reads the leaves served before the payment's leaf was made.
+	let p = common::proxy::Proxy::start(&url);
+	let hidden = htlc.clone();
+	p.rewrite(Some(std::sync::Arc::new(move |path: &str, _: &Value, status: u16, v: &mut Value| {
+		if status == 200 && path == "/v1/leaf_data" {
+			if let Some(l) = v["leaves"].as_array_mut() {
+				l.retain(|e| e["leaf_id"] != hidden.as_str());
+			}
+		}
+		None
+	})));
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let a2 = Arca::new("N907A2");
+	let made = a2.ok(&["create", "--server", &p.url.clone(), "--node-url", &r.node_url(), "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1", "--mnemonic", &mnemonic]);
+	p.rewrite(None);
+	println!("N907 A2's restore: restored {} | not_recovered {} | mailbox {}", made["restore"]["restored"], made["restore"]["not_recovered"],
+		made["restore"]["mailbox"]);
+	println!("N907 the leaf in A2 after its restore: {}", coin_of(&a2, &htlc));
+	assert!(p.count("/v1/mailbox_read") > 0, "A2's restore read its mailbox");
+	let counted = |when: &str| {
+		let leaf = coin_of(&a2, &htlc);
+		let bal = held_in(&a2, &x);
+		println!("N907 {}: A2's balance in X {} (A's {}) | the leaf {}", when, bal, bal_a, leaf);
+		assert!(matches!(leaf["state"].as_str(), Some("spent") | None), "{}: the paid leaf is not counted: {}", when, leaf);
+		assert_eq!(bal, bal_a, "{}: A2 shows what A shows", when);
+	};
+	counted("after A2's restore");
+	a2.ok(&["sync"]);
+	counted("after a sync");
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 610));
+	r.synced().await;
+	let s = a2.ok(&["sync"]);
+	println!("N907 A2's catch-up: {}", s["caught_up"]);
+	counted("after a catch-up");
+	a2.ok(&["restore"]);
+	a2.ok(&["sync"]);
+	counted("after a restore run again");
+
+	// A store an older wallet left holding the leaf live, with no record of
+	// the payment: its next restore puts it right, and so does its next
+	// catch-up.
+	let unrecord = || {
+		let db = rusqlite::Connection::open(a2.dir.join("arca.sqlite")).unwrap();
+		db.execute("UPDATE coin SET state = 'live', spent_by = NULL, note = '' WHERE leaf_id = ?1", [&htlc]).unwrap();
+		db.execute("DELETE FROM meta WHERE key = 'lightning_sends'", []).unwrap();
+		assert_eq!(held_in(&a2, &x), bal_a + coin_of(&a2, &htlc)["value"].as_str().map(|v| v.parse::<u64>().unwrap())
+			.or_else(|| coin_of(&a2, &htlc)["value"].as_u64()).unwrap(), "the leaf counted again, as an older store held it");
+	};
+	unrecord();
+	a2.ok(&["restore"]);
+	counted("an older store's leaf, after a restore");
+	unrecord();
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 610));
+	r.synced().await;
+	let s = a2.ok(&["sync"]);
+	println!("N907 an older store's catch-up: {}", s["caught_up"]["given_elsewhere"]);
+	assert!(s["caught_up"]["given_elsewhere"].as_array().is_some_and(|g| g.iter().any(|x| x["leaf_id"] == htlc.as_str()
+		&& x["state"] == "spent")), "the catch-up gives the leaf up: {}", s["caught_up"]);
+	counted("an older store's leaf, after a catch-up");
+
+	// A2 pays out what it shows: no coin it counts is the operator's.
+	let b = wallet_at("N907B", &url, &r);
+	let req = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let (ok, v) = a2.run(&["send", &req, "--amount", &(bal_a.saturating_sub(20_000)).to_string(), "--asset", &xs]);
+	println!("N907 A2 pays its balance less 20,000: ok={} {}", ok, if ok { v["inputs"].clone() } else { v["error"].clone() });
+	assert!(ok, "{}", v);
+	drop((ox, px));
+	for w in [&a, &a2, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// The second review's F2, turned around (D63, D65). A asks to receive over
 /// Lightning; the payment is held, its leaf made in a round and taken up,
 /// and the wallet's claim never reaches the operator. The device is lost.
