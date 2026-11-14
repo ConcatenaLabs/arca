@@ -520,7 +520,7 @@ impl Wallet {
 		}
 		let (asset, value, home_in) = match self.received_held(hash)? {
 			Ok(h) => h,
-			Err(why) => return Ok(Some(why)),
+			Err(not) => return Ok(Some(not.why)),
 		};
 		if asset.to_string() != rec["asset"].as_str().unwrap_or("") || value > atoms {
 			return Err(Error::Refused(format!("the received leaf is not the swap's: {} of {} under {}, the swap's {} of {}",

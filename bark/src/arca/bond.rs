@@ -364,7 +364,17 @@ impl Wallet {
 		if matches!(c.state.as_str(), "offered" | "sending" | "given") && !to_round && !self.given_with_exit(c)? {
 			return Ok(paid_out);
 		}
-		if !paid_out {
+		self.received_out_of_round(c)
+	}
+
+	/// Whether the coin `c`, live, is at risk out of round: a coin of kind
+	/// transfer or fill (a payment out of round, or a trade's) of `received`
+	/// lineage ([`super::places::Lineage`]). What [`Self::at_risk`] says of
+	/// a live coin, and what a swap's choice of coins reads
+	/// ([`super::pay::fit_order`]): spending such a coin adds nothing at
+	/// risk, spending any other may.
+	pub(crate) fn received_out_of_round(&self, c: &super::store::CoinRow) -> Result<bool, Error> {
+		if c.kind != "transfer" && c.kind != "fill" {
 			return Ok(false);
 		}
 		let record = Self::record_of(c)?;

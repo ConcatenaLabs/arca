@@ -128,6 +128,7 @@ pub mod plan;
 mod restore;
 pub mod resting;
 mod round;
+pub mod slice;
 mod speed;
 mod take;
 pub mod tower;
