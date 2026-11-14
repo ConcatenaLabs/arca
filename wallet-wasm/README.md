@@ -174,11 +174,11 @@ leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
 `order_rest`, `order_resting {orders?, brief?}`, `order_fill_resting_quote {order,
 amount?}`, `order_fill_resting {order, amount?, shown?}`,
 `order_cancel_resting_quote {order}`, `order_cancel_resting {order, shown?}`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
-want}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
+want, leaves?}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
 {accept}`, `swap_cancel {swap}`, `swaps {swaps?}`); the swap of BTC in a Bitcoin
 ark (`btc_swap_*`); payments over Lightning in and out of the tree
-(`lightning_pay_quote {invoice, asset?, max_fee_ppm?}`, `lightning_pay {invoice,
-asset?, max_fee_ppm?, timeout?, shown?}`, `lightning_payments`,
+(`lightning_pay_quote {invoice, asset?, max_fee_ppm?, timeout?, leaves?}`, `lightning_pay {invoice,
+asset?, max_fee_ppm?, timeout?, shown?, leaves?}`, `lightning_payments`,
 `lightning_receive_quote {asset, amount, max_fee_ppm?}`, `lightning_receive
 {asset, amount, description?, max_fee_ppm?, hash?}`,
 `lightning_receive_preimage {hash, preimage}`, `lightning_receive_ready {hash,
@@ -312,7 +312,8 @@ over Lightning works the same way: `lightning_pay_quote` answers what paying an
 invoice leaves the wallet in all (`spends`: the amount, the operator's fee and
 the margins of the coins it spends), the coins it spends (`gives`) and the
 change it leaves (`change`), and `lightning_pay` with `shown` set to
-that answer pays only on it. `lightning_receive_quote` answers what a receive's
+that answer pays only on it. A payment that names a `timeout` is quoted with
+it: the coins a lock may take are those that outlive it (`coins_outlive`). `lightning_receive_quote` answers what a receive's
 leaf will hold once claimed (`claimed`: the amount less the operator's fee and
 the margins of the claim), asking the operator nothing. Both quotes carry the
 operator's limit on one payment over its node in the asset (`max_payment`, in

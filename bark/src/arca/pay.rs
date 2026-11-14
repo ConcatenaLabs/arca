@@ -35,6 +35,32 @@ pub const SWAP_DEADLINE_MARGIN: u32 = 2 * 86_400;
 /// deadline. A coin of a batch without a sweep has no expiry and qualifies.
 pub const FIT_LIFE: u32 = 7 * 86_400;
 
+/// What a coin locked under a payment hash must outlive past the lock's
+/// timeout, beside its leaf's exit delay ([`lock_outlives`]): a day, what
+/// the exit deadline ([`WalletPolicy::EXIT_DEADLINE`]) leaves for the unroll
+/// and an anchor rollback beside the longest exit delay it allows for
+/// ([`WalletPolicy::DEFAULT_MAX_EXIT_SECONDS`]).
+pub const LOCK_UNROLL: u32 = WalletPolicy::EXIT_DEADLINE - WalletPolicy::DEFAULT_MAX_EXIT_SECONDS as u32;
+
+/// The median time every coin spent into an `htlc-1` leaf of the wallet's
+/// own must outlive (its first expiry at or after it), for a lock timing out
+/// at `timeout` whose leaf's exit delay is `exit_delay`: the timeout, that
+/// delay and [`LOCK_UNROLL`]. The leaf inherits the earliest expiry of the
+/// coins it is made from, and its owner's refund opens only at the timeout
+/// and after the exit delay from the leaf's confirmation: a lock that
+/// outlived its batch would have to be unrolled before its timeout, and a
+/// wallet away until then would find the refund's path swept. One figure
+/// for a payment's quote and for the payment.
+pub fn lock_outlives(timeout: u32, exit_delay: RelativeTime) -> u32 {
+	timeout.saturating_add(exit_delay.seconds().min(u32::MAX as u64) as u32).saturating_add(LOCK_UNROLL)
+}
+
+/// Whether a coin of first expiry `expiry` outlives `until`, when a lock
+/// names one: a coin of a batch without a sweep has no expiry, and does.
+pub(crate) fn outlives(expiry: u32, until: Option<u32>) -> bool {
+	expiry == u32::MAX || until.is_none_or(|u| expiry >= u)
+}
+
 /// How many times the operator's least margin the wallet leaves, within the
 /// operator's most: room for the operator's floor to rise between the
 /// wallet reading it and the operator co-signing.
@@ -551,6 +577,59 @@ impl Wallet {
 		self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, false, Reads::ALL, spend)
 	}
 
+	/// [`Self::choose_coins_for`] for a payment over Lightning: one coin that
+	/// pays it alone first, in a swap's order ([`fit_order`]), and D58's order
+	/// only when none does. The `htlc-1` leaf it makes is the operator's to
+	/// claim, so the receiver of a direct payment, who keeps the coin and is
+	/// handed the longest life the payer can give (D58), is not served by
+	/// it; a large coin spent on a small payment would only move its
+	/// remainder out of round.
+	///
+	/// The leaf inherits the earliest expiry of the coins it is made from,
+	/// and its owner's refund opens only at its timeout and after its exit
+	/// delay. So every coin tried or taken, alone, together or named
+	/// ([`Self::paying_from`]), outlives `outlive` ([`lock_outlives`] of the
+	/// lock's timeout and its leaf's exit delay): one that does not is passed
+	/// over, named in the refusal when the caller named it, and offered to a
+	/// round when it would have paid ([`Error::SettleFirst`]). A coin of a
+	/// batch without a sweep has no expiry, and always does.
+	pub(crate) fn choose_coins_alone_first(&self, info: &Value, asset: AssetId, paid: u64, out: &ExplicitOutput, min_leaf: u64,
+		spend: Spend, outlive: u32) -> Result<(Vec<In>, u64, u64), Error>
+	{
+		let was = self.lock_until.replace(Some(outlive));
+		let r = self.choose(info, asset, paid, std::slice::from_ref(out), true, min_leaf, 0, true, Reads::ALL, spend);
+		self.lock_until.set(was);
+		r
+	}
+
+	/// The live coins of `asset` the wallet could pay `spend` with but for
+	/// their life: those a payment under a hash that its coins must outlive
+	/// `until` passes over ([`Self::choose_coins_alone_first`]). A round
+	/// refreshes them.
+	pub(crate) fn short_lived(&self, asset: AssetId, spend: Spend, until: u32) -> Result<Vec<In>, Error> {
+		let was = self.lock_until.replace(None);
+		let all = self.spendable(asset, spend);
+		self.lock_until.set(was);
+		Ok(all?.into_iter().filter(|c| !outlives(c.row.expiry, Some(until))).collect())
+	}
+
+	/// Runs `f` paying only from the coins `leaves` names, when it names
+	/// any: a swap offer or a payment over Lightning whose caller chooses its
+	/// coins (a maker naming a working coin, so a reserve stays in round).
+	/// [`Self::choose`] refuses, before anything is signed, a named coin it
+	/// cannot pay from now, and pays from the named coins alone, in the
+	/// order it would take them.
+	pub fn paying_from<T>(&mut self, leaves: &[String], f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+		if leaves.is_empty() {
+			return f(self);
+		}
+		let named = leaves.iter().map(|l| l.trim().to_lowercase()).collect();
+		let was = self.pay_from.replace(Some(named));
+		let r = f(self);
+		*self.pay_from.borrow_mut() = was;
+		r
+	}
+
 	/// The live coins of `asset` the wallet can pay with ([`Self::spendable`]).
 	pub(crate) fn spendable_coins(&self, asset: AssetId) -> Result<Vec<In>, Error> {
 		self.spendable(asset, Spend::Pay)
@@ -592,15 +671,18 @@ impl Wallet {
 
 	/// The live coins of `asset`, furthest from their exit date first (D58:
 	/// what a receiver gets has the longest life the wallet can give it), the
-	/// largest first among those of one date, each resolved (a swap reorders
-	/// them, [`fit_order`]); a coin past its
+	/// largest first among those of one date, each resolved (a swap and a
+	/// payment over Lightning reorder them, [`fit_order`]); a coin past its
 	/// exit deadline is not paid on (the operator co-signs no spend of it,
 	/// and `sync` takes it on the chain), nor one an offline-refresh plan
 	/// names ([`super::plan`]). While a quote runs, the coins it counts in
 	/// refreshes that wait as well ([`Self::counted_given`]). While the
 	/// wallet sets an instant limit, no coin its place bars from `spend`
 	/// ([`super::places`]): an arriving coin, and trade proceeds for a
-	/// payment that leaves the Arca.
+	/// payment that leaves the Arca. While the call names the coins it pays
+	/// from ([`Self::paying_from`]), none but those; and while a payment
+	/// under a hash chooses its coins, none its lock would outlive
+	/// ([`Self::choose_coins_alone_first`]).
 	fn spendable(&self, asset: AssetId, spend: Spend) -> Result<Vec<In>, Error> {
 		let mut out = vec![];
 		let barred = self.unspendable(spend)?;
@@ -618,6 +700,13 @@ impl Wallet {
 				continue;
 			}
 			if planned.contains(&row.leaf_id) || barred.contains(&row.leaf_id) {
+				continue;
+			}
+			if self.pay_from.borrow().as_ref().is_some_and(|named| !named.contains(&row.leaf_id)) {
+				continue;
+			}
+			// A payment under a hash: no coin its lock would outlive.
+			if !outlives(row.expiry, self.lock_until.get()) {
 				continue;
 			}
 			// A resting order's coin is the order: a fill, a cancel or its
@@ -650,7 +739,9 @@ impl Wallet {
 	/// board (the operator's depth limit for a payment, which no coin at it
 	/// can make; less for a coin a trade would shape first), or because
 	/// their record is of the format with its owner's exit, which the other
-	/// side does not read (`reads`). A round gives each of them back as a
+	/// side does not read (`reads`), or because a payment under a hash is
+	/// choosing its coins and its lock would outlive them
+	/// ([`Self::choose_coins_alone_first`]). A round gives each of them back as a
 	/// coin of the wallet's own that pays anything at once. And the coins
 	/// given up in a round of the wallet's own whose forfeits it signed but
 	/// whose new leaves it has not taken yet ([`Self::owed_by_own_rounds`]):
@@ -700,6 +791,8 @@ impl Wallet {
 				"at the operator's depth limit of reassignments since a round"
 			} else if !reads.exit && row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
 				"of the record format the other side's older build does not read"
+			} else if !outlives(row.expiry, self.lock_until.get()) {
+				"too near their exit date to be locked under this payment's hash until its timeout and the refund after it"
 			} else {
 				continue;
 			};
@@ -908,6 +1001,38 @@ impl Wallet {
 	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize, fit: bool, reads: Reads, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
+		// Coins the caller named ([`Self::paying_from`]): each one the wallet
+		// can pay this from now, or nothing is signed; and no refresh is
+		// taken back for coins it did not name.
+		let named = self.pay_from.borrow().clone();
+		if let Some(named) = named {
+			// Whatever their life: a named coin a lock would outlive is
+			// refused below, in words of its own.
+			let lock = self.lock_until.replace(None);
+			let have = self.spendable(asset, spend);
+			self.lock_until.set(lock);
+			let mut have: Vec<In> = have?;
+			have.retain(|c| reads.record(&c.row.record) && depth_limit(info).is_none_or(|l| c.coin.hops < l));
+			let missing: Vec<&String> = named.iter().filter(|l| !have.iter().any(|c| c.row.leaf_id == **l)).collect();
+			if !missing.is_empty() {
+				return Err(Error::Refused(format!("the coins named to pay this from must each be a live coin of asset {} the wallet can \
+					pay from now (final, held by no offer, refresh or instant limit, below the operator's depth limit, of a format the \
+					other side reads), and {} {} not; nothing was signed", asset,
+					missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "), if missing.len() == 1 { "is" } else { "are" })));
+			}
+			if let Some(until) = lock {
+				let short: Vec<String> = have.iter().filter(|c| !outlives(c.row.expiry, Some(until)))
+					.map(|c| format!("{} (its expiry is median time {})", c.row.leaf_id, c.row.expiry)).collect();
+				if !short.is_empty() {
+					return Err(Error::Refused(format!("a coin locked under this payment's hash must outlive median time {} (the lock's \
+						timeout, its leaf's exit delay and a day for the unroll), or its refund could be cut before it opens, and of the \
+						coins named to pay this from {} {} not: name coins that live longer, or put {} through a round first \
+						(settle_first); nothing was signed", until, short.join(", "), if short.len() == 1 { "does" } else { "do" },
+						if short.len() == 1 { "it" } else { "them" })));
+				}
+			}
+			return self.choose_live(info, asset, paid, others, pays_margin, min_leaf, other_inputs, fit, reads, spend);
+		}
 		// A spend that waits only for a round ([`Error::SettleFirst`]) takes
 		// back no refresh: the coins it names may be in one now, on their
 		// way to paying it.
@@ -951,7 +1076,8 @@ impl Wallet {
 		}
 	}
 
-	/// [`Self::choose`] from the coins live now. With `fit` (a swap), no coin
+	/// [`Self::choose`] from the coins live now. With `fit` (a swap, or a
+	/// payment over Lightning), no coin
 	/// at the operator's depth limit is taken (its spend could only be
 	/// refused, after the other side signed), and each coin [`fit_order`]
 	/// names is tried alone first, with its real margins: the first whose
@@ -978,8 +1104,10 @@ impl Wallet {
 		}
 		if fit {
 			let now = self.now()?.to_consensus_u32();
-			let order = fit_order(&candidates.iter().map(|c| (c.coin.value, c.row.expiry, c.coin.hops, matches!(c.row.kind.as_str(), "transfer" | "fill")))
-				.collect::<Vec<_>>(), paid, depth_limit(info), now);
+			let coins = candidates.iter().map(|c| Ok(FitCoin { value: c.coin.value, expiry: c.row.expiry, hops: c.coin.hops,
+				out_of_round: matches!(c.row.kind.as_str(), "transfer" | "fill"), at_risk: self.received_out_of_round(&c.row)? }))
+				.collect::<Result<Vec<_>, Error>>()?;
+			let order = fit_order(&coins, paid, depth_limit(info), now, self.lock_until.get());
 			for i in order {
 				let c = &candidates[i];
 				if let Some(alone) = self.pays_alone(c, &margins, paid, others, pays_margin, min_leaf, other_inputs, asset)? {
@@ -1048,6 +1176,16 @@ impl Wallet {
 			leave for their fees", total_live, asset, paid, need);
 		if total_live > kept && chosen.len() >= cap {
 			words = format!("{}; a payment gives at most {} of its coins, the largest, which hold {}: a round merges them", words, cap, kept);
+		}
+		// A payment under a hash: the coins passed over for their life are
+		// not among those, and are said apart.
+		if let Some(until) = self.lock_until.get() {
+			let short = self.short_lived(asset, spend, until)?;
+			if !short.is_empty() {
+				words = format!("{}; {} more of its coins, holding {}, are too near their exit date to be locked under this payment's \
+					hash, which a coin must outlive to median time {} (the lock's timeout, its leaf's exit delay and a day for the \
+					unroll): a round refreshes them", words, short.len(), short.iter().map(|c| c.coin.value).sum::<u64>(), until);
+			}
 		}
 		let refused = self.short_of(asset, need.saturating_sub(total_live), words)?;
 		// Nothing more on its way covers it: the most it pays now goes with
@@ -2564,8 +2702,8 @@ impl Wallet {
 		if !Self::checkpoint_exit_offered(&info) {
 			self.exit_required("the operator does not offer it (info.checkpoint_exit)")?;
 		}
-		// The taker is not known yet, so the coins are chosen as ever (change
-		// already out of round first, D93). An older taker's library reads
+		// The taker is not known yet, so the coins are chosen as ever (coins
+		// already at risk first, D93: [`fit_order`]). An older taker's library reads
 		// no coin record of the newer format and refuses such an offer when
 		// it reads it, before signing anything: it never holds a coin it
 		// cannot read.
@@ -3941,42 +4079,87 @@ pub(crate) fn depth_limit(info: &Value) -> Option<usize> {
 	info["depth_limit"].as_u64().map(|l| l as usize)
 }
 
-/// The coins a swap tries alone, in order, by index into `coins` (each its
-/// value, its expiry, its reassignments since a round (`hops`) and whether
-/// it is out of round, received or made by a payment out of round): those
+/// A coin as a swap's choice of coins reads it ([`fit_order`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FitCoin {
+	pub value: u64,
+	pub expiry: u32,
+	/// Its reassignments since a round or a board.
+	pub hops: usize,
+	/// Out of round: of kind transfer or fill, received or made by a
+	/// payment out of round.
+	pub out_of_round: bool,
+	/// At risk out of round ([`Wallet::received_out_of_round`]): of
+	/// `received` lineage, so the operator with another party could take it
+	/// by signing twice, and it counts against the wallet's instant budget.
+	pub at_risk: bool,
+}
+
+/// The coins a swap, or a payment over Lightning, tries alone, in order, by
+/// index into `coins`: those
 /// with at least [`FIT_LIFE`] left before their expiry at `now` (so the coin
-/// the other side gets lives at least that long), worth at least `paid`, in
-/// two tiers (D93):
-/// 1. coins already out of round whose new coins stay below `depth_limit`
-///    with room for one more (a cancel's), so at most `depth_limit` − 2
-///    deep, the smallest first: spending one leaves the wallet's total out of
-///    round where it was;
-/// 2. coins no reassignment deep (of a round or a board), the smallest
-///    first.
+/// the other side gets lives at least that long) and, for a payment under a
+/// hash, outliving `lock` ([`lock_outlives`]: its lock's timeout, exit delay
+/// and unroll, which may lie further off), worth at least `paid`, in
+/// two tiers (D93, as amended for #892):
+/// 1. coins already at risk out of round ([`FitCoin::at_risk`]) whose new
+///    coins stay below `depth_limit` with room for one more (a cancel's), so
+///    at most `depth_limit` − 2 deep, the smallest first: the swap's change
+///    from one is at risk as the coin was, so spending it adds nothing to
+///    what the wallet holds at risk;
+/// 2. every other coin that may pay, the smallest first: the coins of the
+///    wallet's own lineage out of round with the same room below the limit,
+///    and the coins no reassignment deep (of a round or a board); of one
+///    value, one out of round first. On an operator without checkpoint
+///    exits the swap's change is received, at risk whole, so the smallest
+///    coin that pays adds the least; with them it is at risk to nobody, and
+///    the smallest still moves the least into the trade and one
+///    reassignment deeper.
+///
 /// Whether one pays alone, with its margins and a change of none or at least
 /// the smallest leaf, is the caller's to try ([`Wallet::pays_alone`]); when
-/// none does, the coins are taken in D58's order.
+/// none does, the coins are taken in D58's order. Every coin a swap may pay
+/// from is final ([`Wallet::spendable`]), and so one its other side accepts
+/// at once.
 ///
 /// A swap's change rests on the reassignment with the other side's coins, so
-/// it is out of round until the next round refreshes it, and counts against
-/// the operator's bond and the wallet's instant budget meanwhile. Taken
-/// largest first, a maker spent its one large coin on every swap and held
-/// nearly all of it out of round after each (#702). Taken smallest first,
-/// the newest change came first again and again, one reassignment deeper
-/// each time, to the depth limit (#703). Taken shallowest first, a fresh
-/// large coin was preferred over a small change that paid alone, putting most
-/// of it out of round (#709). Taken only from the coins within a day of the
-/// newest, a maker whose one giant coin was refreshed a day after the rest
-/// had no other coin to try, and spent the giant on every swap.
-pub(crate) fn fit_order(coins: &[(u64, u32, usize, bool)], paid: u64, depth_limit: Option<usize>, now: u32) -> Vec<usize> {
-	let lives = |e: u32| e == u32::MAX || e >= now.saturating_add(FIT_LIFE);
-	let fits = |i: &usize| coins[*i].0 >= paid && lives(coins[*i].1);
+/// it is out of round until the next round refreshes it, and without its
+/// owner's exit it counts against the operator's bond and the wallet's
+/// instant budget meanwhile. Taken largest first, a maker spent its one large
+/// coin on every swap and held nearly all of it out of round after each
+/// (#702). Taken smallest first, the newest change came first again and
+/// again, one reassignment deeper each time, to the depth limit (#703).
+/// Taken shallowest first, a fresh large coin was preferred over a small
+/// change that paid alone, putting most of it out of round (#709). Taken only
+/// from the coins within a day of the newest, a maker whose one giant coin
+/// was refreshed a day after the rest had no other coin to try, and spent
+/// the giant on every swap. Taken with every coin out of round first, a maker
+/// spent its own change of 848,792 (at risk to nobody) on a trade of 20,000
+/// while working coins paid it alone, and on an operator without checkpoint
+/// exits the trade's change, at risk whole, held its instant budget full
+/// until a round refreshed it (#892). A payment over Lightning taken in D58's
+/// order (the largest of the latest date first) spent a maker's reserve of
+/// 5,000,000 on a lock of 10,000, and the next swap spent the reserve's change.
+/// Taken by the seven days alone, a working coin with seven days left was
+/// tried before a reserve with 28 for a lock timing out in eight, which the
+/// operator's window for a payment's timeout allows: the lock would have
+/// outlived its batch (review KR15).
+pub(crate) fn fit_order(coins: &[FitCoin], paid: u64, depth_limit: Option<usize>, now: u32, lock: Option<u32>) -> Vec<usize> {
+	let lives = |e: u32| e == u32::MAX || (e >= now.saturating_add(FIT_LIFE) && outlives(e, lock));
+	let fits = |i: &usize| coins[*i].value >= paid && lives(coins[*i].expiry);
 	let roomy = |h: usize| depth_limit.is_none_or(|l| h + 2 <= l);
-	let mut out_of_round: Vec<usize> = (0..coins.len()).filter(fits).filter(|&i| coins[i].3 && roomy(coins[i].2)).collect();
-	out_of_round.sort_by_key(|&i| (coins[i].0, i));
-	let mut fresh: Vec<usize> = (0..coins.len()).filter(fits).filter(|&i| !coins[i].3 && coins[i].2 == 0).collect();
-	fresh.sort_by_key(|&i| (coins[i].0, i));
-	out_of_round.into_iter().chain(fresh).collect()
+	let tier = |i: usize| -> Option<u8> {
+		let c = &coins[i];
+		match (c.out_of_round, c.at_risk) {
+			(true, true) if roomy(c.hops) => Some(1),
+			(true, false) if roomy(c.hops) => Some(2),
+			(false, _) if c.hops == 0 => Some(2),
+			_ => None,
+		}
+	};
+	let mut out: Vec<(u8, usize)> = (0..coins.len()).filter(fits).filter_map(|i| tier(i).map(|t| (t, i))).collect();
+	out.sort_by_key(|&(t, i)| (t, coins[i].value, !coins[i].out_of_round, i));
+	out.into_iter().map(|(_, i)| i).collect()
 }
 
 /// The coins a trade's shaping self-payment ([`Wallet::shape_coin`]) tries
@@ -4043,12 +4226,13 @@ mod tests {
 	/// A swap tries alone, in order, the coins with at least seven days of
 	/// life worth at least what it pays: those already out of round with room
 	/// below the depth limit, the smallest first, then those of a round or a
-	/// board, the smallest first.
+	/// board, the smallest first. Here every coin out of round is received
+	/// change, at risk (an operator without checkpoint exits).
 	#[test]
 	fn a_swap_tries_out_of_round_change_first_then_fresh_coins() {
 		let now = 1_000_000u32;
 		let t = now + 20 * 86_400;
-		let coins = [
+		let coins = fit_coins(&[
 			(2_000_000_000, t + 33 * 3_600, 0, false), // 0: the giant, fresh, 33 h newer than the rest
 			(30_000, t, 0, false),                     // 1: fresh
 			(199_272, t, 1, true),                     // 2: change, one deep
@@ -4058,14 +4242,87 @@ mod tests {
 			(25_000, t, 4, true),                      // 6: change four deep: no room below a limit of 5
 			(60_000, t, 1, false),                     // 7: fresh kind but one deep (not taken alone)
 			(45_000, u32::MAX, 0, false),              // 8: no expiry (a batch without a sweep)
-		];
-		assert_eq!(fit_order(&coins, 25_000, Some(5), now), vec![3, 2, 1, 8, 0], "change 50k then 199k, then fresh 30k, 45k and the giant");
-		assert_eq!(fit_order(&coins, 100_000, Some(5), now), vec![2, 0], "the 199k change before the fresh giant (#709)");
-		assert_eq!(fit_order(&coins, 35_000, Some(5), now), vec![3, 2, 8, 0],
+		], true);
+		assert_eq!(fit_order(&coins, 25_000, Some(5), now, None), vec![3, 2, 1, 8, 0], "change 50k then 199k, then fresh 30k, 45k and the giant");
+		assert_eq!(fit_order(&coins, 100_000, Some(5), now, None), vec![2, 0], "the 199k change before the fresh giant (#709)");
+		assert_eq!(fit_order(&coins, 35_000, Some(5), now, None), vec![3, 2, 8, 0],
 			"a mid-size coin before the giant 33 h newer than it, not the giant alone; the 40k of five days is not tried");
-		assert_eq!(fit_order(&coins, 25_000, None, now), vec![6, 3, 2, 1, 8, 0], "no limit published: every change has room");
-		assert!(fit_order(&coins, 3_000_000_000, Some(5), now).is_empty(), "no coin holds it alone");
-		assert!(fit_order(&[], 1, Some(5), now).is_empty());
+		assert_eq!(fit_order(&coins, 25_000, None, now, None), vec![6, 3, 2, 1, 8, 0], "no limit published: every change has room");
+		assert!(fit_order(&coins, 3_000_000_000, Some(5), now, None).is_empty(), "no coin holds it alone");
+		assert!(fit_order(&[], 1, Some(5), now, None).is_empty());
+	}
+
+	/// `(value, expiry, hops, out of round)` as [`FitCoin`]s, each coin out of
+	/// round at risk when `received`, and of the wallet's own lineage when not.
+	fn fit_coins(coins: &[(u64, u32, usize, bool)], received: bool) -> Vec<FitCoin> {
+		coins.iter().map(|&(value, expiry, hops, out_of_round)| FitCoin { value, expiry, hops, out_of_round, at_risk: out_of_round && received })
+			.collect()
+	}
+
+	/// #892: a coin of the wallet's own lineage out of round (its change from
+	/// paying out of a round's coin, at risk to nobody) ranks with the coins
+	/// of a round or a board, by value: a trade of 20,000 is tried first on
+	/// the working coin of 100,000, never on the own coin of 848,792 while a
+	/// smaller one pays it; a coin already at risk still comes first, since
+	/// spending it adds nothing at risk; and the large coin is still tried
+	/// when it alone pays.
+	#[test]
+	fn a_swap_tries_coins_at_risk_first_then_the_smallest_whatever_its_round() {
+		let now = 1_000_000u32;
+		let t = now + 20 * 86_400;
+		let mut coins = vec![
+			FitCoin { value: 848_792, expiry: t, hops: 1, out_of_round: true, at_risk: false },   // 0: own change, at risk to nobody
+			FitCoin { value: 100_000, expiry: t, hops: 0, out_of_round: false, at_risk: false },  // 1: a working coin
+			FitCoin { value: 150_000, expiry: t, hops: 0, out_of_round: false, at_risk: false },  // 2: a working coin
+			FitCoin { value: 5_000_000, expiry: t, hops: 0, out_of_round: false, at_risk: false }, // 3: a reserve
+			FitCoin { value: 120_000, expiry: t, hops: 2, out_of_round: true, at_risk: false },   // 4: own, two deep
+			FitCoin { value: 300_000, expiry: t, hops: 4, out_of_round: true, at_risk: false },   // 5: own, four deep: no room below 5
+		];
+		assert_eq!(fit_order(&coins, 20_000, Some(5), now, None), vec![1, 4, 2, 0, 3], "the smallest that pays, the own change of 848,792 after \
+			every working coin");
+		assert_eq!(fit_order(&coins, 900_000, Some(5), now, None), vec![3], "only the reserve holds it");
+		assert_eq!(fit_order(&coins, 200_000, Some(5), now, None), vec![0, 3], "the own change before the reserve");
+		assert_eq!(fit_order(&coins, 200_000, None, now, None), vec![5, 0, 3], "no limit published: the four-deep coin has room");
+		// A coin received out of round seconds ago, at risk already: first,
+		// whatever its size, as spending it adds nothing at risk.
+		coins.push(FitCoin { value: 999_931, expiry: t, hops: 1, out_of_round: true, at_risk: true }); // 6
+		coins.push(FitCoin { value: 60_000, expiry: t, hops: 3, out_of_round: true, at_risk: true });  // 7: at risk, three deep
+		coins.push(FitCoin { value: 50_000, expiry: t, hops: 4, out_of_round: true, at_risk: true });  // 8: at risk, no room
+		assert_eq!(fit_order(&coins, 20_000, Some(5), now, None), vec![7, 6, 1, 4, 2, 0, 3]);
+		// Of one value, the coin out of round first: it adds nothing out of round.
+		let tie = [FitCoin { value: 100_000, expiry: t, hops: 0, out_of_round: false, at_risk: false },
+			FitCoin { value: 100_000, expiry: t, hops: 1, out_of_round: true, at_risk: false }];
+		assert_eq!(fit_order(&tie, 20_000, Some(5), now, None), vec![1, 0]);
+	}
+
+	/// Review KR15: a coin spent into a lock must outlive it. A working coin
+	/// with exactly seven days of life is tried first for a swap, and for a
+	/// payment whose lock it outlives; for a lock timing out in eight days
+	/// (an operator's `send_timeout_seconds` of four days allows it) it is not
+	/// tried at all, and the reserve with 28 days pays. A coin without an
+	/// expiry (a batch without a sweep) outlives every lock.
+	#[test]
+	fn a_lightning_input_must_outlive_the_locks_timeout() {
+		let now = 1_000_000u32;
+		let exit_delay = RelativeTime::from_seconds_ceil(36 * 3_600).unwrap();
+		let coins = [
+			FitCoin { value: 100_000, expiry: now + FIT_LIFE, hops: 0, out_of_round: false, at_risk: false },         // 0: working, 7 days
+			FitCoin { value: 5_000_000, expiry: now + 28 * 86_400, hops: 0, out_of_round: false, at_risk: false },   // 1: the reserve
+			FitCoin { value: 90_000, expiry: now + 9 * 86_400, hops: 1, out_of_round: true, at_risk: true },         // 2: at risk, 9 days
+			FitCoin { value: 120_000, expiry: u32::MAX, hops: 0, out_of_round: false, at_risk: false },              // 3: no expiry
+		];
+		assert_eq!(fit_order(&coins, 10_000, Some(5), now, None), vec![2, 0, 3, 1], "a swap: seven days are enough");
+		// A lock timing out in a day: the timeout, 36 hours and a day, 3.5 days from now.
+		let short = lock_outlives(now + 86_400 + 600, exit_delay);
+		assert_eq!(short, now + 86_400 + 600 + exit_delay.seconds() as u32 + LOCK_UNROLL);
+		assert_eq!(LOCK_UNROLL, 86_400);
+		assert_eq!(fit_order(&coins, 10_000, Some(5), now, Some(short)), vec![2, 0, 3, 1], "every coin outlives it");
+		// A lock timing out in eight days: 10.5 days from now.
+		let long = lock_outlives(now + 8 * 86_400, exit_delay);
+		assert!(coins[0].expiry < long && coins[2].expiry < long && coins[1].expiry > long);
+		assert_eq!(fit_order(&coins, 10_000, Some(5), now, Some(long)), vec![3, 1],
+			"neither the seven-day working coin nor the nine-day coin at risk is tried for a lock that outlives them");
+		assert!(outlives(long, Some(long)) && !outlives(long - 1, Some(long)) && outlives(u32::MAX, Some(long)) && outlives(1, None));
 	}
 
 	/// An offer's or an acceptance's `landing-2` leaf, as written for another

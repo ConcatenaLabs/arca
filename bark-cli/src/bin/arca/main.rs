@@ -972,6 +972,11 @@ enum SwapCmd {
 		want_asset: String,
 		#[arg(long)]
 		want: u64,
+		/// Pays from these coins alone (each a live coin of the asset given
+		/// that the wallet can pay from now, else refused before anything is
+		/// held); unnamed, the wallet chooses.
+		#[arg(long = "leaf")]
+		leaves: Vec<String>,
 	},
 	/// Takes an offer, signing the wallet's side. The coins the swap gives
 	/// the wallet carry the earliest dates of every coin it spends, which are
@@ -1296,6 +1301,11 @@ enum LightningCmd {
 		/// seconds; `sync` follows it after that.
 		#[arg(long, default_value_t = 60)]
 		wait: u64,
+		/// Pays from these coins alone (each a live coin of the invoice's
+		/// asset that the wallet can pay from now, else refused before
+		/// anything is signed); unnamed, the wallet chooses.
+		#[arg(long = "leaf")]
+		leaves: Vec<String>,
 	},
 	/// Every payment over Lightning the wallet made, with where it stands.
 	Payments,
@@ -1584,8 +1594,9 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::SendQuote { request, amount, asset: a, route } =>
 			w.send_quote_routed(&request, amount, a.as_deref().map(asset).transpose()?, route.as_deref()),
 		Cmd::Mailbox => w.mailbox(),
-		Cmd::Lightning(LightningCmd::Pay { invoice, asset: a, max_fee_ppm, timeout, wait }) => {
-			let mut v = w.lightning_pay_until(&invoice, a.as_deref().map(asset).transpose()?, max_fee_ppm, timeout)?;
+		Cmd::Lightning(LightningCmd::Pay { invoice, asset: a, max_fee_ppm, timeout, wait, leaves }) => {
+			let from = a.as_deref().map(asset).transpose()?;
+			let mut v = w.paying_from(&leaves, |w| w.lightning_pay_until(&invoice, from, max_fee_ppm, timeout))?;
 			let hash = v["paying"]["payment_hash"].as_str().unwrap_or("").to_string();
 			v["payment"] = w.lightning_follow(&hash, std::time::Duration::from_secs(wait))?;
 			Ok(v)
@@ -1745,7 +1756,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			w.offboard_of(a, of, &script, fee_asset.as_deref().map(asset).transpose()?, max_fee_ppm, shown.as_ref())
 		},
 		Cmd::Offboards => w.offboards(),
-		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want }) => w.swap_offer(asset(&give_asset)?, give, asset(&want_asset)?, want),
+		Cmd::Swap(SwapCmd::Offer { give_asset, give, want_asset, want, leaves }) => {
+			let (g, wa) = (asset(&give_asset)?, asset(&want_asset)?);
+			w.paying_from(&leaves, |w| w.swap_offer(g, give, wa, want))
+		},
 		Cmd::Swap(SwapCmd::Accept { offer, accept_near_deadline }) => w.swap_accept(&offer, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Complete { accept, accept_near_deadline }) => w.swap_complete(&accept, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Cancel { swap }) => w.swap_cancel(&swap),
