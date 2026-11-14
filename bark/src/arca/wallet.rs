@@ -187,6 +187,10 @@ pub struct Wallet {
 	/// How long `sync` keeps trying to reach the operator, with back-off,
 	/// before it takes it for unreachable ([`WITNESS_PATIENCE`] unless set).
 	pub witness_patience: std::time::Duration,
+	/// While a pass of `sync` works with the operator on a witness that
+	/// succeeded: whether it does (`.0`), and why it stopped, once a witness
+	/// failed while it ran (`.1`; [`Wallet::witnessed_now`]).
+	pub(crate) pass: std::cell::RefCell<(bool, Option<String>)>,
 	/// The change of every fee coin this process's exits spent, not in a
 	/// block yet: a later exit of the same `sync` pays its fees from it, as
 	/// the steps of one exit do.
@@ -984,7 +988,7 @@ impl Wallet {
 		chain.follow_anchor_depth(opt(ANCHOR_DEPTH_META)?.and_then(|d| d.parse().ok()), &get("chain_name")?);
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
-			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
+			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, pass: Default::default(), change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), pay_from: Default::default(), lock_until: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), slice: Default::default(), statuses_read: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
@@ -1076,6 +1080,9 @@ impl Wallet {
 				let (mailbox, proof) = self.binding(&key)?;
 				bindings.push(json!({"owner": hex(&key.x_only_public_key().0.serialize()), "mailbox": mailbox, "proof": proof}));
 			}
+			// Each binding is signed by its coin's key: handed over on a
+			// witness that stands now.
+			self.witnessed_now()?;
 			let answer = self.server.bind_mailbox(&bindings)?;
 			let shown = answer["bound"].as_array().cloned().unwrap_or_default();
 			for (c, b) in chunk.iter().zip(bindings.iter()) {
@@ -1546,13 +1553,53 @@ impl Wallet {
 	/// finds a rollback refuses, and the wallet's next [`Self::witness`] takes
 	/// the coins resting on what was lost on the chain.
 	pub(crate) fn witnessed_now(&self) -> Result<(), Error> {
-		let v = self.witness_check()?;
-		match v["rolled_back"]["at"].as_u64() {
+		let v = self.witness_check().and_then(|v| match v["rolled_back"]["at"].as_u64() {
 			Some(at) => Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the \
 				wallet goes no further with this operator, and takes on the chain every coin resting on what it signed after", at,
 				v["rolled_back"]["why"].as_str().unwrap_or("")))),
 			None => Ok(()),
+		});
+		if let Err(e) = &v {
+			self.pass_lost(e);
 		}
+		v
+	}
+
+	/// A witness failed while a pass of `sync` worked with the operator on
+	/// one that had succeeded: the pass asks the operator nothing more and
+	/// hands it nothing more, whatever step or item comes next. Every
+	/// request fails from here as one the operator did not answer
+	/// ([`super::client::ServerClient::stop`]) until the pass ends, the
+	/// first failure kept as its reason. Nothing outside such a pass.
+	fn pass_lost(&self, e: &Error) {
+		let mut pass = self.pass.borrow_mut();
+		if pass.0 && pass.1.is_none() {
+			let why = format!("a witness of the operator's signer's record failed while this sync ran ({}): the wallet asks the \
+				operator nothing more, and signs nothing more for it, until its next sync", e);
+			self.server.stop(&why);
+			pass.1 = Some(why);
+		}
+	}
+
+	/// Why the pass of `sync` under way stopped working with the operator,
+	/// when a witness failed while it ran ([`Self::pass_lost`]).
+	pub(crate) fn pass_stopped(&self) -> Option<String> {
+		self.pass.borrow().1.clone()
+	}
+
+	/// A pass of `sync` works with the operator from here, its witness
+	/// having succeeded (`on`), or no longer does: a pass that ended.
+	pub(crate) fn pass_works(&self, on: bool) {
+		*self.pass.borrow_mut() = (on, None);
+		if !on {
+			self.server.resume();
+		}
+	}
+
+	/// Whether a witness of the operator's signer's record succeeded within
+	/// [`WITNESS_FOR`] in this process and found no rollback: asks nothing.
+	pub(crate) fn witness_stands(&self) -> bool {
+		self.witnessed.borrow().as_ref().is_some_and(|(at, v)| at.elapsed() < WITNESS_FOR && v["rolled_back"].is_null())
 	}
 
 	/// The witness itself ([`Self::witness`]), without acting on a
@@ -4539,7 +4586,10 @@ impl Wallet {
 	/// byte for byte: the server answers a board it already holds with its
 	/// status. Returns the coin's state.
 	fn post_board(&mut self, leaf_id: &str, body: &Value, tx: &Transaction) -> Result<&'static str, Error> {
-		match self.server.post("register_board", body) {
+		// The registration, and the board's broadcast after it: on a witness
+		// that stands now. Without one the registration stands, to be posted
+		// again, as when the server's answer is not seen.
+		match self.witnessed_now().and_then(|_| self.server.post("register_board", body)) {
 			Ok(status) => {
 				self.store.set_board_request(leaf_id, "done", &status.to_string())?;
 				if status["state"].as_str() == Some("lost") {

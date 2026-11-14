@@ -694,6 +694,8 @@ impl Wallet {
 	}
 
 	fn cancel_at_operator(&mut self, id: &str) -> Result<Value, Error> {
+		// A signature for the operator: on a witness that stands now.
+		self.witnessed_now()?;
 		let pid = unhex32(id)?;
 		let mailbox = self.keys.mailbox()?;
 		let st = self.server.post("cancel_plan", &json!({"plan_id": id,

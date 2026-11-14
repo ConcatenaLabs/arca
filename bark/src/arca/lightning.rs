@@ -600,6 +600,7 @@ impl Wallet {
 			done(self, &mut rec)?;
 			return Ok(json!({"payment_hash": hash, "state": "paid", "preimage": rec["preimage"]}));
 		}
+		self.witnessed_now()?;
 		let t = self.server.post("lightning_send_release_terms", &json!({"payment_hash": hash}))?;
 		let nodes: Vec<&str> = t["nodes"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
 		let released: Vec<&str> = t["released"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
@@ -613,6 +614,9 @@ impl Wallet {
 		let c = t["round"]["connector_vout"].as_u64().unwrap_or(u64::MAX) as u32;
 		let rels = arca_covenant::Release::for_paid_send(&coin, &preimage, &round, c)
 			.map_err(|e| Error::Refused(format!("the release of payment {}: {}", hash, e)))?;
+		// The releases are signed for the operator: on a witness that stands
+		// now, the terms having taken what time they took.
+		self.witnessed_now()?;
 		let key = self.coin_key(&row.owner_nonce)?;
 		let releases: Vec<Value> = rels.iter().map(|r| json!({"node": hex(&r.node_hash),
 			"signature": hex(sign(&key, &r.message().digest).as_ref())})).collect();
@@ -1136,7 +1140,9 @@ impl Wallet {
 			}
 			let state = rec["state"].as_str().unwrap_or("").to_string();
 			let step = match state.as_str() {
-				"requested" => match self.server.post("lightning_receive", &rec["request"]) {
+				// The request carries the wallet's signature: handed over on
+				// a witness that stands now.
+				"requested" => match self.witnessed_now().and_then(|_| self.server.post("lightning_receive", &rec["request"])) {
 					Ok(r) => self.receive_answered(&hash, &r).map(|r| json!({"payment_hash": hash, "state": r["state"]})),
 					Err(e) => Err(e),
 				},

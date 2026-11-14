@@ -434,6 +434,8 @@ pub struct ServerClient {
 	base: String,
 	timeout: u64,
 	info: std::sync::Arc<std::sync::Mutex<Option<(web_time::Instant, Value)>>>,
+	/// Why no request is sent now ([`Self::stop`]), while none is.
+	stopped: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ServerClient {
@@ -445,7 +447,7 @@ impl ServerClient {
 		// more than one; one already installed is kept.
 		#[cfg(feature = "arca")]
 		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-		Ok(ServerClient { base: base.trim_end_matches('/').to_string(), timeout: 60, info: Default::default() })
+		Ok(ServerClient { base: base.trim_end_matches('/').to_string(), timeout: 60, info: Default::default(), stopped: Default::default() })
 	}
 
 	pub fn base(&self) -> &str {
@@ -513,11 +515,34 @@ impl ServerClient {
 	}
 
 	pub fn get(&self, call: &str) -> Result<Value, Error> {
-		Self::answer(call, self.send("GET", call, None))
+		Self::answer(call, self.asked("GET", call, None))
 	}
 
 	pub fn post(&self, call: &str, body: &Value) -> Result<Value, Error> {
-		Self::answer(call, self.send("POST", call, Some(body)))
+		Self::answer(call, self.asked("POST", call, Some(body)))
+	}
+
+	/// [`Self::send`], unless the client is stopped ([`Self::stop`]): then
+	/// nothing is sent, and the call fails as one the server did not answer.
+	fn asked(&self, method: &str, call: &str, body: Option<&Value>) -> Result<(i32, String), String> {
+		if let Some(why) = self.stopped.lock().expect("the stop").as_ref() {
+			return Err(why.clone());
+		}
+		self.send(method, call, body)
+	}
+
+	/// Sends no request from now on, each call failing with `why` as one
+	/// the server did not answer ([`Error::Unreachable`]), until
+	/// [`Self::resume`]: for a `sync` whose witness of the operator's
+	/// signer's record failed while it ran, which asks the operator nothing
+	/// more, and hands it nothing, until its next pass.
+	pub fn stop(&self, why: &str) {
+		*self.stopped.lock().expect("the stop") = Some(why.to_string());
+	}
+
+	/// Sends requests again.
+	pub fn resume(&self) {
+		*self.stopped.lock().expect("the stop") = None;
 	}
 
 	/// Forgets the `info` kept, so the next call reads it again: before a

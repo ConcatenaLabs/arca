@@ -1974,9 +1974,37 @@ impl Wallet {
 	/// restore, which leaves the history to the syncs after it.
 	pub(crate) fn sync_with(&mut self, catch_up: bool, deposits: bool, history: bool, budget_ms: Option<u64>) -> Result<Value, Error> {
 		self.statuses_read.borrow_mut().clear();
+		self.pass_works(false);
 		let out = self.sync_slice(catch_up, deposits, history, budget_ms);
+		// The pass's work with the operator ends with the call, and with it
+		// what stopped it, if a witness failed while it ran.
+		self.pass_works(false);
 		self.statuses_read.borrow_mut().clear();
 		out
+	}
+
+	/// Whether a step of `sync` works with the operator now: the pass's
+	/// witness succeeded and proved no rollback (`talk`), no witness has
+	/// failed since ([`Self::pass_lost`]), and one stands within
+	/// [`super::wallet::WITNESS_FOR`], taken again here when the last is
+	/// older ([`Self::witnessed_now`]). So no step starts its work with the
+	/// operator on a witness that is not current, in one call or in slices.
+	fn talks(&self, talk: bool) -> bool {
+		talk && self.witnessed_now().is_ok()
+	}
+
+	/// What `sync` says when the operator cannot be reached, `e` being why.
+	fn unreachable_said(&self, e: &str) -> Value {
+		let busy = e.contains("rate_limited");
+		json!({"why": e, "note": self.spelling.say(if busy {
+			"the server asks the wallet to slow down (rate_limited): nothing is decided on that; the wallet asks again at its next \
+			sync. Nothing is taken on the chain for want of an answer before a coin's home_from (a day before its exit date); run \
+			{sync} at least once a day while the wallet holds a coin off the chain or waits for a payment"
+		} else {
+			"the operator cannot be reached now: nothing is taken on the chain for that before a coin's home_from (a day before its \
+			exit date, exit_by); from then sync takes it on the chain unless its refresh has completed. Run {sync} at least \
+			once a day while the wallet holds a coin off the chain or waits for a payment"
+		})})
 	}
 
 	/// [`Self::sync_with`], one call of it.
@@ -1994,7 +2022,10 @@ impl Wallet {
 		};
 		let again;
 		// Whether the pass's witness and `info` stand for this slice: it
-		// resumes the pass on the tip they were taken at.
+		// resumes the pass on the tip they were taken at, and a witness
+		// stands in this process (one that succeeded within
+		// [`super::wallet::WITNESS_FOR`]). A pass's witness is never taken
+		// as good on its record alone.
 		let mut kept = false;
 		let mut r = match resumed {
 			Some(mut r) => {
@@ -2006,7 +2037,7 @@ impl Wallet {
 				// pass's.
 				again = match self.tip_rechecked()? {
 					Some(tip) => {
-						kept = r.witnessed.as_deref() == Some(tip.as_str());
+						kept = r.witnessed.as_deref() == Some(tip.as_str()) && self.witness_stands();
 						self.recheck_lineages()?
 					},
 					None => self.recheck()?,
@@ -2137,6 +2168,13 @@ impl Wallet {
 					r.add_cost(steps.done());
 					return Ok(Some(r.next.clone()));
 				}
+				// A witness that failed while the step ran ends the pass's
+				// work with the operator ([`Self::pass_lost`]): what is left
+				// of the pass is the wallet's own and short, and runs here, as
+				// after a witness that fails at a slice's start.
+				if deadline.is_some() && self.pass_stopped().is_some() {
+					deadline = None;
+				}
 			};
 		}
 		// Deposits a restore left owed, before anything else: the coins it
@@ -2146,15 +2184,14 @@ impl Wallet {
 			if with_deposits && w.store.meta(super::tower::DEPOSITS_OWED).ok().flatten().is_some() { arr(w.progress_deposits()) }
 			else { Value::Null }
 		});
-		// The witness, patiently, once a pass: after a rollback of the
-		// operator's signer's record the wallet does only what it does on the
-		// chain, and while no witness succeeds it takes no coin and signs no
-		// spend through the operator. A slice that resumes the pass on the tip
-		// the pass's witness and `info` succeeded at takes them as they were:
-		// every step that signs, or reads `info`, witnesses the record again
-		// itself when the last witness is older than [`super::wallet::WITNESS_FOR`]
-		// ([`Self::witnessed_now`]), and a slice on another tip takes them
-		// afresh. The witness's own time is not counted in the slice's budget.
+		// The witness, patiently: after a rollback of the operator's signer's
+		// record the wallet does only what it does on the chain, and while no
+		// witness succeeds it takes no coin and signs no spend through the
+		// operator. A slice that resumes the pass on the tip its witness and
+		// `info` succeeded at, while a witness stands in this process, takes
+		// them as the pass found them (`kept`); any other slice takes them
+		// afresh. The witness's own time is not counted in the slice's
+		// budget.
 		let (witness, info_failed, tries) = if kept {
 			(Ok(r.out.get("witness").cloned().unwrap_or(Value::Null)), None, 1)
 		} else {
@@ -2188,11 +2225,17 @@ impl Wallet {
 		r.out.insert("witness".into(), witness);
 		let gone = self.rolled_back()?.is_some();
 		let talk = witnessed && !gone;
+		// From here the pass works with the operator on a witness that
+		// succeeded. Each step that does so takes one again when the last is
+		// older than a witness stands ([`Self::talks`]), as does each
+		// signature it hands over; one that fails ends the pass's work with
+		// the operator ([`Self::pass_lost`]).
+		self.pass_works(talk);
 		let waiting = || json!({"note": "the witness of the operator's signer's record did not succeed: the wallet takes no coin and \
 			signs no spend through the operator until one does"});
 		// What a slice may spend of the catch-up and the history: what is left
 		// of it, at most their usual second.
-		let within = |most: u64| -> u64 {
+		let within = |deadline: Option<web_time::Instant>, most: u64| -> u64 {
 			match deadline {
 				Some(d) => (d.saturating_duration_since(web_time::Instant::now()).as_millis() as u64).clamp(1, most),
 				None => most,
@@ -2201,16 +2244,16 @@ impl Wallet {
 		// The forfeits of every round the operator holds for them, first: a
 		// held round is dropped when they do not come within its window, and
 		// nothing after this needs them.
-		step!("held", |w: &mut Self| if talk { arr(w.progress_held()) } else { json!([]) });
-		step!("boards", |w: &mut Self| if talk { arr(w.retry_boards()) } else { json!([]) });
-		step!("transfers", |w: &mut Self| if talk { arr(w.retry_transfers()) } else { json!([]) });
+		step!("held", |w: &mut Self| if w.talks(talk) { arr(w.progress_held()) } else { json!([]) });
+		step!("boards", |w: &mut Self| if w.talks(talk) { arr(w.retry_boards()) } else { json!([]) });
+		step!("transfers", |w: &mut Self| if w.talks(talk) { arr(w.retry_transfers()) } else { json!([]) });
 		// Payments over Lightning the operator has not decided: a paid one
 		// closed with its preimage, a failed one taken back.
-		step!("lightning", |w: &mut Self| if talk { arr(w.progress_lightning()) } else { json!([]) });
+		step!("lightning", |w: &mut Self| if w.talks(talk) { arr(w.progress_lightning()) } else { json!([]) });
 		// Payments received over Lightning: a held one's participation taken
 		// up as the wallet's own, a leaf the wallet holds claimed.
-		step!("receives", |w: &mut Self| if talk { arr(w.progress_receives()) } else { json!([]) });
-		step!("mailbox", |w: &mut Self| if talk || gone { w.mailbox().unwrap_or_else(err) } else { waiting() });
+		step!("receives", |w: &mut Self| if w.talks(talk) { arr(w.progress_receives()) } else { json!([]) });
+		step!("mailbox", |w: &mut Self| if gone || w.talks(talk) { w.mailbox().unwrap_or_else(err) } else { waiting() });
 		// What other stores of the mnemonic did: coins they made taken, coins
 		// held here that they gave up given up here too. At most once every
 		// ten minutes ([`super::restore::CATCH_UP_EVERY`]), and at every sync
@@ -2219,29 +2262,30 @@ impl Wallet {
 		// ([`super::restore::SYNC_CATCH_UP_MS`]), less what a slice has left:
 		// one that reads longer reads on at the next.
 		step!("catch up", |w: &mut Self| {
-			if talk && catch_up && !w.spent_elsewhere().map(|s| s.is_empty()).unwrap_or(true) {
+			let talk = catch_up && w.talks(talk);
+			if talk && !w.spent_elsewhere().map(|s| s.is_empty()).unwrap_or(true) {
 				w.settle_spent_elsewhere().map(|v| v.unwrap_or(Value::Null)).unwrap_or_else(err)
-			} else if talk && catch_up && w.catch_up_due().unwrap_or(false) {
-				w.catch_up_within(Some(within(super::restore::SYNC_CATCH_UP_MS))).map(|v| v.0).unwrap_or_else(err)
+			} else if talk && w.catch_up_due().unwrap_or(false) {
+				w.catch_up_within(Some(within(deadline, super::restore::SYNC_CATCH_UP_MS))).map(|v| v.0).unwrap_or_else(err)
 			} else { Value::Null }
 		});
 		// The coins a restore left to be checked after it (the wallet's
 		// history): one slice of them, of about a second
 		// ([`super::restore::SYNC_HISTORY_MS`]); a program that runs slices
 		// of its own while nobody asks it anything finishes it sooner.
-		step!("history", |w: &mut Self| if talk && with_history {
-			w.restore_history_within(Some(within(super::restore::SYNC_HISTORY_MS))).map(|v| v.unwrap_or(Value::Null)).unwrap_or_else(err)
+		step!("history", |w: &mut Self| if with_history && w.talks(talk) {
+			w.restore_history_within(Some(within(deadline, super::restore::SYNC_HISTORY_MS))).map(|v| v.unwrap_or(Value::Null)).unwrap_or_else(err)
 		} else { Value::Null });
 		// Every coin kept before the wallet named its mailbox key is bound to
 		// it, so that a restore from the mnemonic finds it.
-		step!("bound", |w: &mut Self| if talk { w.bind_unbound().unwrap_or_else(err) } else { Value::Null });
+		step!("bound", |w: &mut Self| if w.talks(talk) { w.bind_unbound().unwrap_or_else(err) } else { Value::Null });
 		// Every coin a sweep took from the wallet, owed by the operator:
 		// claimed, its repayment taken up as a participation of the wallet's.
-		step!("owed", |w: &mut Self| if talk { arr(w.progress_owed()) } else { json!([]) });
-		step!("participations", |w: &mut Self| if talk { arr(w.progress_participations()) } else if gone { json!([]) } else { waiting() });
+		step!("owed", |w: &mut Self| if w.talks(talk) { arr(w.progress_owed()) } else { json!([]) });
+		step!("participations", |w: &mut Self| if w.talks(talk) { arr(w.progress_participations()) } else if gone { json!([]) } else { waiting() });
 		// Offline-refresh plans: each step whose round is final taken up, a
 		// stopped plan cancelled.
-		step!("plans", |w: &mut Self| if talk { arr(w.progress_plans()) } else { json!([]) });
+		step!("plans", |w: &mut Self| if w.talks(talk) { arr(w.progress_plans()) } else { json!([]) });
 		// Each order placed on the chain: its offboard recorded once released,
 		// and unlocked by the wallet when the operator has not.
 		step!("orders", |w: &mut Self| arr(w.progress_orders()));
@@ -2251,18 +2295,18 @@ impl Wallet {
 		// Each order resting in the tree: published once its round is final
 		// and its participation released; each fill the wallet sent and has
 		// no answer to sent again.
-		step!("resting", |w: &mut Self| if talk { arr(w.progress_resting()) } else { json!([]) });
+		step!("resting", |w: &mut Self| if w.talks(talk) { arr(w.progress_resting()) } else { json!([]) });
 		// A leaf received over Lightning that those participations brought
 		// in is claimed at once.
 		// Only while a witness succeeds: the operator is asked nothing about a
 		// payment received while none does.
-		step!("receives again", |w: &mut Self| match if talk { w.progress_receives() } else { Ok(vec![]) } {
+		step!("receives again", |w: &mut Self| match if w.talks(talk) { w.progress_receives() } else { Ok(vec![]) } {
 			Ok(v) => Value::Array(v.into_iter().filter(|s| s["state"] == "received" || s["state"] == "failed").collect()),
 			Err(_) => json!([]),
 		});
 		// D57: the refresh of every live coin in its refresh window, asked for
 		// by the wallet itself.
-		step!("refresh", |w: &mut Self| if talk && info_failed.is_none() { arr(w.refresh_due()) } else { json!([]) });
+		step!("refresh", |w: &mut Self| if info_failed.is_none() && w.talks(talk) { arr(w.refresh_due()) } else { json!([]) });
 		step!("forfeits", |w: &mut Self| arr(w.watch_forfeits()));
 		// Every live coin resting on a batch deposited with the watchtowers,
 		// every deposit of a coin no longer the wallet's withdrawn: none of
@@ -2278,25 +2322,18 @@ impl Wallet {
 		// within three days of it. Before that day nothing is taken on the
 		// chain because the operator does not answer: the coins are shown
 		// with their dates, and sync tries again.
+		// A witness that failed while the pass ran counts as the operator not
+		// reached, with what it said.
 		let cannot = match (gone, failed) {
 			(true, _) => None,
 			(false, Some(e)) => Some(e),
-			(false, None) => info_failed.map(|e| e.to_string()),
+			(false, None) => info_failed.map(|e| e.to_string()).or_else(|| self.pass_stopped()),
 		};
 		let (why, unreachable) = match (gone, cannot) {
 			(true, _) => (Home::Stopped, Value::Null),
 			(false, Some(e)) => {
 				self.set_unreachable(Some(&e))?;
-				let busy = e.contains("rate_limited");
-				(Home::Unreachable(e.clone()), json!({"why": e, "note": self.spelling.say(if busy {
-					"the server asks the wallet to slow down (rate_limited): nothing is decided on that; the wallet asks again at its next \
-					sync. Nothing is taken on the chain for want of an answer before a coin's home_from (a day before its exit date); run \
-					{sync} at least once a day while the wallet holds a coin off the chain or waits for a payment"
-				} else {
-					"the operator cannot be reached now: nothing is taken on the chain for that before a coin's home_from (a day before its \
-					exit date, exit_by); from then sync takes it on the chain unless its refresh has completed. Run {sync} at least \
-					once a day while the wallet holds a coin off the chain or waits for a payment"
-				})}))
+				(Home::Unreachable(e.clone()), self.unreachable_said(&e))
 			},
 			(false, None) => {
 				self.set_unreachable(None)?;
@@ -2309,7 +2346,13 @@ impl Wallet {
 		step!("exits", |w: &mut Self| arr(w.progress_exits()));
 		// A coin kept safe on the chain while the wallet was away, its claim
 		// final: boarded back.
-		step!("reboards", |w: &mut Self| if talk { arr(w.progress_reboards()) } else { json!([]) });
+		step!("reboards", |w: &mut Self| if w.talks(talk) { arr(w.progress_reboards()) } else { json!([]) });
+		// A witness that failed in a step after `home` is said as well.
+		if let Some(e) = self.pass_stopped().filter(|_| !gone && r.out.get("unreachable").is_none_or(|v| v.is_null())) {
+			self.set_unreachable(Some(&e))?;
+			r.out.insert("unreachable".into(), self.unreachable_said(&e));
+			r.out.insert("answering".into(), json!(false));
+		}
 		// The schedule, in a slice of its own when the slice is spent.
 		if ran > 0 && deadline.is_some_and(|d| web_time::Instant::now() >= d) {
 			r.next = super::slice::LAST.into();

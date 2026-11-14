@@ -1239,6 +1239,8 @@ impl Wallet {
 			return Err(Error::Refused(format!("participation {} is {}: only one the operator holds pending is withdrawn", pid, state)));
 		}
 		let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
+		// Signatures for the operator: on a witness that stands now.
+		self.witnessed_now()?;
 		let id = unhex32(pid).map_err(|e| Error::Store(e.to_string()))?;
 		let digest = withdraw_digest(&self.genesis, &self.operator, &id);
 		let mut sigs = vec![];
@@ -1544,6 +1546,14 @@ impl Wallet {
 	}
 
 	fn submit(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
+		// The participation carries the wallet's signatures, made now or
+		// kept from a post the operator never answered: handed over on a
+		// witness that stands now. Without one it is not handed over, whatever
+		// the witness said: it stands, and `sync` posts it again.
+		self.witnessed_now().map_err(|e| match e {
+			e @ Error::Unreachable(_) => e,
+			e => Error::Unreachable(e.to_string()),
+		})?;
 		let call = if Self::is_take(body) {
 			"take_order"
 		} else if body.get("claims").is_some() {
@@ -2509,6 +2519,12 @@ impl Wallet {
 			return Ok(None);
 		}
 		let later = |code: &str| matches!(code, "release_early" | "round_not_final" | "not_synced" | "internal");
+		// The releases were signed when the participation completed: handed
+		// over on a witness that stands now, and kept for the next sync
+		// otherwise.
+		if let Err(e) = self.witnessed_now() {
+			return Ok(Some(json!({"error": e.to_string()})));
+		}
 		let answer = match self.server.post("release_leaves", &json!({"participation_id": pid, "releases": pending})) {
 			Ok(v) => v["released"].clone(),
 			Err(Error::Server { code, .. }) if later(&code) => return Ok(Some(json!({"waiting": code}))),

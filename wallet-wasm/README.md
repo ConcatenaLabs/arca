@@ -247,11 +247,19 @@ between two items of a long step (a participation, a coin's refresh, deposit,
 journey home or exit, a call asking the operator which of 64 coins hold its
 capital back, a payment over Lightning, a plan, an order); an item that
 has started runs to its end. What a slice does before its first step (the
-command's start, its re-check) is not counted in `n`, and the witness of the
-operator's signer's record and the operator's `info` are taken once a pass: a
-slice that goes on with the pass on the chain's tip they were taken at takes
-them as the pass found them, and one on another tip takes them afresh. So a
-pass in slices costs about what one call does. A slice in which the operator cannot be reached
+command's start, its re-check) is not counted in `n`. The witness of the
+operator's signer's record and the operator's `info` are taken at a pass's
+start, and a slice that goes on with the pass takes them as the pass found them
+only on the chain's tip they were taken at and while a witness stands in the
+wallet kept open (ten seconds); any other slice takes them again. Which coins
+hold the operator's capital back is asked once a pass; what the bond leaves
+uncovered is computed again whenever the tip or what the wallet holds out of
+round has changed. So a pass in slices costs about what one call does. In one
+call as in slices, every step that works with the operator, and every signature
+handed to it, starts on a witness that stands; a witness that fails while a
+pass runs ends the pass's work with the operator: nothing more is asked or
+signed, the rest of the pass runs in the same call, and its answer says so
+(`unreachable`). A slice in which the operator cannot be reached
 waits out the witness's patience once and then runs the rest of the pass,
 since without the operator each step after is short. Each slice but the last answers
 `{"more": true, "next", "slice", "cost_by_step", "recheck"}`: `recheck` is
@@ -385,8 +393,10 @@ spends nothing it does not have to on reading the chain again.
   on the chain at once), every round and board's finality, each coin's dates,
   and its lineage looked for on the chain and in the mempool. Then the witness
   of the operator's signer's record (`start.witness`), unless the command stays
-  on the machine and the node or witnesses itself (`sync`, once a pass, and
-  `hand_over_forfeits`); a witness stands for ten seconds. A command
+  on the machine and the node or witnesses itself (`hand_over_forfeits`, and
+  `sync`: as its pass starts, and again before each step that works with the
+  operator and each signature it hands over once the last is older); a witness
+  stands for ten seconds. A command
   given `"recheck": "coins"` among its arguments runs only the part of the
   re-check that concerns the coins (each coin against the chain and its
   lineage watch), leaving the following of its participations' rounds (a round

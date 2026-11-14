@@ -35,26 +35,45 @@
 //! re-check when it is not, so no slice acts on a tip it has not looked at
 //! (its changes join the pass's).
 //!
-//! **What a pass pays once.** The witness of the operator's signer's record
-//! and the operator's `info` are taken once a pass: a slice that resumes the
-//! pass on the tip they were taken at takes them as the pass found them (the
-//! resume point keeps that tip), and a slice on another tip, after its whole
-//! re-check, takes them afresh. Nothing is signed on that alone: every step
-//! that signs, or reads `info`, witnesses the record again itself once the
-//! last witness is older than [`super::wallet::WITNESS_FOR`]. What a step
-//! asks the operator before its items (which coins hold its capital back,
-//! what the bond leaves uncovered) is asked once a pass and kept with the
-//! resume point, whatever the tip: it is the operator's answer, not the
-//! chain's, and a tip that moves every few seconds would otherwise have the
-//! step ask it again before it ever reached its items. The budget
-//! counts the pass's work only: what a slice does before its first step (the
-//! command's start, the re-check) and the witness's own time are not
-//! counted, so each slice advances the pass by about its budget whatever
-//! that fixed work costs; a budget of 0 stops at the first safe point after
-//! the slice's first step or item. A slice whose witness fails has waited
-//! out the witness's patience: it runs the rest of the pass, as one call
-//! does, so the patience is paid once a pass and the steps that take coins
-//! home when the operator cannot be reached come in every pass.
+//! **What a pass pays once, and what it never takes on trust.** The witness
+//! of the operator's signer's record and the operator's `info` are taken at
+//! the start of a pass. A slice that resumes the pass takes them as the pass
+//! found them only on the tip they were taken at (the resume point keeps
+//! that tip) and only while a witness stands in the process, one that
+//! succeeded within [`super::wallet::WITNESS_FOR`]; any other slice, a
+//! process opened afresh among them, takes them again, patiently, after its
+//! re-check. The record of an earlier witness is never good on its own. In
+//! one call as in slices, each step that works with the operator starts on a
+//! witness that stands, taking one again when the last is older, and so does
+//! each signature the wallet hands the operator, made then or kept from a
+//! post the operator never answered ([`Wallet::witnessed_now`]). A witness
+//! that fails while the pass runs ends the pass's work with the operator: no
+//! request leaves after it, nothing is signed for the operator, what is left
+//! of the pass runs to its end in the same call as it does when the operator
+//! cannot be reached, and the pass says why (`unreachable`).
+//!
+//! What a step asks the operator before its items is kept with the resume
+//! point only where a stale answer can cost the wallet nothing. Which coins
+//! hold the operator's capital back (`holding_back`) is asked once a pass
+//! and kept for it whatever the tip: it is the operator's word about its own
+//! capital, all it decides is a refresh at no fee, which the operator takes
+//! for nothing or refuses, and a tip that moves every few seconds would
+//! otherwise have the step ask it again before it ever reached its coins.
+//! What the bond leaves uncovered decides a refresh the wallet may pay for,
+//! and comes from the chain and the store: it is kept only while the tip,
+//! what the wallet holds out of round and whether it ever saw a bond are
+//! what they were, and computed again otherwise
+//! ([`Wallet::uncovered_in_pass`]). Everything else a slice decides on it
+//! reads when it runs.
+//!
+//! The budget counts the pass's work only: what a slice does before its
+//! first step (the command's start, the re-check) and the witness's own time
+//! are not counted, so each slice advances the pass by about its budget
+//! whatever that fixed work costs; a budget of 0 stops at the first safe
+//! point after the slice's first step or item. A slice whose witness fails
+//! has waited out the witness's patience: it runs the rest of the pass, as
+//! one call does, so the patience is paid once a pass and the steps that
+//! take coins home when the operator cannot be reached come in every pass.
 //!
 //! A resume point is kept for each set of arguments, so a caller that syncs
 //! in slices with other arguments than another (`catch_up`, `deposits`)
@@ -142,10 +161,13 @@ pub(crate) struct Resume {
 	/// What each step cost in this slice alone.
 	pub last: serde_json::Map<String, Value>,
 	/// The chain's tip the pass's witness and `info` succeeded at: a slice
-	/// resumed on that tip takes them as the pass found them.
+	/// resumed on that tip takes them as the pass found them while a witness
+	/// stands in the process, and never on this record alone.
 	pub witnessed: Option<String>,
-	/// What a step read of the operator once for the whole pass, by step
-	/// ([`Wallet::slice_memo`]).
+	/// What a step read once for the pass, by step ([`Wallet::slice_memo`]):
+	/// the operator's `holding_back` answer, kept for the pass, and what the
+	/// bond leaves uncovered, with the tip and the store's state it holds
+	/// for.
 	pub memo: serde_json::Map<String, Value>,
 }
 
@@ -269,7 +291,11 @@ impl Wallet {
 		if s.done.contains(key) {
 			return Item::Skip;
 		}
-		if s.cut || (s.ran > 0 && web_time::Instant::now() >= s.deadline) {
+		// A pass whose witness failed while it ran asks the operator nothing
+		// more: what is left of it runs to its end in this call
+		// ([`Wallet::pass_stopped`]).
+		let stopped = self.pass.borrow().1.is_some();
+		if s.cut || (s.ran > 0 && !stopped && web_time::Instant::now() >= s.deadline) {
 			s.cut = true;
 			return Item::Stop;
 		}
@@ -280,11 +306,12 @@ impl Wallet {
 
 	/// What step `key` read once for the pass under way and kept
 	/// ([`Self::slice_memo_keep`]), when a slice runs; `None` otherwise. For
-	/// what a step asks the operator before its items, which a pass in slices
-	/// would otherwise ask again in every slice that goes on with the step.
-	/// It is the operator's answer, not the chain's, and a pass lasts
-	/// [`RESUME_FOR`] at most: a slice on a new tip still takes its whole
-	/// re-check and witness, and nothing is signed on what is kept here.
+	/// what a step reads before its items, which a pass in slices would
+	/// otherwise read again in every slice that goes on with the step. A
+	/// later slice decides on what is kept here, so a step keeps only what
+	/// costs the wallet nothing when stale, or keeps with it what it holds
+	/// for and checks that before it uses it; nothing a signature relies on
+	/// is taken from here alone.
 	pub(crate) fn slice_memo(&self, key: &str) -> Option<Value> {
 		self.slice.borrow().as_ref().and_then(|s| s.memo.get(key).cloned())
 	}

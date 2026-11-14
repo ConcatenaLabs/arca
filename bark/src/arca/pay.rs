@@ -1742,7 +1742,9 @@ impl Wallet {
 		for (id, body, inputs) in self.store.transfers_in("requested")? {
 			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
 			let mine: Vec<String> = serde_json::from_str(&inputs).map_err(|e| Error::Store(e.to_string()))?;
-			out.push(match self.post_transfer(id, &body, &mine) {
+			// The request carries the wallet's signatures: posted again on
+			// a witness that stands now, and left standing otherwise.
+			out.push(match self.witnessed_now().and_then(|_| self.post_transfer(id, &body, &mine)) {
 				Ok(v) => v,
 				Err(e) => json!({"transfer_request": id, "error": e.to_string()}),
 			});
