@@ -241,6 +241,24 @@ impl Ctx {
 		cp
 	}
 
+	fn htlc2(&self) -> LockPolicy {
+		let p = &self.output("htlc2")["params"];
+		let l = LockPolicy {
+			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
+			exit_delay: rel(&p["exit_delay"]),
+			terms: LockTerms {
+				payment_hash: h32(&p["payment_hash"]), timeout: time(&p["timeout"]), refunder: key(&p["refunder"]),
+				refund_delay: rel(&p["refund_delay"]),
+			},
+		};
+		l.check().unwrap();
+		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
+		assert_eq!(l.leaf_constant(), h32(&p["K"]));
+		assert_eq!(l.alone_prefix(arca_covenant::lock::ALONE_CLAIM), hex(&p["claim_prefix"]));
+		assert_eq!(l.alone_prefix(arca_covenant::lock::ALONE_REFUND), hex(&p["refund_prefix"]));
+		l
+	}
+
 	fn htlc(&self, name: &str) -> LeafPolicy {
 		let p = &self.output(name)["params"];
 		let direction = HtlcDirection::from_name(p["direction"].as_str().unwrap()).unwrap();
@@ -376,6 +394,15 @@ impl Ctx {
 					("refund", h.refund_script().unwrap()),
 				]))
 			},
+			"htlc2" => {
+				let l = self.htlc2();
+				(l.taproot(), BTreeMap::from([
+					("claim_c", l.claim_together_script()),
+					("refund_c", l.refund_together_script()),
+					("claim", l.claim_script()),
+					("refund", l.refund_script()),
+				]))
+			},
 			n @ ("landing" | "landing2") => {
 				let l = self.landing_of(n);
 				(l.taproot(), BTreeMap::from([("collab", l.collab_script()), ("landing", l.exit_script())]))
@@ -394,7 +421,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 24);
+	assert_eq!(outputs.len(), 25);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();
