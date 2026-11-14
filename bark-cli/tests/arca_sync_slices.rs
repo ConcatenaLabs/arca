@@ -10,7 +10,7 @@
 //! 2. The whole pass in slices ends in the same coins and participations as
 //!    the pass in one call, two copies of one store compared, with rounds to
 //!    complete and refreshes waiting.
-//! 3. A cut at every safe point (a budget of 1 ms), each followed by a
+//! 3. A cut at every safe point (a budget of 0 ms), each followed by a
 //!    command of another kind (a payment, a swap offer, a refresh, a
 //!    restore's history step, a read): every slice and every command
 //!    answers, a slice ends after every step and inside every step cut
@@ -37,6 +37,12 @@
 //! 11. A cut at every step with other commands between (a refresh
 //!    withdrawn, a swap offered, accepted and completed, an exit, a whole
 //!    sync, coin places): the wallet's value is whole after.
+//! 12. On a store as large as a busy maker's (seven assets, about six
+//!    hundred live coins, a long history), a pass in slices of a second
+//!    ends, costs about what one call costs, and no slice holds the wallet
+//!    for more than a part of it: what a pass reads once (the operator's
+//!    witness and `info`, the coins it holds capital back for) is not read
+//!    again in every slice.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -83,9 +89,13 @@ async fn boarded(r: &mut Running, w: &Arca, server: &str, assets: &[(AssetId, u6
 		let s = script(&w.ok(&["address"]));
 		r.pay_to(s, *a, v + 3_000_000);
 	}
-	let s = script(&w.ok(&["address"]));
+	// One on-chain fee coin a board: a board's change is not spendable until
+	// its block.
 	let x = r.x;
-	r.pay_to(s, x, 3_000_000);
+	for _ in 0..assets.len().max(1) {
+		let s = script(&w.ok(&["address"]));
+		r.pay_to(s, x, 3_000_000);
+	}
 	r.produce().await;
 	for (a, v) in assets {
 		w.ok(&["board", &a.to_string(), &v.to_string(), "--fee-asset", &x.to_string()]);
@@ -134,6 +144,29 @@ async fn busy_of(r: &mut Running, m: &Arca, b: &Arca, paid: usize, done: usize, 
 	if done == paid {
 		final_round(r).await;
 	}
+}
+
+/// Every round waiting (one an asset), each to final.
+async fn final_rounds(r: &Running) {
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty(), "{:?}", failed.iter().map(|(a, e)| format!("{}: {}", a, e)).collect::<Vec<_>>());
+	r.produce().await;
+	r.bury().await;
+	for b in built {
+		r.round_state(&b.tx.txid(), RoundState::Final).await;
+	}
+}
+
+/// Rounds run and `m` synced until no coin of `m` waits in one.
+async fn settled(r: &Running, m: &Arca) {
+	for _ in 0..10 {
+		final_rounds(r).await;
+		m.ok(&["sync"]);
+		if !m.ok(&["coins"]).as_array().unwrap().iter().any(|c| c["state"] == "given") {
+			return;
+		}
+	}
+	panic!("coins left given: {}", m.ok(&["coins"]));
 }
 
 /// `b` pays `m` `n` coins of `amount` X.
@@ -521,7 +554,7 @@ async fn a_cut_at_every_safe_point_leaves_every_command_its_wallet() {
 	let kinds = ["pay", "offer", "refresh", "history", "read"];
 	let mut ran: std::collections::BTreeMap<&str, (usize, usize)> = std::collections::BTreeMap::new();
 	let mdir = m.dir.clone();
-	let s = sliced(&m.dir, &json!({}), 1, |k| {
+	let s = sliced(&m.dir, &json!({}), 0, |k| {
 		let kind = kinds[k % kinds.len()];
 		let ok = match kind {
 			"pay" => {
@@ -570,7 +603,7 @@ async fn a_cut_at_every_safe_point_leaves_every_command_its_wallet() {
 	let longest = s.iter().map(|(_, ms)| *ms).max().unwrap();
 	let last = &s.last().unwrap().0;
 	println!("SL3 the pass's participations: {}", last["participations"]);
-	println!("SL3 {} slices of 1 ms, the longest {} ms; commands between them (asked, answered): {:?}", s.len(), longest, ran);
+	println!("SL3 {} slices of 0 ms, the longest {} ms; commands between them (asked, answered): {:?}", s.len(), longest, ran);
 	for (v, _) in &s {
 		assert!(v["error"].is_null(), "{}", v);
 	}
@@ -1152,5 +1185,202 @@ async fn cuts_with_trades_exits_and_a_whole_sync_between() {
 	assert!(m.ok(&["coins"]).as_array().unwrap().iter().all(|c| c["state"] != "given"), "no coin left given");
 	for w in [&m, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// Rows of a long history written into the store at `dir`, `n` of each
+/// kind: payments over Lightning settled, received ones done, and resting
+/// orders done. (The harness has no Lightning gateway; a maker's store
+/// holds hundreds of each, every one a row its sync's steps read.)
+fn history_rows(dir: &Path, n: usize) {
+	let db = rusqlite::Connection::open(dir.join("arca.sqlite")).unwrap();
+	let id = |p: &str, k: usize| format!("{}{:062x}", p, k);
+	let pays: serde_json::Map<String, Value> = (0..n).map(|k| (id("a1", k), json!({"state": "settled"}))).collect();
+	let gets: serde_json::Map<String, Value> = (0..n).map(|k| (id("b1", k), json!({"state": "done"}))).collect();
+	for (k, v) in [("lightning_sends", Value::Object(pays)), ("lightning_receives", Value::Object(gets))] {
+		db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", [k, &v.to_string()]).unwrap();
+	}
+	for k in 0..n {
+		db.execute("INSERT INTO resting_order (id, nonce, terms, amount, credit_nonces, order_leaf, state, created_at) \
+			VALUES (?1, zeroblob(32), '{}', 0, '[]', NULL, 'done', 1)", [id("f1", k)]).unwrap();
+	}
+}
+
+/// A pass of `sync` with `args` on the wallet at `dir`, opened once for the
+/// whole pass as a host keeps it: in one call, or in slices of `budget`
+/// ms (at most `most`). Each call's answer, its time and its cost.
+fn pass_of(dir: &Path, args: &Value, budget: Option<u64>, most: usize) -> Vec<(Value, u64, Value)> {
+	tokio::task::block_in_place(|| {
+		let mut w = Wallet::open(dir).expect("open the wallet");
+		let mut out = vec![];
+		loop {
+			let mut a = args.clone();
+			if let Some(b) = budget {
+				a["budget_ms"] = json!(b);
+			}
+			let t = Instant::now();
+			let v = command::run(&mut w, "sync", &a).expect("a slice answers");
+			let ms = t.elapsed().as_millis() as u64;
+			let more = v["result"]["more"] == json!(true);
+			out.push((v["result"].clone(), ms, json!({"start": v["start"].clone(), "cost": v["cost"].clone()})));
+			if !more || out.len() >= most {
+				return out;
+			}
+		}
+	})
+}
+
+/// What a pass cost: slices, ms in all, the longest slice, and the node's
+/// and the operator's requests in all (start and command).
+fn pass_cost(p: &[(Value, u64, Value)]) -> (usize, u64, u64, u64, u64) {
+	let n = |v: &Value| v.as_u64().unwrap_or(0);
+	let (mut node, mut op) = (0, 0);
+	for (_, _, c) in p {
+		node += n(&c["cost"]["start"]["node"]) + n(&c["cost"]["command"]["node"]);
+		op += n(&c["cost"]["start"]["operator"]) + n(&c["cost"]["command"]["operator"]);
+	}
+	(p.len(), p.iter().map(|x| x.1).sum(), p.iter().map(|x| x.1).max().unwrap_or(0), node, op)
+}
+
+/// Where a pass's time went: by step, summed over its slices (ms, the
+/// node's and the operator's requests, how many slices ran the step).
+fn by_step(p: &[(Value, u64, Value)]) -> std::collections::BTreeMap<String, (u64, u64, u64, u64)> {
+	let mut m: std::collections::BTreeMap<String, (u64, u64, u64, u64)> = std::collections::BTreeMap::new();
+	for (v, _, c) in p {
+		// The last answer's `cost_by_step` is the whole pass's: it is what a
+		// pass in one call answers too.
+		let _ = c;
+		if v["more"] != json!(true) {
+			m.clear();
+		}
+		let steps = v["cost_by_step"].clone();
+		for (k, s) in steps.as_object().cloned().unwrap_or_default() {
+			let e = m.entry(k).or_default();
+			e.0 += s["ms"].as_u64().unwrap_or(0);
+			e.1 += s["node"].as_u64().unwrap_or(0);
+			e.2 += s["operator"].as_u64().unwrap_or(0);
+			e.3 = s["slice"].as_u64().unwrap_or(1);
+		}
+	}
+	m
+}
+
+/// A store as large as a busy maker's: seven assets, about six hundred live
+/// coins (each board refreshed into pieces, a third of those into pieces
+/// again), forty payments received and refreshed, ten refreshes waiting for
+/// a round, payments sent, and two hundred rows each of Lightning payments
+/// sent and received and of resting orders done. A pass in slices of a
+/// second costs about what one call costs, and a slice advances by real
+/// work for its budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_in_slices_on_a_large_store_costs_about_one_call() {
+	let mut r = Running::start_with_assets(5).await;
+	let x = r.x;
+	let assets: Vec<AssetId> = [r.x, r.y].into_iter().chain(r.more.iter().copied()).collect();
+	let url = r.url();
+	let p = Proxy::start(&url);
+	let (m, b) = (Arca::new("SL12 M"), Arca::new("SL12 B"));
+	let t0 = Instant::now();
+	let boards: Vec<(AssetId, u64)> = assets.iter().map(|a| (*a, 6_000_000)).collect();
+	boarded(&mut r, &m, &p.url, &boards).await;
+	boarded(&mut r, &b, &url, &[(x, 3_000_000)]).await;
+	// Each board in fourteen pieces of 400,000 and a reserve; then five of
+	// each asset's pieces in fourteen of 25,000 and a reserve.
+	let split = |m: &Arca, leaves: Vec<String>, piece: u64| {
+		for l in leaves {
+			let args = json!({"leaves": [l], "piece": piece.to_string(), "pieces": 14});
+			let q = library(m, "quote", args.clone()).unwrap();
+			let mut a = args.clone();
+			a["shown"] = q["coins"].clone();
+			let made = library(m, "participate", a).unwrap();
+			assert_eq!(made["participations"][0]["state"], "pending", "{}", made);
+		}
+	};
+	for a in &assets {
+		let board: Vec<String> = live_of(&m, *a, 6_000_000);
+		split(&m, board, 400_000);
+	}
+	settled(&r, &m).await;
+	for a in &assets {
+		// The pieces of about 400,000 (less a fee where the operator asks one).
+		let l: Vec<String> = coins(&m).into_iter()
+			.filter(|(_, c)| c.0 == "live" && c.2 == a.to_string() && (300_000..=400_000).contains(&c.1.trim_matches('"').parse::<u64>().unwrap_or(0)))
+			.map(|(id, _)| id).collect();
+		assert!(l.len() >= 5, "pieces of {}: {}; its coins {:?}", a, l.len(), coins(&m).values().filter(|c| c.2 == a.to_string()).collect::<Vec<_>>());
+		split(&m, l.into_iter().take(5).collect(), 25_000);
+	}
+	settled(&r, &m).await;
+	// Forty payments received, thirty of them refreshed, ten waiting; ten
+	// payments sent.
+	pay_many_of(&mut r, &m, &b, 40, 20_000).await;
+	let received: Vec<String> = m.ok(&["coins"]).as_array().unwrap().iter()
+		.filter(|c| c["state"] == "live" && c["kind"] == "transfer").map(|c| c["leaf_id"].as_str().unwrap().to_string()).collect();
+	for l in received.iter().take(30) {
+		m.ok(&["participate", "--leaf", l]);
+	}
+	settled(&r, &m).await;
+	m.ok(&["sync"]);
+	for _ in 0..10 {
+		pay(&m, &b, x, 1_000);
+	}
+	for l in received.iter().skip(30) {
+		m.ok(&["participate", "--leaf", l]);
+	}
+	history_rows(&m.dir, 200);
+	let cs = coins(&m);
+	let live = cs.values().filter(|c| c.0 == "live").count();
+	let by_asset = assets.iter().map(|a| cs.values().filter(|c| c.0 == "live" && c.2 == a.to_string()).count()).collect::<Vec<_>>();
+	println!("SL12 store built in {} s: {} coins, {} live {:?}, {} participations", t0.elapsed().as_secs(), cs.len(), live, by_asset,
+		participations(&m).len());
+	let mut states: std::collections::BTreeMap<(String, String), usize> = std::collections::BTreeMap::new();
+	for c in cs.values() {
+		*states.entry((c.2.chars().take(6).collect(), c.0.clone())).or_default() += 1;
+	}
+	println!("SL12 coins by asset and state: {:?}", states);
+	assert!(live >= 550, "a large store: {} live coins", live);
+	// The operator over a far link, as in SL1.
+	let delay = std::env::var("SL_OPERATOR_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
+	p.delay(Duration::from_millis(delay));
+	let args = json!({"catch_up": false, "deposits": false});
+	let whole = copy_of(&m, "SL12 whole");
+	let one = pass_of(&whole.dir, &args, None, 1);
+	let (_, one_ms, _, one_node, one_op) = pass_cost(&one);
+	println!("SL12 one call ({} ms a call to the operator): {} ms, node {}, operator {}", delay, one_ms, one_node, one_op);
+	println!("SL12 one call by step: {:?}", by_step(&one));
+	println!("SL12 one call's refresh: {}", one[0].0["cost_by_step"]["refresh"]);
+	println!("SL12 one call's held: {}", one[0].0["cost_by_step"]["held"]);
+	let budgets: Vec<u64> = std::env::var("SL_BUDGETS").ok().map(|v| v.split(',').filter_map(|b| b.parse().ok()).collect())
+		.unwrap_or(vec![1000]);
+	let mut results = vec![];
+	for b in budgets {
+		let c = copy_of(&m, &format!("SL12 sliced {}", b));
+		let most = std::env::var("SL_MOST").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+		let s = pass_of(&c.dir, &args, Some(b), most);
+		let (n, ms, longest, node, op) = pass_cost(&s);
+		let ended = s.last().unwrap().0["more"] != json!(true);
+		println!("SL12 slices of {} ms: {} slices{}, {} ms in all, the longest {} ms, node {}, operator {}; {:.2} times one call", b, n,
+			if ended { "" } else { " (not ended)" }, ms, longest, node, op, ms as f64 / one_ms.max(1) as f64);
+		println!("SL12 slices of {} ms by step (ms, node, operator, the slice it ended in): {:?}", b, by_step(&s));
+		for (k, (v, ms, c)) in s.iter().enumerate().take(4) {
+			println!("SL12 slice {} of {} ms: {} ms, start {}, cost {}, steps {:?}", k + 1, b, ms, c["cost"]["start"], c["cost"]["command"],
+				v["cost_by_step"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default());
+		}
+		results.push((b, n, ms, longest, node, op, ended));
+		let _ = std::fs::remove_dir_all(&c.dir);
+	}
+	p.delay(Duration::ZERO);
+	for w in [&m, &whole, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+	// Bounded against the one call on the same machine at the same moment, so
+	// that a loaded machine slows both alike: the pass ends, costs at most
+	// about twice the one call, asks the operator little more than it, and no
+	// slice holds the wallet for more than a fraction of it.
+	for (b, n, ms, longest, _, op, ended) in results {
+		assert!(ended, "slices of {} ms: the pass ends ({} slices)", b, n);
+		assert!(ms <= 2 * one_ms + 5_000, "slices of {} ms: {} ms in all against {} ms in one call", b, ms, one_ms);
+		assert!(op <= one_op + 2 * n as u64 + 10, "slices of {} ms: {} requests of the operator against {} in one call, in {} slices", b, op,
+			one_op, n);
+		assert!(longest * 4 <= one_ms, "slices of {} ms: a slice held the wallet {} ms, against {} ms in one call", b, longest, one_ms);
 	}
 }
