@@ -500,3 +500,94 @@ async fn own_change_counts_nothing_and_a_received_coin_counts_whole() {
 		let _ = std::fs::remove_dir_all(&k.dir);
 	}
 }
+
+/// The hostile seller with the operator, against a lock between two holders
+/// (`htlc-2`): seller A locks its board to buyer B out of round, and B
+/// holds the lock at once. Then A and a signer that breaks the once-per-salt
+/// rule spend A's board, the lock's input, a second time on the chain: B's
+/// lock is void, and B, which holds the operator's signature under the
+/// board's salt from the lock's record, reads the second one from that spend
+/// and burns the bond in a block. The loss is the received-payment trust a
+/// coin out of round carries, bounded by the bond.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_seller_and_the_operator_spending_a_locks_input_again_burn_the_bond() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let a = Arca::new("bond lock A");
+	let b = Arca::new("bond lock B");
+	let create = ["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1",
+		"--min-exit-delay-units", "1"];
+	a.ok(&create);
+	b.ok(&create);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, r.x, 10_000_000);
+	let s = script(&b.ok(&["address"]));
+	r.pay_to(s, r.x, 2_000_000);
+	r.produce().await;
+	let ab = a.ok(&["board", &x, "2000000"]);
+	let a_board = ab["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the server to credit A's board", || a.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	a.ok(&["sync"]);
+	let w = keypair("bond W");
+	let s_key = keypair("operator");
+	let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
+	let policy = BondPolicy::new(chain, s_key.x_only_public_key().0, w.x_only_public_key().0,
+		RelativeTime::from_units(notice_units()).unwrap()).unwrap();
+	let bond_at = post(&mut r, &policy, &w).await;
+	assert_eq!(b.ok(&["bond"])["state"], "bonded");
+
+	// --- A locks its board to B; B holds it at once ---
+	let preimage = [0x61u8; 32];
+	use bitcoin::hashes::Hash as _;
+	let hash = hex(bitcoin::hashes::sha256::Hash::hash(&preimage).as_ref());
+	let req = b.ok(&["lock", "request", "--asset", &x, "--amount", "600000", "--hash", &hash]);
+	let locked = a.ok(&["lock", "to", &req.to_string(), "--timeout-in", "20000"]);
+	println!("A locks to B: leaf {} timeout {}", locked["leaf_id"], locked["timeout"]);
+	b.ok(&["sync"]);
+	let ready = b.ok(&["lock", "ready", &hash]);
+	assert_eq!(ready["ready"], true, "{}", ready);
+	let lines = b.ok(&["bond-evidence"])["lines"].as_array().unwrap().clone();
+	println!("B's evidence from the lock: {} line(s)", lines.len());
+	let rec = CoinRecord::from_bytes(&unhex(a.ok(&["record", &a_board])["record"].as_str().unwrap())).unwrap();
+	let CoinRecord::Board(board) = rec else { panic!("A's coin is a board") };
+	assert!(lines.iter().any(|l| l["salt"] == hex(&board.salt())), "B holds the operator's signature under the board's salt: {:?}", lines);
+
+	// --- A and the rule-breaking signer spend A's board again ---
+	let bp = board.policy();
+	let board_tx: Transaction = r.rt.client().raw_transaction(&elements::Txid::from_str(ab["txid"].as_str().unwrap()).unwrap()).unwrap();
+	let vout = board_tx.output.iter().position(|o| o.script_pubkey == bp.script_pubkey()).unwrap() as u32;
+	let board_at = OutPoint::new(board_tx.txid(), vout);
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap();
+	let a_key = Keys::new(mnemonic.trim(), 0, 1).unwrap().leaf(&board.owner_nonce).unwrap();
+	let back = ExplicitOutput::new(board.asset, board.value - 5_000, script(&a.ok(&["address"])));
+	let m = bp.message(board.asset, board.value, std::slice::from_ref(&back)).unwrap();
+	let sign = |k: &elements::secp256k1_zkp::Keypair| arca_covenant::sign::sign_digest(k, &m.digest, &[3; 32]);
+	let pair = Pair { operator: sign(&s_key), owner: sign(&a_key) };
+	let theft = collab_tx(&bp, board_at, board.asset, board.value, std::slice::from_ref(&back), &pair, &FeeSource::Reserve).unwrap();
+	let stolen = r.rt.client().send_raw_transaction(&theft.tx).unwrap();
+	r.produce().await;
+	r.bury().await;
+	assert!(height_of(&r, &stolen.to_string()) > 0, "the second spend is in a block");
+	println!("A and the signer spend the lock's input again: {}", stolen);
+
+	// B's lock can no longer come on the chain: its input is spent elsewhere.
+	let why = b.refused(&["lock", "ready", &hash], "spent elsewhere on the chain");
+	println!("B's lock after the theft: {}", why);
+
+	// --- B's watcher burns the bond ---
+	let watched = b.ok(&["watch-bond"]);
+	println!("B's watch-bond: evidence {} conflicts {} slashed {}", watched["evidence"], watched["conflicts"], watched["slashed"]);
+	assert_eq!(watched["evidence"]["from_chain"], 1, "the operator's second signature, read from the chain");
+	assert_eq!(watched["conflicts"][0]["salt"], hex(&board.salt()));
+	let slash = elements::Txid::from_str(watched["slashed"][0]["txid"].as_str().unwrap()).unwrap();
+	r.produce().await;
+	r.bury().await;
+	let tx: Transaction = r.rt.client().raw_transaction(&slash).unwrap();
+	assert!(tx.input.iter().any(|i| i.previous_output == bond_at), "the slash spends the bond");
+	assert_eq!(arca_covenant::issuer::burned(&tx, AssetId::from_str(&x).unwrap()), BOND, "the whole bond burned");
+	println!("the slash {} is in block {}: it burns {} of X", slash, height_of(&r, &slash.to_string()), BOND);
+}

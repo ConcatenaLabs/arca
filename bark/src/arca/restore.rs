@@ -693,6 +693,11 @@ impl Wallet {
 		self.take_served_bases(e);
 		let a = self.checked_as_held(&record, &owner, &nonce, now)?;
 		let (mut state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		// A lock served to its payee is held apart from the spendable coins,
+		// as the mailbox holds it ([`super::lock`]).
+		if record.is_lock() {
+			state = super::lock::LOCK_IN;
+		}
 		let mut row = self.row(&record, &a, state, &note).map_err(|e| e.to_string())?;
 		// A board is live once the operator credits it, whatever the chain
 		// reads ([`Wallet::board_waits`]): a restore or another device's
@@ -2158,7 +2163,7 @@ impl Wallet {
 				// Into a checkpoint with or without its owner's exit: the pair
 				// names the checkpoint's output, so one of the two verifies.
 				let signed = [false, true].into_iter().any(|checkpoint_exit| {
-					let plan = TransferPlan { checkpoint_exit, inputs: vec![(coin.clone(), cpv)], outputs: vec![] };
+					let plan = TransferPlan { locks: vec![], checkpoint_exit, inputs: vec![(coin.clone(), cpv)], outputs: vec![] };
 					plan.checkpoint_message(0).ok().zip(signature(&t["checkpoint_sig"]))
 						.is_some_and(|(m, s)| arca_covenant::sign::verify_digest(&s, &m.digest, &owner))
 				});

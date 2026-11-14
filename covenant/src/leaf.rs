@@ -78,6 +78,7 @@ use crate::channel::{ChannelPolicy, ChannelTerms};
 use crate::claim::LapseTerms;
 use crate::collab::Collab2;
 use crate::htlc::{HtlcPath, HtlcTerms};
+use crate::lock::{LockPolicy, LockTerms};
 use crate::landing::LandingTerms;
 use crate::message::{rebind_message, Chain, CsfsMessage};
 use crate::script::{BuilderExt, ExplicitOutput};
@@ -106,8 +107,24 @@ pub fn leaf_salt(owner_nonce: &[u8; 32], creator_nonce: &[u8; 32]) -> [u8; 32] {
 /// The rebindable two-party script for the constant `k` (`K`, or a
 /// landing leaf's `K ‖ P`), shared by the leaf and the checkpoint.
 pub(crate) fn rebindable_two_party(owner: &XOnlyPublicKey, operator: &XOnlyPublicKey, k: &[u8]) -> Script {
+	rebindable_digest(Builder::new(), k).two_party_csfs(owner, operator).into_script()
+}
+
+/// The rebindable one-key script for the prefix `k`: the message the
+/// two-party script builds, verified under `key` alone with
+/// `OP_CHECKSIGFROMSTACK`. Witness, bottom to top: `<sig> <m>`. A signature
+/// made over it spends the coin wherever it lands, as a pair does
+/// ([`crate::lock`]'s unilateral endings).
+pub(crate) fn rebindable_one_party(key: &XOnlyPublicKey, k: &[u8]) -> Script {
+	rebindable_digest(Builder::new(), k).push_slice(&key.serialize()).push_opcode(OP_CHECKSIGFROMSTACK).into_script()
+}
+
+/// The part every rebindable script shares: from `<m>` on top of the stack,
+/// the digest `SHA256(k ‖ this input's asset and value ‖ m ‖ SHA256(record
+/// 0) ‖ …)` over outputs `0..m-1`, left on top.
+fn rebindable_digest(b: Builder, k: &[u8]) -> Builder {
 	let slot = |b: Builder, j: i64| b.output_record(j).ops(&[OP_SHA256, OP_ROT, OP_SWAP, OP_CAT, OP_SWAP]);
-	let mut b = Builder::new()
+	let mut b = b
 		.push_opcode(OP_SIZE).push_int(1).push_opcode(OP_EQUALVERIFY)
 		.push_opcode(OP_DUP).push_int(1).push_int(MAX_OUTPUTS as i64 + 1).ops(&[OP_WITHIN, OP_VERIFY])
 		.push_opcode(OP_DUP).push_slice(k).current_input_record().ops(&[OP_CAT, OP_SWAP, OP_CAT, OP_SWAP]);
@@ -116,7 +133,7 @@ pub(crate) fn rebindable_two_party(owner: &XOnlyPublicKey, operator: &XOnlyPubli
 		b = b.push_opcode(OP_DUP).push_int(j).ops(&[OP_GREATERTHAN, OP_IF]);
 		b = slot(b, j).push_opcode(OP_ENDIF);
 	}
-	b.ops(&[OP_DROP, OP_SHA256]).two_party_csfs(owner, operator).into_script()
+	b.ops(&[OP_DROP, OP_SHA256])
 }
 
 /// `OP_TUCK <A> OP_CHECKSIGFROMSTACKVERIFY <S> OP_CHECKSIGFROMSTACK`: both
@@ -184,6 +201,9 @@ pub struct LeafPolicy {
 	/// `claim-1`'s lapse: after the distribution's deadline, the leaf pays its
 	/// return script ([`crate::claim`]); `None` otherwise.
 	pub claim: Option<LapseTerms>,
+	/// `htlc-2`'s terms: the leaf is a hash-lock between two holders, the
+	/// owner the payee ([`crate::lock`]); `None` otherwise.
+	pub lock: Option<LockTerms>,
 }
 
 impl LeafPolicy {
@@ -281,6 +301,9 @@ impl LeafPolicy {
 	/// `vtxo-2`: `[[arca/collab-2, data], exit]` ([`crate::collab`]).
 	/// `claim-1` and `vest-1`: `[collab, [exit, lapse]]` ([`crate::claim`]).
 	pub fn taproot(&self) -> TapOutput {
+		if let Some(l) = self.lock_policy() {
+			return l.taproot();
+		}
 		if let Some(c) = self.channel_policy() {
 			return c.taproot(&c.opening());
 		}
@@ -311,7 +334,9 @@ impl LeafPolicy {
 	/// The template it follows: `vtxo-1`, `vtxo-2`, `htlc-1`, `order-3` (or
 	/// `order-2`), `landing-1`, `landing-2`, `channel-1`, `claim-1` or `vest-1`.
 	pub fn template(&self) -> crate::Template {
-		if self.vest().is_some() {
+		if self.lock.is_some() {
+			crate::Template::Htlc2
+		} else if self.vest().is_some() {
 			crate::Template::Vest1
 		} else if self.claim.is_some() {
 			crate::Template::Claim1
@@ -333,6 +358,13 @@ impl LeafPolicy {
 	/// The channel a `channel-1` leaf opens; `None` for any other template.
 	pub fn channel_policy(&self) -> Option<ChannelPolicy> {
 		self.channel.map(|terms| ChannelPolicy {
+			owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay, terms,
+		})
+	}
+
+	/// The hash-lock an `htlc-2` leaf is; `None` for any other template.
+	pub fn lock_policy(&self) -> Option<LockPolicy> {
+		self.lock.map(|terms| LockPolicy {
 			owner: self.owner, operator: self.operator, salt: self.salt, chain: self.chain, exit_delay: self.exit_delay, terms,
 		})
 	}

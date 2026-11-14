@@ -192,7 +192,7 @@ fn fill_body(r: &Running, st: &Value, p: &OrderPolicy, paid: (&Coin, ValidCoin),
 	outputs.extend(plan.rest.clone());
 	outputs.push(ExplicitOutput::new(p.terms().asset_a, taker_value, leaves.0.policy(s, r.chain).script_pubkey()));
 	outputs.push(ExplicitOutput::new(paid.1.asset, change, leaves.1.policy(s, r.chain).script_pubkey()));
-	let tplan = TransferPlan { checkpoint_exit: false, inputs: vec![(paid.1.clone(), kept)], outputs };
+	let tplan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(paid.1.clone(), kept)], outputs };
 	let cp = sign_digest(signer, &tplan.checkpoint_message(0).unwrap().digest, &random32());
 	let re = sign_digest(signer, &tplan.reassignment_message(0).unwrap().digest, &random32());
 	let leaf_json = |asset: elements::AssetId, v: u64, l: &NewLeaf| json!({
@@ -769,7 +769,7 @@ async fn an_exit_fill_goes_only_to_a_maker_that_reads_its_records() {
 		outputs.extend(plan.rest.clone());
 		outputs.push(ExplicitOutput::new(p.terms().asset_a, 300_000, l.policy(xonly(&r.s), r.chain).script_pubkey()));
 		outputs.push(ExplicitOutput::new(v.asset, VALUE - 1 - plan.credit.value - 1, ch.policy(xonly(&r.s), r.chain).script_pubkey()));
-		let tplan = TransferPlan { checkpoint_exit: true, inputs: vec![(v.clone(), VALUE - 1)], outputs: outputs.clone() };
+		let tplan = TransferPlan { locks: vec![], checkpoint_exit: true, inputs: vec![(v.clone(), VALUE - 1)], outputs: outputs.clone() };
 		let order_out = ExplicitOutput::new(p.terms().asset_a, value, p.script_pubkey()).txout();
 		let named = vec![order_out, tplan.checkpoint_output(0).txout()];
 		let cp = sign_digest(key, &tplan.checkpoint_message(0).unwrap().digest, &random32());

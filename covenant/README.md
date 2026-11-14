@@ -44,6 +44,7 @@ sweep, whose pruned forms also come from sequentia-contracts
 | `forfeit` | The round's connector output (`ConnectorPolicy`) | The operator's issuance of the round's connector asset: its signature, and exactly one explicit atom with no reissuance token issued on that input |
 | `checkpoint` | The checkpoint output | The collaborative path with the checkpoint's own salt; the sweep with notice, except for a coin of a batch without one; in a reassignment of several owners' coins, the owner's exit after the coin's own exit delay (`CheckpointPolicy::exit`) |
 | `htlc` | `htlc-1`: a leaf whose exit is a hash-locked pair, for a payment out of the tree over Lightning or into it | The leaf's collaborative path; a claim with the preimage after a relative delay; a refund after the timeout and a relative delay. The operator's delay is the shorter: out of the tree the operator claims and the owner refunds, into it the owner claims and the operator refunds |
+| `lock` | `htlc-2`: a hash-lock between two holders, a payer `P` and a payee `Q`, for a purchase whose other leg settles elsewhere (`LockPolicy`, `LockTerms`) | `[[CLAIM-C, REFUND-C], [CLAIM, REFUND]]`: `Q` and the operator with the preimage at any time; `P` and the operator from the timeout `T`; `Q` alone with the preimage after its exit delay; `P` alone from `T` and after its own delay. No path without a condition ([Hash-locks between two holders](#hash-locks-between-two-holders)) |
 | `landing` | `landing-2` and `landing-1`: the leaf of a supervised asset, whose issuer can freeze holdings by consensus rule | The leaf's collaborative path, its script pushing `K ‖ P` (`K` the salt's own, `P = hash160(L)` the landing program), so its message is `SHA256(K ‖ P ‖ …)` and a pair made for one landing spends only a leaf that lands there, while a double-sign under its salt is evidence to the equivocation bond as for any coin; the landing, which after the exit delay pays P2WPKH of the owner's landing key `L`, explicitly in the leaf's asset, holding at least the value less the fee allowance (`LandingTerms`; 119 bytes with a 512-second delay), where a freeze of the asset binds; `landing_tx` builds it. A `landing-2` leaf's landing pays the output at the spending input's own index (`LandingTerms::own_index`, `script_at_own_index`), so two landings spent together each need an output of their own; a `landing-1` leaf's pays output 0, so two `landing-1` coins of one holder, or one beside a landing at input 0, share one output and one coin's worth leaves past the freeze. `landing-1` is read and spent for the coins built under it; an operator builds `landing-2`. `check_explicit` is the profile's rule for a transaction that moves a supervised asset: every output explicit |
 | `board` | The board output (`board-1`) | The leaf's own collaborative path; the owner's conversion into the leaf of the board's value (a landing leaf for a board of a supervised asset, `landing-2` in board record format 5 or `landing-1` in format 3) |
 | `offboard` | The offboard output a round pays: the destination's value and the margin its unlock takes as its fee (`unlock_margin`, the operator's price and the wallet's alike) | Unlock into the owner's destination, at the input's own index, with the preimage; the operator's reclaim after a delay |
@@ -906,9 +907,130 @@ off-chain and has an exit delay of at least the policy's minimum, so when the
 sender's leaf reaches the chain, the receiver publishes the checkpoint and the
 reassignment within that delay, or a watchtower holding the receiver's record
 does while the receiver is away. It answers at once: a rollback that disconnects
-its answer does not restart the delay of the leaf it answered. Against the sender
-and the operator together it is not safe, before a round: that is the trust the
-specification calls operator-confirmed.
+its answer does not restart the delay of the leaf it answered. A lock between two
+holders (below) is such a coin for both of them: the payee's wallet and watchtower
+answer a stale exit of its lineage whether or not they know the preimage yet, and
+the answer brings the lock's leaf on the chain, where its scripts decide. Against
+the sender and the operator together it is not safe, before a round: that is the
+trust the specification calls operator-confirmed.
+
+## Hash-locks between two holders
+
+`htlc-2` (`lock`, `LockPolicy`) locks a payer's coin for a payee under a hash
+`h` until a timeout `T`, a median time, inside the tree and out of round. It is
+what a seller of an asset held in the tree locks for a buyer who pays in BTC
+on a Bitcoin ark under the same hash: the buyer holds its side once the lock
+is co-signed, with no round between, and the seller's refund rests on script.
+
+| Path | Script | Who, when |
+|---|---|---|
+| CLAIM-C | the hash gate, then the leaf's collaborative path of `Q` and `S` under the leaf's `K` | `Q` and the operator, with the preimage, at any time: the claim out of round |
+| REFUND-C | `<T> CLTV DROP`, then the collaborative path of `P` and `S` under the same `K` | `P` and the operator from `T`: the refund out of round |
+| CLAIM | `<d_Q> CSV DROP`, the hash gate, then `Q` alone over the outputs under `K ‖ 01` | `Q` alone on the chain, `d_Q` (the leaf's exit delay) after the leaf confirms |
+| REFUND | `<T> CLTV DROP <d_P> CSV DROP`, then `P` alone over the outputs under `K ‖ 02` | `P` alone on the chain, from `T` and `d_P` after the leaf confirms |
+
+No path spends the leaf without the preimage before `T`; from `T` on the
+refunds open beside the claims, which stay open with the preimage. On the
+chain, for a leaf confirmed at `C`, CLAIM opens at `C + d_Q` and REFUND at
+`max(T, C + d_P)`. A lock made for a purchase has `d_P ≥ d_Q` plus
+`REFUND_DELAY_MARGIN_UNITS` (eight units, 4,096 s; `LockPolicy::check_delays`), so
+however late the leaf is unrolled, CLAIM opens before REFUND and a payee
+holding the preimage is never beaten to the coin; it costs the payer that
+much longer only on its refund alone on the chain, and only when the leaf
+reaches the chain later than `T − d_P`. The leaf has no collaborative path without a
+condition, as `htlc-1` has: one would let `Q` and the operator take the coin
+without the preimage, and the payer's refund would rest on them. `Q`, `P` and
+`S` are three distinct keys (`LockPolicy::check`), `P` a key the payer draws
+for the lock. Both collaborative paths sign a `vtxo-1` leaf's message under the
+leaf's one `K` (`collab_message`), over the outputs they commit to and not
+over the path. A claim pair and a refund pair of one lock over different
+outputs are therefore two different messages the operator signed under one
+salt, the evidence the bond slashes (`rebind_signed_in` reads either ending
+from the chain, the claim's preimage among its witness items), so the
+operator decides a lock one way only; over the same outputs they are one
+message, and one outcome whichever lands. Its signature of one ending
+beside the other ending's holder pays only the outputs that pair committed
+to.
+
+CLAIM and REFUND are rebindable as the collaborative paths are: the holder
+signs, with `OP_CHECKSIGFROMSTACK`, the message the script builds from the
+coin and outputs `0..m-1` (`claim_message`, `refund_message`), never the
+outpoint. A CLAIM or REFUND signed in advance therefore spends the leaf at
+whatever outpoint its path brings it to on the chain, however the steps above
+it were paid for, and whoever broadcasts it adds a fee coin after the outputs
+it commits to. CLAIM's message starts with `K ‖ 01` and REFUND's with `K ‖ 02`,
+76 + 32m bytes, so neither is ever a collaborative message (75 + 32m bytes)
+under the same `K`: a holder's signature of one path opens no other, and the
+operator signs neither. Measured on the node (`regtest/t29_htlc2_lock.py`):
+the claim together 307 vB and the refund together 290 vB, each into one output
+with a reserve fee; the refund alone 267 vB, signed before the leaf existed,
+into one output with a reserve fee; the claim alone 412 vB, signed before the
+leaf existed, with a fee coin added after signing and its change.
+
+**The purchase.** The buyer `Q` asks the seller `P` to lock, naming its key and
+nonce, only when the operator lists `htlc-2` among its templates, the seller
+offers it, and the lock's value fits the buyer's instant room; otherwise the
+purchase goes through the operator's `htlc-1` receive and a round. `P` locks by
+an ordinary out-of-round transfer into the `htlc-2` leaf and its change. `Q`
+validates the coin as any coin received out of round (the receipt policy, the
+swap's hash, value, key, nonce and timeout) and holds it within its instant
+limit; then it pays the BTC. `P` claims the BTC, which reveals the preimage,
+and posts it to the operator. The buyer's wallet also hands the preimage to
+its own watchtower and posts it to the operator the moment its BTC payment
+settles, so a claim never waits on the seller posting it. `Q` then claims by
+CLAIM-C into a leaf of its own, received lineage until a round. Nothing is
+fronted by the operator, and the Bitcoin side sees only the invoice under `h`.
+
+**Its record and its endings.** An `htlc-2` leaf is made only by a
+reassignment, never in a round: a round's leaf record naming it is refused. The
+coin record's tag 10 carries it (`transfer`): the payee's key, the two nonces,
+the payee's delay and the terms (`h`, `T`, `P` and `d_P`). An input that spends
+it names its path (`LockSpend`): the claim, with the preimage, moves it into a
+checkpoint of `Q`'s; the refund moves it into a checkpoint of `P`'s, by a
+transaction whose lock time is `T`. Neither checkpoint has an exit, and the
+record carries the preimage of a claim, so whoever holds the coin can bring it
+on-chain. A record whose input names a path for a coin that is no lock, none
+for one that is, or a preimage that does not open `h` is refused
+(`TransferError::LockSpend`). On the chain, `LockPolicy::claim_tx` and
+`refund_tx` build CLAIM and REFUND for the payee and the payer to sign.
+
+**The timeout.** `P` sets `T` at least `L_B + ρ + u + d_Q + 3,600` seconds out:
+`L_B` the latest moment the Bitcoin leg can reveal the preimage or return the
+BTC (the invoice's expiry or, later, `(δ + 6) · 1,200` seconds for the Bitcoin
+ark's HTLC-send expiry delta `δ`, and ten minutes), `ρ` an hour to react, `u`
+an hour to unroll the lineage, and `d_Q` the buyer's exit delay. `Q` pays only
+while the leaf's home date, `T − d_Q − u`, lies at least `ρ` past `L_B`. With
+`δ = 258` blocks, `L_B` is 317,400 seconds out, so `T` is 457,800 seconds
+(5.3 days) out at a 36-hour exit delay, and 501,256 seconds (5.8 days) at an
+exit delay of 338 units (48 hours); each block of `δ` adds 20 minutes. That is how long
+a seller's coin stays locked when the buyer never pays: the seller's refund
+opens at `T`. A buyer who asks for locks and never pays costs the seller one
+working coin of the lock's value for that long per open lock; the seller
+bounds it by what it reserves for open swaps.
+
+**The operator's rules.** It co-signs the lock when the outputs name three
+distinct, unused keys, `T` lies within its bounds and before the earliest
+expiry of the coin's batches less `d_P` and the unroll, both delays lie within
+its exit-delay bounds, and the lock's depth leaves room for an ending:
+`1 + max(input hops) + 1 ≤ depth_limit`, so both a claim and a refund can
+follow every lock. It keeps the lock (`hash`, leaf, payee, payer, `T`, state)
+and posts its record to both holders' mailboxes, so a restore from either
+phrase finds it. It co-signs the claim only with a preimage that opens `h`,
+before `T` less a margin, and the refund only from `T`, never both, and keeps
+and serves the preimage once it has it.
+
+**Every order of events.**
+
+| Events | Outcome |
+|---|---|
+| `P` never locks | Nothing is locked; `Q` pays nothing |
+| `P` locks; `Q` never pays, or pays after the invoice expired | The BTC payment fails back to `Q`; `P` refunds from `T` by REFUND-C, or by REFUND on the chain if the operator refuses |
+| `Q` pays; `P` never claims | The Bitcoin HTLC times out and `Q`'s BTC returns; `P` refunds from `T` |
+| `Q` pays; `P` claims | The preimage is out; `Q` claims by CLAIM-C, or, refused, exits on the chain by its home date and claims by CLAIM with `ρ` to spare |
+| `Q` offline after paying | Its watchtower holds the lock's record, a CLAIM `Q` signed in advance, which fits the leaf wherever it lands (the preimage is not under the signature) and the preimage `Q`'s wallet handed it; failing that, it reads the preimage from the operator. From the home date it brings the lock on the chain and claims it. The buyer's own settled BTC payment is where the preimage comes from: the seller can claim the BTC and post nothing, and only the buyer's wallet reads its payment (a BTC swap's `pay_status`), handing the preimage to the watchtower and the operator. With no preimage by the home date, the watchtower does nothing. If the buyer was not paid against, the BTC returns to it. If the seller claimed the BTC and posted nothing, the buyer gets the lock only if its wallet comes back before its home date to read the preimage from its payment and take the lock on the chain. A buyer offline from paying until past its home date, with a seller that posts nothing, loses the lock: that is the limit of a watchtower that cannot read the Bitcoin leg |
+| `P` offline after locking | No deadline binds `P`: from `T` it refunds when it returns, unless `Q` claimed with the preimage `P` revealed. Its watchtower, holding a REFUND `P` signed in advance, refunds on the chain an hour past `T` while the lock is open |
+| `P` and the operator spend `P`'s checkpoint elsewhere before the lock confirms | The lock is void, and a buyer who paid loses up to its value: the trust of any coin received out of round, which the instant limit bounds. The buyer holds the evidence: the operator's signatures in the lock's record (the checkpoint pair and the reassignment pair over `P`'s coin), and its signature in the conflicting spend, which `rebind_signed_in` reads from the chain: two messages under one salt, which SLASH takes as for any coin signed twice |
+| The Bitcoin leg is reorganised | Nothing changes here: the BTC leg is the Bitcoin ark's; a preimage revealed stays revealed. A rollback of the rounds under the lock returns the identical round, and the lock stands or falls with `P`'s coin as any coin received out of round |
 
 ## The accumulator batch
 

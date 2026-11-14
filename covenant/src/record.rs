@@ -67,7 +67,8 @@
 //! u8    format version, 2
 //! u8    template, 1 (vtxo), 3 (htlc), 4 (order), 5 (landing), 7 (channel), 8 (claim) or 9 (vest);
 //!       6 is reserved and reads as ENCLAVE_RETIRED
-//! u8    template version, 1 (vtxo, htlc, landing, channel, claim, vest), 2 (landing), or 2 or 3 (order)
+//! u8    template version, 1 (vtxo, htlc, landing, channel, claim, vest), 2 (landing), or 2 or 3 (order);
+//!       htlc version 2 (`htlc-2`) is made only out of round, and a leaf record naming it is refused
 //! [32]  owner key A                   the vtxo-1 parameters
 //! [32]  owner nonce                   the salt is SHA256("Arca/salt" ‖ owner nonce ‖ operator nonce)
 //! [32]  operator nonce
@@ -222,6 +223,11 @@ pub enum Template {
 	/// `htlc-1`, a leaf whose exit is a hash-locked pair: a claim with a
 	/// preimage and a refund after a timeout ([`crate::htlc`]).
 	Htlc1,
+	/// `htlc-2`, a hash-lock between two holders: the payee claims with the
+	/// preimage, the payer is refunded from a timeout, each with the operator
+	/// out of round or alone on the chain ([`crate::lock`]). A reassignment
+	/// makes it out of round; a leaf record of a round never names it.
+	Htlc2,
 	/// `order-2`, a resting order: the operator fills it with the maker
 	/// offline, and one exit delay after it reaches the chain it lands as
 	/// SeqDEX's own order, `seqdex/order` version 1 ([`crate::order`]). Its
@@ -264,7 +270,7 @@ impl Template {
 	/// Every template this crate knows, in the order of their ids and
 	/// versions. The operator publishes those its rounds make
 	/// (`info.templates`), which leaves out `order-2`.
-	pub const ALL: [Template; 11] = [Template::Vtxo1, Template::Vtxo2, Template::Board1, Template::Htlc1, Template::Order2,
+	pub const ALL: [Template; 12] = [Template::Vtxo1, Template::Vtxo2, Template::Board1, Template::Htlc1, Template::Htlc2, Template::Order2,
 		Template::Order3, Template::Landing1, Template::Landing2, Template::Channel1, Template::Claim1, Template::Vest1];
 
 	/// The template id of `vtxo`.
@@ -292,7 +298,7 @@ impl Template {
 		match self {
 			Template::Vtxo1 => Template::VTXO,
 			Template::Board1 => Template::BOARD,
-			Template::Htlc1 => Template::HTLC,
+			Template::Htlc1 | Template::Htlc2 => Template::HTLC,
 			Template::Order2 | Template::Order3 => Template::ORDER,
 			Template::Landing1 | Template::Landing2 => Template::LANDING,
 			Template::Channel1 => Template::CHANNEL,
@@ -307,7 +313,7 @@ impl Template {
 		match self {
 			Template::Vtxo1 | Template::Board1 | Template::Htlc1 | Template::Landing1 | Template::Channel1
 			| Template::Claim1 | Template::Vest1 => 1,
-			Template::Order2 | Template::Vtxo2 | Template::Landing2 => 2,
+			Template::Order2 | Template::Vtxo2 | Template::Landing2 | Template::Htlc2 => 2,
 			Template::Order3 => 3,
 		}
 	}
@@ -317,7 +323,7 @@ impl Template {
 		match self {
 			Template::Vtxo1 | Template::Vtxo2 => "vtxo",
 			Template::Board1 => "board",
-			Template::Htlc1 => "htlc",
+			Template::Htlc1 | Template::Htlc2 => "htlc",
 			Template::Order2 | Template::Order3 => "order",
 			Template::Landing1 | Template::Landing2 => "landing",
 			Template::Channel1 => "channel",
@@ -333,6 +339,7 @@ impl Template {
 			(Template::VTXO, 2) => Ok(Template::Vtxo2),
 			(Template::BOARD, 1) => Ok(Template::Board1),
 			(Template::HTLC, 1) => Ok(Template::Htlc1),
+			(Template::HTLC, 2) => Ok(Template::Htlc2),
 			(Template::ORDER, 2) => Ok(Template::Order2),
 			(Template::ORDER, 3) => Ok(Template::Order3),
 			(Template::LANDING, 1) => Ok(Template::Landing1),
@@ -374,7 +381,7 @@ impl FromStr for Template {
 		let known: &[Template] = match name {
 			"vtxo" => &[Template::Vtxo1, Template::Vtxo2],
 			"board" => &[Template::Board1],
-			"htlc" => &[Template::Htlc1],
+			"htlc" => &[Template::Htlc1, Template::Htlc2],
 			"order" => &[Template::Order2, Template::Order3],
 			"landing" => &[Template::Landing1, Template::Landing2],
 			"channel" => &[Template::Channel1],
@@ -705,6 +712,7 @@ pub(crate) fn check_template(template: Template, htlc: &Option<HtlcTerms>, order
 		_ => {},
 	}
 	match (template, htlc, order, landing) {
+		(Template::Htlc2, ..) => return Err(RecordError::Template("htlc-2 is made out of round; a leaf record never names it".into())),
 		(Template::Vtxo1 | Template::Vtxo2, None, None, None) => {},
 		(Template::Htlc1, Some(t), None, None) => t.check(exit_delay).map_err(RecordError::Htlc)?,
 		(Template::Order2 | Template::Order3, None, Some(o), None) if o.template() == template => o.check(asset, owner, operator)
@@ -733,7 +741,7 @@ pub(crate) fn leaf_policy(template: Template,
 	-> LeafPolicy
 {
 	let (htlc, order, landing, claim) = template_terms;
-	LeafPolicy {
+	LeafPolicy { lock: None,
 		owner, operator, salt, chain, exit_delay,
 		htlc: *htlc,
 		order: *order,

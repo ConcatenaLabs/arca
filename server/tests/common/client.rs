@@ -185,7 +185,7 @@ pub struct Held {
 /// fresh for this leaf.
 pub fn new_leaf(key: &Keypair) -> (NewLeaf, [u8; 32]) {
 	let nonce = random32();
-	(NewLeaf { v2: false, owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
+	(NewLeaf { lock: None, v2: false, owner: xonly(key), owner_nonce: nonce, creator_nonce: random32(), exit_delay: exit_delay(), htlc: None, landing: None }, nonce)
 }
 
 /// Resolves `held` under `policy` against `bases`, as its owner would before
@@ -207,14 +207,32 @@ pub fn transfer_body(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64
 pub fn transfer_body_with(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId, u64, NewLeaf)], operator: XOnlyPublicKey, chain: Chain,
 	checkpoint_exit: bool) -> Value
 {
-	let plan = TransferPlan { checkpoint_exit,
+	let none: Vec<Option<(arca_covenant::LockSpend, Keypair)>> = vec![None; coins.len()];
+	transfer_body_locks(coins, &none, outputs, operator, chain, checkpoint_exit)
+}
+
+/// [`transfer_body_with`], each input that is an `htlc-2` lock ended by the
+/// path beside it, signed by the key beside it (the payee's for a claim,
+/// the payer's for a refund).
+pub fn transfer_body_locks(coins: &[(&Held, ValidCoin, u64)], locks: &[Option<(arca_covenant::LockSpend, Keypair)>],
+	outputs: &[(AssetId, u64, NewLeaf)], operator: XOnlyPublicKey, chain: Chain, checkpoint_exit: bool) -> Value
+{
+	let plan = TransferPlan { locks: locks.iter().map(|l| l.map(|(s, _)| s)).collect(), checkpoint_exit,
 		inputs: coins.iter().map(|(_, c, v)| (c.clone(), *v)).collect(),
 		outputs: outputs.iter().map(|(a, v, l)| ExplicitOutput::new(*a, *v, l.policy(operator, chain).script_pubkey())).collect(),
 	};
 	let inputs: Vec<Value> = coins.iter().enumerate().map(|(k, (h, _, v))| {
-		let cp: Signature = sign_digest(&h.key, &plan.checkpoint_message(k).unwrap().digest, &random32());
-		let re: Signature = sign_digest(&h.key, &plan.reassignment_message(k).unwrap().digest, &random32());
-		json!({"leaf_id": h.id.to_string(), "checkpoint_value": v.to_string(), "checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())})
+		let key = locks[k].map_or(h.key, |(_, key)| key);
+		let cp: Signature = sign_digest(&key, &plan.checkpoint_message(k).unwrap().digest, &random32());
+		let re: Signature = sign_digest(&key, &plan.reassignment_message(k).unwrap().digest, &random32());
+		let mut i = json!({"leaf_id": h.id.to_string(), "checkpoint_value": v.to_string(), "checkpoint_sig": hex(cp.as_ref()),
+			"reassignment_sig": hex(re.as_ref())});
+		match locks[k].map(|(s, _)| s) {
+			Some(arca_covenant::LockSpend::Claim { preimage }) => i["lock"] = json!({"path": "claim", "preimage": hex(&preimage)}),
+			Some(arca_covenant::LockSpend::Refund) => i["lock"] = json!({"path": "refund"}),
+			None => {},
+		}
+		i
 	}).collect();
 	let outs: Vec<Value> = outputs.iter().map(|(a, v, l)| {
 		let mut o = json!({
@@ -225,6 +243,12 @@ pub fn transfer_body_with(coins: &[(&Held, ValidCoin, u64)], outputs: &[(AssetId
 			o["htlc"] = json!({
 				"direction": h.direction.name(), "payment_hash": hex(&h.payment_hash),
 				"timeout": h.timeout.to_consensus_u32(), "operator_delay_units": h.operator_delay.units(),
+			});
+		}
+		if let Some(t) = &l.lock {
+			o["lock"] = json!({
+				"payment_hash": hex(&t.payment_hash), "timeout": t.timeout.to_consensus_u32(),
+				"refunder": hex(&t.refunder.serialize()), "refund_delay_units": t.refund_delay.units(),
 			});
 		}
 		if let Some(t) = &l.landing {

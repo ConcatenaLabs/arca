@@ -229,7 +229,7 @@ impl FillRequest {
 			let checkpoint_value = u64_of(take(8)?);
 			let checkpoint_sig = Signature::from_slice(take(64)?).map_err(|e| e.to_string())?;
 			let reassignment_sig = Signature::from_slice(take(64)?).map_err(|e| e.to_string())?;
-			inputs.push(InputRequest { leaf_id, checkpoint_value, checkpoint_sig, reassignment_sig, delegation_sig: None });
+			inputs.push(InputRequest { leaf_id, checkpoint_value, checkpoint_sig, reassignment_sig, delegation_sig: None, lock: None });
 		}
 		let m = take(1)?[0] as usize;
 		let mut outputs = Vec::with_capacity(m);
@@ -249,8 +249,8 @@ impl FillRequest {
 				0 => None,
 				_ => Some(u32::from_le_bytes(take(4)?.try_into().expect("4 bytes"))),
 			};
-			outputs.push(OutputRequest {
-				asset, value, leaf: arca_covenant::NewLeaf { v2: false, owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None },
+			outputs.push(OutputRequest { payer_mailbox: None,
+				asset, value, leaf: arca_covenant::NewLeaf { lock: None, v2: false, owner, owner_nonce, creator_nonce, exit_delay, htlc: None, landing: None },
 				mailbox, until,
 			});
 		}
@@ -707,7 +707,7 @@ impl Orders {
 		}
 		let dummy = Signature::from_slice(&[1; 64]).expect("64 bytes");
 		let pair = Pair { operator: dummy, owner: dummy };
-		let sized: Vec<ValidInput> = checked.iter().zip(&req.inputs).map(|(c, i)| ValidInput {
+		let sized: Vec<ValidInput> = checked.iter().zip(&req.inputs).map(|(c, i)| ValidInput { lock: None,
 			coin: c.coin.clone(), checkpoint: c.coin.checkpoint_of(req.checkpoint_exit && c.coin.exit_allowed(), i.checkpoint_value),
 			checkpoint_value: i.checkpoint_value, checkpoint_pair: pair,
 			reassignment_pair: pair,
@@ -735,7 +735,7 @@ impl Orders {
 		}
 
 		// The taker's signatures.
-		let tplan = TransferPlan { checkpoint_exit: req.checkpoint_exit,
+		let tplan = TransferPlan { locks: vec![], checkpoint_exit: req.checkpoint_exit,
 			inputs: checked.iter().zip(&req.inputs).map(|(c, i)| (c.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outputs.clone(),
 		};
@@ -971,7 +971,7 @@ impl Orders {
 			order: oc.record.clone(),
 			signature: fill_sig,
 			partial: plan.rest.is_some(),
-			inputs: checked.iter().zip(&req.inputs).zip(&sigs).enumerate().map(|(k, ((c, i), (cp, re)))| TransferInput { exit: tplan.exit(k),
+			inputs: checked.iter().zip(&req.inputs).zip(&sigs).enumerate().map(|(k, ((c, i), (cp, re)))| TransferInput { lock: None, exit: tplan.exit(k),
 				coin: c.record.clone(), checkpoint_value: i.checkpoint_value,
 				checkpoint: Pair { operator: *cp, owner: i.checkpoint_sig },
 				reassignment: Pair { operator: *re, owner: i.reassignment_sig },

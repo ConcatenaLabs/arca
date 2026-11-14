@@ -250,7 +250,7 @@ impl BoardRecord {
 
 	/// The leaf the board converts into.
 	pub fn leaf(&self) -> LeafPolicy {
-		LeafPolicy {
+		LeafPolicy { lock: None,
 			claim: None,
 			owner: self.owner, operator: self.operator, salt: self.salt(), chain: self.chain, exit_delay: self.exit_delay,
 			htlc: None,

@@ -213,7 +213,7 @@ impl Wallet {
 			None => {
 				let own = self.own_leaf_for("take")?;
 				let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-				let out = Out { asset: b, value: need, leaf: own, mailbox, until: None };
+				let out = Out { payer_mailbox: None, asset: b, value: need, leaf: own, mailbox, until: None };
 				let min_leaf = Self::min_leaf(&info, b)?;
 				let explicit = ExplicitOutput::new(b, need, own.policy(self.operator, self.genesis).script_pubkey());
 				let (inputs, _, change): (Vec<In>, u64, u64) = self.choose_coins(&info, b, need, &explicit, min_leaf)
@@ -221,7 +221,7 @@ impl Wallet {
 				let mut outs = vec![out];
 				if change > 0 {
 					let back = self.own_leaf_for("change")?;
-					outs.push(Out { asset: b, value: change, leaf: back, mailbox, until: None });
+					outs.push(Out { payer_mailbox: None, asset: b, value: change, leaf: back, mailbox, until: None });
 				}
 				let paid = self.transfer_back(&inputs, &outs)?;
 				let leaf = self.store.nonce(&own.owner_nonce)?.and_then(|n| n.leaf_id)

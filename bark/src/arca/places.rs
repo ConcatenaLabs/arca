@@ -287,7 +287,7 @@ pub const INSTANT_COUNTED_CAPS: &str = "instant_counted_caps";
 pub const INSTANT_CAP_SEEN: &str = "instant_cap_seen";
 
 /// The states of a coin that still counts as the wallet's in a place.
-pub const PLACED: [&str; 7] = ["live", "pending", "offered", "sending", "given", "forfeited", "exiting"];
+pub const PLACED: [&str; 8] = ["live", "pending", "offered", "sending", "given", "forfeited", "exiting", super::lock::LOCK_IN];
 
 /// A coin's lineage, back to the rounds and boards it rests on: see the
 /// [module documentation](self). Ordered from the safest.
@@ -380,7 +380,16 @@ impl Wallet {
 	/// Whether `record` names a coin of the wallet's own key.
 	pub(crate) fn is_mine(&self, record: &CoinRecord) -> bool {
 		let (owner, nonce) = owner_of(record);
-		self.keys.leaf_xonly(&nonce).is_ok_and(|k| k == owner)
+		if self.keys.leaf_xonly(&nonce).is_ok_and(|k| k == owner) {
+			return true;
+		}
+		// A lock the wallet made as its payer is its own value by script:
+		// nothing takes it before its timeout but its payee with the preimage,
+		// which the wallet alone reveals, nor after it but the wallet. So what
+		// its refund makes is of the lineage of the coins it locked.
+		super::lock::lock_terms(record).is_some_and(|(t, _, _, creator)| {
+			self.keys.leaf_xonly(&super::lock::refund_nonce(&creator)).is_ok_and(|k| k == t.refunder)
+		})
 	}
 
 	/// The lineage of the coin `record` names: see the [module

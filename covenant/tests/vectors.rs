@@ -140,7 +140,7 @@ impl Ctx {
 
 	fn leaf(&self) -> LeafPolicy {
 		let p = &self.output("leaf")["params"];
-		let leaf = LeafPolicy { claim: None,
+		let leaf = LeafPolicy { lock: None, claim: None,
 			owner: key(&p["owner"]),
 			operator: key(&p["operator"]),
 			salt: h32(&p["salt"]),
@@ -157,7 +157,7 @@ impl Ctx {
 
 	fn board(&self) -> BoardPolicy {
 		let p = &self.output("board")["params"];
-		let leaf = LeafPolicy { claim: None,
+		let leaf = LeafPolicy { lock: None, claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]),
 			htlc: None,
@@ -241,6 +241,24 @@ impl Ctx {
 		cp
 	}
 
+	fn htlc2(&self) -> LockPolicy {
+		let p = &self.output("htlc2")["params"];
+		let l = LockPolicy {
+			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
+			exit_delay: rel(&p["exit_delay"]),
+			terms: LockTerms {
+				payment_hash: h32(&p["payment_hash"]), timeout: time(&p["timeout"]), refunder: key(&p["refunder"]),
+				refund_delay: rel(&p["refund_delay"]),
+			},
+		};
+		l.check().unwrap();
+		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
+		assert_eq!(l.leaf_constant(), h32(&p["K"]));
+		assert_eq!(l.alone_prefix(arca_covenant::lock::ALONE_CLAIM), hex(&p["claim_prefix"]));
+		assert_eq!(l.alone_prefix(arca_covenant::lock::ALONE_REFUND), hex(&p["refund_prefix"]));
+		l
+	}
+
 	fn htlc(&self, name: &str) -> LeafPolicy {
 		let p = &self.output(name)["params"];
 		let direction = HtlcDirection::from_name(p["direction"].as_str().unwrap()).unwrap();
@@ -251,7 +269,7 @@ impl Ctx {
 			timeout: time(&p["timeout"]),
 			operator_delay: rel(&p["operator_delay"]),
 		};
-		let h = LeafPolicy { claim: None,
+		let h = LeafPolicy { lock: None, claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain, exit_delay,
 			htlc: Some(terms),
 			order: None,
@@ -277,7 +295,7 @@ impl Ctx {
 		let landing = arca_covenant::Landing { program, allowance: p["allowance"].as_u64().unwrap(), own_index };
 		let terms = landing.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
 		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
-		let l = LeafPolicy { claim: None,
+		let l = LeafPolicy { lock: None, claim: None,
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]), htlc: None, order: None, landing: Some(terms),
 			channel: None, v2: false,
@@ -299,7 +317,7 @@ impl Ctx {
 		};
 		let terms = lapse.terms(asset(&p["asset"]), p["value"].as_u64().unwrap()).unwrap();
 		assert_eq!(terms.min_value, p["min_value"].as_u64().unwrap());
-		let l = LeafPolicy { claim: Some(terms),
+		let l = LeafPolicy { lock: None, claim: Some(terms),
 			owner: key(&p["owner"]), operator: key(&p["operator"]), salt: h32(&p["salt"]), chain: self.chain,
 			exit_delay: rel(&p["exit_delay"]), htlc: None, order: None, landing: None,
 			channel: None, v2: false,
@@ -376,6 +394,15 @@ impl Ctx {
 					("refund", h.refund_script().unwrap()),
 				]))
 			},
+			"htlc2" => {
+				let l = self.htlc2();
+				(l.taproot(), BTreeMap::from([
+					("claim_c", l.claim_together_script()),
+					("refund_c", l.refund_together_script()),
+					("claim", l.claim_script()),
+					("refund", l.refund_script()),
+				]))
+			},
 			n @ ("landing" | "landing2") => {
 				let l = self.landing_of(n);
 				(l.taproot(), BTreeMap::from([("collab", l.collab_script()), ("landing", l.exit_script())]))
@@ -394,7 +421,7 @@ impl Ctx {
 fn every_output_matches_its_vector() {
 	let ctx = Ctx::load();
 	let outputs = ctx.v["outputs"].as_object().unwrap();
-	assert_eq!(outputs.len(), 24);
+	assert_eq!(outputs.len(), 25);
 	for (name, o) in outputs {
 		let (tap, leaves) = ctx.built(name);
 		let expected = o["leaves"].as_object().unwrap();

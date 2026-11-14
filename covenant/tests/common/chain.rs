@@ -36,7 +36,7 @@ impl Party {
 	pub fn new(label: &str, delay: RelativeTime) -> Party {
 		let key = keypair(&format!("chain {} key", label));
 		Party {
-			leaf: NewLeaf {
+			leaf: NewLeaf { lock: None,
 				owner: xonly(&key), owner_nonce: label32(&format!("chain {} owner nonce", label)),
 				creator_nonce: label32(&format!("chain {} creator nonce", label)), exit_delay: delay,
 				htlc: None,
@@ -131,7 +131,7 @@ pub fn sign_plan(plan: &TransferPlan, owners: &[&Keypair], s: &Keypair) -> Vec<(
 
 pub fn record_for(plan: &TransferPlan, records: &[&CoinRecord], pairs: &[(Pair, Pair)], index: u8, leaf: NewLeaf) -> CoinRecord {
 	CoinRecord::Transfer(Box::new(Transfer {
-		inputs: records.iter().zip(pairs).zip(&plan.inputs).enumerate().map(|(k, ((r, (cp, re)), (_, v)))| TransferInput { exit: plan.exit(k),
+		inputs: records.iter().zip(pairs).zip(&plan.inputs).enumerate().map(|(k, ((r, (cp, re)), (_, v)))| TransferInput { lock: plan.lock(k), exit: plan.exit(k),
 			coin: (*r).clone(), checkpoint_value: *v, checkpoint: *cp, reassignment: *re,
 		}).collect(),
 		outputs: plan.outputs.clone(),
@@ -154,7 +154,7 @@ pub fn hops(b: &Batches, rounds: &[Transaction], policy: &WalletPolicy, t: Media
 	let b1 = Party::new("B1", delay);
 	let a_change = Party::new("A change", delay);
 	let cp1 = a_coin.value - MARGIN;
-	let plan1 = TransferPlan { checkpoint_exit: false,
+	let plan1 = TransferPlan { locks: vec![], checkpoint_exit: false,
 		inputs: vec![(a_coin.clone(), cp1)],
 		outputs: vec![
 			ExplicitOutput::new(x, 7_000_000, b1.leaf.policy(s, chain).script_pubkey()),
@@ -170,7 +170,7 @@ pub fn hops(b: &Batches, rounds: &[Transaction], policy: &WalletPolicy, t: Media
 	let b2 = Party::new("B2", delay);
 	let c2 = Party::new("C2", delay);
 	let (cp_b, cp_c) = (b1_coin.value - MARGIN, c_coin.value - MARGIN);
-	let plan2 = TransferPlan { checkpoint_exit: false,
+	let plan2 = TransferPlan { locks: vec![], checkpoint_exit: false,
 		inputs: vec![(b1_coin.clone(), cp_b), (c_coin.clone(), cp_c)],
 		outputs: vec![
 			ExplicitOutput::new(y, cp_c, b2.leaf.policy(s, chain).script_pubkey()),
@@ -185,7 +185,7 @@ pub fn hops(b: &Batches, rounds: &[Transaction], policy: &WalletPolicy, t: Media
 	// Hop 3: B pays the Y on to D.
 	let d = Party::new("D", delay);
 	let cp3 = b2_coin.value - MARGIN;
-	let plan3 = TransferPlan { checkpoint_exit: false,
+	let plan3 = TransferPlan { locks: vec![], checkpoint_exit: false,
 		inputs: vec![(b2_coin, cp3)],
 		outputs: vec![ExplicitOutput::new(y, cp3 - MARGIN, d.leaf.policy(s, chain).script_pubkey())],
 	};

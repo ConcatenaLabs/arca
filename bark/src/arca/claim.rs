@@ -463,9 +463,9 @@ impl Wallet {
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let probe = ExplicitOutput::new(asset, need, leaf.policy(self.operator, self.genesis).script_pubkey());
 		let (inputs, _margin, change) = self.choose_coins(info, asset, need, &probe, min).map_err(Error::without_figures)?;
-		let mut outs = vec![Out { asset, value: need, leaf: leaf.clone(), mailbox, until: None }];
+		let mut outs = vec![Out { payer_mailbox: None, asset, value: need, leaf: leaf.clone(), mailbox, until: None }];
 		if change > 0 {
-			outs.push(Out { asset, value: change, leaf: self.own_leaf_for("change")?, mailbox, until: None });
+			outs.push(Out { payer_mailbox: None, asset, value: change, leaf: self.own_leaf_for("change")?, mailbox, until: None });
 		}
 		self.transfer_back(&inputs, &outs)?;
 		let id = self.store.nonce(&leaf.owner_nonce)?.and_then(|n| n.leaf_id)

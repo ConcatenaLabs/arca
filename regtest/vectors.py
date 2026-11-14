@@ -138,6 +138,7 @@ S = Key("S")
 OWNERS = [Key("A%d" % i) for i in range(NLEAVES)]
 A = OWNERS[PATH_LEAF]
 B = Key("B")                               # a receiver
+P = Key("P")                               # the payer of an htlc-2 lock
 FEE_KEY = Key("fee")
 
 X_ID = label_hash("asset", "X")            # the batch asset, internal byte order
@@ -155,6 +156,7 @@ SALT_RECV = label_hash("salt", "receiver leaf")
 SALT_CHANGE = label_hash("salt", "change leaf")
 SALT_HTLC = label_hash("salt", "htlc")
 SALT_HTLC_RECEIVE = label_hash("salt", "htlc receive")
+SALT_HTLC2 = label_hash("salt", "htlc-2")
 SALT_BOARD = label_hash("salt", "board")
 SALT_LANDING = label_hash("salt", "landing")
 SALT_LANDING2 = label_hash("salt", "landing 2")
@@ -517,6 +519,15 @@ def generate():
         "operator_delay": HTLC_OPERATOR_DELAY, "claim_delay": DELAY, "refund_delay": HTLC_OPERATOR_DELAY,
         "max_outputs": M_MAX},
         htap_r, [("collab", 1), ("claim", 2), ("refund", 2)])
+    h2tap, _ = htlc2_taptree(A.x, S.x, P.x, SALT_HTLC2, CTAG, sha256(PAYMENT_PREIMAGE), HTLC_TIMEOUT, DELAY,
+                             HTLC_OPERATOR_DELAY)
+    outputs["htlc2"] = output_json("htlc-2, a hash-lock between two holders", {
+        "owner": hx(A.x), "operator": hx(S.x), "refunder": hx(P.x), "salt": hx(SALT_HTLC2), "chain_tag": hx(CTAG),
+        "K": hx(leaf_const(CTAG, SALT_HTLC2, fold=True)), "payment_hash": hx(sha256(PAYMENT_PREIMAGE)),
+        "timeout": HTLC_TIMEOUT, "exit_delay": DELAY, "refund_delay": HTLC_OPERATOR_DELAY, "max_outputs": M_MAX,
+        "claim_prefix": hx(htlc2_alone_prefix(CTAG, SALT_HTLC2, HTLC2_ALONE_CLAIM)),
+        "refund_prefix": hx(htlc2_alone_prefix(CTAG, SALT_HTLC2, HTLC2_ALONE_REFUND))},
+        h2tap, [("claim_c", 2), ("refund_c", 2), ("claim", 2), ("refund", 2)])
     gtap, _ = landing_taptree(A.x, S.x, SALT_LANDING, CTAG, DELAY, LANDING_PROGRAM, X_ID, LEAF_VALUE, LANDING_ALLOWANCE)
     outputs["landing"] = output_json("landing-1, a leaf of a supervised asset", {
         "owner": hx(A.x), "operator": hx(S.x), "salt": hx(SALT_LANDING), "chain_tag": hx(CTAG),
@@ -808,7 +819,7 @@ def generate():
             "genesis_hash": {"internal": hx(GENESIS), "display": GENESIS_DISPLAY},
             "chain_tag": hx(CTAG),
             "nums": hx(NUMS),
-            "keys": dict([("S", S.json()), ("B", B.json())] + [(k.label, k.json()) for k in OWNERS]),
+            "keys": dict([("S", S.json()), ("B", B.json()), ("P", P.json())] + [(k.label, k.json()) for k in OWNERS]),
             "assets": {"X": hx(X_ID), "T": hx(T_ID), "Y": hx(OTHER_ID)},
             "created": CREATED, "expiries": EXPIRIES, "notice": W, "notice_seconds": W_SECONDS,
             "exit_delay": DELAY, "watch_service_time": T_WATCH, "htlc_timeout": HTLC_TIMEOUT,
@@ -821,7 +832,7 @@ def generate():
                              ("checkpoint with landing", hx(SALT_CHECKPOINT_LANDING)), ("receiver leaf", hx(SALT_RECV)),
                              ("change leaf", hx(SALT_CHANGE)), ("board", hx(SALT_BOARD)), ("landing", hx(SALT_LANDING)),
                              ("claim", hx(SALT_CLAIM))]
-                          + [("htlc", hx(SALT_HTLC)), ("htlc receive", hx(SALT_HTLC_RECEIVE))]),
+                          + [("htlc", hx(SALT_HTLC)), ("htlc receive", hx(SALT_HTLC_RECEIVE)), ("htlc-2", hx(SALT_HTLC2))]),
             "preimages": dict([("entry%d" % j, hx(PREIMAGES[j])) for j in range(NLEAVES)]
                               + [("forfeit", hx(FORFEIT_PREIMAGE)), ("payment", hx(PAYMENT_PREIMAGE))]),
             "fee_coin_script_pubkey": hx(FEE_COIN_TAP.scriptPubKey),

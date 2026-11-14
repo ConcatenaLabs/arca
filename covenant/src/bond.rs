@@ -457,22 +457,34 @@ fn cosigned_into(coin: &crate::ValidCoin, out: &mut Vec<Cosigned>) {
 
 /// What `S` signed for input `input` of `tx`, a collaborative spend of a
 /// coin under `salt` (a leaf, a checkpoint, a board, `htlc-1` or `order-2`'s
-/// collaborative path) found on the chain or in a mempool, `prevout` the
-/// output it spends: the message rebuilt from the transaction and the coin,
-/// and the operator's signature, the witness's first item. `None` when the
-/// input is no such spend: its script pushes no `K` of `salt` (nor a
-/// landing leaf's `K ‖ P`), its witness, an annex (BIP341) set aside
-/// ([`crate::witness::without_annex`]), is not
-/// `<sig_S> <sig_A> <m> <script> <control>`, or what it commits to is not
-/// explicit. The caller checks the signature ([`BondPolicy::verify`]). The
-/// signatures commit to no annex, so a spend with one is the same spend.
+/// collaborative path, either ending of an `htlc-2` lock together) found on
+/// the chain or in a mempool, `prevout` the output it spends: the message
+/// rebuilt from the transaction and the coin, and the operator's signature,
+/// the witness's first item. `None` when the input is no such spend: its
+/// script pushes no `K` of `salt` (nor a landing leaf's `K ‖ P`), its
+/// witness, an annex (BIP341) set aside ([`crate::witness::without_annex`]),
+/// is neither `<sig_S> <sig_A> <m> <script> <control>` nor an `htlc-2`
+/// claim's `<sig_S> <sig_Q> <m> <preimage> <script> <control>`, whose script
+/// opens with the hash gate the preimage opens ([`crate::lock`]), or what
+/// it commits to is not explicit. The caller checks the signature
+/// ([`BondPolicy::verify`]). The signatures commit to no annex, so a spend
+/// with one is the same spend.
 pub fn rebind_signed_in(chain: &Chain, salt: &[u8; 32], tx: &Transaction, input: usize, prevout: &TxOut) -> Option<Signed> {
 	let w = crate::witness::without_annex(&tx.input.get(input)?.witness.script_witness);
-	if w.len() != 5 || w[0].len() != 64 || w[1].len() != 64 || w[2].len() != 1 {
+	if !(w.len() == 5 || w.len() == 6) || w[0].len() != 64 || w[1].len() != 64 || w[2].len() != 1 {
 		return None;
 	}
+	let script = Script::from(w[w.len() - 2].clone());
+	// An htlc-2 claim together carries the preimage above `m`, and its
+	// script opens with the gate that preimage opens.
+	if w.len() == 6 {
+		let preimage: [u8; 32] = w[3].as_slice().try_into().ok()?;
+		let gate = crate::entry::hash_gate(elements::script::Builder::new(), &crate::script::sha256(&preimage)).into_script();
+		if !script.as_bytes().starts_with(gate.as_bytes()) {
+			return None;
+		}
+	}
 	let k = chain.leaf_constant(salt);
-	let script = Script::from(w[3].clone());
 	// What the script pushes for its message: `K`, or a landing leaf's
 	// `K ‖ P` ([`Chain::landing_prefix`]), 52 bytes.
 	let k = script.instructions().find_map(|i| match i {

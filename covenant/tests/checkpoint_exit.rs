@@ -140,7 +140,7 @@ fn thief() -> Script {
 /// adversary.
 fn kill(c: &mut Arca, tag: &str, s: &Keypair, ck: &Keypair, cc: &ValidCoin, w_in: &ValidInput, ccp: OutPoint, cpv: u64) {
 	let back = vec![ExplicitOutput::new(cc.asset, cpv - MARGIN, thief())];
-	let bp = TransferPlan { checkpoint_exit: w_in.checkpoint.exit.is_some(), inputs: vec![(cc.clone(), cpv)], outputs: back.clone() };
+	let bp = TransferPlan { locks: vec![], checkpoint_exit: w_in.checkpoint.exit.is_some(), inputs: vec![(cc.clone(), cpv)], outputs: back.clone() };
 	assert_eq!(bp.checkpoint(0), w_in.checkpoint, "the second spend is of the same checkpoint");
 	let d = bp.reassignment_message(0).unwrap().digest;
 	let second = ValidInput { reassignment_pair: Pair { operator: sig(s, &d), owner: sig(ck, &d) }, ..w_in.clone() };
@@ -168,7 +168,7 @@ fn swap_case(c: &mut Arca, tag: &str, s: &Keypair, policy: &WalletPolicy, rounds
 	};
 	let (ay_leaf, cx_leaf, ac_leaf) = (leaf("A gets Y"), leaf("C gets X"), leaf("A change"));
 	let cpv = LEAF - MARGIN;
-	let plan = TransferPlan { checkpoint_exit: true, inputs: vec![(acoin.clone(), cpv), (ccoin.clone(), cpv)],
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: true, inputs: vec![(acoin.clone(), cpv), (ccoin.clone(), cpv)],
 		outputs: vec![ExplicitOutput::new(y, cpv, ay_leaf.policy(xonly(s), c.net.chain).script_pubkey()),
 			ExplicitOutput::new(x, 4_000_000, cx_leaf.policy(xonly(s), c.net.chain).script_pubkey()),
 			ExplicitOutput::new(x, cpv - 4_000_000 - MARGIN, ac_leaf.policy(xonly(s), c.net.chain).script_pubkey())] };
@@ -338,7 +338,7 @@ fn the_exit_flag_is_signed_and_has_one_encoding() {
 	let coin = ab.resolve(&rounds, &strict).unwrap();
 	let (_, to) = party("ob1 flag B", delay());
 	for exit in [false, true] {
-		let plan = TransferPlan { checkpoint_exit: exit, inputs: vec![(coin.clone(), LEAF - MARGIN)],
+		let plan = TransferPlan { locks: vec![], checkpoint_exit: exit, inputs: vec![(coin.clone(), LEAF - MARGIN)],
 			outputs: vec![ExplicitOutput::new(x, LEAF - 2 * MARGIN, to.policy(xonly(&s), c.net.chain).script_pubkey())] };
 		let p = sign_plan(&plan, &[&a], &s);
 		let rec = record_for(&plan, &[&ab], &p, 0, to);
@@ -407,7 +407,7 @@ fn make_fill(order_rec: &CoinRecord, order: &ValidCoin, coin_rec: &CoinRecord, c
 		order: order_rec.clone(),
 		signature: sig(s, &digest),
 		partial: plan.rest.is_some(),
-		inputs: vec![TransferInput { exit: true,
+		inputs: vec![TransferInput { lock: None, exit: true,
 			coin: coin_rec.clone(), checkpoint_value: coin.value,
 			checkpoint: Pair { operator: sig(s, &m_cp.digest), owner: sig(payer, &m_cp.digest) },
 			reassignment: Pair { operator: sig(s, &m_f.digest), owner: sig(payer, &m_f.digest) },
@@ -557,7 +557,7 @@ fn a_dead_fill_leaves_the_makers_order_coin_to_land() {
 	let fs = fee_of(&mut c);
 	let tcp = OutPoint::new(c.net.pass("the taker's checkpoint", &with_coin(t_in.checkpoint_tx(t_at, &fs).unwrap().tx)), 0);
 	let back = vec![ExplicitOutput::new(y, t_in.checkpoint_value - MARGIN, thief())];
-	let bp = TransferPlan { checkpoint_exit: true, inputs: vec![(taker_coin.clone(), t_in.checkpoint_value)], outputs: back.clone() };
+	let bp = TransferPlan { locks: vec![], checkpoint_exit: true, inputs: vec![(taker_coin.clone(), t_in.checkpoint_value)], outputs: back.clone() };
 	let d = bp.reassignment_message(0).unwrap().digest;
 	let second = ValidInput { reassignment_pair: Pair { operator: sig(&s, &d), owner: sig(&taker, &d) }, ..t_in.clone() };
 	c.net.pass("ATTACK taker + operator: a second spend of the taker's checkpoint",
