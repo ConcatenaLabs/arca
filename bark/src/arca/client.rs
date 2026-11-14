@@ -652,13 +652,6 @@ impl ServerClient {
 		let auth = self.auth("leaf_data", key, chain, &mailbox_read_request(after.max(0) as u64, limit))?;
 		self.post("leaf_data", &json!({"auth": auth, "after": after.max(0).to_string(), "limit": limit}))
 	}
-
-	/// Binds each leaf of `bindings` (`{owner, mailbox, proof}`, at most
-	/// [`MAX_BINDINGS`]) to the mailbox key its owner key signed it to: the
-	/// server answers the mailbox each key is bound to.
-	pub fn bind_mailbox(&self, bindings: &[Value]) -> Result<Value, Error> {
-		self.post("bind_mailbox", &json!({"bindings": bindings}))
-	}
 }
 
 #[cfg(test)]

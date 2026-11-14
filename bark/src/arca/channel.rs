@@ -451,7 +451,10 @@ impl Wallet {
 		if !p["pay"].is_null() {
 			body["pay"] = p["pay"].clone();
 		}
-		let answer = match self.server.post("channel_update", &body) {
+		// A hand-over ([`Wallet::hand_over`]), of a state signed now or
+		// kept from a post the operator never answered, after the read of
+		// the channel's state: without a current witness the state stands.
+		let answer = match self.hand_over("channel_update", &body) {
 			Ok(a) => a,
 			// Not answered: the state stands, and is sent again.
 			Err(Error::Unreachable(why)) => return Err(Error::Unreachable(format!("channel {} state {}: {}", leaf_id, s.number, why))),

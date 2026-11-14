@@ -253,13 +253,13 @@ start, and a slice that goes on with the pass takes them as the pass found them
 only on the chain's tip they were taken at and while a witness stands in the
 wallet kept open (ten seconds); any other slice takes them again. Which coins
 hold the operator's capital back is asked once a pass; what the bond leaves
-uncovered is computed again whenever the tip or what the wallet holds out of
-round has changed. So a pass in slices costs about what one call does. In one
-call as in slices, every step that works with the operator, and every signature
-handed to it, starts on a witness that stands; a witness that fails while a
-pass runs ends the pass's work with the operator: nothing more is asked or
-signed, the rest of the pass runs in the same call, and its answer says so
-(`unreachable`). A slice in which the operator cannot be reached
+uncovered is computed again in every slice that reaches the refresh step's
+coins. So a pass in slices costs about what one call does. In one call as in
+slices, every step that works with the operator starts on a witness that
+stands, and every signature handed to it follows [the hand-over
+rule](#hand-over); a witness that fails while a pass runs ends the pass's work
+with the operator: nothing more is asked or handed over, the rest of the pass
+runs in the same call, and its answer says so (`unreachable`). A slice in which the operator cannot be reached
 waits out the witness's patience once and then runs the rest of the pass,
 since without the operator each step after is short. Each slice but the last answers
 `{"more": true, "next", "slice", "cost_by_step", "recheck"}`: `recheck` is
@@ -395,8 +395,8 @@ spends nothing it does not have to on reading the chain again.
   of the operator's signer's record (`start.witness`), unless the command stays
   on the machine and the node or witnesses itself (`hand_over_forfeits`, and
   `sync`: as its pass starts, and again before each step that works with the
-  operator and each signature it hands over once the last is older); a witness
-  stands for ten seconds. A command
+  operator once the last is older, and at each hand-over of a signature, [as
+  below](#hand-over)); a witness stands for ten seconds. A command
   given `"recheck": "coins"` among its arguments runs only the part of the
   re-check that concerns the coins (each coin against the chain and its
   lineage watch), leaving the following of its participations' rounds (a round
@@ -415,6 +415,21 @@ spends nothing it does not have to on reading the chain again.
   then: a payment pays only from coins whose rounds and boards are final now,
   a take reads its order unspent and final, a swap reads the other side's
   coins as a receiver does; fees in what the node accepts now.
+- <a id="hand-over"></a>**When a signature is handed to the operator:** every
+  signature that authorizes a spend, a forfeit, a release or a delegation is
+  handed to the operator only on a witness that is current at that moment:
+  the wallet witnesses again after the last operator wait before the
+  hand-over, and before each repeat of a kept signature (a transfer, a fill, a
+  board, a participation or a release posted again after a post the operator
+  never answered). The other signatures that commit the wallet to something
+  (a plan and its cancellation, a withdrawal or a decline of a participation,
+  a payment asked over Lightning, a claim, a mailbox binding) are handed over
+  the same way. Without a current witness nothing is posted, and what would
+  have been handed over stands for the next `sync`, as a post the operator
+  never answered does. Authentication proofs are outside the rule: the
+  signatures over the operator's challenge that a mailbox read, a leaf read,
+  an owed lookup or a `holding_back` read carries prove which key asks, and
+  authorize nothing but that read's answer.
 - **When a coin is received:** the five checks and the bounds on every leaf of
   its lineage, then it is kept; until then it is not counted.
 

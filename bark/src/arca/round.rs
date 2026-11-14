@@ -1205,7 +1205,7 @@ impl Wallet {
 			sigs.push(hex(sign(&self.coin_key(&row.owner_nonce)?, &digest).as_ref()));
 		}
 		let reason: String = why.chars().take(400).collect();
-		let st = match self.server.post("decline_participation", &json!({"participation_id": pid, "round_txid": round, "signatures": sigs,
+		let st = match self.hand_over("decline_participation", &json!({"participation_id": pid, "round_txid": round, "signatures": sigs,
 			"reason": reason})) {
 			Ok(st) => st,
 			Err(Error::Server { code, .. }) if code == "not_declined" => return Ok(None),
@@ -1239,8 +1239,6 @@ impl Wallet {
 			return Err(Error::Refused(format!("participation {} is {}: only one the operator holds pending is withdrawn", pid, state)));
 		}
 		let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
-		// Signatures for the operator: on a witness that stands now.
-		self.witnessed_now()?;
 		let id = unhex32(pid).map_err(|e| Error::Store(e.to_string()))?;
 		let digest = withdraw_digest(&self.genesis, &self.operator, &id);
 		let mut sigs = vec![];
@@ -1251,7 +1249,7 @@ impl Wallet {
 			sigs.push(hex(sign(&self.coin_key(&row.owner_nonce)?, &digest).as_ref()));
 			leaves.push(l.to_string());
 		}
-		let st = match self.server.post("withdraw_participation", &json!({"participation_id": pid, "signatures": sigs})) {
+		let st = match self.hand_over("withdraw_participation", &json!({"participation_id": pid, "signatures": sigs})) {
 			Ok(st) => st,
 			Err(Error::Server { code, message, .. }) if code == "in_round" => {
 				return Ok(json!({"participation": pid, "state": "in_round", "note": message}));
@@ -1547,13 +1545,9 @@ impl Wallet {
 
 	fn submit(&mut self, pid: &str, body: &Value, given: &[String]) -> Result<Value, Error> {
 		// The participation carries the wallet's signatures, made now or
-		// kept from a post the operator never answered: handed over on a
-		// witness that stands now. Without one it is not handed over, whatever
-		// the witness said: it stands, and `sync` posts it again.
-		self.witnessed_now().map_err(|e| match e {
-			e @ Error::Unreachable(_) => e,
-			e => Error::Unreachable(e.to_string()),
-		})?;
+		// kept from a post the operator never answered: a hand-over
+		// ([`Self::hand_over`]), after the `info` read below. Without a
+		// current witness it stands, and `sync` posts it again.
 		let call = if Self::is_take(body) {
 			"take_order"
 		} else if body.get("claims").is_some() {
@@ -1609,7 +1603,7 @@ impl Wallet {
 			},
 			_ => body,
 		};
-		match self.server.post(call, body) {
+		match self.hand_over(call, body) {
 			Ok(a) => {
 				self.store.set_participation(pid, a["state"].as_str().unwrap_or("pending"), None, None)?;
 				Ok(a)
@@ -2387,6 +2381,13 @@ impl Wallet {
 			Some(f) => f.height().unwrap_or(0).saturating_sub(100),
 			None => self.chain.tip()?.height.saturating_sub(100),
 		};
+		// The forfeits go to the operator below, after the tree's read and
+		// the checks that took what time they took: on a witness current now
+		// ([`Self::hand_over`]), taken before the store marks them signed, so
+		// that without one the participation stands as it was and the next
+		// sync completes it again. Nothing but local work from here to the
+		// post.
+		self.witnessed_now()?;
 		self.store.put_tx(&round_txid.to_string(), &elements::encode::serialize(&round), "round")?;
 		self.store.atomically(|s| {
 			for (l, margin) in &signed {
@@ -2519,13 +2520,11 @@ impl Wallet {
 			return Ok(None);
 		}
 		let later = |code: &str| matches!(code, "release_early" | "round_not_final" | "not_synced" | "internal");
-		// The releases were signed when the participation completed: handed
-		// over on a witness that stands now, and kept for the next sync
-		// otherwise.
-		if let Err(e) = self.witnessed_now() {
-			return Ok(Some(json!({"error": e.to_string()})));
-		}
-		let answer = match self.server.post("release_leaves", &json!({"participation_id": pid, "releases": pending})) {
+		// The releases were signed when the participation completed: each
+		// post of them, the set's and each one's alone after it, is a hand-over
+		// ([`Self::hand_over`]); without a current witness they are kept for
+		// the next sync.
+		let answer = match self.hand_over("release_leaves", &json!({"participation_id": pid, "releases": pending})) {
 			Ok(v) => v["released"].clone(),
 			Err(Error::Server { code, .. }) if later(&code) => return Ok(Some(json!({"waiting": code}))),
 			// Refused for good as a set (one coin of it, say, now under an
@@ -2534,7 +2533,7 @@ impl Wallet {
 			Err(Error::Server { .. }) => {
 				let mut taken = vec![];
 				for r in &pending {
-					match self.server.post("release_leaves", &json!({"participation_id": pid, "releases": [r]})) {
+					match self.hand_over("release_leaves", &json!({"participation_id": pid, "releases": [r]})) {
 						Ok(v) => taken.extend(v["released"].as_array().cloned().unwrap_or_default()),
 						Err(Error::Server { code, .. }) if later(&code) => return Ok(Some(json!({"waiting": code}))),
 						Err(e @ Error::Server { .. }) => taken.push(json!({"leaf_id": r["leaf_id"], "refused": e.to_string()})),

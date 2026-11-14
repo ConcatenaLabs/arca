@@ -44,13 +44,13 @@
 //! process opened afresh among them, takes them again, patiently, after its
 //! re-check. The record of an earlier witness is never good on its own. In
 //! one call as in slices, each step that works with the operator starts on a
-//! witness that stands, taking one again when the last is older, and so does
-//! each signature the wallet hands the operator, made then or kept from a
-//! post the operator never answered ([`Wallet::witnessed_now`]). A witness
-//! that fails while the pass runs ends the pass's work with the operator: no
-//! request leaves after it, nothing is signed for the operator, what is left
-//! of the pass runs to its end in the same call as it does when the operator
-//! cannot be reached, and the pass says why (`unreachable`).
+//! witness that stands, taking one again when the last is older, and every
+//! signature the wallet hands the operator follows the rule stated at
+//! [`Wallet::hand_over`]. A witness that fails while the pass runs ends the
+//! pass's work with the operator: no request leaves after it, nothing is
+//! handed to the operator, what is left of the pass runs to its end in the
+//! same call as it does when the operator cannot be reached, and the pass
+//! says why (`unreachable`).
 //!
 //! What a step asks the operator before its items is kept with the resume
 //! point only where a stale answer can cost the wallet nothing. Which coins
@@ -59,12 +59,10 @@
 //! capital, all it decides is a refresh at no fee, which the operator takes
 //! for nothing or refuses, and a tip that moves every few seconds would
 //! otherwise have the step ask it again before it ever reached its coins.
-//! What the bond leaves uncovered decides a refresh the wallet may pay for,
-//! and comes from the chain and the store: it is kept only while the tip,
-//! what the wallet holds out of round and whether it ever saw a bond are
-//! what they were, and computed again otherwise
-//! ([`Wallet::uncovered_in_pass`]). Everything else a slice decides on it
-//! reads when it runs.
+//! What the bond leaves uncovered decides a refresh the wallet may pay for:
+//! it is never kept, and computed again in each slice that reaches the
+//! step's coins ([`Wallet::uncovered`]). Everything else a slice decides on
+//! it reads when it runs.
 //!
 //! The budget counts the pass's work only: what a slice does before its
 //! first step (the command's start, the re-check) and the witness's own time

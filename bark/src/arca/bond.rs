@@ -606,37 +606,6 @@ impl Wallet {
 			.map(|c| c.leaf_id).collect())
 	}
 
-	/// [`Self::uncovered`] for a step of `sync`: in a pass in slices, the
-	/// answer the pass computed is kept ([`Wallet::slice_memo`]) only while
-	/// what it was computed from stands: the chain's tip, which the bond's
-	/// standing is read at, and in the store what the wallet holds out of
-	/// round and whether it ever saw a bond. A slice on another tip (after
-	/// its whole re-check), or after a command that changed what the wallet
-	/// holds out of round, computes it again, so a bond that has come to
-	/// cover the wallet's coins has none of them refreshed for a fee on an
-	/// older answer. The operator's `info` and the node's rates are as they
-	/// were read when it was computed, as in one call of `sync`, which reads
-	/// them once for the whole step. Outside a slice nothing is kept.
-	pub(crate) fn uncovered_in_pass(&self) -> Result<Vec<String>, Error> {
-		let held = self.out_of_round()?;
-		if held.is_empty() {
-			return Ok(vec![]);
-		}
-		let at = json!({
-			"tip": self.chain.tip()?.hash.to_string(),
-			"held": held.iter().map(|(a, v)| (a.to_string(), json!(v.to_string()))).collect::<serde_json::Map<String, Value>>(),
-			"bond_seen": self.store.meta(BOND_SEEN)?.is_some(),
-		});
-		if let Some(kept) = self.slice_memo("uncovered").filter(|k| k["at"] == at) {
-			if let Ok(coins) = serde_json::from_value::<Vec<String>>(kept["coins"].clone()) {
-				return Ok(coins);
-			}
-		}
-		let coins = self.uncovered()?;
-		self.slice_memo_keep("uncovered", json!({"at": at, "coins": coins}));
-		Ok(coins)
-	}
-
 	/// `arca bond`: the operator's bond as this wallet checks it, and what
 	/// the wallet holds out of round against it.
 	pub fn bond(&self) -> Result<Value, Error> {

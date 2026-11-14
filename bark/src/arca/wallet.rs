@@ -1083,10 +1083,9 @@ impl Wallet {
 				let (mailbox, proof) = self.binding(&key)?;
 				bindings.push(json!({"owner": hex(&key.x_only_public_key().0.serialize()), "mailbox": mailbox, "proof": proof}));
 			}
-			// Each binding is signed by its coin's key: handed over on a
-			// witness that stands now.
-			self.witnessed_now()?;
-			let answer = self.server.bind_mailbox(&bindings)?;
+			// Each binding is signed by its coin's key: a hand-over
+			// ([`Self::hand_over`]).
+			let answer = self.hand_over("bind_mailbox", &json!({"bindings": bindings}))?;
 			let shown = answer["bound"].as_array().cloned().unwrap_or_default();
 			for (c, b) in chunk.iter().zip(bindings.iter()) {
 				let at = shown.iter().find(|x| x["owner"] == b["owner"]).map(|x| x["mailbox"].clone()).unwrap_or(Value::Null);
@@ -1552,7 +1551,8 @@ impl Wallet {
 	/// point that takes a coin or signs a spend through the operator runs
 	/// first (`send`, `participate`, `board`, the swap calls, `sync`'s work
 	/// with the server, `mailbox`), so a client built on the library cannot
-	/// forget it. A witness that fails is an unreachable server; one that
+	/// forget it, and what every hand-over of a signature runs last
+	/// ([`Self::hand_over`]). A witness that fails is an unreachable server; one that
 	/// finds a rollback refuses, and the wallet's next [`Self::witness`] takes
 	/// the coins resting on what was lost on the chain.
 	pub(crate) fn witnessed_now(&self) -> Result<(), Error> {
@@ -1566,6 +1566,37 @@ impl Wallet {
 			self.pass_lost(e);
 		}
 		v
+	}
+
+	/// Posts `body` to the operator's `call` on a witness that is current
+	/// now ([`Self::witnessed_now`]), else posts nothing and fails as a
+	/// server not reached ([`Error::Unreachable`]), whatever the witness
+	/// said, so the caller keeps what it would hand over as it keeps a post
+	/// the operator never answered.
+	///
+	/// **The rule.** Every signature that authorizes a spend, a forfeit, a
+	/// release or a delegation is handed to the operator only on a witness
+	/// that is current at that moment: the wallet witnesses again after the
+	/// last operator wait before the hand-over, and before each repeat of a
+	/// kept signature. Every such post goes through here, and so do the other
+	/// signatures that commit the wallet to something (a plan, its
+	/// cancellation, a withdrawal or a decline of a participation, a board,
+	/// a payment asked over Lightning, a claim, a mailbox binding). The one
+	/// site that must check before its own local work, the forfeits (before
+	/// the store marks them signed), runs [`Self::witnessed_now`] itself,
+	/// with nothing but local work between it and the post. Authentication
+	/// proofs are outside the rule:
+	/// the challenge signatures ([`super::client::ServerClient::auth`],
+	/// `holding_back`'s one proof over its calls, the mailbox and leaf
+	/// reads, the owed lookup) prove which key asks for a read and authorize
+	/// none of those; the operator can do nothing with one but answer that
+	/// read.
+	pub(crate) fn hand_over(&self, call: &str, body: &Value) -> Result<Value, Error> {
+		self.witnessed_now().map_err(|e| match e {
+			e @ Error::Unreachable(_) => e,
+			e => Error::Unreachable(e.to_string()),
+		})?;
+		self.server.post(call, body)
 	}
 
 	/// A witness failed while a pass of `sync` worked with the operator on
@@ -2159,11 +2190,6 @@ impl Wallet {
 		// alone keeps its node's fronted value from coming back: on a batch
 		// without a sweep nothing else ever asks for its refresh, and the
 		// operator's capital stays out until the batch's horizon.
-		// What the bond leaves uncovered: a coin it names is refreshed at
-		// once through the ordinary quote, which may ask a fee, so a pass in
-		// slices keeps the answer only while everything it is computed from
-		// on the chain and in the store stands ([`Self::uncovered_in_pass`]).
-		let mut uncovered = self.uncovered_in_pass()?;
 		// What the operator names (`holding_back`, once for every 64 coins,
 		// each call an item a slice may stop after): asked once a pass and
 		// kept for it whatever the tip (`slice_memo`), so that a pass in
@@ -2181,6 +2207,16 @@ impl Wallet {
 		if self.slice_cut() {
 			return Ok(vec![]);
 		}
+		// What the bond leaves uncovered: a coin it names is refreshed at
+		// once through the ordinary quote, which may ask a fee. Computed in
+		// every slice that reaches the step's coins, never kept: it depends
+		// on the bond's standing, the operator's terms and budgets and the
+		// node's rates as well as on the store, and costs a few milliseconds
+		// of reads, and one read of the operator's `info` when the one the
+		// client keeps is older than five seconds ([`Self::uncovered`]).
+		// After `holding_back`, so a slice that stops inside the operator's
+		// answer pays nothing for it.
+		let mut uncovered = self.uncovered()?;
 		uncovered.extend(named.iter().cloned());
 		// The named coins due, by asset, each with whether the six-hour wait
 		// holds it.
@@ -4604,7 +4640,7 @@ impl Wallet {
 		// The registration, and the board's broadcast after it: on a witness
 		// that stands now. Without one the registration stands, to be posted
 		// again, as when the server's answer is not seen.
-		match self.witnessed_now().and_then(|_| self.server.post("register_board", body)) {
+		match self.hand_over("register_board", body) {
 			Ok(status) => {
 				self.store.set_board_request(leaf_id, "done", &status.to_string())?;
 				if status["state"].as_str() == Some("lost") {
