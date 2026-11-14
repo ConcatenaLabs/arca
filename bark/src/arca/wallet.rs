@@ -2109,22 +2109,22 @@ impl Wallet {
 		// alone keeps its node's fronted value from coming back: on a batch
 		// without a sweep nothing else ever asks for its refresh, and the
 		// operator's capital stays out until the batch's horizon.
-		// What the bond leaves uncovered and what the operator names: asked
-		// once a pass (`holding_back` once for every 64 coins, each call an
-		// item a slice may stop after), so that a pass in slices does not ask
-		// them again in each slice that goes on with this step. Kept for the
-		// pass whatever the tip (`slice_memo`): a stale answer asks a free
-		// refresh of a coin no longer named, which the quote at no fee
-		// refuses before anything is signed, or leaves a newly named one to
-		// the next pass.
-		let mut uncovered = match self.slice_memo("uncovered").and_then(|v| serde_json::from_value::<Vec<String>>(v).ok()) {
-			Some(kept) => kept,
-			None => {
-				let u = self.uncovered()?;
-				self.slice_memo_keep("uncovered", json!(u));
-				u
-			},
-		};
+		// What the bond leaves uncovered: a coin it names is refreshed at
+		// once through the ordinary quote, which may ask a fee, so a pass in
+		// slices keeps the answer only while everything it is computed from
+		// on the chain and in the store stands ([`Self::uncovered_in_pass`]).
+		let mut uncovered = self.uncovered_in_pass()?;
+		// What the operator names (`holding_back`, once for every 64 coins,
+		// each call an item a slice may stop after): asked once a pass and
+		// kept for it whatever the tip (`slice_memo`), so that a pass in
+		// slices does not ask it again in each slice that goes on with this
+		// step. It is the operator's word about its own capital, not the
+		// chain's, and all a stale one can do is ask the refresh at no fee
+		// ([`Self::named_refresh_quote`]) of a coin no longer named: the
+		// participation the wallet signs there pays no fee whatever the
+		// schedule says, so the operator takes it for nothing or refuses it,
+		// and the coin stays live. A coin newly named waits for the next
+		// pass. Nothing else is decided on it.
 		let named = self.holding_back()?;
 		// A slice that stopped inside the operator's answer goes on with it
 		// in the next.
