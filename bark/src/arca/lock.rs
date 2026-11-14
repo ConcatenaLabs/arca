@@ -324,8 +324,13 @@ impl Wallet {
 		let to = Out { asset, value, leaf, mailbox, until: None, payer_mailbox: Some(own_mailbox) };
 		let to_out = to.explicit(self);
 		let reads = super::pay::Reads::of(request);
-		// Only coins whose lock can be followed by its claim and its refund.
+		// Only coins whose lock can be followed by its claim and its refund,
+		// taken in the order a swap's and a Lightning lock's coins are
+		// (`fit_order`, the smallest that pays alone first), and each
+		// outliving the lock: its batches not swept before the timeout, the
+		// payer's delay and the unroll have passed, as the operator requires.
 		self.locking.set(true);
+		let was = self.lock_until.replace(Some(super::pay::lock_outlives(timeout, refund_delay)));
 		let chosen = self.choose(&info, asset, value, std::slice::from_ref(&to_out), true, min, 0, true, reads, spend);
 		self.locking.set(false);
 		// Refused only for the depth bound: said so, rather than what the
@@ -343,6 +348,7 @@ impl Wallet {
 			},
 			ok => ok,
 		};
+		self.lock_until.set(was);
 		let (inputs, margin, change) = chosen?;
 		self.store.put_nonce(&rn, &refunder.serialize(), "lock refund")?;
 		let mut outs = vec![to];
