@@ -1055,3 +1055,176 @@ async fn a_rolled_back_lock_row_still_signs_one_ending() {
 	assert!(v.to_string().contains("double_spend") || v.to_string().contains("already_signed"), "refused by the signer's record: {}", v);
 }
 
+
+/// A lock's watchtower, the operator down, answers a sender up the lock's
+/// lineage that takes its coin on the chain alone: it brings the lock's leaf
+/// and, holding the preimage, claims it before the timeout. With `fee_rise`
+/// the node's floor in the asset rose after the endings were signed, so no
+/// ending's own margin pays it and the claim needs a fee coin of the tower's.
+async fn tower_answers_a_lock_on_the_chain(wallet_present: bool, pre_known: bool, two_hops: bool, fee_rise: bool) {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let tag = format!("{}{}{}{}", if wallet_present { "w" } else { "t" }, if pre_known { "k" } else { "u" }, if two_hops { "2" } else { "1" },
+		if fee_rise { "f" } else { "" });
+	let s0 = Arca::new(&format!("lockch S0 {}", tag));
+	let p = Arca::new(&format!("lockch P {}", tag));
+	let q = Arca::new(&format!("lockch Q {}", tag));
+	for w in [&s0, &p, &q] {
+		w.ok(&create_args(&url, &node));
+	}
+	let owner = if two_hops { &s0 } else { &p };
+	let s = script(&owner.ok(&["address"]));
+	r.pay_to(s, r.x, 5_000_000);
+	let s = script(&q.ok(&["address"]));
+	r.pay_to(s, r.x, 2_000_000);
+	r.produce().await;
+	let ab = owner.ok(&["board", &x, "2000000"]);
+	let board_id = ab["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || owner.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	owner.ok(&["sync"]);
+	if two_hops {
+		let req = p.ok(&["receive", "--asset", &x, "--amount", "1000000"]);
+		s0.ok(&["send", req["request"].as_str().unwrap(), "--amount", "1000000", "--asset", &x]);
+		p.ok(&["sync"]);
+		println!("lock[{}] P holds live {} received out of round from S0's board", tag, held(&p, &x, "live"));
+	}
+	let tq = Tower::new(&format!("lockch TQ {}", tag), &url, &node);
+	let s = script(&tq.wallet.ok(&["address"]));
+	r.pay_to(s, r.x, 2_000_000);
+	r.produce().await;
+	r.bury().await;
+	q.ok(&["watchtowers", &tq.url]);
+	let pre = [0x6fu8; 32];
+	let h = hex(&sha256::Hash::hash(&pre).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "600000", "--hash", &h]);
+	let l = p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "30000"]);
+	let t = num(&l["timeout"]) as u32;
+	let lock_leaf = l["leaf_id"].as_str().unwrap().to_string();
+	q.ok(&["sync"]);
+	let ready = q.ok(&["lock", "ready", &h]);
+	assert_eq!(ready["ready"], true, "{}", ready);
+	println!("lock[{}] lock ready: home_in {} (T - now = {})", tag, ready["home_in"], t - common::node::median_time(&r.rt));
+	assert_eq!(tq.lock_deposit(&h)["state"], "held");
+	r.server.stop();
+	if pre_known {
+		let _ = q.run(&["lock", "preimage", &h, &hex(&pre)]);
+		assert_eq!(tq.lock_deposit(&h)["lock"]["preimage_known"], true);
+	}
+	let q = if wallet_present { Some(q) } else { drop(q); None };
+
+	let (conv_id, board, key, genesis, wsh) = convert_board(&mut r, owner, &board_id, ab["txid"].as_str().unwrap()).await;
+	let delay = board.leaf().exit_delay.seconds();
+	let converted_at = common::node::median_time(&r.rt);
+	if fee_rise {
+		// The node's floor in X rises twentyfold after the endings were signed:
+		// no ending's own margin pays it, nor a step's reserve.
+		let rates: Value = r.rt.client().call("getfeeexchangerates", &[]).unwrap();
+		let cur = rates[&x].as_u64().unwrap();
+		common::node::list_fee_asset(&r.rt, r.x, (cur / 20).max(1));
+		println!("lock[{}] X's rate {} -> {}: fees in X cost twenty times the atoms", tag, cur, (cur / 20).max(1));
+	}
+	let mut answered = false;
+	for k in 0..10 {
+		if let Some(q) = &q {
+			let (ok, s) = q.run(&["sync"]);
+			println!("lock[{}] Q's sync #{} ok={}: exits {} locks {}", tag, k, ok, s["exits"], s["locks"]);
+		} else {
+			tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+			println!("lock[{}] TQ #{}: {} {}", tag, k, tq.lock_deposit(&h)["state"], tq.lock_deposit(&h)["note"]);
+		}
+		r.produce().await;
+		if !unspent(&r, &conv_id, 0) {
+			answered = true;
+			break;
+		}
+	}
+	println!("lock[{}] answered={} within {} s of the conversion (the leaf's delay is {} s)", tag, answered,
+		common::node::median_time(&r.rt) - converted_at, delay);
+	assert!(answered, "nobody answered");
+	assert!((common::node::median_time(&r.rt) - converted_at) < delay as u32, "the answer came inside the leaf's delay");
+	// The sender's own exit, past its delay: refused because its leaf is spent, and for no other reason.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, delay as u32 + 700));
+	r.produce().await;
+	r.bury().await;
+	let back = arca_covenant::ExplicitOutput::new(board.asset, board.value - 5_000, wsh.clone());
+	let ks = board.leaf().exit_tx(elements::OutPoint::new(conv_id, 0), board.asset, board.value, std::slice::from_ref(&back),
+		&arca_covenant::FeeSource::Reserve).unwrap();
+	let sig = arca_covenant::sign::sign_digest(&key, &ks.sighash(genesis).unwrap(), &[10; 32]);
+	let exit = ks.finish(vec![sig.as_ref().to_vec()]).tx;
+	let sent = r.rt.client().send_raw_transaction(&exit).map(|t| t.to_string()).map_err(|e| e.to_string());
+	println!("lock[{}] the sender's exit of its leaf: {:?}", tag, sent);
+	let why = sent.expect_err("the sender's exit spent an answered leaf");
+	assert!(why.contains("missingorspent") || why.contains("missing-inputs") || why.contains("conflict"), "refused as spent: {}", why);
+
+	// Where the lock's leaf is now, and what becomes of it.
+	let start = std::time::Instant::now();
+	let mut q_claim: Option<String> = None;
+	loop {
+		let d = tq.lock_deposit(&h);
+		let row = q.as_ref().map(|q| q.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == lock_leaf.as_str()).cloned().unwrap_or(Value::Null));
+		println!("lock[{}] median {} (T {}) | TQ {} {} | Q's coin {:?}", tag, common::node::median_time(&r.rt), t, d["state"], d["note"],
+			row.as_ref().map(|c| c["state"].clone()));
+		if !pre_known {
+			// Without the preimage nothing more may happen: the leaf waits on the chain.
+			let on = d["state"] == "on_chain" || d["state"] == "brought" || row.as_ref().is_some_and(|c| c["state"] == "exiting");
+			assert!(on, "the lock's leaf waits on the chain: {} {:?}", d, row);
+			break;
+		}
+		let claimed_by_tower = d["broadcast"].as_array().and_then(|a| a.iter().find(|t| t["ending"] == "CLAIM")).cloned();
+		if let Some(c) = &claimed_by_tower {
+			let ctx = tx(&r, c["txid"].as_str().unwrap());
+			if confirmations(&r, &ctx.txid()) >= 1 {
+				assert_eq!(ctx.input[0].witness.script_witness[2], pre.to_vec());
+				println!("lock[{}] the watchtower's CLAIM {} is in a block at median {} (T {}), {} inputs, pays {:?}", tag, ctx.txid(),
+					common::node::median_time(&r.rt), t, ctx.input.len(), ctx.output[0].value.explicit());
+				assert!(common::node::median_time(&r.rt) < t, "claimed before the timeout");
+				if fee_rise {
+					assert!(ctx.input.len() >= 2, "the watchtower added a fee coin of its own after the signing");
+				}
+				break;
+			}
+		}
+		if let Some(q) = &q {
+			let (_, s) = q.run(&["sync"]);
+			println!("lock[{}] Q's sync exits {} locks {}", tag, s["exits"], s["locks"]);
+			if let Some(txid) = lock_claim_of(&s, &lock_leaf).or(q_claim.clone()) {
+				q_claim = Some(txid.clone());
+				let ctx = tx(&r, &txid);
+				if confirmations(&r, &ctx.txid()) >= 1 {
+					assert_eq!(ctx.input[0].witness.script_witness[2], pre.to_vec());
+					assert!(common::node::median_time(&r.rt) < t, "claimed before the timeout");
+					println!("lock[{}] Q's CLAIM {} in a block at median {} (T {}), by syncs alone", tag, ctx.txid(), common::node::median_time(&r.rt), t);
+					break;
+				}
+			}
+		}
+		assert!(start.elapsed() < std::time::Duration::from_secs(600) && common::node::median_time(&r.rt) < t, "the lock was not claimed before T");
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 300));
+		r.produce().await;
+		r.bury().await;
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_tower_adds_a_fee_coin_to_its_claim_after_the_floor_rose() { tower_answers_a_lock_on_the_chain(false, true, false, true).await; }
+
+/// The claim txid of `leaf`'s exit, wherever a sync's answer names it.
+fn lock_claim_of(v: &Value, leaf: &str) -> Option<String> {
+	match v {
+		Value::Object(o) => {
+			if o.get("leaf_id").and_then(|l| l.as_str()) == Some(leaf) {
+				if let Some(t) = o.get("claim").and_then(|c| c["txid"].as_str().or(c.as_str())) {
+					return Some(t.to_string());
+				}
+			}
+			o.values().find_map(|x| lock_claim_of(x, leaf))
+		},
+		Value::Array(a) => a.iter().find_map(|x| lock_claim_of(x, leaf)),
+		_ => None,
+	}
+}

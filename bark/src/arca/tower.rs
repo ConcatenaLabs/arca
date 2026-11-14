@@ -1427,6 +1427,7 @@ impl Wallet {
 		if chosen.is_none() {
 			if let Some((out, sig)) = endings.last() {
 				let mut payer = Payer::new(None);
+				payer.moved = Some(coin.asset);
 				match self.with_fee(&mut payer, &|f| build(*out, sig, f)) {
 					Ok(u) => chosen = Some(u),
 					Err(e) => why = format!("{}; with a fee coin of its own: {}", why, e),
