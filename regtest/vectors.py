@@ -524,7 +524,9 @@ def generate():
     outputs["htlc2"] = output_json("htlc-2, a hash-lock between two holders", {
         "owner": hx(A.x), "operator": hx(S.x), "refunder": hx(P.x), "salt": hx(SALT_HTLC2), "chain_tag": hx(CTAG),
         "K": hx(leaf_const(CTAG, SALT_HTLC2, fold=True)), "payment_hash": hx(sha256(PAYMENT_PREIMAGE)),
-        "timeout": HTLC_TIMEOUT, "exit_delay": DELAY, "refund_delay": HTLC_OPERATOR_DELAY, "max_outputs": M_MAX},
+        "timeout": HTLC_TIMEOUT, "exit_delay": DELAY, "refund_delay": HTLC_OPERATOR_DELAY, "max_outputs": M_MAX,
+        "claim_prefix": hx(htlc2_alone_prefix(CTAG, SALT_HTLC2, HTLC2_ALONE_CLAIM)),
+        "refund_prefix": hx(htlc2_alone_prefix(CTAG, SALT_HTLC2, HTLC2_ALONE_REFUND))},
         h2tap, [("claim_c", 2), ("refund_c", 2), ("claim", 2), ("refund", 2)])
     gtap, _ = landing_taptree(A.x, S.x, SALT_LANDING, CTAG, DELAY, LANDING_PROGRAM, X_ID, LEAF_VALUE, LANDING_ALLOWANCE)
     outputs["landing"] = output_json("landing-1, a leaf of a supervised asset", {

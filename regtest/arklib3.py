@@ -109,6 +109,27 @@ def collab3_loop(a_x, s_x, salt, ctag, M=M_MAX, fold=False, const=None):
     return CScript(s)
 
 
+def rebind1_loop(key_x, const, M=M_MAX):
+    """collab3_loop's message, verified under one key alone: the unilateral
+    endings of htlc-2. Witness (bottom -> top): <sig> <m>. `const` is the
+    whole prefix (htlc-2's K || 01 or K || 02, htlc2_alone_prefix)."""
+    s = list(collab3_loop(key_x, key_x, None, None, M=M, const=const))
+    tail = _csfs_2of2(key_x, key_x)
+    assert s[-len(tail):] == tail
+    return CScript(s[:-len(tail)] + [key_x, OP_CHECKSIGFROMSTACK])
+
+
+HTLC2_ALONE_CLAIM = b"\x01"
+HTLC2_ALONE_REFUND = b"\x02"
+
+
+def htlc2_alone_prefix(ctag, salt, byte):
+    """What htlc-2's CLAIM (byte 01) or REFUND (02) signs under: K || byte,
+    33 bytes, so its message (76 + 32m bytes) is never a collaborative one
+    (75 + 32m) under the same K."""
+    return leaf_const(ctag, salt, fold=True) + byte
+
+
 def exit_leaf(a_x, delay):
     return CScript([delay, OP_CHECKSEQUENCEVERIFY, OP_DROP, a_x, OP_CHECKSIG])
 
@@ -854,10 +875,11 @@ def htlc2_taptree(q_x, s_x, p_x, salt, ctag, h, timeout, claim_delay, refund_del
                                           <sig_S> <sig_Q> <m> <preimage>
       refund_c  <timeout> CLTV DROP, then the collaborative path between P
                 and S under the same salt <sig_S> <sig_P> <m>
-      claim     <claim_delay> CSV DROP, a 32-byte preimage of h, Q's
-                signature             <sig_Q> <preimage>
-      refund    <timeout> CLTV DROP <refund_delay> CSV DROP, P's signature
-                                          <sig_P>
+      claim     <claim_delay> CSV DROP, a 32-byte preimage of h, then Q
+                alone over the outputs under K || 01
+                                          <sig_Q> <m> <preimage>
+      refund    <timeout> CLTV DROP <refund_delay> CSV DROP, then P alone
+                over the outputs under K || 02     <sig_P> <m>
 
     Tree [[claim_c, refund_c], [claim, refund]]. No path spends the leaf
     without the preimage before the timeout; from it on the refunds open
@@ -867,15 +889,20 @@ def htlc2_taptree(q_x, s_x, p_x, salt, ctag, h, timeout, claim_delay, refund_del
     form of message under the same salt, over the outputs and not the path:
     a claim and a refund of one leaf co-signed by S over different outputs
     are two messages S signed under one salt, the bond's evidence; over the
-    same outputs they are one message and one outcome. claim_delay is Q's exit delay,
+    same outputs they are one message and one outcome. The unilateral claim
+    and refund sign the same form of message under K || 01 and K || 02
+    (htlc2_alone_prefix), never the outpoint, so a claim or refund signed in
+    advance spends the leaf wherever its path lands and lets whoever
+    broadcasts it add a fee coin. claim_delay is Q's exit delay,
     refund_delay P's (CSV operands, rel_time); the timeout is a median
     time."""
     assert len({q_x, s_x, p_x}) == 3, "three distinct keys"
     claim_c = CScript(hash_gate(h) + list(collab3_loop(q_x, s_x, salt, ctag, fold=True)))
     refund_c = CScript([timeout, OP_CHECKLOCKTIMEVERIFY, OP_DROP] + list(collab3_loop(p_x, s_x, salt, ctag, fold=True)))
-    claim = CScript([claim_delay, OP_CHECKSEQUENCEVERIFY, OP_DROP] + hash_gate(h) + [q_x, OP_CHECKSIG])
-    refund = CScript([timeout, OP_CHECKLOCKTIMEVERIFY, OP_DROP, refund_delay, OP_CHECKSEQUENCEVERIFY, OP_DROP,
-                      p_x, OP_CHECKSIG])
+    claim = CScript([claim_delay, OP_CHECKSEQUENCEVERIFY, OP_DROP] + hash_gate(h)
+                    + list(rebind1_loop(q_x, htlc2_alone_prefix(ctag, salt, HTLC2_ALONE_CLAIM))))
+    refund = CScript([timeout, OP_CHECKLOCKTIMEVERIFY, OP_DROP, refund_delay, OP_CHECKSEQUENCEVERIFY, OP_DROP]
+                     + list(rebind1_loop(p_x, htlc2_alone_prefix(ctag, salt, HTLC2_ALONE_REFUND))))
     tap = taproot_construct(NUMS, [[("claim_c", claim_c), ("refund_c", refund_c)], [("claim", claim), ("refund", refund)]])
     return tap, {"claim_c": claim_c, "refund_c": refund_c, "claim": claim, "refund": refund}
 

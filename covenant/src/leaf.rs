@@ -106,8 +106,24 @@ pub fn leaf_salt(owner_nonce: &[u8; 32], creator_nonce: &[u8; 32]) -> [u8; 32] {
 /// The rebindable two-party script for the constant `k` (`K`, or a
 /// landing leaf's `K ‖ P`), shared by the leaf and the checkpoint.
 pub(crate) fn rebindable_two_party(owner: &XOnlyPublicKey, operator: &XOnlyPublicKey, k: &[u8]) -> Script {
+	rebindable_digest(Builder::new(), k).two_party_csfs(owner, operator).into_script()
+}
+
+/// The rebindable one-key script for the prefix `k`: the message the
+/// two-party script builds, verified under `key` alone with
+/// `OP_CHECKSIGFROMSTACK`. Witness, bottom to top: `<sig> <m>`. A signature
+/// made over it spends the coin wherever it lands, as a pair does
+/// ([`crate::lock`]'s unilateral endings).
+pub(crate) fn rebindable_one_party(key: &XOnlyPublicKey, k: &[u8]) -> Script {
+	rebindable_digest(Builder::new(), k).push_slice(&key.serialize()).push_opcode(OP_CHECKSIGFROMSTACK).into_script()
+}
+
+/// The part every rebindable script shares: from `<m>` on top of the stack,
+/// the digest `SHA256(k ‖ this input's asset and value ‖ m ‖ SHA256(record
+/// 0) ‖ …)` over outputs `0..m-1`, left on top.
+fn rebindable_digest(b: Builder, k: &[u8]) -> Builder {
 	let slot = |b: Builder, j: i64| b.output_record(j).ops(&[OP_SHA256, OP_ROT, OP_SWAP, OP_CAT, OP_SWAP]);
-	let mut b = Builder::new()
+	let mut b = b
 		.push_opcode(OP_SIZE).push_int(1).push_opcode(OP_EQUALVERIFY)
 		.push_opcode(OP_DUP).push_int(1).push_int(MAX_OUTPUTS as i64 + 1).ops(&[OP_WITHIN, OP_VERIFY])
 		.push_opcode(OP_DUP).push_slice(k).current_input_record().ops(&[OP_CAT, OP_SWAP, OP_CAT, OP_SWAP]);
@@ -116,7 +132,7 @@ pub(crate) fn rebindable_two_party(owner: &XOnlyPublicKey, operator: &XOnlyPubli
 		b = b.push_opcode(OP_DUP).push_int(j).ops(&[OP_GREATERTHAN, OP_IF]);
 		b = slot(b, j).push_opcode(OP_ENDIF);
 	}
-	b.ops(&[OP_DROP, OP_SHA256]).two_party_csfs(owner, operator).into_script()
+	b.ops(&[OP_DROP, OP_SHA256])
 }
 
 /// `OP_TUCK <A> OP_CHECKSIGFROMSTACKVERIFY <S> OP_CHECKSIGFROMSTACK`: both

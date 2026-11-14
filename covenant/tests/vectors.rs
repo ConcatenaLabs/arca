@@ -254,6 +254,8 @@ impl Ctx {
 		l.check().unwrap();
 		assert_eq!(self.chain.tag(), h32(&p["chain_tag"]));
 		assert_eq!(l.leaf_constant(), h32(&p["K"]));
+		assert_eq!(l.alone_prefix(arca_covenant::lock::ALONE_CLAIM), hex(&p["claim_prefix"]));
+		assert_eq!(l.alone_prefix(arca_covenant::lock::ALONE_REFUND), hex(&p["refund_prefix"]));
 		l
 	}
 

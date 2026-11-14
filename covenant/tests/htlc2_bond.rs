@@ -96,4 +96,22 @@ fn the_bond_reads_both_endings_of_a_lock_together() {
 	assert_eq!(with(&claim, &|w| w.insert(3, vec![7; 32])), None, "seven items");
 	assert_eq!(with(&claim, &|w| w[2] = vec![1, 0]), None, "an m of two bytes");
 	assert_eq!(bond::rebind_signed_in(&chain, &label32("another salt"), &claim.tx, 0, &claim.prevouts[0]), None, "another salt");
+
+	// The unilateral endings carry no signature of the operator's: the
+	// holder alone signs CLAIM's and REFUND's messages, and the reader takes
+	// neither for the operator's.
+	let mca = lock.claim_message(x, value, std::slice::from_ref(&to_q)).unwrap();
+	let mra = lock.refund_message(x, value, std::slice::from_ref(&to_p)).unwrap();
+	let mut alone_claim = Spend::new(0).fake_input("htlc2 bond lock", explicit(x, value, lock.script_pubkey()), lock.exit_delay.to_sequence())
+		.outputs(vec![to_q.txout(), fee(x, value - to_q.value)]);
+	alone_claim.witness(0, lock.claim_witness(&sig(&q, &mca.digest), 1, &preimage));
+	let mut alone_refund = Spend::new(timeout.to_consensus_u32())
+		.fake_input("htlc2 bond lock", explicit(x, value, lock.script_pubkey()), lock.terms.refund_delay.to_sequence())
+		.outputs(vec![to_p.txout(), fee(x, value - to_p.value)]);
+	alone_refund.witness(0, lock.refund_witness(&sig(&p, &mra.digest), 1));
+	for spend in [&alone_claim, &alone_refund] {
+		Verifier::consensus(genesis).verify_tx(&spend.prevouts, &spend.tx).unwrap();
+		assert_eq!(read(spend), None, "a unilateral ending holds nothing the operator signed");
+	}
+	println!("CLAIM and REFUND alone: valid, and read as nothing of the operator's");
 }

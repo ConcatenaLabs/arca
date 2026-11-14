@@ -7,17 +7,25 @@ alone:
 
     claim_c   a 32-byte preimage of h, then Q and S over the outputs
     refund_c  <T> CLTV DROP, then P and S over the outputs
-    claim     <Q's delay> CSV DROP, a 32-byte preimage of h, Q's signature
-    refund    <T> CLTV DROP <P's delay> CSV DROP, P's signature
+    claim     <Q's delay> CSV DROP, a 32-byte preimage of h, then Q alone
+              over the outputs under K || 01
+    refund    <T> CLTV DROP <P's delay> CSV DROP, then P alone over the
+              outputs under K || 02
+
+The unilateral claim and refund are signed before the leaf exists, as a
+watchtower holds them, and spend it at the outpoint it lands at, one of them
+with a fee coin added after signing.
 
 Every negative case is refused by the mempool and again when forced into a
 block:
 
 - the claim, together or alone, without the preimage, with a wrong one, or
-  signed by P or by S in Q's place;
+  signed by P or by S in Q's place; alone with Q's signature of the
+  collaborative message or of other outputs;
 - the refund together before the timeout (a lock time below it, or the
   timeout not reached), or signed by Q in P's place; alone before the timeout
-  or before P's delay, or signed by Q or by S;
+  or before P's delay, or signed by Q or by S, or with P's signature of the
+  collaborative message or of the claim's;
 - either collaborative path with S's signature twice, or with a pair made
   for another salt.
 
@@ -134,45 +142,92 @@ class T29(Ark3, ArkBase, BitcoinTestFramework):
         self.send(r(self.s_sec, self.p_sec), "refund_c/P and S from the timeout")
 
     # -- alone, on the chain -----------------------------------------------
+    def alone_sig(self, key, salt, byte, value, to_spk):
+        """The holder's signature of the unilateral ending's message into one
+        output `to_spk` of `value` less FEE, made from the amount alone:
+        before the leaf exists, so over no outpoint."""
+        outs = [(self.X_ID, value - FEE, bytes(to_spk))]
+        msg = rebind_msg3(self.ctag, salt, self.X_ID, value, outs, const=htlc2_alone_prefix(self.ctag, salt, byte))
+        return sign_schnorr(key, msg), msg
+
+    def fee_coin(self):
+        """A coin of X anyone spends (OP_TRUE), to add as a fee input."""
+        return self.fund(OP_TRUE_SPK, 20_000, self.X)
+
+    def alone_tx(self, u, tap, lv, name, below, to_spk, seq, locktime=0, fee_coin=None):
+        """`name` spends u into its one committed output (u.amount - FEE) and
+        the fee; with `fee_coin`, that coin follows as input 1 and its value
+        less FEE goes back to OP_TRUE after the committed output."""
+        outs = [self.out(u.amount - FEE, to_spk, self.X_OUT)]
+        ins = [(u, seq)]
+        if fee_coin is not None:
+            ins.append((fee_coin, 0xfffffffe))
+            outs.append(self.out(fee_coin.amount - FEE, OP_TRUE_SPK, self.X_OUT))
+        tx = self.mktx(ins, outs + [self.fee(2 * FEE if fee_coin else FEE, self.X_OUT)], locktime)
+        self.setwit(tx, 0, list(below) + [bytes(lv[name]), control_block(tap, name)])
+        if fee_coin is not None:
+            self.setwit(tx, 1, OP_TRUE_WITNESS)
+        return tx
+
     def claimed_alone(self):
-        """Q claims with the preimage after its delay; P and S cannot."""
+        """Q claims with the preimage after its delay, by a signature made
+        before the leaf existed, with a fee coin added after; P and S cannot,
+        nor Q's signature of CLAIM-C's message or of other outputs."""
         timeout = self.mtp() + 30 * H
-        tap, lv, _ = self.lock("claim", timeout)
-        u = self.fund(tap.scriptPubKey, V, self.X)
+        tap, lv, salt = self.lock("claim", timeout)
         to = taproot_construct(self.q_x).scriptPubKey
-        c = lambda pre, key, seq=Q_DELAY: self.path_tx(u, tap, lv, "claim", [], to, seq, key=key, after=[pre])
-        self.reject(c(self.pre, self.q_sec), "claim/neg before Q's delay")
+        sq, m_alone = self.alone_sig(self.q_sec, salt, HTLC2_ALONE_CLAIM, V, to)
+        u = self.fund(tap.scriptPubKey, V, self.X)
+        fc = self.fee_coin()
+        c = lambda sig, pre=self.pre, seq=Q_DELAY, fee=None: self.alone_tx(u, tap, lv, "claim", [sig, b"\x01", pre], to,
+                                                                          seq, fee_coin=fee)
+        self.reject(c(sq), "claim/neg before Q's delay")
         self.wait_csv(u.txid, Q_S)
-        self.reject(c(self.pre, self.q_sec, seq=Q_DELAY - 1), "claim/neg with a sequence below Q's delay")
-        self.reject(c(_os.urandom(32), self.q_sec), "claim/neg with a wrong preimage")
-        self.reject(c(self.pre, self.p_sec), "claim/neg signed by P")
-        self.reject(c(self.pre, self.s_sec), "claim/neg signed by S")
-        self.send(c(self.pre, self.q_sec), "claim/Q alone with the preimage after its delay")
+        self.reject(c(sq, seq=Q_DELAY - 1), "claim/neg with a sequence below Q's delay")
+        self.reject(c(sq, pre=_os.urandom(32)), "claim/neg with a wrong preimage")
+        self.reject(c(self.alone_sig(self.p_sec, salt, HTLC2_ALONE_CLAIM, V, to)[0]), "claim/neg signed by P")
+        self.reject(c(self.alone_sig(self.s_sec, salt, HTLC2_ALONE_CLAIM, V, to)[0]), "claim/neg signed by S")
+        m_collab = rebind_msg3(self.ctag, salt, self.X_ID, V, [(self.X_ID, V - FEE, bytes(to))], fold=True)
+        assert m_collab != m_alone
+        self.reject(c(sign_schnorr(self.q_sec, m_collab)), "claim/neg with Q's signature of the collaborative message")
+        self.reject(c(self.alone_sig(self.q_sec, salt, HTLC2_ALONE_CLAIM, V, self.leaf_of(self.q_x))[0]),
+                    "claim/neg with Q's signature over other outputs")
+        self.reject(c(self.alone_sig(self.q_sec, salt, HTLC2_ALONE_REFUND, V, to)[0]),
+                    "claim/neg with Q's signature under the refund's prefix")
+        self.send(c(sq, fee=fc), "claim/Q alone, signed before the leaf, a fee coin added")
 
     def refunded_alone(self):
-        """P refunds alone from the timeout and after its delay; Q and S
-        cannot; the refund in the block that creates the output past the
-        timeout is refused: REFUND opens at max(timeout, confirmation + P's
-        delay), CLAIM at confirmation + Q's delay."""
+        """P refunds alone from the timeout and after its delay, by a
+        signature made before the leaf existed; Q and S cannot, nor P's
+        signature of REFUND-C's message or of CLAIM's; the refund in the block
+        that creates the output past the timeout is refused: REFUND opens at
+        max(timeout, confirmation + P's delay), CLAIM at confirmation + Q's
+        delay."""
         timeout = self.mtp() + 6 * H
-        tap, lv, _ = self.lock("refund", timeout)
-        u = self.fund(tap.scriptPubKey, V, self.X)
+        tap, lv, salt = self.lock("refund", timeout)
         to = taproot_construct(self.p_x).scriptPubKey
-        r = lambda key=None, seq=P_DELAY, lock=timeout: self.path_tx(u, tap, lv, "refund", [], to, seq, locktime=lock,
-                                                                     key=key or self.p_sec)
+        sp, _ = self.alone_sig(self.p_sec, salt, HTLC2_ALONE_REFUND, V, to)
+        u = self.fund(tap.scriptPubKey, V, self.X)
+        r = lambda sig=sp, seq=P_DELAY, lock=timeout: self.alone_tx(u, tap, lv, "refund", [sig, b"\x01"], to, seq,
+                                                                    locktime=lock)
         self.reject(r(), "refund/neg before P's delay and the timeout")
         self.wait_csv(u.txid, P_S)
         self.reject(r(lock=self.mtp() - 1), "refund/neg with a lock time below the timeout")
         self.reject(r(), "refund/neg after P's delay, before the timeout")
         self.mtp_past(timeout)
         self.reject(r(seq=P_DELAY - 1), "refund/neg with a sequence below P's delay")
-        self.reject(r(key=self.q_sec), "refund/neg signed by Q")
-        self.reject(r(key=self.s_sec), "refund/neg signed by S")
-        self.send(r(), "refund/P alone from the timeout and after its delay")
+        self.reject(r(self.alone_sig(self.q_sec, salt, HTLC2_ALONE_REFUND, V, to)[0]), "refund/neg signed by Q")
+        self.reject(r(self.alone_sig(self.s_sec, salt, HTLC2_ALONE_REFUND, V, to)[0]), "refund/neg signed by S")
+        m_collab = rebind_msg3(self.ctag, salt, self.X_ID, V, [(self.X_ID, V - FEE, bytes(to))], fold=True)
+        self.reject(r(sign_schnorr(self.p_sec, m_collab)), "refund/neg with P's signature of the collaborative message")
+        self.reject(r(self.alone_sig(self.p_sec, salt, HTLC2_ALONE_CLAIM, V, to)[0]),
+                    "refund/neg with P's signature under the claim's prefix")
+        self.send(r(), "refund/P alone from the timeout and after its delay, signed before the leaf")
         # Created past the timeout: refused in the block that creates it.
-        tap2, lv2, _ = self.lock("refund_late", timeout)
+        tap2, lv2, salt2 = self.lock("refund_late", timeout)
         u2 = self.fund(tap2.scriptPubKey, V, self.X, mine=False)
-        late = self.path_tx(u2, tap2, lv2, "refund", [], to, P_DELAY, locktime=timeout, key=self.p_sec)
+        sp2, _ = self.alone_sig(self.p_sec, salt2, HTLC2_ALONE_REFUND, V, to)
+        late = self.alone_tx(u2, tap2, lv2, "refund", [sp2, b"\x01"], to, P_DELAY, locktime=timeout)
         self.reject_beside(u2.txid, late, "refund/neg in the block that creates the output, past the timeout",
                            "bad-txns-nonfinal")
         self.generate(self.node, 1)

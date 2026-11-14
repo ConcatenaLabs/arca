@@ -8,8 +8,8 @@
 //! |---|---|---|
 //! | CLAIM-C | the hash gate, then the collaborative path of `Q` and `S` under the leaf's salt | `<sig_S> <sig_Q> <m> <preimage>` |
 //! | REFUND-C | `<T> CLTV DROP`, then the collaborative path of `P` and `S` under the same salt | `<sig_S> <sig_P> <m>` |
-//! | CLAIM | `<Q's delay> CSV DROP`, the hash gate, `<Q> CHECKSIG` | `<sig_Q> <preimage>` |
-//! | REFUND | `<T> CLTV DROP <P's delay> CSV DROP <P> CHECKSIG` | `<sig_P>` |
+//! | CLAIM | `<Q's delay> CSV DROP`, the hash gate, then `Q` alone over the outputs under `K ‖ 01` | `<sig_Q> <m> <preimage>` |
+//! | REFUND | `<T> CLTV DROP <P's delay> CSV DROP`, then `P` alone over the outputs under `K ‖ 02` | `<sig_P> <m>` |
 //!
 //! The tree is `[[CLAIM-C, REFUND-C], [CLAIM, REFUND]]`. No path spends the
 //! leaf without the preimage before `T`; from `T` on, the refunds open
@@ -24,6 +24,18 @@
 //! the leaf reaches the chain, CLAIM opens that margin before REFUND, so a
 //! payee holding the preimage is never beaten to the coin by the payer's
 //! unilateral refund.
+//!
+//! The unilateral endings are rebindable as the collaborative ones are: the
+//! holder signs, with `OP_CHECKSIGFROMSTACK`, the message the script builds
+//! from the coin and outputs `0..m-1` ([`crate::leaf`]), never the outpoint.
+//! A CLAIM or a REFUND signed in advance (a watchtower holds them) therefore
+//! spends the leaf wherever its path brings it on the chain, and leaves the
+//! inputs and outputs past those it commits to free, so whoever broadcasts it
+//! adds a fee coin. CLAIM's message starts with `K ‖ 01`, REFUND's with
+//! `K ‖ 02` ([`ALONE_CLAIM`], [`ALONE_REFUND`]): 76 + 32m bytes, so neither
+//! is ever a collaborative message (75 + 32m) under the same `K`, and a
+//! holder's signature of one path never opens another. The operator signs
+//! no message of either.
 //!
 //! Both collaborative paths sign the message the leaf's collaborative path
 //! signs ([`crate::leaf`]), under the leaf's one constant `K`, over the
@@ -48,7 +60,7 @@ use elements::Script;
 use elements::AssetId;
 
 use crate::entry::hash_gate;
-use crate::leaf::{rebindable_two_party, two_party_items, two_party_message};
+use crate::leaf::{rebindable_one_party, rebindable_two_party, two_party_items, two_party_message};
 use crate::message::{Chain, CsfsMessage};
 use crate::{Error, ExplicitOutput};
 use crate::script::BuilderExt;
@@ -58,6 +70,12 @@ use crate::time::{MedianTime, RelativeTime};
 /// What a lock's payer's delay exceeds its payee's by, at least: eight
 /// 512-second units (4,096 s), an hour to react with the units' rounding.
 pub const REFUND_DELAY_MARGIN_UNITS: u16 = 8;
+
+/// The byte after `K` in the message CLAIM's key signs.
+pub const ALONE_CLAIM: u8 = 0x01;
+
+/// The byte after `K` in the message REFUND's key signs.
+pub const ALONE_REFUND: u8 = 0x02;
 
 /// The paths of an `htlc-2` leaf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -155,17 +173,39 @@ impl LockPolicy {
 		join(&lock, &rebindable_two_party(&self.terms.refunder, &self.operator, &self.leaf_constant()))
 	}
 
-	/// CLAIM: `<Q's delay> CSV DROP`, the hash gate, `<Q> CHECKSIG`.
-	pub fn claim_script(&self) -> Script {
-		let b = Builder::new().push_int(self.exit_delay.to_sequence() as i64).ops(&[OP_CSV, OP_DROP]);
-		hash_gate(b, &self.terms.payment_hash).push_slice(&self.owner.serialize()).push_opcode(OP_CHECKSIG).into_script()
+	/// The prefix CLAIM's or REFUND's message starts with: `K ‖ byte`.
+	pub fn alone_prefix(&self, byte: u8) -> Vec<u8> {
+		let mut k = self.leaf_constant().to_vec();
+		k.push(byte);
+		k
 	}
 
-	/// REFUND: `<T> CLTV DROP <P's delay> CSV DROP <P> CHECKSIG`.
+	/// CLAIM: `<Q's delay> CSV DROP`, the hash gate, then `Q` alone over the
+	/// outputs under `K ‖ 01`.
+	pub fn claim_script(&self) -> Script {
+		let b = Builder::new().push_int(self.exit_delay.to_sequence() as i64).ops(&[OP_CSV, OP_DROP]);
+		let gate = hash_gate(b, &self.terms.payment_hash).into_script();
+		join(&gate, &rebindable_one_party(&self.owner, &self.alone_prefix(ALONE_CLAIM)))
+	}
+
+	/// REFUND: `<T> CLTV DROP <P's delay> CSV DROP`, then `P` alone over the
+	/// outputs under `K ‖ 02`.
 	pub fn refund_script(&self) -> Script {
-		Builder::new().push_int(self.terms.timeout.to_consensus_u32() as i64).ops(&[OP_CLTV, OP_DROP])
-			.push_int(self.terms.refund_delay.to_sequence() as i64).ops(&[OP_CSV, OP_DROP])
-			.push_slice(&self.terms.refunder.serialize()).push_opcode(OP_CHECKSIG).into_script()
+		let lock = Builder::new().push_int(self.terms.timeout.to_consensus_u32() as i64).ops(&[OP_CLTV, OP_DROP])
+			.push_int(self.terms.refund_delay.to_sequence() as i64).ops(&[OP_CSV, OP_DROP]).into_script();
+		join(&lock, &rebindable_one_party(&self.terms.refunder, &self.alone_prefix(ALONE_REFUND)))
+	}
+
+	/// The message `Q` signs for CLAIM of the coin (`asset_in`, `value_in`)
+	/// into `outputs`, at indices `0..m`: under `K ‖ 01`.
+	pub fn claim_message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		two_party_message(&self.alone_prefix(ALONE_CLAIM), asset_in, value_in, outputs)
+	}
+
+	/// The message `P` signs for REFUND of the coin into `outputs`: under
+	/// `K ‖ 02`.
+	pub fn refund_message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		two_party_message(&self.alone_prefix(ALONE_REFUND), asset_in, value_in, outputs)
 	}
 
 	/// The script of a path.
@@ -216,16 +256,18 @@ impl LockPolicy {
 		self.taproot().witness(&self.refund_together_script(), two_party_items(operator_sig, refunder_sig, m))
 	}
 
-	/// The full witness of CLAIM: `Q`'s signature and the preimage. The
-	/// input's sequence is `Q`'s delay.
-	pub fn claim_witness(&self, sig: &Signature, preimage: &[u8; 32]) -> Vec<Vec<u8>> {
-		self.taproot().witness(&self.claim_script(), vec![sig.as_ref().to_vec(), preimage.to_vec()])
+	/// The full witness of CLAIM for `m` committed outputs: `Q`'s signature
+	/// of [`Self::claim_message`] and the preimage. The input's sequence is
+	/// `Q`'s delay.
+	pub fn claim_witness(&self, sig: &Signature, m: u8, preimage: &[u8; 32]) -> Vec<Vec<u8>> {
+		self.taproot().witness(&self.claim_script(), vec![sig.as_ref().to_vec(), vec![m], preimage.to_vec()])
 	}
 
-	/// The full witness of REFUND: `P`'s signature. The spend's lock time is
-	/// at least the timeout and its input's sequence `P`'s delay.
-	pub fn refund_witness(&self, sig: &Signature) -> Vec<Vec<u8>> {
-		self.taproot().witness(&self.refund_script(), vec![sig.as_ref().to_vec()])
+	/// The full witness of REFUND for `m` committed outputs: `P`'s signature
+	/// of [`Self::refund_message`]. The spend's lock time is at least the
+	/// timeout and its input's sequence `P`'s delay.
+	pub fn refund_witness(&self, sig: &Signature, m: u8) -> Vec<Vec<u8>> {
+		self.taproot().witness(&self.refund_script(), vec![sig.as_ref().to_vec(), vec![m]])
 	}
 }
 
