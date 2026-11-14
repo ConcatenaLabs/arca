@@ -89,8 +89,10 @@
 //! on the chain that long after its round (`collect_after_seconds`): every
 //! refresh round is held until its forfeits are in, so drive it with
 //! `/build`, the wallets' syncs, `/pass`, then `/produce` and `/bury`, and
-//! the collection with `/advance` and `/settle`. It applies without
-//! `ARCA_OPERATOR_LIGHTNING` and `ARCA_OPERATOR_ISSUER` only.
+//! the collection with `/advance` and `/settle`. It applies with
+//! `ARCA_OPERATOR_LIGHTNING` too (and `ARCA_OPERATOR_FINALITY_POLL_MS` and
+//! `ARCA_OPERATOR_DELEGATED_RECLAIM` with it), so a trade of BTC runs at the
+//! testnet's settings; not with `ARCA_OPERATOR_ISSUER`.
 //!
 //! With `ARCA_OPERATOR_CHANNELS` set to a capacity in atoms, the operator
 //! makes channel leaves (`channel-1`) of every plain asset it serves, with up
@@ -661,6 +663,8 @@ async fn with_lightning() -> (Running, Vec<sequentia_ext::lightning::LightningNo
 		c.lightning.poll_seconds = 1;
 		c.lightning.retry_seconds = 10;
 		c.lightning.receive_window_seconds = 600;
+		finality_knobs(c);
+		no_sweep_knob(c);
 	}).await;
 	let x = r.x;
 	let (ox, px) = tokio::task::block_in_place(|| {
@@ -778,6 +782,18 @@ fn finality_knobs(c: &mut server::server::Config) {
 	}
 }
 
+/// `ARCA_OPERATOR_NO_SWEEP` (seconds, a service horizon), when set: batches without a sweep,
+/// collected at that horizon, as the testnet's operator runs them. The Lightning server applies it
+/// too, so a Lightning scenario runs at the testnet's settings.
+fn no_sweep_knob(c: &mut server::server::Config) {
+	if let Ok(h) = std::env::var("ARCA_OPERATOR_NO_SWEEP") {
+		let h: u32 = h.trim().parse().expect("ARCA_OPERATOR_NO_SWEEP is a service horizon in seconds");
+		c.batches.no_sweep = true;
+		c.batches.holder_batches = Some(0);
+		c.batches.collect_after_seconds = Some(h);
+	}
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a server kept running for a wallet outside this process; run by hand"]
 async fn operator_for_browsers() {
@@ -785,19 +801,11 @@ async fn operator_for_browsers() {
 	let (mut r, _nodes) = match std::env::var_os("ARCA_OPERATOR_LIGHTNING") {
 		Some(_) => with_lightning().await,
 		None if std::env::var_os("ARCA_OPERATOR_ISSUER").is_some() => (Running::start_on(&["-evbparams=simplicity:-1:::"], |_, _, _| {}).await, vec![]),
-		// Batches without a sweep, collected at the horizon named (seconds).
-		None => match std::env::var("ARCA_OPERATOR_NO_SWEEP") {
-			Ok(h) => {
-				let h: u32 = h.trim().parse().expect("ARCA_OPERATOR_NO_SWEEP is a service horizon in seconds");
-				(Running::start_with(|c, _, _| {
-					finality_knobs(c);
-					c.batches.no_sweep = true;
-					c.batches.holder_batches = Some(0);
-					c.batches.collect_after_seconds = Some(h);
-				}).await, vec![])
-			},
-			Err(_) => (Running::start_with(|c, _, _| finality_knobs(c)).await, vec![]),
-		},
+		// Batches without a sweep when ARCA_OPERATOR_NO_SWEEP names a horizon (no_sweep_knob).
+		None => (Running::start_with(|c, _, _| {
+			finality_knobs(c);
+			no_sweep_knob(c);
+		}).await, vec![]),
 	};
 	let mut profiles = Profiles::default();
 	serve_profiles(&mut r, &mut profiles).await;
