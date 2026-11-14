@@ -1598,3 +1598,93 @@ async fn a_witness_that_fails_inside_a_pass_ends_its_work_with_the_operator() {
 	fakes.take();
 	let _ = std::fs::remove_dir_all(&m.dir);
 }
+
+/// What the bond leaves uncovered is computed again in every slice, not only
+/// on a new tip: a pass cut inside `refresh` with a received coin uncovered
+/// (the wallet requires a bond and the operator posts none), then a bond
+/// already final configured at the operator without another block, the tip
+/// unchanged. The slices after, on the wallet opened again, give up no coin
+/// outside its refresh window for a refresh that pays a fee.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bond_configured_on_the_same_tip_drops_stale_uncovered() {
+	let mut r = Running::start_with(|c, _, _| c.fees.refresh_ppm = 5_000).await;
+	let x = r.x;
+	let url = r.url();
+	let p = Proxy::start(&url);
+	let (m, b) = (Arca::new("same tip M"), Arca::new("same tip B"));
+	boarded(&mut r, &m, &p.url, &[(x, 3_000_000)]).await;
+	boarded(&mut r, &b, &url, &[(x, 3_000_000)]).await;
+	pay(&b, &m, x, 100_000);
+	p.rewrite(Some(Arc::new(|path, _, _, v| {
+		if path == "/v1/holding_back" {
+			*v = json!({"leaves": []});
+			return Some(200);
+		}
+		None
+	})));
+	{
+		let db = rusqlite::Connection::open(m.dir.join("arca.sqlite")).unwrap();
+		db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('bond_seen', '{\"why\":\"required\"}')", []).unwrap();
+	}
+	let withdraw = common::running::keypair("bond W");
+	let operator = common::running::keypair("operator");
+	let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
+	let units = server::bond::min_notice_seconds(server::bond::LIFETIME, arca_covenant::RelativeTime::from_units(338).unwrap())
+		.div_ceil(512) as u16;
+	let policy = arca_covenant::bond::BondPolicy::new(chain, operator.x_only_public_key().0, withdraw.x_only_public_key().0,
+		arca_covenant::RelativeTime::from_units(units).unwrap()).unwrap();
+	let tx = r.pay_to(policy.script_pubkey(), x, 5_000_000);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
+	let tip = r.rt.client().best_block_hash().unwrap();
+	let mut w = Wallet::open(&m.dir).expect("open the wallet");
+	let slice = |w: &mut Wallet| -> Value {
+		tokio::task::block_in_place(|| command::run(w, "sync", &json!({"budget_ms": 0}))).map(|v| v["result"].clone()).unwrap()
+	};
+	let mut cut = false;
+	for _ in 0..40 {
+		let v = slice(&mut w);
+		if v["next"] == "refresh" && v["cost_by_step"]["refresh"].is_object() {
+			println!("same tip cut inside refresh: {}", v);
+			cut = true;
+			break;
+		}
+	}
+	assert!(cut, "the pass stopped inside refresh");
+	{
+		let db = rusqlite::Connection::open(m.dir.join("arca.sqlite")).unwrap();
+		let kept: String = db.query_row("SELECT value FROM meta WHERE key = 'sync_resume'", [], |r| r.get(0)).unwrap();
+		println!("same tip resume at the cut: {}", kept);
+	}
+	let before = p.count("/v1/submit_participation");
+	assert_eq!(before, 0, "the refresh step stopped before its coin");
+	r.config.bond = Some(server::bond::BondSection { withdraw_key: withdraw.x_only_public_key().0.to_string(), notice_units: units,
+		outpoint: Some(format!("{}:{}", tx.txid(), vout)), notice: None, instant_budget_fraction: None, instant_limit_value: None });
+	r.restart_server().await;
+	r.synced().await;
+	assert_eq!(r.rt.client().best_block_hash().unwrap(), tip, "the bond became configured without a tip change");
+	assert_eq!(library(&m, "bond", json!({})).unwrap()["covers"], true, "the bond covers the transfer at the same tip");
+	drop(w);
+	let mut w = Wallet::open(&m.dir).expect("reopen with the operator's new info");
+	let mut last = slice(&mut w);
+	let mut slices = 1;
+	while last["more"] == true {
+		last = slice(&mut w);
+		slices += 1;
+		assert!(slices < 40);
+	}
+	let after = p.count("/v1/submit_participation");
+	println!("same tip final answer: {}; paid refresh submissions {} -> {}; last request {:?}", last, before, after,
+		p.last("/v1/submit_participation").map(|(q, _, _)| q));
+	if after > before {
+		let (q, _, _) = p.last("/v1/submit_participation").unwrap();
+		assert_eq!(q["fees"][0]["amount"], "500", "the stale answer selected the ordinary paid quote");
+	}
+	assert_eq!(after, before, "a coin now covered and outside its refresh window was given up at the same tip");
+	p.rewrite(None);
+	for w in [&m, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
