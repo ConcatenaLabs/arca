@@ -939,10 +939,12 @@ async fn a_resumed_slice_rechecks_a_tip_that_moved() {
 		db.query_row("SELECT state FROM coin WHERE leaf_id = ?1", [leaf], |r| r.get(0)).unwrap()
 	};
 	let height = |r: &Running| r.rt.client().call::<Value>("getblockcount", &[]).unwrap().as_u64().unwrap();
-	// One wallet open across the slices, as a host keeps it.
+	// One wallet open across the slices, as a host keeps it. A budget of 0:
+	// each slice stops after its first step, so the pass is still under way
+	// at the fourth.
 	let mut w = Wallet::open(&m.dir).expect("open the wallet");
 	let slice = |w: &mut Wallet| -> Value {
-		tokio::task::block_in_place(|| command::run(w, "sync", &json!({"budget_ms": 1}))).map(|v| v["result"].clone()).unwrap()
+		tokio::task::block_in_place(|| command::run(w, "sync", &json!({"budget_ms": 0}))).map(|v| v["result"].clone()).unwrap()
 	};
 	let first = slice(&mut w);
 	assert_eq!(first["slice"], 1, "{}", first);

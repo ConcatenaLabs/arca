@@ -2047,6 +2047,12 @@ impl Wallet {
 				{
 					all.extend(new.iter().cloned());
 				}
+				// A reorganisation any slice's re-check found is the pass's.
+				if again["reorganised"] == json!(true) {
+					if let Some(all) = r.out.get_mut("recheck").filter(|v| v.is_object()) {
+						all["reorganised"] = json!(true);
+					}
+				}
 				r
 			},
 			None => {
