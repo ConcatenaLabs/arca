@@ -239,13 +239,27 @@ wallet then finds it free between the two.
 
 `sync` and `deposits` also run in slices, for a program that must answer others
 while they run (a maker's firm offer, a person's trade): with `"budget_ms": n`
-the command stops at the first safe point past `n` milliseconds and answers
-`"more": true`; the program runs whatever it was asked meanwhile and calls the
+the command stops at the first safe point past `n` milliseconds of the pass's
+work and answers `"more": true`; the program runs whatever it was asked meanwhile and calls the
 command again with the same arguments, which goes on where it stopped, until an
 answer comes without `more`. A safe point lies between two steps of `sync`, or
 between two items of a long step (a participation, a coin's refresh, deposit,
-journey home or exit, a payment over Lightning, a plan, an order); an item that
-has started runs to its end. A slice in which the operator cannot be reached
+journey home or exit, a call asking the operator which of 64 coins hold its
+capital back, a payment over Lightning, a plan, an order); an item that
+has started runs to its end. What a slice does before its first step (the
+command's start, its re-check) is not counted in `n`. The witness of the
+operator's signer's record and the operator's `info` are taken at a pass's
+start, and a slice that goes on with the pass takes them as the pass found them
+only on the chain's tip they were taken at and while a witness stands in the
+wallet kept open (ten seconds); any other slice takes them again. Which coins
+hold the operator's capital back is asked once a pass; what the bond leaves
+uncovered is computed again in every slice that reaches the refresh step's
+coins. So a pass in slices costs about what one call does. In one call as in
+slices, every step that works with the operator starts on a witness that
+stands, and every signature handed to it follows [the hand-over
+rule](#hand-over); a witness that fails while a pass runs ends the pass's work
+with the operator: nothing more is asked or handed over, the rest of the pass
+runs in the same call, and its answer says so (`unreachable`). A slice in which the operator cannot be reached
 waits out the witness's patience once and then runs the rest of the pass,
 since without the operator each step after is short. Each slice but the last answers
 `{"more": true, "next", "slice", "cost_by_step", "recheck"}`: `recheck` is
@@ -379,7 +393,10 @@ spends nothing it does not have to on reading the chain again.
   on the chain at once), every round and board's finality, each coin's dates,
   and its lineage looked for on the chain and in the mempool. Then the witness
   of the operator's signer's record (`start.witness`), unless the command stays
-  on the machine and the node; a witness stands for ten seconds. A command
+  on the machine and the node or witnesses itself (`hand_over_forfeits`, and
+  `sync`: as its pass starts, and again before each step that works with the
+  operator once the last is older, and at each hand-over of a signature, [as
+  below](#hand-over)); a witness stands for ten seconds. A command
   given `"recheck": "coins"` among its arguments runs only the part of the
   re-check that concerns the coins (each coin against the chain and its
   lineage watch), leaving the following of its participations' rounds (a round
@@ -398,6 +415,21 @@ spends nothing it does not have to on reading the chain again.
   then: a payment pays only from coins whose rounds and boards are final now,
   a take reads its order unspent and final, a swap reads the other side's
   coins as a receiver does; fees in what the node accepts now.
+- <a id="hand-over"></a>**When a signature is handed to the operator:** every
+  signature that authorizes a spend, a forfeit, a release or a delegation is
+  handed to the operator only on a witness that is current at that moment:
+  the wallet witnesses again after the last operator wait before the
+  hand-over, and before each repeat of a kept signature (a transfer, a fill, a
+  board, a participation or a release posted again after a post the operator
+  never answered). The other signatures that commit the wallet to something
+  (a plan and its cancellation, a withdrawal or a decline of a participation,
+  a payment asked over Lightning, a claim, a mailbox binding) are handed over
+  the same way. Without a current witness nothing is posted, and what would
+  have been handed over stands for the next `sync`, as a post the operator
+  never answered does. Authentication proofs are outside the rule: the
+  signatures over the operator's challenge that a mailbox read, a leaf read,
+  an owed lookup or a `holding_back` read carries prove which key asks, and
+  authorize nothing but that read's answer.
 - **When a coin is received:** the five checks and the bounds on every leaf of
   its lineage, then it is kept; until then it is not counted.
 

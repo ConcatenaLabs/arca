@@ -38,6 +38,9 @@ pub struct Running {
 	pub purse: Purse,
 	pub x: AssetId,
 	pub y: AssetId,
+	/// Assets beyond X and Y, for a test that holds many (none unless it
+	/// asks, [`Running::start_with_assets`]).
+	pub more: Vec<AssetId>,
 	pub signer: SignerProcess,
 	pub db: TestDb,
 	/// The keepers of the signer's record, each on a port of its own, as on
@@ -84,6 +87,13 @@ impl Running {
 		Self::start_at(rt, 0, None, tune).await
 	}
 
+	/// [`Running::start`] with `more` assets beyond X and Y, each listed by
+	/// the operator and funded as Y is.
+	pub async fn start_with_assets(more: usize) -> Running {
+		let rt = tokio::task::block_in_place(node::start);
+		Self::start_more(rt, 0, None, more, |_, _, _| {}).await
+	}
+
 	async fn start_tuned<F: FnOnce(&mut Config, AssetId, AssetId)>(keepers: usize, required: Option<usize>, tune: F) -> Running {
 		let rt = tokio::task::block_in_place(node::start);
 		Self::start_at(rt, keepers, required, tune).await
@@ -92,12 +102,20 @@ impl Running {
 	async fn start_at<F: FnOnce(&mut Config, AssetId, AssetId)>(rt: Regtest, keepers: usize, required: Option<usize>, tune: F)
 		-> Running
 	{
+		Self::start_more(rt, keepers, required, 0, tune).await
+	}
+
+	async fn start_more<F: FnOnce(&mut Config, AssetId, AssetId)>(rt: Regtest, keepers: usize, required: Option<usize>, more: usize,
+		tune: F) -> Running
+	{
 		// The server's log, at the level RUST_LOG names.
 		let _ = env_logger::builder().is_test(true).try_init();
 		let db = TestDb::new().await;
 		let mut purse = tokio::task::block_in_place(|| Purse::new(&rt));
 		let x = tokio::task::block_in_place(|| purse.issue(&rt, "asset X", 100_000_000_000));
 		let y = tokio::task::block_in_place(|| purse.issue(&rt, "asset Y", 100_000_000_000));
+		let more: Vec<AssetId> = (0..more).map(|k| tokio::task::block_in_place(|| purse.issue(&rt, &format!("asset {}", k), 100_000_000_000)))
+			.collect();
 		node::list_fee_asset(&rt, x, 100_000_000);
 		let s = keypair("operator");
 		let genesis = rt.client().genesis_hash().unwrap();
@@ -149,7 +167,7 @@ impl Running {
 			assets: vec![
 				AssetSection::new(x, MIN_LEAF),
 				AssetSection::new(y, MIN_LEAF),
-			],
+			].into_iter().chain(more.iter().map(|a| AssetSection::new(*a, MIN_LEAF))).collect(),
 			fee_assets: None,
 			fees: Default::default(),
 			// The watcher acts on the chain for the operator, as it does on a
@@ -178,10 +196,13 @@ impl Running {
 		};
 		tune(&mut config, x, y);
 		let server = Server::start(&config).await.unwrap();
-		let mut r = Running { server, config, rt, purse, x, y, signer, db, keepers };
+		let mut r = Running { server, config, rt, purse, x, y, more: more.clone(), signer, db, keepers };
 		r.fund_server(x, 50_000_000).await;
 		r.fund_server(x, 50_000_000).await;
 		r.fund_server(y, 50_000_000).await;
+		for a in more {
+			r.fund_server(a, 50_000_000).await;
+		}
 		r.produce().await;
 		r.bury().await;
 		r.synced().await;

@@ -752,3 +752,201 @@ async fn a_holders_two_named_coins_are_refreshed_together_for_no_fee() {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }
+
+/// From its first call to `path` on, the proxy `p` answers every witness of
+/// the operator's signer's record with a 502, and holds that first call for
+/// eleven seconds, longer than a witness stands for a wallet (ten): the
+/// wallet then reads the answer with its last witness too old to sign on,
+/// and no new one to be had.
+fn the_witness_fails_from(p: &common::proxy::Proxy, path: &'static str) {
+	let (q, once) = (p.clone(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+	p.rewrite(Some(std::sync::Arc::new(move |at, _, _, _| {
+		if at == path && !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+			q.lose("/v1/witness", true);
+			std::thread::sleep(Duration::from_secs(11));
+		}
+		None
+	})));
+}
+
+/// The witness succeeds again, and nothing is held.
+fn the_witness_is_back(p: &common::proxy::Proxy) {
+	p.rewrite(None);
+	p.lose("/v1/witness", false);
+}
+
+/// No release of a paid Lightning payment's leaf is signed once the witness
+/// of the operator's signer's record fails. The sender's sync reads the
+/// operator's terms for the release, which here take longer than a witness
+/// stands, and from then every witness fails: the wallet witnesses again
+/// before it signs, signs nothing, hands nothing over and asks the operator
+/// for nothing more in that sync. Once the witness succeeds again, its next
+/// sync releases every node.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_release_of_a_paid_send_is_signed_once_the_witness_fails() {
+	let Some(lnd) = common::lightning::lightningd("no_release_of_a_paid_send_is_signed_once_the_witness_fails") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+	}).await;
+	let x_id = r.x;
+	let x = x_id.to_string();
+	r.fund_server(x_id, 100_000_000).await;
+	let (ox, px) = tokio::task::block_in_place(|| {
+		let ox = common::lightning::node(&r.rt, &mut r.purse, &lnd, "wox", true, x_id, 2_000_000_000);
+		let px = common::lightning::node(&r.rt, &mut r.purse, &lnd, "wpx", true, x_id, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x_id, 1_000_000_000, 300_000_000);
+		(ox, px)
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut().filter(|a| a.asset == x) {
+		a.lightning = Some(server::server::LegSection::at(ox.rpc_path()));
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("the leg up", || g.leg(&x_id, true).is_ok()).await;
+	let p = common::proxy::Proxy::start(&r.url());
+	let nurl = r.node_url();
+	let a = Arca::new("WL");
+	a.ok(&["create", "--server", &p.url, "--node-url", &nurl, "--node-user", "arca", "--exit-delay-units", "4",
+		"--min-exit-delay-units", "1"]);
+	let s = script(&a.ok(&["address"]));
+	r.pay_to(s, x_id, 5_000_000);
+	r.produce().await;
+	a.ok(&["board", &x, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board credited", || a.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	refresh_all(&r, &[&a]).await;
+	// The payment is paid while the operator's terms for the release cannot
+	// be read, so the release is left to the wallet's next sync.
+	let (inv, _) = common::lightning::invoice(&px, x_id, 100_000, "witnessed-release");
+	p.lose("/v1/lightning_send_release_terms", true);
+	let paid = a.ok(&["lightning", "pay", &inv, "--asset", &x]);
+	p.lose("/v1/lightning_send_release_terms", false);
+	assert_eq!(paid["payment"]["state"], "paid", "{}", paid);
+	let hash = paid["paying"]["payment_hash"].as_str().unwrap().to_string();
+	let terms = r.server.sends.release_terms(&id32(&hash)).await.unwrap();
+	assert!(!terms.nodes.is_empty() && terms.released.is_empty(), "the payment's leaf rests on a node not released yet");
+	let before = p.calls().len();
+	the_witness_fails_from(&p, "/v1/lightning_send_release_terms");
+	let (_, s) = a.run(&["sync"]);
+	let calls: Vec<(String, u16)> = p.calls()[before..].iter().map(|(path, _, status, _)| (path.clone(), *status)).collect();
+	let count = |path: &str| calls.iter().filter(|(c, _)| c == path).count();
+	let failed = calls.iter().position(|(c, st)| c == "/v1/witness" && *st == 502);
+	let terms = r.server.sends.release_terms(&id32(&hash)).await.unwrap();
+	println!("with the witness failing from the release's terms on: terms read {}, releases handed over {}, witnesses {}; the calls \
+		after the witness failed: {:?}; nodes {}, released {}; lightning {}; unreachable {}", count("/v1/lightning_send_release_terms"),
+		count("/v1/lightning_send_release"), count("/v1/witness"), failed.map(|k| &calls[k + 1..]), terms.nodes.len(),
+		terms.released.len(), s["lightning"], s["unreachable"]);
+	assert_eq!(count("/v1/lightning_send_release_terms"), 1, "the release's terms were read: {}", s);
+	assert_eq!(count("/v1/lightning_send_release"), 0, "a release was signed and handed over while the witness failed: {}", s);
+	assert!(terms.released.is_empty(), "the operator holds no release");
+	let failed = failed.expect("the wallet witnessed again before it signed");
+	assert_eq!(calls.iter().filter(|(c, st)| c == "/v1/witness" && *st == 502).count(), 1, "one witness before the signature, and none \
+		after it failed: {:?}", calls);
+	assert!(calls[failed + 1..].is_empty(), "the operator was asked after the witness failed: {:?}", &calls[failed + 1..]);
+	assert!(s["unreachable"].is_object(), "the sync says the operator could not be witnessed: {}", s);
+	// The witness succeeds again: the next sync releases every node.
+	the_witness_is_back(&p);
+	a.ok(&["sync"]);
+	let terms = r.server.sends.release_terms(&id32(&hash)).await.unwrap();
+	println!("with the witness back: {} node(s), {} released", terms.nodes.len(), terms.released.len());
+	assert!(!terms.nodes.is_empty() && terms.released == terms.nodes, "the sender's sync released every node");
+	let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// No delegation of a filled order's coin is signed once the witness of the
+/// operator's signer's record fails. The maker's sync reads the operator's
+/// terms for the delegation, which here take longer than a witness stands,
+/// and from then every witness fails: the wallet witnesses again before it
+/// signs, signs nothing and hands nothing over. Once the witness succeeds
+/// again, its next sync delegates.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_delegation_of_a_filled_order_is_signed_once_the_witness_fails() {
+	let mut r = Running::start_with(|c, x, _| {
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+		c.assets[0] = server::server::AssetSection::new(x, 1_000);
+	}).await;
+	let (x_id, y_id) = (r.x, r.y);
+	let (x, y) = (x_id.to_string(), y_id.to_string());
+	common::node::list_fee_asset(&r.rt, y_id, 100_000_000);
+	r.fund_server(x_id, 100_000_000).await;
+	r.fund_server(y_id, 100_000_000).await;
+	let p = common::proxy::Proxy::start(&r.url());
+	let (url, node) = (r.url(), r.node_url());
+	let (m, t) = (Arca::new("WM"), Arca::new("WT"));
+	for (w, server, asset) in [(&m, &p.url, x_id), (&t, &url, y_id)] {
+		w.ok(&["create", "--server", server, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1",
+			"--min-exit-delay-units", "1"]);
+		r.pay_to(script(&w.ok(&["address"])), asset, 1_600_000);
+		r.pay_to(script(&w.ok(&["address"])), x_id, 1_000_000);
+	}
+	r.produce().await;
+	m.ok(&["board", &x, "1500000"]);
+	t.ok(&["board", &y, "1500000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("both boards credited", || {
+		m.ok(&["boards"])[0]["server"]["state"] == "credited" && t.ok(&["boards"])[0]["server"]["state"] == "credited"
+	}).await;
+	// M rests 1,000,000 X for Y; T refreshes its board in the same rounds
+	// and fills 300,000 of the order.
+	let rested = m.ok(&["order", "rest", "--sell", &x, "--amount", "1000000", "--for", &y, "--rate-num", "1", "--rate-den", "1",
+		"--min-lot", "100000", "--expires-in-hours", "720"]);
+	assert_eq!(rested["state"], "pending", "{}", rested);
+	t.ok(&["participate"]);
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty() && built.len() == 2, "{} built, {:?}", built.len(), failed.len());
+	r.produce().await;
+	r.bury().await;
+	for b in &built {
+		r.round_state(&b.tx.txid(), RoundState::Final).await;
+	}
+	m.ok(&["sync"]);
+	t.ok(&["sync"]);
+	let view = m.ok(&["order", "resting"]);
+	let order = view["orders"].as_array().unwrap().iter().find(|o| o["rested_by"] == rested["order"]).unwrap()["order"]
+		.as_str().unwrap().to_string();
+	let f = t.ok(&["order", "fill-resting", &order, "--amount", "300000"]);
+	assert_eq!(f["filled"], "300000", "{}", f);
+	assert!(r.server.store.delegation(&id32(&order)).await.unwrap().is_none(), "the order's coin has not delegated yet");
+	// M comes back, and the witness fails from the delegation's terms on.
+	let before = p.calls().len();
+	the_witness_fails_from(&p, "/v1/order_fill_delegation_terms");
+	let (_, s) = m.run(&["sync"]);
+	let calls: Vec<(String, u16)> = p.calls()[before..].iter().map(|(path, _, status, _)| (path.clone(), *status)).collect();
+	let count = |path: &str| calls.iter().filter(|(c, _)| c == path).count();
+	let failed = calls.iter().position(|(c, st)| c == "/v1/witness" && *st == 502);
+	println!("with the witness failing from the delegation's terms on: terms read {}, delegations handed over {}, witnesses {}; the \
+		calls after the witness failed: {:?}; resting {}; unreachable {}", count("/v1/order_fill_delegation_terms"),
+		count("/v1/order_fill_delegation"), count("/v1/witness"), failed.map(|k| &calls[k + 1..]), s["resting"], s["unreachable"]);
+	assert_eq!(count("/v1/order_fill_delegation_terms"), 1, "the delegation's terms were read: {}", s);
+	assert_eq!(count("/v1/order_fill_delegation"), 0, "a delegation was signed and handed over while the witness failed: {}", s);
+	assert!(r.server.store.delegation(&id32(&order)).await.unwrap().is_none(), "the operator holds no delegation of the order's coin");
+	let failed = failed.expect("the wallet witnessed again before it signed");
+	assert_eq!(calls.iter().filter(|(c, st)| c == "/v1/witness" && *st == 502).count(), 1, "one witness before the signature, and none \
+		after it failed: {:?}", calls);
+	assert!(calls[failed + 1..].is_empty(), "the operator was asked after the witness failed: {:?}", &calls[failed + 1..]);
+	assert!(s["unreachable"].is_object(), "the sync says the operator could not be witnessed: {}", s);
+	// The witness succeeds again: the next sync delegates.
+	the_witness_is_back(&p);
+	let s = m.ok(&["sync"]);
+	assert!(r.server.store.delegation(&id32(&order)).await.unwrap().is_some(), "the maker's sync delegates the order's coin: {}", s);
+	for w in [&m, &t] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}

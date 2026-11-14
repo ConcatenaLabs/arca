@@ -1633,7 +1633,7 @@ impl Wallet {
 		let paying = body.get("invoice").is_some();
 		let claiming = body.get("preimage").is_some();
 		let call = if paying { "lightning_send" } else if claiming { "lightning_receive_claim" } else { "cosign_transfer" };
-		let answered = self.server.post(call, body);
+		let answered = self.hand_over(call, body);
 		let payment = answered.as_ref().ok().map(|a| if paying { a["payment"].clone() } else { a["receive"].clone() });
 		let answered = answered.map(|a| if paying || claiming { a["cosigned"].clone() } else { a });
 		let out = self.take_transfer_answer(id, answered, mine)?;
@@ -1784,6 +1784,9 @@ impl Wallet {
 		for (id, body, inputs) in self.store.transfers_in("requested")? {
 			let body: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
 			let mine: Vec<String> = serde_json::from_str(&inputs).map_err(|e| Error::Store(e.to_string()))?;
+			// The request carries the wallet's signatures: posted again as a
+			// hand-over ([`Self::hand_over`]), and left standing without a
+			// current witness.
 			out.push(match self.post_transfer(id, &body, &mine) {
 				Ok(v) => v,
 				Err(e) => json!({"transfer_request": id, "error": e.to_string()}),

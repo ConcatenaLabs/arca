@@ -488,6 +488,7 @@ impl Wallet {
 	/// `order_record`) into the fill that made `made`.
 	fn delegate_fill(&self, order_record: &CoinRecord, made: &arca_covenant::ValidCoin, order_coin: &str) -> Result<Value, Error> {
 		use arca_covenant::transfer::FillLeaf;
+		self.witnessed_now()?;
 		let t = self.server.post("order_fill_delegation_terms", &json!({"order_coin": order_coin}))?;
 		if t["delegated"] == true {
 			return Ok(json!({"order_coin": order_coin, "delegated": true}));
@@ -517,7 +518,7 @@ impl Wallet {
 		if key.x_only_public_key().0 != d.from {
 			return Err(Error::Keys(format!("the wallet's key for order coin {} is not the coin's", order_coin)));
 		}
-		let a = self.server.post("order_fill_delegation", &json!({"order_coin": order_coin,
+		let a = self.hand_over("order_fill_delegation", &json!({"order_coin": order_coin,
 			"signature": hex(sign(&key, &d.message().digest).as_ref())}))?;
 		Ok(json!({"order_coin": order_coin, "delegated": true, "kept": a["kept"]}))
 	}
@@ -544,7 +545,7 @@ impl Wallet {
 		if self.server_info()?.get("checkpoint_exit").is_some() {
 			body["record_formats"] = json!(arca_covenant::RECORD_FORMATS);
 		}
-		self.server.post("order_publish", &body)
+		self.hand_over("order_publish", &body)
 	}
 
 	/// How the wallet's resting orders stand, as the operator shows them, and
@@ -838,7 +839,7 @@ impl Wallet {
 			let left: Vec<Value> = pending.into_iter().filter(|p| p["body"] != *body).collect();
 			w.store.set_meta(PENDING_FILLS, &Value::Array(left).to_string())
 		};
-		match self.server.post("order_fill", body) {
+		match self.hand_over("order_fill", body) {
 			Ok(done) => {
 				// Each coin's record carries the fill, the operator's
 				// signatures with it, and is checked as any coin received.
@@ -887,6 +888,14 @@ impl Wallet {
 		let mut out = vec![];
 		for p in pending {
 			let given: Vec<String> = p["given"].as_array().into_iter().flatten().filter_map(|g| g.as_str().map(String::from)).collect();
+			// The fill carries the wallet's signatures: its post is a
+			// hand-over ([`Wallet::hand_over`]); checked here as well, so a
+			// fill without a current witness is said to stand, left to the
+			// next sync.
+			if let Err(e) = self.witnessed_now() {
+				out.push(json!({"fill_of": p["body"]["order"], "answer": {"state": "sent", "error": e.to_string()}}));
+				continue;
+			}
 			match self.send_fill(&p["body"], &given) {
 				Ok(v) => out.push(json!({"fill_of": p["body"]["order"], "answer": v})),
 				Err(e) => out.push(json!({"fill_of": p["body"]["order"], "refused": e.to_string()})),

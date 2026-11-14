@@ -203,7 +203,9 @@ impl Wallet {
 			j["leaf"]["mailbox_proof"] = json!(proof);
 			let signature = sign(&coin_key, &claim_digest(&self.genesis, &self.operator, &coin, &id));
 			let body = json!({"leaf_id": coin.to_string(), "leaf": j["leaf"], "signature": hex(signature.as_ref())});
-			match self.server.post("owed_claim", &body) {
+			// Each attempt is a hand-over of its own ([`Self::hand_over`]),
+			// after the operator's answer to the one before.
+			match self.hand_over("owed_claim", &body) {
 				Ok(st) => {
 					if st["participation_id"].as_str() != Some(pid.as_str()) {
 						return Err(Error::Refused(format!("the operator answers the claim of coin {} with participation {}, not {}", coin,
