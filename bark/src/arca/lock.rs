@@ -445,9 +445,23 @@ impl Wallet {
 		let rec = self.lock_rec("payee", hash)?.ok_or_else(|| Error::Refused(format!("the wallet asked no lock under hash {}", hash)))?;
 		let Some(row) = self.lock_row("payee", hash)? else {
 			if let Some(c) = rec["leaf_id"].as_str().map(|l| self.store.coin(l)).transpose()?.flatten() {
+				if c.state != LOCK_IN {
+					if let Ok((_, a)) = self.held(&c) {
+						let mut path = vec![];
+						Self::path_outputs(&a.valid, &mut path);
+						if self.chain.locate(&path)?.iter().all(Option::is_none) {
+							return Err(Error::Refused(format!("the lock under hash {} rests on a coin spent elsewhere on the chain: it can \
+								never come home, and nothing is to be paid for it", hash)));
+						}
+					}
+				}
 				if c.state == "exiting" {
 					return Err(Error::Refused(format!("the lock under hash {} is being taken on the chain ({}): no spend of it is co-signed \
 						any more; nothing is to be paid for it", hash, c.note)));
+				}
+				if c.state != LOCK_IN {
+					return Err(Error::Refused(format!("the lock under hash {} is held no longer ({}: {}): nothing is to be paid for it", hash,
+						c.state, c.note)));
 				}
 			}
 			return Ok(json!({"payment_hash": hash, "ready": false, "why": "the lock has not come", "state": rec["state"]}));
@@ -616,10 +630,13 @@ impl Wallet {
 	/// timeout. Each step that fails is said and tried again at the next.
 	pub(crate) fn progress_locks(&mut self, talk: bool) -> Result<Vec<Value>, Error> {
 		self.adopt_locks()?;
-		let mut out = self.locks_home(talk)?;
 		if !talk {
-			return Ok(out);
+			return self.locks_home(talk);
 		}
+		// What the operator answers first, where it proves itself (a refund
+		// from the timeout, a claim with its preimage): a lock it ended is
+		// then not taken on the chain for nothing. The chain afterwards.
+		let mut out = vec![];
 		let now = self.now()?.to_consensus_u32() as u64;
 		for (k, rec) in self.locks_map()? {
 			let (role, hash) = k.split_once('/').map(|(a, b)| (a.to_string(), b.to_string())).unwrap_or_default();
@@ -706,6 +723,7 @@ impl Wallet {
 				_ => {},
 			}
 		}
+		out.extend(self.locks_home(talk)?);
 		Ok(out)
 	}
 
