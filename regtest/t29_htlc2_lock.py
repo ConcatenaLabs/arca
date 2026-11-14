@@ -31,8 +31,10 @@ block:
 
 So nothing spends the lock without the preimage before the timeout, nothing
 spends it from the timeout on without the preimage or P, and the operator
-alone spends it by no path. A claim pair and a refund pair of one lock are two
-different messages under one salt: the bond's evidence, recorded at the end.
+alone spends it by no path. A claim pair and a refund pair of one lock over
+different outputs are two different messages under one salt: the bond's
+evidence, recorded at the end. Over the same outputs they are one message and
+one outcome.
 """
 from arklib3 import *
 import os as _os
