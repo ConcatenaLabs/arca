@@ -280,9 +280,10 @@ fn reads_only(command: &str) -> bool {
 /// ([`Wallet::recheck_coins`]): a program that answers others from the
 /// wallet asks for it on its answer path, and runs `sync` on a timer.
 fn start(w: &mut Wallet, command: &str, coins_only: bool) -> Value {
-	// `hand_over_forfeits` witnesses itself, as it signs.
+	// `hand_over_forfeits` witnesses itself, as it signs; so does `sync`,
+	// once a pass ([`Wallet::sync_sliced`]).
 	let local = matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit" | "exit_quote" | "speed_up" | "schedule"
-		| "hand_over_forfeits" | "deposits"
+		| "hand_over_forfeits" | "sync" | "deposits"
 		| "orders" | "order_refund" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards");
 	// A command that reads only, of the operator or an offer, skips the
 	// witness: it guards the coins the wallet takes and the spends it signs

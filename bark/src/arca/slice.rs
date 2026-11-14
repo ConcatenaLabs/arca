@@ -3,24 +3,26 @@
 //! The library runs one command at a time, and a command runs to its end. A
 //! program that answers others from the wallet (a maker's firm offer, a
 //! page's trade) asks for `sync` and `deposits` with `budget_ms`: the
-//! command stops at the first safe point past that many milliseconds,
-//! answers `more: true`, and the next call with the same arguments goes on
-//! where it stopped. Between two calls the program runs whatever it was
-//! asked. Without `budget_ms` everything runs in one call, as it always has.
+//! command stops at the first safe point past that many milliseconds of the
+//! pass's work, answers `more: true`, and the next call with the same
+//! arguments goes on where it stopped. Between two calls the program runs
+//! whatever it was asked. Without `budget_ms` everything runs in one call,
+//! as it always has.
 //!
 //! **Safe points.** A slice stops only between two steps of `sync`, or
 //! between two items of a long step ([`ITEMS`]): a participation, a coin's
-//! refresh, a coin's deposit, a coin taken home, an exit moved on, a payment
-//! over Lightning, a plan, an order. An item that has started runs to its
-//! end, so nothing is ever cut between a signature and its record, between
-//! handing over forfeits and recording it, or between a broadcast and its
-//! record; nor are the deposits a trade's coins go to at once, before the
-//! trade is reported done, which run outside the slice. Any other step runs
-//! whole in one slice and runs once a pass.
-//! Each step reads what it needs from the store and the operator when it
-//! runs: nothing read in one slice is used in another, so a command run
-//! between two slices (a payment, a refresh, a trade) is seen by every step
-//! after it.
+//! refresh, a call asking the operator which coins hold its capital back
+//! (`holding_back`, 64 coins a call), a coin's deposit, a coin taken home,
+//! an exit moved on, a payment over Lightning, a plan, an order. An item
+//! that has started runs to its end, so nothing is ever cut between a
+//! signature and its record, between handing over forfeits and recording it,
+//! or between a broadcast and its record; nor are the deposits a trade's
+//! coins go to at once, before the trade is reported done, which run outside
+//! the slice. Any other step runs whole in one slice and runs once a pass.
+//! Each step reads the coins and records it works on from the store when it
+//! runs, so a command run between two slices (a payment, a refresh, a
+//! trade) is seen by every step after it; only what a pass reads once (below)
+//! is carried from one slice to the next.
 //!
 //! **The resume point** is kept in the store ([`SYNC_RESUME`]): the step to
 //! run next, the items of that step already done in this pass, and what the
@@ -28,15 +30,26 @@
 //! stops between two slices goes on from there; one that stops inside a
 //! slice goes on from the slice before, and each step it runs again finds
 //! its finished items finished in the store. A resumed slice takes the
-//! witness of the operator's signer's record again before it asks the
-//! operator anything, and the re-check every other command takes at its
-//! start: the lineage watch while the chain's tip is the one the last
-//! complete re-check ran at, the whole re-check when it is not, so no slice
-//! acts on a tip it has not looked at (its changes join the pass's). A
-//! slice whose witness fails has waited out the witness's patience: it runs
-//! the rest of the pass, as one call does, so the patience is paid once a
-//! pass and the steps that take coins home when the operator cannot be
-//! reached come in every pass.
+//! re-check every other command takes at its start: the lineage watch while
+//! the chain's tip is the one the last complete re-check ran at, the whole
+//! re-check when it is not, so no slice acts on a tip it has not looked at
+//! (its changes join the pass's).
+//!
+//! **What a pass pays once.** The witness of the operator's signer's record
+//! and the operator's `info` are taken once a pass: a slice that resumes the
+//! pass on the tip they were taken at takes them as the pass found them (the
+//! resume point keeps that tip), and a slice on another tip, after its whole
+//! re-check, takes them afresh. Nothing is signed on that alone: every step
+//! that signs, or reads `info`, witnesses the record again itself once the
+//! last witness is older than [`super::wallet::WITNESS_FOR`]. The budget
+//! counts the pass's work only: what a slice does before its first step (the
+//! command's start, the re-check) and the witness's own time are not
+//! counted, so each slice advances the pass by about its budget whatever
+//! that fixed work costs; a budget of 0 stops at the first safe point after
+//! the slice's first step or item. A slice whose witness fails has waited
+//! out the witness's patience: it runs the rest of the pass, as one call
+//! does, so the patience is paid once a pass and the steps that take coins
+//! home when the operator cannot be reached come in every pass.
 //!
 //! A resume point is kept for each set of arguments, so a caller that syncs
 //! in slices with other arguments than another (`catch_up`, `deposits`)
@@ -89,6 +102,8 @@ pub(crate) struct Slice {
 	pub ran: usize,
 	/// Whether the step stopped before its last item.
 	pub cut: bool,
+	/// What the pass's steps read once for the whole pass ([`Wallet::slice_memo`]).
+	pub memo: serde_json::Map<String, Value>,
 }
 
 /// What a loop over a step's items does with the next one.
@@ -121,17 +136,25 @@ pub(crate) struct Resume {
 	pub slices: u64,
 	/// What each step cost in this slice alone.
 	pub last: serde_json::Map<String, Value>,
+	/// The chain's tip the pass's witness and `info` succeeded at: a slice
+	/// resumed on that tip takes them as the pass found them.
+	pub witnessed: Option<String>,
+	/// What a step read once for the whole pass, by step, on that tip
+	/// ([`Wallet::slice_memo`]): dropped when a slice resumes on another.
+	pub memo: serde_json::Map<String, Value>,
 }
 
 impl Resume {
 	pub fn new(args: Value, started: u32) -> Resume {
 		Resume { args, started, watch: started, next: STEPS[0].into(), done: BTreeSet::new(), out: serde_json::Map::new(),
-			cost: serde_json::Map::new(), slices: 1, last: serde_json::Map::new() }
+			cost: serde_json::Map::new(), slices: 1, last: serde_json::Map::new(), witnessed: None,
+			memo: serde_json::Map::new() }
 	}
 
 	fn to_json(&self) -> Value {
 		json!({"args": self.args, "started": self.started, "watch": self.watch, "next": self.next, "done": self.done,
-			"out": self.out, "cost": self.cost, "slices": self.slices})
+			"out": self.out, "cost": self.cost, "slices": self.slices, "witnessed": self.witnessed,
+			"memo": self.memo})
 	}
 
 	fn from_json(v: &Value) -> Option<Resume> {
@@ -145,6 +168,8 @@ impl Resume {
 			cost: v["cost"].as_object()?.clone(),
 			slices: v["slices"].as_u64()?,
 			last: serde_json::Map::new(),
+			witnessed: v["witnessed"].as_str().map(str::to_string),
+			memo: v["memo"].as_object().cloned().unwrap_or_default(),
 		})
 	}
 
@@ -248,6 +273,23 @@ impl Wallet {
 		Item::Go
 	}
 
+	/// What step `key` read once for the pass under way and kept
+	/// ([`Self::slice_memo_keep`]), when a slice runs and it was kept on the
+	/// tip the slice runs on; `None` otherwise. For what a step reads before
+	/// its items, of the operator or of many coins, which a pass in slices
+	/// would otherwise read again in every slice that goes on with the step.
+	pub(crate) fn slice_memo(&self, key: &str) -> Option<Value> {
+		self.slice.borrow().as_ref().and_then(|s| s.memo.get(key).cloned())
+	}
+
+	/// Keeps `v` as what step `key` read for the pass under way, when a
+	/// slice runs; nothing otherwise.
+	pub(crate) fn slice_memo_keep(&self, key: &str, v: Value) {
+		if let Some(s) = self.slice.borrow_mut().as_mut() {
+			s.memo.insert(key.to_string(), v);
+		}
+	}
+
 	/// Whether the step under way stopped before its last item.
 	pub(crate) fn slice_cut(&self) -> bool {
 		self.slice.borrow().as_ref().is_some_and(|s| s.cut)
@@ -269,7 +311,7 @@ impl Wallet {
 			(kept["started"].as_u64().unwrap_or(now as u64), serde_json::from_value(kept["done"].clone()).unwrap_or_default())
 		} else { (now as u64, BTreeSet::new()) };
 		*self.slice.borrow_mut() = Some(Slice { deadline: web_time::Instant::now() + std::time::Duration::from_millis(b), done, ran: 0,
-			cut: false });
+			cut: false, memo: serde_json::Map::new() });
 		let out = self.progress_deposits();
 		let s = self.slice.borrow_mut().take().expect("set above");
 		let out = out?;

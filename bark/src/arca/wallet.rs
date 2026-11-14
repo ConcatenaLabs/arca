@@ -2028,15 +2028,27 @@ impl Wallet {
 		}
 		let mailbox = self.keys.mailbox()?;
 		let x = mailbox.x_only_public_key().0;
-		let proof = self.server.post("challenge", &json!({})).ok()
-			.and_then(|v| unhex32(v["challenge"].as_str().unwrap_or("")).ok())
-			.map(|c| (c, sign(&mailbox, &super::client::auth_digest(&self.genesis, "holding_back", &c, &x, &[]))));
 		let coins: Vec<String> = live.iter().map(|c| c.leaf_id.clone()).collect();
 		let batch: Vec<String> = live.iter().filter(|c| c.kind == "batch").map(|c| c.leaf_id.clone()).collect();
-		let mut out = vec![];
+		// In a pass of `sync` in slices each call is an item of its step: what
+		// the calls before named is kept for the pass, and a slice may stop
+		// between two calls (each costs the operator about a second).
+		let mut out: Vec<String> = self.slice_memo("holding back").and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+		let mut proof = None;
 		// The operator's bound on one call (`holding_back`).
 		for (k, chunk) in coins.chunks(64).enumerate() {
-			let proven = proof.as_ref().and_then(|(c, sig)| self.server.post("holding_back", &json!({"leaf_ids": chunk,
+			match self.slice_item(&format!("holding back {}", chunk[0])) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
+			// The proof, once a call of this command reads.
+			if proof.is_none() {
+				proof = Some(self.server.post("challenge", &json!({})).ok()
+					.and_then(|v| unhex32(v["challenge"].as_str().unwrap_or("")).ok())
+					.map(|c| (c, sign(&mailbox, &super::client::auth_digest(&self.genesis, "holding_back", &c, &x, &[])))));
+			}
+			let proven = proof.as_ref().and_then(|p| p.as_ref()).and_then(|(c, sig)| self.server.post("holding_back", &json!({"leaf_ids": chunk,
 				"challenge": hex(c), "keys": [{"key": hex(&x.serialize()), "signature": hex(sig.as_ref())}]})).ok());
 			let a = match proven {
 				Some(a) => a,
@@ -2059,6 +2071,7 @@ impl Wallet {
 					out.push(id.to_string());
 				}
 			}
+			self.slice_memo_keep("holding back", json!(out));
 		}
 		Ok(out)
 	}
@@ -2096,8 +2109,25 @@ impl Wallet {
 		// alone keeps its node's fronted value from coming back: on a batch
 		// without a sweep nothing else ever asks for its refresh, and the
 		// operator's capital stays out until the batch's horizon.
-		let mut uncovered = self.uncovered()?;
+		// What the bond leaves uncovered and what the operator names: read once
+		// a pass, as each asks the operator (`holding_back` once for every 64
+		// coins, each call an item a slice may stop after), so that a pass in
+		// slices does not read them again in each slice that goes on with
+		// this step.
+		let mut uncovered = match self.slice_memo("uncovered").and_then(|v| serde_json::from_value::<Vec<String>>(v).ok()) {
+			Some(kept) => kept,
+			None => {
+				let u = self.uncovered()?;
+				self.slice_memo_keep("uncovered", json!(u));
+				u
+			},
+		};
 		let named = self.holding_back()?;
+		// A slice that stopped inside the operator's answer goes on with it
+		// in the next.
+		if self.slice_cut() {
+			return Ok(vec![]);
+		}
 		uncovered.extend(named.iter().cloned());
 		// The named coins due, by asset, each with whether the six-hour wait
 		// holds it.

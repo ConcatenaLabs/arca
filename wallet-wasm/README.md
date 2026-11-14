@@ -239,13 +239,19 @@ wallet then finds it free between the two.
 
 `sync` and `deposits` also run in slices, for a program that must answer others
 while they run (a maker's firm offer, a person's trade): with `"budget_ms": n`
-the command stops at the first safe point past `n` milliseconds and answers
-`"more": true`; the program runs whatever it was asked meanwhile and calls the
+the command stops at the first safe point past `n` milliseconds of the pass's
+work and answers `"more": true`; the program runs whatever it was asked meanwhile and calls the
 command again with the same arguments, which goes on where it stopped, until an
 answer comes without `more`. A safe point lies between two steps of `sync`, or
 between two items of a long step (a participation, a coin's refresh, deposit,
-journey home or exit, a payment over Lightning, a plan, an order); an item that
-has started runs to its end. A slice in which the operator cannot be reached
+journey home or exit, a call asking the operator which of 64 coins hold its
+capital back, a payment over Lightning, a plan, an order); an item that
+has started runs to its end. What a slice does before its first step (the
+command's start, its re-check) is not counted in `n`, and the witness of the
+operator's signer's record and the operator's `info` are taken once a pass: a
+slice that goes on with the pass on the chain's tip they were taken at takes
+them as the pass found them, and one on another tip takes them afresh. So a
+pass in slices costs about what one call does. A slice in which the operator cannot be reached
 waits out the witness's patience once and then runs the rest of the pass,
 since without the operator each step after is short. Each slice but the last answers
 `{"more": true, "next", "slice", "cost_by_step", "recheck"}`: `recheck` is
@@ -379,7 +385,8 @@ spends nothing it does not have to on reading the chain again.
   on the chain at once), every round and board's finality, each coin's dates,
   and its lineage looked for on the chain and in the mempool. Then the witness
   of the operator's signer's record (`start.witness`), unless the command stays
-  on the machine and the node; a witness stands for ten seconds. A command
+  on the machine and the node or witnesses itself (`sync`, once a pass, and
+  `hand_over_forfeits`); a witness stands for ten seconds. A command
   given `"recheck": "coins"` among its arguments runs only the part of the
   re-check that concerns the coins (each coin against the chain and its
   lineage watch), leaving the following of its participations' rounds (a round

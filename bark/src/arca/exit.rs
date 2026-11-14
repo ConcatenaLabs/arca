@@ -1981,8 +1981,7 @@ impl Wallet {
 
 	/// [`Self::sync_with`], one call of it.
 	fn sync_slice(&mut self, catch_up: bool, deposits: bool, history: bool, budget_ms: Option<u64>) -> Result<Value, Error> {
-		let begun = web_time::Instant::now();
-		let deadline = budget_ms.map(|b| begun + std::time::Duration::from_millis(b));
+		let budget = budget_ms.map(std::time::Duration::from_millis);
 		let now = self.now()?.to_consensus_u32();
 		let args = json!([catch_up, deposits, history]);
 		let resumed = match budget_ms {
@@ -1993,7 +1992,10 @@ impl Wallet {
 				None
 			},
 		};
-		let mut again = Value::Null;
+		let again;
+		// Whether the pass's witness and `info` stand for this slice: it
+		// resumes the pass on the tip they were taken at.
+		let mut kept = false;
 		let mut r = match resumed {
 			Some(mut r) => {
 				r.slices += 1;
@@ -2003,9 +2005,16 @@ impl Wallet {
 				// the whole re-check when it is not. Its changes join the
 				// pass's.
 				again = match self.tip_rechecked()? {
-					Some(_) => self.recheck_lineages()?,
+					Some(tip) => {
+						kept = r.witnessed.as_deref() == Some(tip.as_str());
+						self.recheck_lineages()?
+					},
 					None => self.recheck()?,
 				};
+				// What the pass read once holds on the tip it was read at only.
+				if !kept {
+					r.memo.clear();
+				}
 				if let (Some(all), Some(new)) = (r.out.get_mut("recheck").and_then(|v| v["changes"].as_array_mut()),
 					again["changes"].as_array())
 				{
@@ -2031,7 +2040,7 @@ impl Wallet {
 		};
 		*self.exit_watch.borrow_mut() = Some(r.watch);
 		*self.exits_done.borrow_mut() = (vec![], vec![]);
-		let out = self.sync_asking(&mut r, catch_up, deposits, history, deadline);
+		let out = self.sync_asking(&mut r, catch_up, deposits, history, budget, kept);
 		r.watch = self.exit_watch.borrow_mut().take().unwrap_or(now);
 		*self.slice.borrow_mut() = None;
 		let (h, e) = std::mem::take(&mut *self.exits_done.borrow_mut());
@@ -2076,10 +2085,14 @@ impl Wallet {
 		// Only a step cut between its items runs in the slice; another runs
 		// whole, a nested loop over items included.
 		if let Some(d) = deadline.filter(|_| super::slice::ITEMS.contains(&name)) {
-			*self.slice.borrow_mut() = Some(super::slice::Slice { deadline: d, done: std::mem::take(&mut r.done), ran: 0, cut: false });
+			*self.slice.borrow_mut() = Some(super::slice::Slice { deadline: d, done: std::mem::take(&mut r.done), ran: 0, cut: false,
+				memo: std::mem::take(&mut r.memo) });
 		}
 		let v = run(self);
-		let slice = self.slice.borrow_mut().take();
+		let mut slice = self.slice.borrow_mut().take();
+		if let Some(s) = slice.as_mut() {
+			r.memo = std::mem::take(&mut s.memo);
+		}
 		steps.lap(self, name);
 		self.exits_meanwhile();
 		*ran += 1;
@@ -2105,11 +2118,17 @@ impl Wallet {
 
 	/// The part of [`Self::sync`] that asks the operator, with every exit step
 	/// whose date comes meanwhile taken at once ([`Self::exits_meanwhile`]):
-	/// each step of the pass `r` not done yet, until the slice ends at
-	/// `deadline`. `Some(next step)` when it stopped before the end.
+	/// each step of the pass `r` not done yet, until the slice has spent
+	/// `budget` on them (the witness's own time not counted). With `kept`, the
+	/// slice resumes the pass on the tip its witness and `info` succeeded at,
+	/// and takes them as the pass found them. `Some(next step)` when it
+	/// stopped before the end.
 	fn sync_asking(&mut self, r: &mut super::slice::Resume, catch_up: bool, with_deposits: bool, with_history: bool,
-		mut deadline: Option<web_time::Instant>) -> Result<Option<String>, Error>
+		budget: Option<std::time::Duration>, kept: bool) -> Result<Option<String>, Error>
 	{
+		// The slice's budget counts from here: what came before it in this
+		// call (the command's start, the re-check) is not the pass's work.
+		let mut deadline = budget.map(|b| web_time::Instant::now() + b);
 		// What each step cost (milliseconds, and requests of the node and of
 		// the operator): `cost_by_step`, for a program that logs a slow sync.
 		let mut steps = Steps::start(self);
@@ -2131,12 +2150,29 @@ impl Wallet {
 			if with_deposits && w.store.meta(super::tower::DEPOSITS_OWED).ok().flatten().is_some() { arr(w.progress_deposits()) }
 			else { Value::Null }
 		});
-		// The witness, patiently, in every slice: after a rollback of the
+		// The witness, patiently, once a pass: after a rollback of the
 		// operator's signer's record the wallet does only what it does on the
 		// chain, and while no witness succeeds it takes no coin and signs no
-		// spend through the operator.
-		let (witness, info_failed, tries) = self.reach_operator();
-		steps.lap(self, "witness");
+		// spend through the operator. A slice that resumes the pass on the tip
+		// the pass's witness and `info` succeeded at takes them as they were:
+		// every step that signs, or reads `info`, witnesses the record again
+		// itself when the last witness is older than [`super::wallet::WITNESS_FOR`]
+		// ([`Self::witnessed_now`]), and a slice on another tip takes them
+		// afresh. The witness's own time is not counted in the slice's budget.
+		let (witness, info_failed, tries) = if kept {
+			(Ok(r.out.get("witness").cloned().unwrap_or(Value::Null)), None, 1)
+		} else {
+			let t = web_time::Instant::now();
+			let reached = self.reach_operator();
+			steps.lap(self, "witness");
+			if let Some(d) = deadline.as_mut() {
+				*d += t.elapsed();
+			}
+			if reached.0.is_ok() && reached.1.is_none() {
+				r.witnessed = self.tip_rechecked()?;
+			}
+			reached
+		};
 		self.exits_meanwhile();
 		let witnessed = witness.is_ok();
 		let failed = witness.as_ref().err().map(|e| e.to_string());
