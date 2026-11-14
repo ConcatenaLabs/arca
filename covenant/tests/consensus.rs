@@ -1347,29 +1347,52 @@ fn htlc2_cases(f: &F, book: &mut Book) {
 	book.fail("htlc-2/neg a refund together with S's signature twice", &refund_c(&lock, &ssp, &ssp, lt), 0, BAD_SIG);
 
 	// Alone, on the chain: Q with the preimage after its delay; P from the
-	// timeout and after its own delay.
-	let claim = |key: &Keypair, pre: &[u8; 32], seq: u32| {
-		let mut s = tx(&lock, 0, seq, paid(&to_q));
-		let sg = s.sign(key, 0, &lock.claim_script(), f.genesis);
-		s.witness(0, lock.claim_witness(&sg, pre));
+	// timeout and after its own delay. Each signs the message its script
+	// builds, never the outpoint: one signature spends the leaf wherever it
+	// lands, and a fee coin may follow the outputs it commits to.
+	let mcq = lock.claim_message(f.x, LEAF, std::slice::from_ref(&to_q)).unwrap();
+	let mrp = lock.refund_message(f.x, LEAF, std::slice::from_ref(&to_p)).unwrap();
+	assert_ne!(mcq.digest, mq.digest, "CLAIM's message is not CLAIM-C's");
+	assert_ne!(mrp.digest, mp.digest, "REFUND's message is not REFUND-C's");
+	let claim_with = |sg: &Signature, pre: &[u8; 32], seq: u32, label: &str| {
+		let mut s = Spend::new(0).fake_input(label, explicit(f.x, LEAF, lock.script_pubkey()), seq).outputs(paid(&to_q));
+		s.witness(0, lock.claim_witness(sg, 1, pre));
 		s
 	};
-	let refund = |key: &Keypair, locktime: u32, seq: u32| {
-		let mut s = tx(&lock, locktime, seq, paid(&to_p));
-		let sg = s.sign(key, 0, &lock.refund_script(), f.genesis);
-		s.witness(0, lock.refund_witness(&sg));
+	let refund_with = |sg: &Signature, locktime: u32, seq: u32, label: &str| {
+		let mut s = Spend::new(locktime).fake_input(label, explicit(f.x, LEAF, lock.script_pubkey()), seq).outputs(paid(&to_p));
+		s.witness(0, lock.refund_witness(sg, 1));
 		s
 	};
+	let claim = |key: &Keypair, pre: &[u8; 32], seq: u32| claim_with(&sig(key, &mcq.digest), pre, seq, "htlc-2");
+	let refund = |key: &Keypair, locktime: u32, seq: u32| refund_with(&sig(key, &mrp.digest), locktime, seq, "htlc-2");
 	book.pass("htlc-2/Q claims alone with the preimage after its delay", &claim(&f.a, &preimage, qd));
+	book.pass("htlc-2/Q's one claim signature spends the leaf at another outpoint",
+		&claim_with(&sig(&f.a, &mcq.digest), &preimage, qd, "htlc-2 elsewhere"));
+	let mut fed = claim(&f.a, &preimage, qd);
+	fed = fed.fake_input("a fee coin", explicit(f.x, 5_000, op_true().script_pubkey()), 0xffff_ffff)
+		.output(explicit(f.x, 5_000, op_true().script_pubkey()));
+	fed.witness(1, op_true_witness());
+	book.pass("htlc-2/Q's claim with a fee coin added after it was signed", &fed);
 	book.fail("htlc-2/neg a claim one unit before Q's delay", &claim(&f.a, &preimage, qd - 1), 0, LOCKTIME);
 	book.fail("htlc-2/neg a claim with a wrong preimage", &claim(&f.a, &label32("wrong"), qd), 0, EQUALVERIFY);
 	book.fail("htlc-2/neg a claim signed by P", &claim(&p, &preimage, qd), 0, BAD_SIG);
 	book.fail("htlc-2/neg a claim signed by S", &claim(&f.s, &preimage, qd), 0, BAD_SIG);
+	book.fail("htlc-2/neg a claim with Q's CLAIM-C signature", &claim_with(&sq, &preimage, qd, "htlc-2"), 0, BAD_SIG);
+	book.fail("htlc-2/neg a claim with Q's signature over other outputs",
+		&claim_with(&sig(&f.a, &lock.claim_message(f.x, LEAF, std::slice::from_ref(&to_p)).unwrap().digest), &preimage, qd, "htlc-2"),
+		0, BAD_SIG);
 	book.pass("htlc-2/P refunds alone from the timeout after its delay", &refund(&p, lt, pdq));
+	book.pass("htlc-2/P's one refund signature spends the leaf at another outpoint",
+		&refund_with(&sig(&p, &mrp.digest), lt, pdq, "htlc-2 elsewhere"));
 	book.fail("htlc-2/neg a refund with a lock time below the timeout", &refund(&p, lt - 1, pdq), 0, LOCKTIME);
 	book.fail("htlc-2/neg a refund one unit before P's delay", &refund(&p, lt, pdq - 1), 0, LOCKTIME);
 	book.fail("htlc-2/neg a refund signed by Q", &refund(&f.a, lt, pdq), 0, BAD_SIG);
 	book.fail("htlc-2/neg a refund signed by S", &refund(&f.s, lt, pdq), 0, BAD_SIG);
+	book.fail("htlc-2/neg a refund with P's REFUND-C signature", &refund_with(&sp, lt, pdq, "htlc-2"), 0, BAD_SIG);
+	book.fail("htlc-2/neg a refund with P's signature of CLAIM's message",
+		&refund_with(&sig(&p, &lock.claim_message(f.x, LEAF, std::slice::from_ref(&to_p)).unwrap().digest), lt, pdq, "htlc-2"),
+		0, BAD_SIG);
 
 	// S's claim pair and refund pair of one lock are two messages under one
 	// salt: the bond's evidence.

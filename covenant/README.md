@@ -923,8 +923,8 @@ is co-signed, with no round between, and the seller's refund rests on script.
 |---|---|---|
 | CLAIM-C | the hash gate, then the leaf's collaborative path of `Q` and `S` under the leaf's `K` | `Q` and the operator, with the preimage, at any time: the claim out of round |
 | REFUND-C | `<T> CLTV DROP`, then the collaborative path of `P` and `S` under the same `K` | `P` and the operator from `T`: the refund out of round |
-| CLAIM | `<d_Q> CSV DROP`, the hash gate, `<Q> CHECKSIG` | `Q` alone on the chain, `d_Q` (the leaf's exit delay) after the leaf confirms |
-| REFUND | `<T> CLTV DROP <d_P> CSV DROP <P> CHECKSIG` | `P` alone on the chain, from `T` and `d_P` after the leaf confirms |
+| CLAIM | `<d_Q> CSV DROP`, the hash gate, then `Q` alone over the outputs under `K ‖ 01` | `Q` alone on the chain, `d_Q` (the leaf's exit delay) after the leaf confirms |
+| REFUND | `<T> CLTV DROP <d_P> CSV DROP`, then `P` alone over the outputs under `K ‖ 02` | `P` alone on the chain, from `T` and `d_P` after the leaf confirms |
 
 No path spends the leaf without the preimage before `T`; from `T` on the
 refunds open beside the claims, which stay open with the preimage. On the
@@ -947,9 +947,22 @@ from the chain, the claim's preimage among its witness items), so the
 operator decides a lock one way only; over the same outputs they are one
 message, and one outcome whichever lands. Its signature of one ending
 beside the other ending's holder pays only the outputs that pair committed
-to. Measured on the node (`regtest/t29_htlc2_lock.py`):
-the claim together 307 vB, the refund together 290 vB, the claim alone 245 vB,
-the refund alone 229 vB, each into one output with a reserve fee.
+to.
+
+CLAIM and REFUND are rebindable as the collaborative paths are: the holder
+signs, with `OP_CHECKSIGFROMSTACK`, the message the script builds from the
+coin and outputs `0..m-1` (`claim_message`, `refund_message`), never the
+outpoint. A CLAIM or REFUND signed in advance therefore spends the leaf at
+whatever outpoint its path brings it to on the chain, however the steps above
+it were paid for, and whoever broadcasts it adds a fee coin after the outputs
+it commits to. CLAIM's message starts with `K ‖ 01` and REFUND's with `K ‖ 02`,
+76 + 32m bytes, so neither is ever a collaborative message (75 + 32m bytes)
+under the same `K`: a holder's signature of one path opens no other, and the
+operator signs neither. Measured on the node (`regtest/t29_htlc2_lock.py`):
+the claim together 307 vB and the refund together 290 vB, each into one output
+with a reserve fee; the refund alone 267 vB, signed before the leaf existed,
+into one output with a reserve fee; the claim alone 412 vB, signed before the
+leaf existed, with a fee coin added after signing and its change.
 
 **The purchase.** The buyer `Q` asks the seller `P` to lock, naming its key and
 nonce, only when the operator lists `htlc-2` among its templates, the seller
@@ -1011,8 +1024,8 @@ and serves the preimage once it has it.
 | `P` locks; `Q` never pays, or pays after the invoice expired | The BTC payment fails back to `Q`; `P` refunds from `T` by REFUND-C, or by REFUND on the chain if the operator refuses |
 | `Q` pays; `P` never claims | The Bitcoin HTLC times out and `Q`'s BTC returns; `P` refunds from `T` |
 | `Q` pays; `P` claims | The preimage is out; `Q` claims by CLAIM-C, or, refused, exits on the chain by its home date and claims by CLAIM with `ρ` to spare |
-| `Q` offline after paying | Its watchtower holds the lock's record, CLAIM spends `Q` signed in advance (the preimage is not under the signature) and the preimage `Q`'s wallet handed it; failing that, it reads the preimage from the operator. From the home date it brings the lock on the chain and claims it. With no preimage from either by then, it does nothing: the buyer was not paid against, or the seller never claimed, and the BTC returns to the buyer |
-| `P` offline after locking | No deadline binds `P`: from `T` it refunds when it returns, unless `Q` claimed with the preimage `P` revealed. Its watchtower, holding REFUND spends `P` signed in advance, refunds on the chain an hour past `T` while the lock is open |
+| `Q` offline after paying | Its watchtower holds the lock's record, a CLAIM `Q` signed in advance, which fits the leaf wherever it lands (the preimage is not under the signature) and the preimage `Q`'s wallet handed it; failing that, it reads the preimage from the operator. From the home date it brings the lock on the chain and claims it. With no preimage from either by then, it does nothing: the buyer was not paid against, or the seller never claimed, and the BTC returns to the buyer |
+| `P` offline after locking | No deadline binds `P`: from `T` it refunds when it returns, unless `Q` claimed with the preimage `P` revealed. Its watchtower, holding a REFUND `P` signed in advance, refunds on the chain an hour past `T` while the lock is open |
 | `P` and the operator spend `P`'s checkpoint elsewhere before the lock confirms | The lock is void, and a buyer who paid loses up to its value: the trust of any coin received out of round, which the instant limit bounds. The buyer holds the evidence: the operator's signatures in the lock's record (the checkpoint pair and the reassignment pair over `P`'s coin), and its signature in the conflicting spend, which `rebind_signed_in` reads from the chain: two messages under one salt, which SLASH takes as for any coin signed twice |
 | The Bitcoin leg is reorganised | Nothing changes here: the BTC leg is the Bitcoin ark's; a preimage revealed stays revealed. A rollback of the rounds under the lock returns the identical round, and the lock stands or falls with `P`'s coin as any coin received out of round |
 
