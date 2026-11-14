@@ -2011,10 +2011,6 @@ impl Wallet {
 					},
 					None => self.recheck()?,
 				};
-				// What the pass read once holds on the tip it was read at only.
-				if !kept {
-					r.memo.clear();
-				}
 				if let (Some(all), Some(new)) = (r.out.get_mut("recheck").and_then(|v| v["changes"].as_array_mut()),
 					again["changes"].as_array())
 				{

@@ -41,7 +41,12 @@
 //! resume point keeps that tip), and a slice on another tip, after its whole
 //! re-check, takes them afresh. Nothing is signed on that alone: every step
 //! that signs, or reads `info`, witnesses the record again itself once the
-//! last witness is older than [`super::wallet::WITNESS_FOR`]. The budget
+//! last witness is older than [`super::wallet::WITNESS_FOR`]. What a step
+//! asks the operator before its items (which coins hold its capital back,
+//! what the bond leaves uncovered) is asked once a pass and kept with the
+//! resume point, whatever the tip: it is the operator's answer, not the
+//! chain's, and a tip that moves every few seconds would otherwise have the
+//! step ask it again before it ever reached its items. The budget
 //! counts the pass's work only: what a slice does before its first step (the
 //! command's start, the re-check) and the witness's own time are not
 //! counted, so each slice advances the pass by about its budget whatever
@@ -139,8 +144,8 @@ pub(crate) struct Resume {
 	/// The chain's tip the pass's witness and `info` succeeded at: a slice
 	/// resumed on that tip takes them as the pass found them.
 	pub witnessed: Option<String>,
-	/// What a step read once for the whole pass, by step, on that tip
-	/// ([`Wallet::slice_memo`]): dropped when a slice resumes on another.
+	/// What a step read of the operator once for the whole pass, by step
+	/// ([`Wallet::slice_memo`]).
 	pub memo: serde_json::Map<String, Value>,
 }
 
@@ -274,10 +279,12 @@ impl Wallet {
 	}
 
 	/// What step `key` read once for the pass under way and kept
-	/// ([`Self::slice_memo_keep`]), when a slice runs and it was kept on the
-	/// tip the slice runs on; `None` otherwise. For what a step reads before
-	/// its items, of the operator or of many coins, which a pass in slices
-	/// would otherwise read again in every slice that goes on with the step.
+	/// ([`Self::slice_memo_keep`]), when a slice runs; `None` otherwise. For
+	/// what a step asks the operator before its items, which a pass in slices
+	/// would otherwise ask again in every slice that goes on with the step.
+	/// It is the operator's answer, not the chain's, and a pass lasts
+	/// [`RESUME_FOR`] at most: a slice on a new tip still takes its whole
+	/// re-check and witness, and nothing is signed on what is kept here.
 	pub(crate) fn slice_memo(&self, key: &str) -> Option<Value> {
 		self.slice.borrow().as_ref().and_then(|s| s.memo.get(key).cloned())
 	}

@@ -2109,11 +2109,14 @@ impl Wallet {
 		// alone keeps its node's fronted value from coming back: on a batch
 		// without a sweep nothing else ever asks for its refresh, and the
 		// operator's capital stays out until the batch's horizon.
-		// What the bond leaves uncovered and what the operator names: read once
-		// a pass, as each asks the operator (`holding_back` once for every 64
-		// coins, each call an item a slice may stop after), so that a pass in
-		// slices does not read them again in each slice that goes on with
-		// this step.
+		// What the bond leaves uncovered and what the operator names: asked
+		// once a pass (`holding_back` once for every 64 coins, each call an
+		// item a slice may stop after), so that a pass in slices does not ask
+		// them again in each slice that goes on with this step. Kept for the
+		// pass whatever the tip (`slice_memo`): a stale answer asks a free
+		// refresh of a coin no longer named, which the quote at no fee
+		// refuses before anything is signed, or leaves a newly named one to
+		// the next pass.
 		let mut uncovered = match self.slice_memo("uncovered").and_then(|v| serde_json::from_value::<Vec<String>>(v).ok()) {
 			Some(kept) => kept,
 			None => {
