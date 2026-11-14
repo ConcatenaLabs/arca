@@ -693,3 +693,75 @@ async fn a_lock_follows_its_round_rolled_back_and_takes_one_ending() {
 	assert_eq!(lock(&p, &hash)["state"], "claimed", "{}", lock(&p, &hash));
 	assert_eq!(held(&p, &x, "lock_out"), 0);
 }
+
+/// The payee's watchtower holds its CLAIM signed in advance. The payer takes
+/// the change of the lock's reassignment home on the chain, which brings
+/// that reassignment by the payer's own transaction, so the lock's leaf
+/// lands at an outpoint nobody predicted. The payee is gone and the operator
+/// down. The watchtower still claims: CLAIM signs no outpoint. Before CLAIM
+/// was rebindable the watchtower held endings over another outpoint, did
+/// nothing, and after the timeout the payer's REFUND took the lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payers_exit_of_its_change_leaves_the_payees_tower_its_claim() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("moved P");
+	let q = Arca::new("moved Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 3_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+	let (url, node) = (r.url(), r.node_url());
+	let tq = Tower::new("moved TQ", &url, &node);
+	let s = script(&tq.wallet.ok(&["address"]));
+	r.pay_to(s, xa, 2_000_000);
+	r.produce().await;
+	r.bury().await;
+	q.ok(&["watchtowers", &tq.url]);
+
+	let pre = [0x5bu8; 32];
+	let h = hex(&sha256::Hash::hash(&pre).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "200000", "--hash", &h]);
+	let l = p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "30000"]);
+	let t = num(&l["timeout"]) as u32;
+	let change = l["transfer"]["outputs"].as_array().unwrap().iter().filter_map(|o| o.as_str()).find(|o| *o != l["leaf_id"].as_str().unwrap())
+		.expect("the lock's change").to_string();
+	q.ok(&["sync"]);
+	assert_eq!(q.ok(&["lock", "ready", &h])["ready"], true);
+	let d0 = tq.lock_deposit(&h);
+	assert!(d0["lock"]["endings"].as_u64().is_some_and(|n| n > 0), "{}", d0);
+	r.server.stop();
+	q.run(&["lock", "preimage", &h, &hex(&pre)]);
+	assert_eq!(tq.lock_deposit(&h)["lock"]["preimage_known"], true);
+	drop(q);
+
+	// The payer takes its change home on the chain, by its wallet's exit:
+	// the shared reassignment comes on the chain by the payer's transaction.
+	let e = exit_until(&r, &p, &change, "claimed", false).await;
+	println!("the payer's change exit: {}", e);
+	r.produce().await;
+	r.bury().await;
+
+	let start = std::time::Instant::now();
+	let ended = loop {
+		let d = tq.lock_deposit(&h);
+		println!("median {} T {} | TQ: {} {}", common::node::median_time(&r.rt), t, d["state"], d["note"]);
+		if d["state"] == "ended" {
+			break d;
+		}
+		let _ = p.run(&["sync"]);
+		assert_ne!(lock(&p, &h)["state"], "refunded", "the payer's refund took a lock its payee's watchtower held the preimage of");
+		assert!(common::node::median_time(&r.rt) < t + 3 * 3600, "the watchtower never claimed: {}", d);
+		assert!(start.elapsed() < std::time::Duration::from_secs(1500), "too long");
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 900));
+		r.produce().await;
+		r.bury().await;
+		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+	};
+	let claim = ended["broadcast"].as_array().and_then(|a| a.iter().find(|t| t["ending"] == "CLAIM")).cloned().expect("a CLAIM among its transactions");
+	let ctx = tx(&r, claim["txid"].as_str().unwrap());
+	assert_eq!(ctx.input[0].witness.script_witness[2], pre.to_vec(), "the CLAIM carries the preimage");
+	assert!(confirmations(&r, &ctx.txid()) >= 1);
+	println!("the watchtower's CLAIM {} ({} vB) is in a block, before T: median {} < {}", ctx.txid(), ctx.vsize(), common::node::median_time(&r.rt), t);
+	let _ = p.run(&["sync"]);
+	assert_ne!(lock(&p, &h)["state"], "refunded");
+}

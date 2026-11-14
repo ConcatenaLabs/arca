@@ -43,14 +43,13 @@ use elements::AssetId;
 use serde_json::{json, Value};
 
 use arca_covenant::lock::{LockSpend, LockTerms, REFUND_DELAY_MARGIN_UNITS};
-use arca_covenant::{CoinRecord, MedianTime, NewLeaf, RelativeTime};
+use arca_covenant::{CoinRecord, ExplicitOutput, MedianTime, NewLeaf, RelativeTime};
 
 use super::chain::{hex, unhex32};
-use super::exit::{Here, Payer};
 use super::pay::{In, Out};
 use super::places::{Place, Spend};
 use super::store::CoinRow;
-use super::wallet::{amount, Wallet};
+use super::wallet::{amount, sign, Wallet};
 use super::{random32, Error};
 
 /// Where the wallet keeps its locks: a map from `<role>/<hash>` (`payee` or
@@ -737,16 +736,16 @@ impl Wallet {
 	/// the coin's record and the transactions it rests on, as any deposit,
 	/// and the lock's ending signed beforehand by the key of the wallet's
 	/// side, for the watchtower to broadcast while the wallet is away: the
-	/// payee's CLAIM (its preimage left out, which the watchtower puts in
-	/// once it knows it) or the payer's REFUND, each paying to an on-chain
-	/// address of the wallet's own, at each of [`ENDING_FEE_STEPS`].
+	/// payee's CLAIM (its preimage, not under the signature, the watchtower
+	/// puts in once it knows it) or the payer's REFUND, each paying to an
+	/// on-chain address of the wallet's own, at each of [`ENDING_FEE_STEPS`].
 	///
-	/// A signature commits to the outpoint it spends, so each ending is
-	/// signed over the outpoint the lock's leaf has when its path is brought
-	/// on the chain from where it rests now, each step paying its fee from
-	/// its own reserve, as a watchtower brings it. The wallet signs them
-	/// again whenever that outpoint changes (a step of the path came on the
-	/// chain another way). `None` for a lock its side no longer holds open.
+	/// Each ending is a signature of the message its path builds over its
+	/// one output (`out` of the coin's asset to `to`), never an outpoint: it
+	/// fits the leaf wherever the leaf's path brings it on the chain, however
+	/// each step was paid for, and the watchtower adds a fee coin of its own
+	/// when none pays the node's floor. `None` for a lock its side no longer
+	/// holds open.
 	pub(crate) fn lock_deposit(&mut self, row: &CoinRow) -> Result<Option<(String, Value)>, Error> {
 		let role = if row.state == LOCK_IN { "payee" } else { "payer" };
 		let record = Self::record_of(row)?;
@@ -767,20 +766,12 @@ impl Wallet {
 		let coin = a.valid;
 		let bytes = record.to_bytes().map_err(|e| Error::Refused(e.to_string()))?;
 		let bases = self.accepted_bases(&record)?;
-		// Where the leaf comes on the chain, each step paid from its reserve.
-		let mut path = vec![];
-		Self::path_outputs(&coin, &mut path);
-		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
-		let mut payer = Payer::new(None);
-		payer.reserve_only = true;
-		payer.moved = Some(coin.asset);
-		let leaf_at = self.bring(&coin, &mut payer, &mut vec![], &here)?;
 		let preimage = rec["preimage"].as_str().map(String::from);
 		let id = hex(&lock_deposit_id(&bytes, role));
-		// Signed again only when the leaf's outpoint changed.
+		// Signed once: an ending fits the leaf at any outpoint.
 		if let Some((old_id, body)) = self.store.deposit(&row.leaf_id)? {
 			let mut v: Value = serde_json::from_str(&body).map_err(|e| Error::Store(e.to_string()))?;
-			if old_id == id && v["lock"]["leaf"] == leaf_at.to_string() {
+			if old_id == id && v["lock"]["endings"].as_array().is_some_and(|e| !e.is_empty()) && v["lock"]["leaf"].is_null() {
 				if v["lock"]["preimage"].as_str() != preimage.as_deref() && preimage.is_some() {
 					v["lock"]["preimage"] = json!(preimage);
 				}
@@ -798,19 +789,21 @@ impl Wallet {
 			},
 		};
 		let to = self.claim_script(&coin, index)?;
-		// The payee's preimage is not covered by its signature: a placeholder
-		// the watchtower replaces.
-		let after: Vec<Vec<u8>> = if role == "payee" { vec![vec![0u8; 32]] } else { vec![] };
-		let base = self.fee_for(coin.asset, 300)?;
+		let policy = coin.leaf.lock_policy().ok_or_else(|| Error::Refused("the coin is no lock".into()))?;
+		let base = self.fee_for(coin.asset, super::exit::LOCK_ENDING_VSIZE)?.max(1);
 		let mut endings = vec![];
 		for k in ENDING_FEE_STEPS {
-			let mut payer = Payer::new(None).at_least(base.saturating_mul(k));
-			payer.reserve_only = true;
-			match self.claim_tx(&mut payer, &key, &coin, leaf_at, &to, &after) {
-				Ok(u) => endings.push(hex(&elements::encode::serialize(&u.tx))),
-				Err(_) if !endings.is_empty() => break,
-				Err(e) => return Err(e),
+			let fee = base.saturating_mul(k);
+			if fee >= coin.value {
+				break;
 			}
+			let out = [ExplicitOutput::new(coin.asset, coin.value - fee, to.clone())];
+			let m = if role == "payee" { policy.claim_message(coin.asset, coin.value, &out) } else { policy.refund_message(coin.asset, coin.value, &out) }
+				.map_err(|e| Error::Refused(e.to_string()))?;
+			endings.push(json!({"out": coin.value - fee, "sig": hex(sign(&key, &m.digest).as_ref())}));
+		}
+		if endings.is_empty() {
+			return Err(Error::Refused(format!("the lock's {} atoms do not cover its ending's fee", coin.value)));
 		}
 		let block = self.server_info().ok().and_then(|i| i["lightning"]["receive"]["block_seconds"].as_u64()).unwrap_or(60).max(1);
 		let act_from = match role {
@@ -820,7 +813,7 @@ impl Wallet {
 		let body = json!({"genesis_hash": self.genesis.genesis_hash().to_string(), "record": hex(&bytes),
 			"bases": bases.iter().map(|t| hex(&elements::encode::serialize(t))).collect::<Vec<_>>(),
 			"lock": {"role": role, "payment_hash": hash, "holder": key.x_only_public_key().0.to_string(), "act_from": act_from,
-				"leaf": leaf_at.to_string(), "endings": endings, "preimage": preimage}});
+				"to": hex(to.as_bytes()), "endings": endings, "preimage": preimage}});
 		Ok(Some((id, body)))
 	}
 

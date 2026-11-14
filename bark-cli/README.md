@@ -1855,8 +1855,12 @@ holds open the wallet deposits, in the clear, the lock's record and its
 ending signed in advance by its own key: the payee's CLAIM, its preimage
 left out (no signature covers it), or the payer's REFUND, each paying to an
 address of the wallet's own, at four fees (the node's floor when signed,
-and twice, four and eight times it). The watchtower checks each ending's
-signature against the lock's payee or refunder key, and acts by time:
+and twice, four and eight times it). Each is a signature of the message the
+path builds over its one output, never of an outpoint, so it spends the
+lock's leaf wherever the leaf's path brings it on the chain, however each
+step was paid for; the wallet signs it once. The watchtower checks each
+ending's signature against the lock's payee or refunder key, and acts by
+time:
 
 - the payee's, from the lock's home date (its timeout less its exit delay
   and the unroll of its path), or as soon as the lock's leaf is on the
@@ -1869,14 +1873,9 @@ signature against the lock's payee or refunder key, and acts by time:
 - neither, for a lock the operator records as claimed or refunded.
 
 It brings the lock's path on the chain as for any coin, then broadcasts the
-cheapest ending the node takes, once the leaf is in a block and the
-ending's time locks allow. A signature commits to the outpoint it spends, so
-the endings are signed over the leaf as its path comes when each step pays
-its fee from its own reserve, the way a watchtower brings it; `sync` signs
-them again whenever that changes. A path brought another way (a step paid
-from a fee coin, by anyone) leaves the watchtower unable to end the lock
-until the wallet's next `sync`; it says so (`on_chain`, naming both
-outpoints).
+cheapest ending whose own margin pays the node's floor, once the leaf is in
+a block and the ending's time locks allow; when none does (fees rose), it
+adds a fee coin of its own to the dearest.
 
 ### Swept coins
 

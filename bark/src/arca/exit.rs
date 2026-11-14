@@ -134,12 +134,6 @@ impl Payer {
 	pub(crate) fn new(asset: Option<AssetId>) -> Payer {
 		Payer { asset, moved: None, coin: None, change: None, used: vec![], min_fee: 0, anchor: false, reserve_only: false }
 	}
-
-	/// A payer whose next transaction pays at least `fee`.
-	pub(crate) fn at_least(mut self, fee: u64) -> Payer {
-		self.min_fee = fee;
-		self
-	}
 }
 
 fn txs_fee(tx: &Transaction) -> Vec<(AssetId, u64)> {
@@ -180,6 +174,11 @@ pub(crate) fn bid_share_ppm(from: u32, timeout: u32, now: u32) -> u64 {
 /// output, about 227, priced at 240; an `htlc-1` leaf's claim or refund, its
 /// longer script and a received leaf's preimage in its witness, about 250,
 /// priced at 300.
+/// What a lock's ending alone on the chain weighs at most, in vbytes, into
+/// one output with its reserve paying (CLAIM, with its preimage, is the
+/// larger), for its fee.
+pub(crate) const LOCK_ENDING_VSIZE: u64 = 300;
+
 fn claim_vsize(leaf: &arca_covenant::LeafPolicy) -> u64 {
 	if leaf.htlc.is_some() || leaf.lock.is_some() { 300 } else if leaf.landing.is_some() { 240 } else { 220 }
 }
@@ -369,11 +368,8 @@ impl Wallet {
 			return self.with_fee(payer, &|f| o.landing_tx(leaf_at, value, f).map_err(|e| Error::Refused(e.to_string())));
 		}
 		let min_fee = payer.min_fee;
-		// A lock: CLAIM by its payee (with the preimage, past its delay),
-		// REFUND by its payer (from its timeout, past the payer's delay).
-		let lock = leaf.lock_policy().map(|p| (key.x_only_public_key().0 == p.terms.refunder, p));
-		self.key_spend_with(payer, key, after, &|f| {
-			let out = match f {
+		let out_for = |f: &FeeSource| -> Result<ExplicitOutput, Error> {
+			Ok(match f {
 				FeeSource::Reserve | FeeSource::Split { .. } => {
 					let fee = self.fee_for(asset, claim_vsize(&leaf))?.max(min_fee);
 					if fee >= value {
@@ -382,11 +378,31 @@ impl Wallet {
 					ExplicitOutput::new(asset, value - fee, to.clone())
 				},
 				FeeSource::Coin { .. } | FeeSource::Burning { .. } => ExplicitOutput::new(asset, value, to.clone()),
-			};
-			if let Some((refund, p)) = &lock {
-				return if *refund { p.refund_tx(leaf_at, asset, value, &[out], f) } else { p.claim_tx(leaf_at, asset, value, &[out], f) }
-					.map_err(|e| Error::Refused(e.to_string()));
+			})
+		};
+		// A lock: CLAIM by its payee (with the preimage, past its delay),
+		// REFUND by its payer (from its timeout, past the payer's delay),
+		// each signing the message its script builds over its outputs.
+		if let Some(p) = leaf.lock_policy() {
+			let refund = key.x_only_public_key().0 == p.terms.refunder;
+			let preimage: Option<[u8; 32]> = after.first().and_then(|a| <[u8; 32]>::try_from(a.as_slice()).ok());
+			if !refund && preimage.is_none() {
+				return Err(Error::Refused("a lock's claim needs its preimage".into()));
 			}
+			return self.with_fee(payer, &|f| {
+				let out = [out_for(f)?];
+				let built = if refund {
+					let m = p.refund_message(asset, value, &out).map_err(|e| Error::Refused(e.to_string()))?;
+					p.refund_tx(leaf_at, asset, value, &out, f, &sign(key, &m.digest))
+				} else {
+					let m = p.claim_message(asset, value, &out).map_err(|e| Error::Refused(e.to_string()))?;
+					p.claim_tx(leaf_at, asset, value, &out, f, &sign(key, &m.digest), &preimage.expect("checked"))
+				};
+				built.map_err(|e| Error::Refused(e.to_string()))
+			});
+		}
+		self.key_spend_with(payer, key, after, &|f| {
+			let out = out_for(f)?;
 			match leaf.htlc {
 				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
 				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),

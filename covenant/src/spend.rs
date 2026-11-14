@@ -630,29 +630,41 @@ impl LeafPolicy {
 
 impl crate::lock::LockPolicy {
 	/// CLAIM of `coin`, this `htlc-2` leaf on-chain holding `value` of
-	/// `asset`, into `outputs`: input 0's sequence is the payee's delay. The
-	/// payee signs [`KeySpend::sighash`], which does not cover the preimage,
-	/// and finishes it with its signature and the preimage
-	/// ([`crate::LockPolicy::claim_witness`]'s items): a watchtower holds it
-	/// signed and adds the preimage once it is out.
-	pub fn claim_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
-		-> Result<KeySpend, SpendError>
+	/// `asset`, into `outputs` (at indices `0..m`), with `sig`, the payee's
+	/// signature of [`crate::LockPolicy::claim_message`] for those outputs,
+	/// and the preimage: input 0's sequence is the payee's delay. The
+	/// signature names no outpoint, so one made in advance (a watchtower
+	/// holds it) fits the leaf wherever it lands, and `fee` may add a fee
+	/// coin after the committed outputs.
+	pub fn claim_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource,
+		sig: &Signature, preimage: &[u8; 32]) -> Result<UnrollTx, SpendError>
 	{
+		if outputs.is_empty() || outputs.len() > MAX_OUTPUTS as usize {
+			return Err(Error::OutputCount(outputs.len()).into());
+		}
 		let spent = explicit_txout(asset, value, self.script_pubkey());
-		KeySpend::build(self.taproot(), self.claim_script(), vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))], outputs, fee)
+		let mut u = assemble(LockTime::ZERO, vec![(coin, spent, Sequence(self.exit_delay.to_sequence()))], outputs, fee, FINAL)?;
+		u.tx.input[0].witness.script_witness = self.claim_witness(sig, outputs.len() as u8, preimage);
+		Ok(u)
 	}
 
 	/// REFUND of `coin`, this `htlc-2` leaf on-chain holding `value` of
-	/// `asset`, into `outputs`: its lock time is the timeout and input 0's
-	/// sequence the payer's delay. The payer signs [`KeySpend::sighash`] and
-	/// finishes it with its signature.
-	pub fn refund_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource)
-		-> Result<KeySpend, SpendError>
+	/// `asset`, into `outputs`, with `sig`, the payer's signature of
+	/// [`crate::LockPolicy::refund_message`] for them: its lock time is the
+	/// timeout and input 0's sequence the payer's delay. As for CLAIM, the
+	/// signature fits the leaf wherever it lands.
+	pub fn refund_tx(&self, coin: OutPoint, asset: AssetId, value: u64, outputs: &[ExplicitOutput], fee: &FeeSource,
+		sig: &Signature) -> Result<UnrollTx, SpendError>
 	{
+		if outputs.is_empty() || outputs.len() > MAX_OUTPUTS as usize {
+			return Err(Error::OutputCount(outputs.len()).into());
+		}
 		let spent = explicit_txout(asset, value, self.script_pubkey());
 		let seq = Sequence(self.terms.refund_delay.to_sequence());
 		let lock = LockTime::from_consensus(self.terms.timeout.to_consensus_u32());
-		KeySpend::build_at(lock, self.taproot(), self.refund_script(), vec![(coin, spent, seq)], outputs, fee)
+		let mut u = assemble(lock, vec![(coin, spent, seq)], outputs, fee, FINAL)?;
+		u.tx.input[0].witness.script_witness = self.refund_witness(sig, outputs.len() as u8);
+		Ok(u)
 	}
 }
 
