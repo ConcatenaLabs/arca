@@ -672,6 +672,10 @@ impl Wallet {
 				if role == "payee" {
 					rec["state"] = json!("held");
 					rec["nonce"] = json!(hex(&c.owner_nonce));
+					// A restore cannot tell whether the lost device paid for it:
+					// held as paid, so it is taken on the chain from its home date
+					// unless claimed, and its claim there waits for the preimage.
+					rec["paid"] = json!(true);
 				} else {
 					rec["state"] = json!("locked");
 					rec["refund_nonce"] = json!(hex(&c.owner_nonce));

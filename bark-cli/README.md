@@ -1282,7 +1282,11 @@ record is lost with a device leaves its legs where a restore finds them:
 payment out of the tree, by hash. Bark keeps an invoice's preimage only in
 its own store, so P restored before it claimed cannot claim: Q's payment
 fails back and P's lock comes back to it. Q restored after it paid takes the
-preimage from the operator, which serves it once P has posted it.
+preimage from the operator, which serves it once P has posted it, or from its
+own settled payment when its Bitcoin ark wallet is restored too. A restore
+cannot tell whether the lost device paid, so it holds a lock it finds as
+paid for: from the lock's home date it takes the lock on the chain unless
+claimed, and the claim there waits for the preimage.
 
 `follow` needs the wallet's Bitcoin ark wallet (`bitcoin create`) and, for
 P's claim, the Bitcoin ark's server able to grant the payment's HTLCs: a

@@ -973,3 +973,49 @@ async fn an_operators_unsigned_refunded_ends_no_lock_whose_preimage_the_payee_ho
 	assert_eq!(ctx.input[0].witness.script_witness[2], pre.to_vec(), "CLAIM with the preimage");
 	println!("the payee's CLAIM {} ({} vB), median {} against T {}", ctx.txid(), ctx.vsize(), common::node::median_time(&r.rt), t);
 }
+
+/// A payee restored from its phrase in mid-swap, after it paid and before it
+/// knows the preimage; then the operator answers nothing. Past its home
+/// date the restored wallet takes the lock on the chain, as a payee whose
+/// wallet knows it paid does, so that it claims once the preimage is out.
+/// Before, a restore forgot it had paid and left the lock where the payer's
+/// refund takes it at the timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_payee_takes_its_lock_home_without_the_preimage_yet() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("restored P");
+	let q = Arca::new("restored Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 3_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+	let pre = [0x5du8; 32];
+	let h = hex(&sha256::Hash::hash(&pre).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "100000", "--hash", &h]);
+	let l = p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "30000"]);
+	let t = num(&l["timeout"]) as u32;
+	let leaf = l["leaf_id"].as_str().unwrap().to_string();
+	q.ok(&["sync"]);
+	let (q2, _) = restored(&r, &q, "restored Q2");
+	let s = script(&q2.ok(&["address"]));
+	r.pay_to(s, xa, 1_000_000);
+	r.produce().await;
+	q2.ok(&["sync"]);
+	println!("the restored payee's lock: {}", lock(&q2, &h));
+	assert_eq!(lock(&q2, &h)["paid"], true, "a restored payee holds its lock as paid");
+	r.server.stop();
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, t - 900 - common::node::median_time(&r.rt)));
+	r.produce().await;
+	r.bury().await;
+	let mut state = Value::Null;
+	for _ in 0..3 {
+		let (_, s) = q2.run(&["sync"]);
+		println!("the restored payee's sync past its home date (median {} T {}): locks {}", common::node::median_time(&r.rt), t, s["locks"]);
+		r.produce().await;
+		state = q2.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf.as_str()).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+		if state == "exiting" {
+			break;
+		}
+	}
+	assert_eq!(state, "exiting", "the restored payee takes its lock on the chain from its home date");
+}
