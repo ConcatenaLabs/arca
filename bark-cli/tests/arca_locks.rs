@@ -1019,3 +1019,39 @@ async fn a_restored_payee_takes_its_lock_home_without_the_preimage_yet() {
 	}
 	assert_eq!(state, "exiting", "the restored payee takes its lock on the chain from its home date");
 }
+
+/// The operator's database is rolled back after a claim was
+/// co-signed (the lock reads open again). At T the payer asks the refund:
+/// the signer, whose record is never rolled back, must refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rolled_back_lock_row_still_signs_one_ending() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("rolled P");
+	let q = Arca::new("rolled Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 3_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+	let pre = [0x5cu8; 32];
+	let h = hex(&sha256::Hash::hash(&pre).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "100000", "--hash", &h]);
+	let l = p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "5000"]);
+	let t = num(&l["timeout"]) as u32;
+	q.ok(&["sync"]);
+	let c = q.ok(&["lock", "claim", &h, &hex(&pre)]);
+	assert_eq!(c["state"], "claimed");
+	// The rollback: the lock row reads open, and the claim's transfer is gone from the row.
+	let n = lock_sql(&r, &format!("UPDATE swap_lock SET state = 'open', ended_by = NULL, preimage = NULL WHERE payment_hash = '\\x{}'", h)).await;
+	assert_eq!(n, 1);
+	let leaf_id = l["leaf_id"].as_str().unwrap().to_string();
+	let n2 = lock_sql(&r, &format!("UPDATE leaf SET state = 'live', spent_by = NULL WHERE leaf_id = '\\x{}'", leaf_id)).await;
+	println!("rolled back: lock row and leaf row ({} row)", n2);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, t - common::node::median_time(&r.rt) + 1));
+	r.bury().await;
+	r.synced().await;
+	let (ok, v) = p.run(&["lock", "refund", &h]);
+	println!("refund after the rollback: ok={} {}", ok, v);
+	assert!(!ok, "the refund of a claimed lock is refused: {}", v);
+	assert!(v.to_string().contains("double_spend") || v.to_string().contains("already_signed"), "refused by the signer's record: {}", v);
+}
+
