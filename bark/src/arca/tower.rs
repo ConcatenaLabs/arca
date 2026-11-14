@@ -1324,7 +1324,20 @@ impl Wallet {
 		let st = self.server.post("lock_status", &json!({"payment_hash": hash})).ok();
 		let theirs = st.as_ref().and_then(|s| s["locks"].as_array())
 			.and_then(|l| l.iter().find(|x| x["leaf_id"] == row.leaf_id.as_str())).and_then(|l| l["state"].as_str().map(String::from));
-		if leaf_at.is_none() && lk["ending"].is_null() && matches!(theirs.as_deref(), Some("claimed" | "refunded")) {
+		// The operator's word ends a deposit only where it proves itself: for
+		// the payer's side, a claim with a preimage that opens the hash (the
+		// payer revealed it, so it was paid), or a refund from the timeout on,
+		// when one can exist. The payee's side holds to its preimage whatever
+		// the operator says: a claim it brings pays only the payee.
+		let opened = st.as_ref().and_then(|s| s["preimage"].as_str()).and_then(|p| unhex32(p).ok())
+			.is_some_and(|p| hex(&sha256::Hash::hash(&p).to_byte_array()) == hash);
+		let timeout = coin.leaf.lock.map(|t| t.timeout.to_consensus_u32() as u64).unwrap_or(u64::MAX);
+		let proven = !payee && match theirs.as_deref() {
+			Some("claimed") => opened,
+			Some("refunded") => now >= timeout,
+			_ => false,
+		};
+		if leaf_at.is_none() && lk["ending"].is_null() && proven {
 			return say(self, "ended", format!("the operator records the lock {} out of round: nothing to do", theirs.unwrap_or_default()), None);
 		}
 		let mut pre = if payee { lk["preimage"].as_str().and_then(|p| unhex32(p).ok()) } else { None };

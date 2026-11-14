@@ -914,3 +914,62 @@ async fn a_payer_alone_exiting_the_locks_input_is_answered_by_the_payees_wallet(
 async fn a_payer_alone_exiting_the_locks_input_is_answered_by_the_payees_watchtower() {
 	a_payer_alone_exiting_the_locks_input_is_answered(false).await;
 }
+
+async fn lock_sql(r: &Running, q: &str) -> u64 {
+	let (c, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move { let _ = conn.await; });
+	c.execute(q, &[]).await.unwrap()
+}
+
+/// The operator answers `lock_status` "refunded" for a lock that is open,
+/// long before its timeout (an unsigned word: here a row edited in the
+/// operator's own database, as a lying operator answers), and so refuses
+/// the payee's claim. The payee holds the preimage. Its wallet keeps the
+/// lock, takes it on the chain from its home date and claims it there
+/// before the timeout. Before, it marked the coin spent on that word and
+/// then refused its own exit: the payer was refunded at the timeout and the
+/// payee, who had paid, held the preimage and nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operators_unsigned_refunded_ends_no_lock_whose_preimage_the_payee_holds() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("lied P");
+	let q = Arca::new("lied Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 3_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+	let s = script(&q.ok(&["address"]));
+	r.pay_to(s, xa, 1_000_000);
+	r.produce().await;
+	let pre = [0x5au8; 32];
+	let h = hex(&sha256::Hash::hash(&pre).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "200000", "--hash", &h]);
+	let l = p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "30000"]);
+	let t = num(&l["timeout"]) as u32;
+	let leaf = l["leaf_id"].as_str().unwrap().to_string();
+	q.ok(&["sync"]);
+	assert_eq!(q.ok(&["lock", "ready", &h])["ready"], true);
+
+	// The operator says "refunded", and so refuses the claim as refunded already.
+	let n = lock_sql(&r, &format!("UPDATE swap_lock SET state = 'refunded' WHERE payment_hash = '\\x{}'", h)).await;
+	assert_eq!(n, 1);
+	let (ok, v) = q.run(&["lock", "preimage", &h, &hex(&pre)]);
+	println!("the payee hands in the preimage: ok={} {}", ok, v);
+	let s = q.ok(&["sync"]);
+	println!("the payee's sync: {}", s["locks"]);
+	let row = |w: &Arca| w.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf.as_str()).cloned().unwrap_or(Value::Null);
+	assert_ne!(row(&q)["state"], "spent", "the payee dropped its lock on the operator's word: {}", row(&q));
+	assert_ne!(lock(&q, &h)["state"], "refunded", "{}", lock(&q, &h));
+
+	// Past its home date, before the timeout: on the chain, and claimed there.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, t - 900 - common::node::median_time(&r.rt)));
+	r.bury().await;
+	r.synced().await;
+	q.ok(&["sync"]);
+	println!("the payee's lock coin past its home date: {}", row(&q));
+	let e = exit_until(&r, &q, &leaf, "claimed", true).await;
+	let claim = e["claim"]["txid"].as_str().or(e["claim"].as_str()).map(String::from).unwrap_or_else(|| panic!("no claim txid: {}", e));
+	let ctx = tx(&r, &claim);
+	assert_eq!(ctx.input[0].witness.script_witness[2], pre.to_vec(), "CLAIM with the preimage");
+	println!("the payee's CLAIM {} ({} vB), median {} against T {}", ctx.txid(), ctx.vsize(), common::node::median_time(&r.rt), t);
+}

@@ -1323,6 +1323,12 @@ alone:
   instant limit, and its home date at least `--need` seconds away; it refuses
   one that never will be (a lock goes into no round, so one past the instant
   limit is never held).
+- The operator's `lock_status` is unsigned, so the wallet ends a lock on it
+  only where it proves itself: the payer takes a lock as claimed only with a
+  preimage that opens its hash, and the payee takes one as refunded only
+  from the timeout on and while it holds no preimage. Holding the preimage,
+  the payee claims, out of round or on the chain, whatever the operator
+  says.
 - `sync` moves locks on: the payee claims as soon as it has the preimage
   (`lock preimage H P` hands it one learnt elsewhere, or the operator serves
   it once the payer posted it); the payer learns the claim, or refunds an
@@ -1883,7 +1889,11 @@ once on the lock's lineage, and otherwise by time:
   operator serves (`lock_status`). While neither has it, the watchtower does
   nothing, and says so: the payee was not paid against;
 - the payer's, an hour past the lock's timeout, while the lock is open;
-- neither, for a lock the operator records as claimed or refunded.
+- the payer's never for a lock the operator shows claimed with a preimage
+  that opens its hash, nor, from the timeout on, for one it records as
+  refunded. The operator's word is unsigned, so the payee's watchtower ends
+  nothing on it, and neither side ends a lock on a word that cannot be true
+  (a refund before the timeout, a claim without the preimage).
 
 It brings the lock's path on the chain as for any coin, then broadcasts the
 cheapest ending whose own margin pays the node's floor, once the leaf is in

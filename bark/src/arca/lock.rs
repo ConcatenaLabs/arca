@@ -579,9 +579,17 @@ impl Wallet {
 					}
 					let mut pre = rec["preimage"].as_str().map(unhex32).transpose()?;
 					let st = self.lock_status(&hash).ok();
-					// Refunded to its payer from its timeout: the lock is gone.
+					// Refunded to its payer from its timeout: the lock is gone. The
+					// operator's word is unsigned, so it ends nothing it could not
+					// be true of: a refund opens only at the timeout, and a payee
+					// holding the preimage claims, out of round or on the chain,
+					// whatever the operator says ([`Self::locks_home`]).
 					let theirs = st.as_ref().and_then(|s| s["locks"].as_array()).and_then(|l| l.iter().find(|x| x["leaf_id"] == row.leaf_id.as_str())).cloned();
-					if theirs.as_ref().is_some_and(|l| l["state"] == "refunded") {
+					let timeout = Self::record_of(&row).ok().and_then(|r| lock_terms(&r)).map(|(t, ..)| t.timeout.to_consensus_u32() as u64);
+					if theirs.as_ref().is_some_and(|l| l["state"] == "refunded") && (pre.is_some() || timeout.is_none_or(|t| now < t)) {
+						out.push(json!({"payment_hash": hash, "role": "payee", "ignored": "the operator says the lock was refunded, which it cannot \
+							be before its timeout, nor end a lock whose preimage the wallet holds: the lock stays held"}));
+					} else if theirs.as_ref().is_some_and(|l| l["state"] == "refunded") {
 						let mut r = self.lock_rec("payee", &hash)?.unwrap_or(rec.clone());
 						r["state"] = json!("refunded");
 						self.set_lock("payee", &hash, r)?;
@@ -609,7 +617,14 @@ impl Wallet {
 					}
 					let st = self.lock_status(&hash).ok();
 					let theirs = st.as_ref().and_then(|s| s["locks"].as_array()).and_then(|l| l.iter().find(|x| x["leaf_id"] == row.leaf_id.as_str())).cloned();
-					if theirs.as_ref().is_some_and(|l| l["state"] == "claimed") {
+					// Claimed by its payee: proven only by a preimage that opens the
+					// hash, which the payer revealed by claiming what it sold for.
+					let opened = st.as_ref().and_then(|s| s["preimage"].as_str()).and_then(|p| unhex32(p).ok())
+						.is_some_and(|p| hex(&sha256::Hash::hash(&p).to_byte_array()) == hash);
+					if theirs.as_ref().is_some_and(|l| l["state"] == "claimed") && !opened {
+						out.push(json!({"payment_hash": hash, "role": "payer", "ignored": "the operator says the lock was claimed and serves no \
+							preimage that opens its hash: the lock stays the wallet's"}));
+					} else if theirs.as_ref().is_some_and(|l| l["state"] == "claimed") {
 						let mut r = rec.clone();
 						r["state"] = json!("claimed");
 						r["preimage"] = st.as_ref().map(|s| s["preimage"].clone()).unwrap_or(Value::Null);
