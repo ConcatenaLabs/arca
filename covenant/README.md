@@ -907,9 +907,12 @@ off-chain and has an exit delay of at least the policy's minimum, so when the
 sender's leaf reaches the chain, the receiver publishes the checkpoint and the
 reassignment within that delay, or a watchtower holding the receiver's record
 does while the receiver is away. It answers at once: a rollback that disconnects
-its answer does not restart the delay of the leaf it answered. Against the sender
-and the operator together it is not safe, before a round: that is the trust the
-specification calls operator-confirmed.
+its answer does not restart the delay of the leaf it answered. A lock between two
+holders (below) is such a coin for both of them: the payee's wallet and watchtower
+answer a stale exit of its lineage whether or not they know the preimage yet, and
+the answer brings the lock's leaf on the chain, where its scripts decide. Against
+the sender and the operator together it is not safe, before a round: that is the
+trust the specification calls operator-confirmed.
 
 ## Hash-locks between two holders
 

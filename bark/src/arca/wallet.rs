@@ -2431,6 +2431,12 @@ impl Wallet {
 	/// The states of a coin the wallet still has to bring home or spend ([`Self::homeward`]).
 	pub(crate) const HOMEWARD: &'static [&'static str] = &["live", "pending", "given", "forfeited", "offered", "sending", "paying", "receiving"];
 
+	/// The coins whose lineage the wallet watches on the chain
+	/// ([`Self::watch_lineages`]): every homeward coin, and each lock between
+	/// two holders, the payee's and the payer's.
+	pub(crate) const WATCHED: &'static [&'static str] =
+		&["live", "pending", "given", "forfeited", "offered", "sending", "paying", "receiving", super::lock::LOCK_IN, super::lock::LOCK_OUT];
+
 	/// The coins the wallet holds live whose latest refresh the operator
 	/// refused: given in a participation it refused, voided or let expire,
 	/// and not refreshed since (a coin refreshed since is spent, or given
@@ -3384,9 +3390,15 @@ impl Wallet {
 	/// where the chain holds it, publishing what it signed in advance (the
 	/// checkpoint from a converted board's leaf, then the reassignment) before
 	/// any exit delay runs out. One look at the chain covers every coin.
+	///
+	/// A lock between two holders is watched as any coin received out of
+	/// round, on both sides ([`Self::WATCHED`]): its payee's, whether or not
+	/// it knows the preimage yet (the answer brings the lock's leaf on the
+	/// chain, where its scripts decide, and its claim there waits for the
+	/// preimage), and its payer's.
 	fn watch_lineages(&mut self) -> Result<Vec<Value>, Error> {
 		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
-		let coins: Vec<CoinRow> = self.store.coins_in_states(Self::HOMEWARD)?;
+		let coins: Vec<CoinRow> = self.store.coins_in_states(Self::WATCHED)?;
 		// Everything this watch looks for (a leaf or checkpoint of a coin's
 		// lineage, its own leaf, a board it rests on spent) is made only by
 		// spends that start at an output the coin descends from: a coin whose

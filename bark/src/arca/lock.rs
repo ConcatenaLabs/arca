@@ -399,6 +399,12 @@ impl Wallet {
 	pub fn lock_ready(&self, hash: &str, need: u64) -> Result<Value, Error> {
 		let rec = self.lock_rec("payee", hash)?.ok_or_else(|| Error::Refused(format!("the wallet asked no lock under hash {}", hash)))?;
 		let Some(row) = self.lock_row("payee", hash)? else {
+			if let Some(c) = rec["leaf_id"].as_str().map(|l| self.store.coin(l)).transpose()?.flatten() {
+				if c.state == "exiting" {
+					return Err(Error::Refused(format!("the lock under hash {} is being taken on the chain ({}): no spend of it is co-signed \
+						any more; nothing is to be paid for it", hash, c.note)));
+				}
+			}
 			return Ok(json!({"payment_hash": hash, "ready": false, "why": "the lock has not come", "state": rec["state"]}));
 		};
 		let (_, a) = self.held(&row)?;
@@ -435,9 +441,25 @@ impl Wallet {
 		// a signer, can never come home: never held, and nothing is paid.
 		let mut path = vec![];
 		Self::path_outputs(coin, &mut path);
-		if self.chain.locate(&path)?.iter().all(Option::is_none) {
+		let here = super::exit::Here { outputs: path.clone(), at: self.chain.locate(&path)? };
+		if here.at.iter().all(Option::is_none) {
 			return Err(Error::Refused(format!("the lock under hash {} rests on a coin spent elsewhere on the chain: it can never come \
 				home, and nothing is to be paid for it", hash)));
+		}
+		// A sender up its lineage took an earlier coin on the chain (its payer
+		// converting the board it locked from, say): the wallet answers by
+		// bringing the lock on the chain ([`Self::watch_lineages`]), where its
+		// scripts decide. A payment not made yet is not made for it.
+		let mut seen = self.lineage_seen(coin, &here)?;
+		for b in coin.boards() {
+			if !self.chain.unspent(&b)? {
+				seen.push(format!("the board at {} it rests on, spent", b));
+			}
+		}
+		if !seen.is_empty() || row.state == "exiting" {
+			return Err(Error::Refused(format!("the lock under hash {} is being taken on the chain ({}): its lineage reached the chain, so \
+				no spend of it is co-signed any more; nothing is to be paid for it", hash,
+				if seen.is_empty() { "its exit started".to_string() } else { seen.join("; ") })));
 		}
 		let info = self.server_info()?;
 		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);

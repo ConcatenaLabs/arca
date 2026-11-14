@@ -765,3 +765,152 @@ async fn a_payers_exit_of_its_change_leaves_the_payees_tower_its_claim() {
 	let _ = p.run(&["sync"]);
 	assert_ne!(lock(&p, &h)["state"], "refunded");
 }
+
+/// A coin of the payer's on the chain, its board converted alone (the
+/// payer's own signature) with a fee coin of OP_TRUE: what a payer does to
+/// void a lock it made from its board by exiting the board's leaf after its
+/// delay. Returns the converted leaf's transaction and the board's record.
+async fn convert_board(r: &mut Running, p: &Arca, board_id: &str, board_txid: &str)
+	-> (elements::Txid, arca_covenant::BoardRecord, elements::secp256k1_zkp::Keypair, elements::BlockHash, Script)
+{
+	let rec = arca_covenant::CoinRecord::from_bytes(&unhex(p.ok(&["record", board_id])["record"].as_str().unwrap())).unwrap();
+	let arca_covenant::CoinRecord::Board(board) = rec else { panic!("the payer's coin is a board") };
+	let bp = board.policy();
+	let board_tx: elements::Transaction = r.rt.client().raw_transaction(&board_txid.parse().unwrap()).unwrap();
+	let vout = board_tx.output.iter().position(|o| o.script_pubkey == bp.script_pubkey()).unwrap() as u32;
+	let board_at = elements::OutPoint::new(board_tx.txid(), vout);
+	let op_true = Script::from(vec![0x51u8]);
+	let wsh = Script::new_v0_wsh(&elements::WScriptHash::hash(op_true.as_bytes()));
+	let fee_tx = r.pay_to(wsh.clone(), r.x, 50_000);
+	r.produce().await;
+	let fvout = fee_tx.output.iter().position(|o| o.script_pubkey == wsh).unwrap() as u32;
+	let fee_at = elements::OutPoint::new(fee_tx.txid(), fvout);
+	let mnemonic = std::fs::read_to_string(p.dir.join("mnemonic")).unwrap();
+	let p_key = bark::arca::keys::Keys::new(mnemonic.trim(), 0, 1).unwrap().leaf(&board.owner_nonce).unwrap();
+	let genesis = r.rt.client().genesis_hash().unwrap();
+	let fee = arca_covenant::FeeSource::Coin { outpoint: fee_at, coin: fee_tx.output[fvout as usize].clone(), fee: 5_000, change: wsh.clone() };
+	let ks = bp.conversion(board_at, &fee).unwrap();
+	let sig = arca_covenant::sign::sign_digest(&p_key, &ks.sighash(genesis).unwrap(), &[9; 32]);
+	let mut conv = ks.finish(vec![sig.as_ref().to_vec()]).tx;
+	for i in 1..conv.input.len() {
+		conv.input[i].witness.script_witness = vec![op_true.as_bytes().to_vec()];
+	}
+	let conv_id = r.rt.client().send_raw_transaction(&conv).unwrap();
+	r.produce().await;
+	r.bury().await;
+	(conv_id, board, p_key, genesis, wsh)
+}
+
+fn unspent(r: &Running, txid: &elements::Txid, vout: u32) -> bool {
+	let u: Value = r.rt.client().call("gettxout", &[json!(txid.to_string()), json!(vout), json!(true)]).unwrap();
+	!u.is_null()
+}
+
+/// The payer alone voids a lock its payee holds, the operator down: it
+/// converts the board it locked from on the chain and would exit the board's
+/// leaf after its delay. The payee answers within that delay, by its wallet
+/// (`wallet_present`) or, the wallet gone, by its watchtower: it publishes
+/// the payer's checkpoint and the reassignment, which bring the lock's leaf
+/// on the chain, where the scripts decide. Its wallet calls the lock held no
+/// longer, so nothing is paid for it. Before the lock was watched as any coin
+/// received out of round, nobody answered and the payer's exit took the
+/// coin.
+async fn a_payer_alone_exiting_the_locks_input_is_answered(wallet_present: bool) {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let (url, node) = (r.url(), r.node_url());
+	let by = if wallet_present { "wallet" } else { "tower" };
+	let p = Arca::new(&format!("voided P {}", by));
+	let q = Arca::new(&format!("voided Q {}", by));
+	p.ok(&create_args(&url, &node));
+	q.ok(&create_args(&url, &node));
+	let s = script(&p.ok(&["address"]));
+	r.pay_to(s, r.x, 5_000_000);
+	// The payee's wallet holds coins on the chain to pay an answer's fees.
+	let s = script(&q.ok(&["address"]));
+	r.pay_to(s, r.x, 2_000_000);
+	r.produce().await;
+	let ab = p.ok(&["board", &x, "2000000"]);
+	let p_board = ab["leaf_id"].as_str().unwrap().to_string();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("P's board credited", || p.ok(&["boards"])[0]["server"]["state"] == "credited").await;
+	p.ok(&["sync"]);
+	let tq = Tower::new(&format!("voided TQ {}", by), &url, &node);
+	let s = script(&tq.wallet.ok(&["address"]));
+	r.pay_to(s, r.x, 2_000_000);
+	r.produce().await;
+	r.bury().await;
+	q.ok(&["watchtowers", &tq.url]);
+
+	let pre = [0x5eu8; 32];
+	let h = hex(&sha256::Hash::hash(&pre).to_byte_array());
+	let req = q.ok(&["lock", "request", "--asset", &x, "--amount", "600000", "--hash", &h]);
+	let l = p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "30000"]);
+	let lock_leaf = l["leaf_id"].as_str().unwrap().to_string();
+	q.ok(&["sync"]);
+	assert_eq!(q.ok(&["lock", "ready", &h])["ready"], true, "the payee holds the lock");
+	assert_eq!(tq.lock_deposit(&h)["state"], "held");
+	r.server.stop();
+	let q = if wallet_present { Some(q) } else { drop(q); None };
+
+	let (conv_id, board, p_key, genesis, wsh) = convert_board(&mut r, &p, &p_board, ab["txid"].as_str().unwrap()).await;
+	let delay = board.leaf().exit_delay.seconds();
+	println!("the payer converted its board: its leaf at {}:0, exit delay {} s", conv_id, delay);
+
+	// The answer, within the leaf's exit delay: the payer's leaf spent by the
+	// checkpoint it signed for the lock.
+	let mut answered = false;
+	for k in 0..10 {
+		if let Some(q) = &q {
+			let (ok, s) = q.run(&["sync"]);
+			println!("the payee's sync #{} ok={}: exits {}", k, ok, s["exits"]);
+		} else {
+			tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+			println!("the watchtower #{}: {} {}", k, tq.lock_deposit(&h)["state"], tq.lock_deposit(&h)["note"]);
+		}
+		r.produce().await;
+		if !unspent(&r, &conv_id, 0) {
+			answered = true;
+			break;
+		}
+	}
+	assert!(answered, "nobody answered the payer's conversion within its exit delay");
+	let spender: Value = r.rt.client().call("getblock", &[r.rt.client().call::<Value>("getbestblockhash", &[]).unwrap(), json!(2)]).unwrap();
+	println!("answered: the payer's leaf is spent ({} txs in the tip block)", spender["tx"].as_array().map_or(0, |a| a.len()));
+
+	// Past the delay the payer's own exit of its leaf finds it spent.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, delay as u32 + 600));
+	r.produce().await;
+	r.bury().await;
+	let back = arca_covenant::ExplicitOutput::new(board.asset, board.value - 5_000, wsh.clone());
+	let ks = board.leaf().exit_tx(elements::OutPoint::new(conv_id, 0), board.asset, board.value, std::slice::from_ref(&back),
+		&arca_covenant::FeeSource::Reserve).unwrap();
+	let sig = arca_covenant::sign::sign_digest(&p_key, &ks.sighash(genesis).unwrap(), &[10; 32]);
+	let exit = ks.finish(vec![sig.as_ref().to_vec()]).tx;
+	let sent = r.rt.client().send_raw_transaction(&exit);
+	println!("the payer's exit of its leaf: {:?}", sent.as_ref().map(|t| t.to_string()).map_err(|e| e.to_string()));
+	assert!(sent.is_err(), "the payer's exit spent a leaf the payee answered");
+
+	if let Some(q) = &q {
+		// The lock's leaf comes on the chain, and the wallet holds it as
+		// being taken home: nothing is paid for a lock in that state.
+		let (ok, v) = q.run(&["lock", "ready", &h]);
+		println!("lock ready after the answer: ok={} {}", ok, v);
+		assert!(!ok || v["ready"] != true, "a lock answered on the chain is not held for a payment: {}", v);
+		let row = q.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == lock_leaf.as_str()).cloned().unwrap_or(Value::Null);
+		println!("the payee's lock coin: {}", row["state"]);
+		assert_eq!(row["state"], "exiting");
+	}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payer_alone_exiting_the_locks_input_is_answered_by_the_payees_wallet() {
+	a_payer_alone_exiting_the_locks_input_is_answered(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payer_alone_exiting_the_locks_input_is_answered_by_the_payees_watchtower() {
+	a_payer_alone_exiting_the_locks_input_is_answered(false).await;
+}

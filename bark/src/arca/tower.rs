@@ -1122,7 +1122,7 @@ impl Wallet {
 	/// checkpoint it descends from, unspent in a block or the mempool. Each
 	/// means a sender has started to take an earlier coin home, which only
 	/// the checkpoint and reassignment answer, within that leaf's exit delay.
-	fn lineage_seen(&self, coin: &arca_covenant::ValidCoin, here: &Here) -> Result<Vec<String>, Error> {
+	pub(crate) fn lineage_seen(&self, coin: &arca_covenant::ValidCoin, here: &Here) -> Result<Vec<String>, Error> {
 		Ok(coin.lineage().into_iter().filter(|o| here.at(&o.output).is_some())
 			.map(|o| format!("a {} it descends from", o.kind)).collect())
 	}
@@ -1338,7 +1338,13 @@ impl Wallet {
 			}
 		}
 		let due = if payee { pre.is_some() && (now >= act_from || leaf_at.is_some()) } else { now >= act_from };
-		if !due {
+		// A sender up the lock's lineage took an earlier coin on the chain
+		// (the payer converting the board it locked from, or exiting a coin
+		// it gave up): answered at once, whatever the time and whether or not
+		// the preimage is known, by bringing the lock's path, as for any coin
+		// paid out of round; the scripts decide the leaf on the chain.
+		let seen = if leaf_at.is_none() { self.lineage_seen(&coin, &here)? } else { vec![] };
+		if !due && seen.is_empty() {
 			if payee && now >= act_from && pre.is_none() {
 				return say(self, &row.state, "its home date has come, and neither its wallet nor the operator has the preimage: nothing to do".into(), None);
 			}
@@ -1360,11 +1366,19 @@ impl Wallet {
 			}
 			let mut all: Vec<Value> = serde_json::from_str::<Value>(&row.txs).ok().and_then(|v| v.as_array().cloned()).unwrap_or_default();
 			all.extend(steps);
-			let note = format!("the lock is due ({}): its path broadcast, its leaf at {}", if payee { "its home date, the preimage known" } else { "its timeout passed, the lock open" }, at);
+			let note = if !seen.is_empty() {
+				format!("a sender up its lineage took an earlier coin on the chain ({}): its path broadcast, its leaf at {}", seen.join("; "), at)
+			} else {
+				format!("the lock is due ({}): its path broadcast, its leaf at {}", if payee { "its home date, the preimage known" } else { "its timeout passed, the lock open" }, at)
+			};
 			return say(self, "brought", note, Some(&Value::Array(all).to_string()));
 		};
 		if !self.chain.finality(&at.txid)?.in_chain() {
 			return Ok(None);
+		}
+		if !due {
+			return say(self, "on_chain", format!("its leaf is on the chain at {}; its {} waits for {}", at, if payee { "CLAIM" } else { "REFUND" },
+				if payee { "the preimage" } else { "the lock's timeout and an hour" }), None);
 		}
 		// The cheapest ending whose own margin pays the node's floor now; else
 		// the dearest, with a fee coin of the watchtower's.

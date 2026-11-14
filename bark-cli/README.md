@@ -1336,6 +1336,14 @@ alone:
 - `lock ready` refuses a lock whose whole path is spent elsewhere on the
   chain (its payer and a signer spent its input again): it can never come
   home, and nothing is to be paid for it.
+- Each side watches its lock's lineage on the chain as it does any coin
+  received out of round: when a sender up the lineage takes an earlier coin
+  on the chain (the payer converting the board it locked from, then exiting
+  its leaf), `sync` answers within that coin's exit delay by publishing the
+  checkpoint and the reassignment it holds, which bring the lock's leaf on
+  the chain, whether or not the payee knows the preimage yet; the ending
+  there waits for its own conditions. `lock ready` then refuses the lock
+  (it is being taken on the chain): a payment not made yet is not made.
 
 ### Paying an address on the chain
 
@@ -1859,8 +1867,13 @@ and twice, four and eight times it). Each is a signature of the message the
 path builds over its one output, never of an outpoint, so it spends the
 lock's leaf wherever the leaf's path brings it on the chain, however each
 step was paid for; the wallet signs it once. The watchtower checks each
-ending's signature against the lock's payee or refunder key, and acts by
-time:
+ending's signature against the lock's payee or refunder key, and acts at
+once on the lock's lineage, and otherwise by time:
+
+- either side's, as soon as a sender up the lock's lineage takes an earlier
+  coin on the chain: it brings the lock's path, as for any coin paid out of
+  round, whether or not it knows the preimage, and the ending then waits for
+  the conditions below;
 
 - the payee's, from the lock's home date (its timeout less its exit delay
   and the unroll of its path), or as soon as the lock's leaf is on the
