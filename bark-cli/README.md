@@ -1326,7 +1326,10 @@ alone:
   hash, a timeout no earlier than asked), its rounds final, inside the
   instant limit, and its home date at least `--need` seconds away; it refuses
   one that never will be (a lock goes into no round, so one past the instant
-  limit is never held).
+  limit is never held). It checks for itself what the operator checks before
+  it co-signs a lock, rather than trusting it: a claim still fits under the
+  depth limit, and no batch the lock rests on expires before the timeout,
+  the payer's delay and the unroll have passed.
 - The operator's `lock_status` is unsigned, so the wallet ends a lock on it
   only where it proves itself: the payer takes a lock as claimed only with a
   preimage that opens its hash, and the payee takes one as refunded only

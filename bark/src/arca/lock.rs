@@ -74,6 +74,30 @@ const STEP_BLOCKS: u64 = 2;
 /// seconds: the operator's `info.locks.unroll_seconds` where it names one.
 pub const UNROLL_SECONDS: u64 = 3_600;
 
+/// Whether a lock at depth `hops` under `depth_limit`, resting on batches
+/// whose earliest first expiry is `expiry` (`None` on boards alone), with
+/// timeout `timeout`, payer's delay `refund_delay` and unroll `unroll`, is
+/// one its payee can rely on: a claim adds one reassignment, so `hops + 1`
+/// is within the limit; and the batches are not swept before the timeout,
+/// the payer's delay and the unroll have passed (the operator's own rule,
+/// which a payee checks rather than trusts). The reason, when not.
+pub fn lock_fits(hops: usize, depth_limit: Option<usize>, expiry: Option<u64>, timeout: u64, refund_delay: u64, unroll: u64)
+	-> Result<(), String>
+{
+	if let Some(limit) = depth_limit {
+		if hops + 1 > limit {
+			return Err(format!("is {} reassignments deep, and the operator's depth limit of {} leaves no room for its claim", hops, limit));
+		}
+	}
+	if let Some(e) = expiry {
+		if timeout + refund_delay + unroll > e {
+			return Err(format!("rests on a batch that expires at median time {}, before its timeout {}, the payer's delay and the \
+				unroll have passed: a sweep could take it", e, timeout));
+		}
+	}
+	Ok(())
+}
+
 /// A lock's home date: its timeout `timeout` less the unroll of its path
 /// (`steps` transactions, every node level and lineage step down to the
 /// leaf, each given [`STEP_BLOCKS`] blocks of `block` seconds, and never less
@@ -477,6 +501,16 @@ impl Wallet {
 				if seen.is_empty() { "its exit started".to_string() } else { seen.join("; ") })));
 		}
 		let info = self.server_info()?;
+		// What the operator checks before it co-signs a lock, checked again
+		// here, so that the payee trusts no operator for it: a claim can
+		// still follow the lock under the depth limit, and the batches its
+		// path rests on are not swept before the payer's refund could follow
+		// the timeout on the chain, let alone before the payee's home date.
+		let record = Self::record_of(&row)?;
+		let unroll = info["locks"]["unroll_seconds"].as_u64().unwrap_or(UNROLL_SECONDS);
+		lock_fits(coin.hops, super::pay::depth_limit(&info), super::pay::first_expiry(&record).map(|e| e as u64),
+			t.timeout.to_consensus_u32() as u64, t.refund_delay.seconds(), unroll)
+			.map_err(|why| Error::Refused(format!("the lock under hash {} {}: nothing is to be paid for it", hash, why)))?;
 		let block = info["lightning"]["receive"]["block_seconds"].as_u64().unwrap_or(60).max(1);
 		let home = self.lock_home(coin, block)?;
 		let median = self.now()?.to_consensus_u32() as u64;
@@ -919,6 +953,18 @@ fn coin_nonce(row: &CoinRow) -> [u8; 32] {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	/// The payee refuses a lock the operator should not have co-signed.
+	#[test]
+	fn a_payee_checks_a_locks_depth_and_expiry_itself() {
+		let t = 2_000_000_000u64;
+		assert_eq!(lock_fits(3, Some(5), Some(t + 10_000), t, 4608, 3600), Ok(()));
+		assert_eq!(lock_fits(4, Some(5), None, t, 4608, 3600), Ok(()));
+		assert!(lock_fits(5, Some(5), None, t, 4608, 3600).unwrap_err().contains("depth limit of 5"));
+		assert!(lock_fits(1, Some(5), Some(t + 8_207), t, 4608, 3600).unwrap_err().contains("expires"));
+		assert_eq!(lock_fits(1, Some(5), Some(t + 8_208), t, 4608, 3600), Ok(()));
+		assert!(lock_fits(1, Some(5), Some(t - 1), t, 4608, 3600).is_err());
+	}
 
 	/// The home date counts every transaction of the path, and never less
 	/// than the specified hour.
