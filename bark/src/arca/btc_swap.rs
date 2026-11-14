@@ -844,6 +844,8 @@ impl Wallet {
 	fn follow_p_lock(&mut self, rec: &mut Value, bitcoin: &Value) -> Result<Option<Value>, Error> {
 		let req = rec["lock_request"].clone();
 		if !req.is_object() || rec["leg"] == "htlc-1" || !Self::operator_locks(&self.server_info()?) {
+			// The older path: the swap's record names it, as it names the new.
+			rec["leg"] = json!("htlc-1");
 			return Ok(None);
 		}
 		let hash = rec["hash"].as_str().unwrap_or("").to_string();
