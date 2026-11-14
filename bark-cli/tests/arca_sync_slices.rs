@@ -43,6 +43,16 @@
 //!    for more than a part of it: what a pass reads once (the operator's
 //!    witness and `info`, the coins it holds capital back for) is not read
 //!    again in every slice.
+//! 13. A slice that resumes its pass once no witness stands in the process
+//!    any more witnesses again, and with every witness failing signs
+//!    nothing.
+//! 14. A witness that fails while a pass runs, in one call or in slices,
+//!    ends the pass's work with the operator: nothing is signed, nothing
+//!    more is asked, the rest of the pass runs in the same call and says
+//!    the operator could not be witnessed.
+//! 15. What the bond leaves uncovered is computed again on a new tip: no
+//!    coin is given up for a paid refresh on an answer a covering bond has
+//!    made stale.
 //!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
@@ -1383,4 +1393,206 @@ async fn a_pass_in_slices_on_a_large_store_costs_about_one_call() {
 			one_op, n);
 		assert!(longest * 4 <= one_ms, "slices of {} ms: a slice held the wallet {} ms, against {} ms in one call", b, longest, one_ms);
 	}
+}
+
+/// A slice that resumes its pass on the same tip does not take the pass's
+/// witness as it stood once no witness stands in the process any more (ten
+/// seconds): with every witness failing by then, it witnesses again, waits
+/// out its patience, signs no cancellation of a stopped plan and asks the
+/// operator nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_slice_rewitnesses_before_signing() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let url = r.url();
+	let p = Proxy::start(&url);
+	let m = Arca::new("SL13 M");
+	boarded(&mut r, &m, &p.url, &[(x, 1_000_000)]).await;
+	let fakes = Fakes::put(&m.dir);
+	let mut w = Wallet::open(&m.dir).expect("open the wallet");
+	// A patience of three seconds, as the tests' command line runs with.
+	w.witness_patience = Duration::from_secs(3);
+	let slice = |w: &mut Wallet| -> Value {
+		tokio::task::block_in_place(|| command::run(w, "sync", &json!({"budget_ms": 0}))).map(|v| v["result"].clone()).unwrap()
+	};
+	let first = slice(&mut w);
+	assert_eq!(first["next"], "held", "{}", first);
+	let witnessed = p.count("/v1/witness");
+	let cancelled = p.count("/v1/cancel_plan");
+	std::thread::sleep(Duration::from_secs(11));
+	p.lose("/v1/witness", true);
+	p.rewrite(Some(Arc::new(|path, _, _, v| {
+		if path == "/v1/plan_status" {
+			*v = json!({"state": "stopped", "steps": []});
+			return Some(200);
+		}
+		None
+	})));
+	for _ in 0..20 {
+		let v = slice(&mut w);
+		if v["cost_by_step"]["plans"].is_object() {
+			break;
+		}
+	}
+	println!("SL13 witness calls {} -> {}; cancel_plan signatures {} -> {}", witnessed, p.count("/v1/witness"),
+		cancelled, p.count("/v1/cancel_plan"));
+	assert!(p.count("/v1/witness") > witnessed, "the expired witness was not taken again");
+	assert_eq!(p.count("/v1/cancel_plan"), cancelled, "a slice signed while its current witness failed");
+	p.lose("/v1/witness", false);
+	p.rewrite(None);
+	fakes.take();
+	let _ = std::fs::remove_dir_all(&m.dir);
+}
+
+/// What the bond leaves uncovered is computed again on a new tip: a pass
+/// cut inside `refresh` with a received coin uncovered (the wallet requires
+/// a bond and the operator posts none), then a bond that covers it posted
+/// and a block more. The slices after give up no coin outside its refresh
+/// window for a refresh that pays a fee.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_tip_drops_stale_uncovered_before_a_paid_refresh() {
+	let mut r = Running::start_with(|c, _, _| c.fees.refresh_ppm = 5_000).await;
+	let x = r.x;
+	let url = r.url();
+	let p = Proxy::start(&url);
+	let (m, b) = (Arca::new("SL15 M"), Arca::new("SL15 B"));
+	boarded(&mut r, &m, &p.url, &[(x, 3_000_000)]).await;
+	boarded(&mut r, &b, &url, &[(x, 3_000_000)]).await;
+	pay(&b, &m, x, 100_000);
+	p.rewrite(Some(Arc::new(|path, _, _, v| {
+		if path == "/v1/holding_back" {
+			*v = json!({"leaves": []});
+			return Some(200);
+		}
+		None
+	})));
+	{
+		let db = rusqlite::Connection::open(m.dir.join("arca.sqlite")).unwrap();
+		db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('bond_seen', '{\"why\":\"required\"}')", []).unwrap();
+	}
+	let mut w = Wallet::open(&m.dir).expect("open the wallet");
+	let slice = |w: &mut Wallet| -> Value {
+		tokio::task::block_in_place(|| command::run(w, "sync", &json!({"budget_ms": 0}))).map(|v| v["result"].clone()).unwrap()
+	};
+	for _ in 0..40 {
+		let v = slice(&mut w);
+		if v["next"] == "refresh" && v["cost_by_step"]["refresh"].is_object() {
+			println!("SL15 cut inside refresh: {}", v);
+			break;
+		}
+	}
+	{
+		let db = rusqlite::Connection::open(m.dir.join("arca.sqlite")).unwrap();
+		let kept: String = db.query_row("SELECT value FROM meta WHERE key = 'sync_resume'", [], |r| r.get(0)).unwrap();
+		println!("SL15 resume at the cut: {}", kept);
+	}
+	let before = p.count("/v1/submit_participation");
+	assert_eq!(before, 0, "the refresh step stopped before its coin");
+	let withdraw = common::running::keypair("bond W");
+	let operator = common::running::keypair("operator");
+	let chain = arca_covenant::Chain::new(r.rt.client().genesis_hash().unwrap());
+	let units = server::bond::min_notice_seconds(server::bond::LIFETIME, arca_covenant::RelativeTime::from_units(338).unwrap())
+		.div_ceil(512) as u16;
+	let policy = arca_covenant::bond::BondPolicy::new(chain, operator.x_only_public_key().0, withdraw.x_only_public_key().0,
+		arca_covenant::RelativeTime::from_units(units).unwrap()).unwrap();
+	let tx = r.pay_to(policy.script_pubkey(), x, 5_000_000);
+	r.produce().await;
+	r.bury().await;
+	let vout = tx.output.iter().position(|o| o.script_pubkey == policy.script_pubkey()).unwrap() as u32;
+	r.config.bond = Some(server::bond::BondSection { withdraw_key: withdraw.x_only_public_key().0.to_string(), notice_units: units,
+		outpoint: Some(format!("{}:{}", tx.txid(), vout)), notice: None, instant_budget_fraction: None, instant_limit_value: None });
+	r.restart_server().await;
+	r.synced().await;
+	assert_eq!(library(&m, "bond", json!({})).unwrap()["covers"], true, "the new bond covers the transfer");
+	let mut last = slice(&mut w);
+	println!("SL15 new-tip resume: {}", last);
+	while last["more"] == true {
+		last = slice(&mut w);
+	}
+	let after = p.count("/v1/submit_participation");
+	println!("SL15 final answer: {}; paid refresh submissions {} -> {}; last request {:?}", last, before, after,
+		p.last("/v1/submit_participation").map(|(q, _, _)| q));
+	if after > before {
+		let (q, _, _) = p.last("/v1/submit_participation").unwrap();
+		assert_eq!(q["fees"][0]["amount"], "500", "the stale answer selected the ordinary paid quote");
+	}
+	assert_eq!(after, before, "a coin now covered and outside its refresh window was given up");
+	p.rewrite(None);
+	for w in [&m, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A witness that fails while a pass runs ends the pass's work with the
+/// operator. A stopped plan's status takes longer here than a witness stands
+/// (ten seconds), and from then every witness of the operator's signer's
+/// record fails: the wallet witnesses again before it signs the plan's
+/// cancellation, signs nothing, asks the operator nothing more (no second
+/// plan, no payment received over Lightning asked after again), runs the
+/// rest of its pass in the same call and says the operator could not be
+/// witnessed. In one call, and in slices on a wallet kept open, where the
+/// slice that meets it had taken the pass's witness as it stood.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_witness_that_fails_inside_a_pass_ends_its_work_with_the_operator() {
+	let mut r = Running::start().await;
+	let x = r.x;
+	let url = r.url();
+	let p = Proxy::start(&url);
+	let m = Arca::new("SL14 M");
+	boarded(&mut r, &m, &p.url, &[(x, 1_000_000)]).await;
+	let fakes = Fakes::put(&m.dir);
+	// A payment the wallet waits to receive over Lightning: its status is
+	// asked in `receives`, before the plans, and in `receives again`, after.
+	{
+		let db = rusqlite::Connection::open(m.dir.join("arca.sqlite")).unwrap();
+		let gets = json!({"b1".repeat(32): {"state": "done"}, "b2".repeat(32): {"state": "done"}, "b3".repeat(32): {"state": "waiting"}});
+		db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('lightning_receives', ?1)", [&gets.to_string()]).unwrap();
+	}
+	for budget in [None, Some(0u64)] {
+		p.lose("/v1/witness", false);
+		let (q, once) = (p.clone(), Arc::new(AtomicBool::new(false)));
+		p.rewrite(Some(Arc::new(move |path, _, _, v| {
+			if path != "/v1/plan_status" {
+				return None;
+			}
+			if !once.swap(true, Ordering::SeqCst) {
+				q.lose("/v1/witness", true);
+				std::thread::sleep(Duration::from_secs(11));
+			}
+			*v = json!({"state": "stopped", "steps": []});
+			Some(200)
+		})));
+		let before = p.calls().len();
+		let mut w = Wallet::open(&m.dir).expect("open the wallet");
+		let mut slices = 0;
+		let last = loop {
+			let mut a = json!({});
+			if let Some(b) = budget {
+				a["budget_ms"] = json!(b);
+			}
+			let v = tokio::task::block_in_place(|| command::run(&mut w, "sync", &a)).map(|v| v["result"].clone()).expect("sync answers");
+			slices += 1;
+			assert!(slices < 200, "the pass ends");
+			if v["more"] != json!(true) {
+				break v;
+			}
+		};
+		let calls: Vec<(String, u16)> = p.calls()[before..].iter().map(|(path, _, status, _)| (path.clone(), *status)).collect();
+		let count = |path: &str| calls.iter().filter(|(c, _)| c == path).count();
+		let failed = calls.iter().position(|(c, s)| c == "/v1/witness" && *s == 502);
+		println!("SL14 budget {:?}: {} call(s) of sync; witnesses {}, plan statuses {}, cancellations signed {}, receive statuses {}; \
+			the calls after the witness failed: {:?}; unreachable {}", budget, slices, count("/v1/witness"), count("/v1/plan_status"),
+			count("/v1/cancel_plan"), count("/v1/lightning_receive_status"), failed.map(|k| &calls[k + 1..]), last["unreachable"]);
+		assert_eq!(count("/v1/plan_status"), 1, "the first plan's status was read, and no other after the witness failed: {:?}", calls);
+		assert_eq!(count("/v1/cancel_plan"), 0, "a cancellation was signed while the witness failed");
+		let failed = failed.expect("the wallet witnessed again before it signed");
+		assert!(calls[failed + 1..].is_empty(), "the operator was asked after the witness failed: {:?}", &calls[failed + 1..]);
+		assert_eq!(count("/v1/lightning_receive_status"), 1, "asked in `receives`, and not again after the witness failed");
+		assert!(last["unreachable"]["why"].is_string(), "the pass says the operator could not be witnessed: {}", last);
+		assert!(last["cost_by_step"]["home"].is_object() && last["schedule"].is_object(), "the rest of the pass ran: {}", last);
+	}
+	p.lose("/v1/witness", false);
+	p.rewrite(None);
+	fakes.take();
+	let _ = std::fs::remove_dir_all(&m.dir);
 }
