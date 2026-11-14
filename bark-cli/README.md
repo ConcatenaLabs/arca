@@ -1885,8 +1885,10 @@ once on the lock's lineage, and otherwise by time:
   round, whether or not it knows the preimage, and the ending then waits for
   the conditions below;
 
-- the payee's, from the lock's home date (its timeout less its exit delay
-  and the unroll of its path), or as soon as the lock's leaf is on the
+- the payee's, from the lock's home date (its timeout less its exit delay,
+  the unroll of its path and ten minutes; the unroll counts two blocks for
+  every transaction of the path, node levels included, and never less than
+  the operator's `info.locks.unroll_seconds`, an hour), or as soon as the lock's leaf is on the
   chain, and only with the preimage: the one the wallet hands it (`POST
   /v1/lock_preimage`, `{"payment_hash", "preimage"}`, sent by `lock
   preimage` and by a BTC swap whose payment settled), or the one the

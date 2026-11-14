@@ -70,6 +70,19 @@ pub const TEMPLATE: &str = "htlc-2";
 /// Blocks a step of the unroll takes, at most, on the payee's way home.
 const STEP_BLOCKS: u64 = 2;
 
+/// The unroll of a lock's path the specification allows at least, `u`, in
+/// seconds: the operator's `info.locks.unroll_seconds` where it names one.
+pub const UNROLL_SECONDS: u64 = 3_600;
+
+/// A lock's home date: its timeout `timeout` less the unroll of its path
+/// (`steps` transactions, every node level and lineage step down to the
+/// leaf, each given [`STEP_BLOCKS`] blocks of `block` seconds, and never less
+/// than `unroll`), the payee's exit delay `exit_delay` and ten minutes.
+pub fn lock_home_date(timeout: u64, exit_delay: u64, steps: u64, block: u64, unroll: u64) -> u64 {
+	let path = steps.saturating_mul(STEP_BLOCKS).saturating_mul(block).max(unroll);
+	timeout.saturating_sub(path + exit_delay + 600)
+}
+
 /// The nonce of the payer's key for the lock whose leaf's creator nonce is
 /// `creator_nonce`: `SHA256("Arca/lock refund" ‖ creator_nonce)`. Drawn from
 /// the leaf, which the payer makes, so a restore from the phrase finds the
@@ -381,13 +394,15 @@ impl Wallet {
 	}
 
 	/// When the payee of a lock must start taking it home on the chain, a
-	/// median time: its timeout, less the unroll of its lineage, its exit
-	/// delay and a margin.
+	/// median time: its timeout, less the unroll of its whole path, its exit
+	/// delay and a margin ([`lock_home_date`]). `unroll` is the operator's
+	/// (`info.locks.unroll_seconds`), an hour when it says none.
 	fn lock_home(&self, coin: &arca_covenant::ValidCoin, block: u64) -> Result<u64, Error> {
 		let t = coin.leaf.lock.ok_or_else(|| Error::Refused("the coin is no lock".into()))?;
-		let steps = coin.lineage().len() as u64 + 1;
-		let home_by = steps * STEP_BLOCKS * block + coin.leaf.exit_delay.seconds() + 600;
-		Ok((t.timeout.to_consensus_u32() as u64).saturating_sub(home_by))
+		let mut path = vec![];
+		Self::path_outputs(coin, &mut path);
+		let unroll = self.server.info().ok().and_then(|i| i["locks"]["unroll_seconds"].as_u64()).unwrap_or(UNROLL_SECONDS);
+		Ok(lock_home_date(t.timeout.to_consensus_u32() as u64, coin.leaf.exit_delay.seconds(), path.len() as u64, block, unroll))
 	}
 
 	/// Whether the lock the wallet asked under `hash` is held: its record
@@ -904,6 +919,19 @@ fn coin_nonce(row: &CoinRow) -> [u8; 32] {
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	/// The home date counts every transaction of the path, and never less
+	/// than the specified hour.
+	#[test]
+	fn a_locks_home_date_counts_its_whole_path_and_at_least_the_hour() {
+		let t = 2_000_000_000;
+		// Three steps at 60 s blocks unroll in 360 s: the hour counts.
+		assert_eq!(lock_home_date(t, 512, 3, 60, 3600), t - 3600 - 512 - 600);
+		// Forty steps at 60 s blocks take 4,800 s: longer than the hour.
+		assert_eq!(lock_home_date(t, 512, 40, 60, 3600), t - 4800 - 512 - 600);
+		assert_eq!(lock_home_date(t, 512, 3, 600, 1800), t - 3600 - 512 - 600);
+		assert_eq!(lock_home_date(100, 512, 3, 60, 3600), 0);
+	}
 
 	#[test]
 	fn the_refund_nonce_is_the_creators_tagged() {
