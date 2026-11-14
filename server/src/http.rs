@@ -19,6 +19,8 @@
 //! | `lightning_receive_status` | POST | no: the payment hash names it |
 //! | `lightning_receive_claim` | POST | by the preimage, and the owners' signatures over the transfer of the leaf |
 //! | `lightning_preimage` | POST | by the preimage, which opens the hash |
+//! | `lock_status` | POST | no: the payment hash names the locks ([`crate::locks`]) |
+//! | `lock_preimage` | POST | by the preimage, which opens the hash |
 //! | `submit_participation` | POST | by each owner's attestation over the participation |
 //! | `participation_status` | POST | no: the id is the hash of the request |
 //! | `transfer_status` | POST | no: the transfer's id names it; at the reads' rate |
@@ -454,7 +456,8 @@ pub fn status_of(code: &str) -> StatusCode {
 		"unauthenticated" => StatusCode::UNAUTHORIZED,
 		"unknown_leaf" | "unknown_board" => StatusCode::NOT_FOUND,
 		"owed_claimed" | "owed_withdrawn" => StatusCode::CONFLICT,
-		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" | "unknown_fill" => StatusCode::NOT_FOUND,
+		"unknown_participation" | "unknown_batch" | "unknown_payment" | "unknown_plan" | "unknown_order" | "unknown_fill" | "unknown_lock" =>
+			StatusCode::NOT_FOUND,
 		"double_spend" | "in_use" | "nonce_used" | "key_reused" | "script_reused" | "salt" | "board_exists" | "merge" | "receive_cap"
 			| "order_taken" | "order_moved" | "planned" | "conflict" | "hash_reused" | "frozen" | "in_round" | "not_withdrawable" | "not_declined" =>
 			StatusCode::CONFLICT,
@@ -940,6 +943,10 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 		checkpoint_exit: app.params.checkpoint_exit,
 		landing_2_only: app.params.landing_2_only,
 		offboards: api::OffboardsInfo { unlock_within_seconds: app.watcher.as_ref().map_or(0, |w| w.unlock_within_seconds()) },
+		locks: api::LocksInfo {
+			max_seconds: crate::locks::LOCK_MAX_SECONDS, claim_margin_seconds: crate::locks::CLAIM_MARGIN_SECONDS,
+			unroll_seconds: crate::locks::UNROLL_SECONDS,
+		},
 	})
 }
 
@@ -1026,6 +1033,14 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 			checkpoint_sig: sig(&i.checkpoint_sig)?,
 			reassignment_sig: sig(&i.reassignment_sig)?,
 			delegation_sig: i.delegation_sig.as_deref().map(sig).transpose()?,
+			lock: match &i.lock {
+				None => None,
+				Some(l) => Some(match (l.path.as_str(), &l.preimage) {
+					("claim", Some(p)) => arca_covenant::LockSpend::Claim { preimage: unhex32(p).map_err(Refusal::malformed)? },
+					("refund", None) => arca_covenant::LockSpend::Refund,
+					(p, _) => return Err(Refusal::malformed(format!("lock path {:?}: claim with its preimage, or refund", p))),
+				}),
+			},
 		});
 	}
 	let mut outputs = Vec::with_capacity(outs.len());
@@ -1044,8 +1059,19 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 					.map_err(|e| Refusal::malformed(format!("htlc operator delay: {}", e)))?,
 			}),
 		};
+		let lock = match &o.lock {
+			None => None,
+			Some(l) => Some(arca_covenant::LockTerms {
+				payment_hash: unhex32(&l.payment_hash).map_err(Refusal::malformed)?,
+				timeout: MedianTime::from_consensus(l.timeout).map_err(|e| Refusal::malformed(format!("lock timeout: {}", e)))?,
+				refunder: key(&l.refunder)?,
+				refund_delay: RelativeTime::from_units(l.refund_delay_units)
+					.map_err(|e| Refusal::malformed(format!("lock refund delay: {}", e)))?,
+			}),
+		};
 		// A landing leaf is named by its terms, landing-2 by its template too.
 		let (v2, own_index) = match o.template.as_deref() {
+			Some("htlc-2") if lock.is_some() => (false, false),
 			None | Some("vtxo-1") => (false, false),
 			Some("vtxo-2") if o.htlc.is_none() && o.landing.is_none() => (true, false),
 			Some("landing-1") if o.landing.is_some() => (false, false),
@@ -1056,7 +1082,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 		outputs.push(OutputRequest {
 			asset: asset(&o.asset)?,
 			value: amount(&o.value)?,
-			leaf: NewLeaf {
+			leaf: NewLeaf { lock,
 				owner: key(&o.owner)?,
 				owner_nonce: unhex32(&o.owner_nonce).map_err(Refusal::malformed)?,
 				creator_nonce: unhex32(&o.creator_nonce).map_err(Refusal::malformed)?,
@@ -1069,6 +1095,7 @@ fn transfer_request(inputs: &[api::TransferInput], outs: &[api::TransferOutput])
 			},
 			mailbox: o.mailbox.as_deref().map(key).transpose()?,
 			until: o.until,
+			payer_mailbox: o.lock.as_ref().and_then(|l| l.payer_mailbox.as_deref()).map(key).transpose()?,
 		});
 	}
 	Ok(TransferRequest { inputs: ins, outputs, checkpoint_exit: false })
@@ -1173,6 +1200,42 @@ async fn lightning_preimage(State(app): State<Arc<App>>, body: Result<Bytes, Byt
 	let preimage = unhex32(&req.preimage).map_err(Refusal::malformed)?;
 	let r = app.receives.post_preimage(&hash, &preimage).await?;
 	Ok(Json(received(&r)))
+}
+
+/// The locks under a payment hash, and the preimage once it is known.
+async fn lock_status_of(app: &App, hash: &[u8; 32]) -> Result<api::LockStatus, Refusal> {
+	let rows = app.store.locks_by_hash(hash).await?;
+	if rows.is_empty() {
+		return Err(Refusal::new(StatusCode::NOT_FOUND, "unknown_lock", format!("no lock is known under hash {}", crate::signer::hex(hash))));
+	}
+	Ok(api::LockStatus {
+		payment_hash: crate::signer::hex(hash),
+		preimage: rows.iter().find_map(|r| r.preimage).map(|p| crate::signer::hex(&p)),
+		locks: rows.iter().map(|r| api::LockInfo {
+			leaf_id: crate::signer::hex(&r.leaf_id), payee: crate::signer::hex(&r.payee), payer: crate::signer::hex(&r.payer),
+			timeout: r.timeout, state: r.state.as_str().into(),
+		}).collect(),
+	})
+}
+
+async fn lock_status(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::LockStatus>, Refusal> {
+	let req: api::LockStatusRequest = parse(body, app.max_request)?;
+	let hash = unhex32(&req.payment_hash).map_err(Refusal::malformed)?;
+	Ok(Json(lock_status_of(&app, &hash).await?))
+}
+
+async fn lock_preimage(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>) -> Result<Json<api::LockStatus>, Refusal> {
+	let req: api::LockPreimage = parse(body, app.max_request)?;
+	let hash = unhex32(&req.payment_hash).map_err(Refusal::malformed)?;
+	let preimage = unhex32(&req.preimage).map_err(Refusal::malformed)?;
+	if arca_covenant::script::sha256(&preimage) != hash {
+		return Err(Refusal::malformed("the preimage does not open the payment hash"));
+	}
+	let status = lock_status_of(&app, &hash).await?;
+	if app.store.lock_preimage(&hash, &preimage).await? > 0 {
+		log::info!("locks: the preimage of hash {} was handed over", crate::signer::hex(&hash));
+	}
+	Ok(Json(api::LockStatus { preimage: Some(crate::signer::hex(&preimage)), ..status }))
 }
 
 async fn lightning_send_status(State(app): State<Arc<App>>, body: Result<Bytes, BytesRejection>)
@@ -2399,6 +2462,8 @@ pub fn router(app: Arc<App>) -> Router {
 		.route("/v1/lightning_receive_status", post(lightning_receive_status))
 		.route("/v1/lightning_receive_claim", post(lightning_receive_claim))
 		.route("/v1/lightning_preimage", post(lightning_preimage))
+		.route("/v1/lock_status", post(lock_status))
+		.route("/v1/lock_preimage", post(lock_preimage))
 		.route("/v1/submit_participation", post(submit_participation))
 		.route("/v1/participation_status", post(participation_status_call))
 		.route("/v1/holding_back", post(holding_back))

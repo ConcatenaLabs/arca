@@ -309,9 +309,9 @@ impl Wallet {
 		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: p.inv.payment_hash,
 			timeout: MedianTime::from_consensus(at).map_err(|e| Error::Refused(e.to_string()))?, operator_delay: p.operator_delay };
 		let exit_delay = self.exit_delay().max(p.owner_delay);
-		let leaf = NewLeaf { v2: false, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None };
+		let leaf = NewLeaf { lock: None, v2: false, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None };
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let htlc = Out { asset: p.asset, value: p.value + p.fee, leaf, mailbox, until: None };
+		let htlc = Out { payer_mailbox: None, asset: p.asset, value: p.value + p.fee, leaf, mailbox, until: None };
 		let min = Self::min_leaf(&p.info, p.asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
 		let bound = max_fee_ppm.unwrap_or(super::DEFAULT_MAX_FEE_PPM);
@@ -367,10 +367,10 @@ impl Wallet {
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: inv.payment_hash, timeout, operator_delay };
 		let exit_delay = self.exit_delay().max(owner_delay);
-		let leaf = NewLeaf { v2: false, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None };
+		let leaf = NewLeaf { lock: None, v2: false, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay, htlc: Some(terms), landing: None };
 		terms.check(exit_delay).map_err(|e| Error::Refused(e.to_string()))?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let htlc = Out { asset, value: value + fee, leaf, mailbox, until: None };
+		let htlc = Out { payer_mailbox: None, asset, value: value + fee, leaf, mailbox, until: None };
 		let min = Self::min_leaf(info, asset)?;
 		let htlc_out = ExplicitOutputOf::explicit_of(&htlc, self);
 		// Every coin taken outlives the lock: its timeout, the leaf's exit
@@ -402,7 +402,7 @@ impl Wallet {
 		let mut outs = vec![htlc];
 		if change > 0 {
 			let leaf = self.own_leaf_for("change")?;
-			outs.push(Out { asset, value: change, leaf, mailbox, until: None });
+			outs.push(Out { payer_mailbox: None, asset, value: change, leaf, mailbox, until: None });
 		}
 		self.set_send(&hash, json!({"invoice": invoice, "asset": asset.to_string(), "amount": value.to_string(), "fee": fee.to_string(),
 			"htlc_owner": hex(&owner.serialize()), "state": "requested"}))?;
@@ -642,12 +642,12 @@ impl Wallet {
 		let cp = self.checkpoint_margin_of(&coin, &m)?;
 		let own = self.own_leaf_for("returned")?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let probe = Out { asset, value: 1, leaf: own, mailbox, until: None };
+		let probe = Out { payer_mailbox: None, asset, value: 1, leaf: own, mailbox, until: None };
 		let re = self.reassignment_margin_of(&coin, &probe, &m)?;
 		let value = coin.value.checked_sub(cp + re).filter(|v| *v > 0)
 			.ok_or_else(|| Error::Refused(format!("the htlc-1 coin's {} atoms do not cover its margins", coin.value)))?;
 		let back = Out { value, ..probe };
-		let input = In { row, checkpoint_value: coin.value - cp, coin };
+		let input = In { lock: None, row, checkpoint_value: coin.value - cp, coin };
 		let answer = self.transfer_back(&[input], &[back])?;
 		let mut r = rec;
 		r["state"] = json!("returned");
@@ -848,7 +848,7 @@ impl Wallet {
 			.map_err(|e| Error::Refused(e.to_string()))?;
 		let probe_leaf = |htlc: Option<HtlcTerms>| -> Result<NewLeaf, Error> {
 			let nonce = random32();
-			Ok(NewLeaf { v2: false, owner: self.keys.leaf_xonly(&nonce)?, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(),
+			Ok(NewLeaf { lock: None, v2: false, owner: self.keys.leaf_xonly(&nonce)?, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(),
 				htlc, landing: None })
 		};
 		let terms = HtlcTerms { direction: HtlcDirection::Receive, payment_hash: [0; 32], timeout, operator_delay: units };
@@ -858,7 +858,7 @@ impl Wallet {
 			origin: ValidOrigin::Transfer { inputs: vec![], outputs: vec![], index: 0 } };
 		let m = super::pay::Margins::of(info, asset)?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let own = Out { asset, value: 1, leaf: probe_leaf(None)?, mailbox, until: None };
+		let own = Out { payer_mailbox: None, asset, value: 1, leaf: probe_leaf(None)?, mailbox, until: None };
 		Ok(self.checkpoint_margin_of(&coin, &m)? + self.reassignment_margin_of(&coin, &own, &m)?)
 	}
 
@@ -1341,12 +1341,12 @@ impl Wallet {
 		let cp = self.checkpoint_margin_of(&coin, &m)?;
 		let own = self.own_leaf_for("received")?;
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let probe = Out { asset, value: 1, leaf: own, mailbox, until: None };
+		let probe = Out { payer_mailbox: None, asset, value: 1, leaf: own, mailbox, until: None };
 		let re = self.reassignment_margin_of(&coin, &probe, &m)?;
 		let value = coin.value.checked_sub(cp + re).filter(|v| *v > 0)
 			.ok_or_else(|| Error::Refused(format!("the leaf's {} atoms do not cover its margins", coin.value)))?;
 		let back = Out { value, ..probe };
-		let input = In { row, checkpoint_value: coin.value - cp, coin };
+		let input = In { lock: None, row, checkpoint_value: coin.value - cp, coin };
 		// From here the preimage may be out: the payment is never failed,
 		// and the leaf comes home by its claim at its home date unless the
 		// operator co-signs.

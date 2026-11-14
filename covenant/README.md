@@ -907,9 +907,12 @@ off-chain and has an exit delay of at least the policy's minimum, so when the
 sender's leaf reaches the chain, the receiver publishes the checkpoint and the
 reassignment within that delay, or a watchtower holding the receiver's record
 does while the receiver is away. It answers at once: a rollback that disconnects
-its answer does not restart the delay of the leaf it answered. Against the sender
-and the operator together it is not safe, before a round: that is the trust the
-specification calls operator-confirmed.
+its answer does not restart the delay of the leaf it answered. A lock between two
+holders (below) is such a coin for both of them: the payee's wallet and watchtower
+answer a stale exit of its lineage whether or not they know the preimage yet, and
+the answer brings the lock's leaf on the chain, where its scripts decide. Against
+the sender and the operator together it is not safe, before a round: that is the
+trust the specification calls operator-confirmed.
 
 ## Hash-locks between two holders
 
@@ -978,6 +981,19 @@ settles, so a claim never waits on the seller posting it. `Q` then claims by
 CLAIM-C into a leaf of its own, received lineage until a round. Nothing is
 fronted by the operator, and the Bitcoin side sees only the invoice under `h`.
 
+**Its record and its endings.** An `htlc-2` leaf is made only by a
+reassignment, never in a round: a round's leaf record naming it is refused. The
+coin record's tag 10 carries it (`transfer`): the payee's key, the two nonces,
+the payee's delay and the terms (`h`, `T`, `P` and `d_P`). An input that spends
+it names its path (`LockSpend`): the claim, with the preimage, moves it into a
+checkpoint of `Q`'s; the refund moves it into a checkpoint of `P`'s, by a
+transaction whose lock time is `T`. Neither checkpoint has an exit, and the
+record carries the preimage of a claim, so whoever holds the coin can bring it
+on-chain. A record whose input names a path for a coin that is no lock, none
+for one that is, or a preimage that does not open `h` is refused
+(`TransferError::LockSpend`). On the chain, `LockPolicy::claim_tx` and
+`refund_tx` build CLAIM and REFUND for the payee and the payer to sign.
+
 **The timeout.** `P` sets `T` at least `L_B + ρ + u + d_Q + 3,600` seconds out:
 `L_B` the latest moment the Bitcoin leg can reveal the preimage or return the
 BTC (the invoice's expiry or, later, `(δ + 6) · 1,200` seconds for the Bitcoin
@@ -1011,8 +1027,8 @@ and serves the preimage once it has it.
 | `P` locks; `Q` never pays, or pays after the invoice expired | The BTC payment fails back to `Q`; `P` refunds from `T` by REFUND-C, or by REFUND on the chain if the operator refuses |
 | `Q` pays; `P` never claims | The Bitcoin HTLC times out and `Q`'s BTC returns; `P` refunds from `T` |
 | `Q` pays; `P` claims | The preimage is out; `Q` claims by CLAIM-C, or, refused, exits on the chain by its home date and claims by CLAIM with `ρ` to spare |
-| `Q` offline after paying | Its watchtower holds the lock's record, a CLAIM `Q` signed in advance, which fits the leaf wherever it lands (the preimage is not under the signature), and the preimage `Q`'s wallet handed it; failing that, it reads the preimage from the operator or a spend on the chain. With no preimage from any source by the home date, it does nothing: the buyer was not paid against, or the seller never claimed, and the BTC returns to the buyer |
-| `P` offline after locking | No deadline binds `P`: from `T` it refunds when it returns, unless `Q` claimed with the preimage `P` revealed |
+| `Q` offline after paying | Its watchtower holds the lock's record, a CLAIM `Q` signed in advance, which fits the leaf wherever it lands (the preimage is not under the signature) and the preimage `Q`'s wallet handed it; failing that, it reads the preimage from the operator. From the home date it brings the lock on the chain and claims it. The buyer's own settled BTC payment is where the preimage comes from: the seller can claim the BTC and post nothing, and only the buyer's wallet reads its payment (a BTC swap's `pay_status`), handing the preimage to the watchtower and the operator. With no preimage by the home date, the watchtower does nothing. If the buyer was not paid against, the BTC returns to it. If the seller claimed the BTC and posted nothing, the buyer gets the lock only if its wallet comes back before its home date to read the preimage from its payment and take the lock on the chain. A buyer offline from paying until past its home date, with a seller that posts nothing, loses the lock: that is the limit of a watchtower that cannot read the Bitcoin leg |
+| `P` offline after locking | No deadline binds `P`: from `T` it refunds when it returns, unless `Q` claimed with the preimage `P` revealed. Its watchtower, holding a REFUND `P` signed in advance, refunds on the chain an hour past `T` while the lock is open |
 | `P` and the operator spend `P`'s checkpoint elsewhere before the lock confirms | The lock is void, and a buyer who paid loses up to its value: the trust of any coin received out of round, which the instant limit bounds. The buyer holds the evidence: the operator's signatures in the lock's record (the checkpoint pair and the reassignment pair over `P`'s coin), and its signature in the conflicting spend, which `rebind_signed_in` reads from the chain: two messages under one salt, which SLASH takes as for any coin signed twice |
 | The Bitcoin leg is reorganised | Nothing changes here: the BTC leg is the Bitcoin ark's; a preimage revealed stays revealed. A rollback of the rounds under the lock returns the identical round, and the lock stands or falls with `P`'s coin as any coin received out of round |
 

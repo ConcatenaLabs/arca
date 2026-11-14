@@ -151,13 +151,15 @@
 //!         [32] the preimage of its entry's unlock hash
 //!         [64] signature, u32 time: its owner's exit authorisation
 //!   u8  1, an output of a reassignment whose leaf is vtxo-1, 3 one whose leaf is htlc-1, 5 one
-//!       whose leaf is landing-1, 8 one whose leaf is vtxo-2, or 9 one whose leaf is landing-2 (7 is
-//!       reserved, and reads as ENCLAVE_RETIRED):
+//!       whose leaf is landing-1, 8 one whose leaf is vtxo-2, 9 one whose leaf is landing-2, or 10
+//!       one whose leaf is htlc-2 (7 is reserved, and reads as ENCLAVE_RETIRED):
 //!         u8   input count, 1 to 16, then per input:
 //!                coin (recursively), u64 the checkpoint's value,
 //!                [64] [64] the checkpoint pair (operator, owner),
 //!                [64] [64] the reassignment pair (operator, owner)
 //!                version 2 only: u8 1 where the checkpoint has its owner's exit, else 0
+//!                where the coin is of tag 10 only: u8 0 and [32] the preimage for its claim,
+//!                or u8 1 for its refund
 //!         u8   output count m, 1 to 4, then per output:
 //!                [32] asset, u64 value, compact size and the scriptPubKey (at most 10,000 bytes)
 //!         u8   the coin's index, below m
@@ -166,7 +168,19 @@
 //!                         u16 operator delay units
 //!         for tags 5 and 9 only: [20] the landing program, u64 the fee allowance: the landing
 //!                         pays at least the coin's output value less it, in its asset
+//!         for tag 10 only: [32] payment hash, u32 timeout, [32] the payer's key, u16 the payer's
+//!                         delay units
 //! ```
+//!
+//! A reassignment may create an `htlc-2` leaf ([`crate::lock`]): a payer's
+//! coin locked to a payee under a hash until a timeout. Its owner is the
+//! payee. It is spent out of round by one of two paths, which the input
+//! spending it names ([`TransferInput::lock`]): the claim, the payee and the
+//! operator with the preimage, into a checkpoint of the payee's; or the
+//! refund, the payer and the operator from the timeout, into a checkpoint of
+//! the payer's, its transaction's lock time the timeout. Neither checkpoint
+//! has an exit. The record carries the claim's preimage, so that anyone
+//! holding it can bring the coin on-chain.
 //!
 //! A reassignment may create an `htlc-1` leaf ([`crate::htlc`]): a payment
 //! out of the tree over Lightning, the operator claiming with the preimage.
@@ -196,6 +210,7 @@ use crate::encode::{write_compact_size, DecodeError, Encoding, Reader};
 use crate::htlc::HtlcTerms;
 use crate::landing::LandingTerms;
 use crate::leaf::{leaf_salt, LeafPolicy, MAX_OUTPUTS};
+use crate::lock::{LockSpend, LockSpender, LockTerms};
 use crate::message::{Chain, CsfsMessage};
 use crate::offboard::MAX_DESTINATION;
 use crate::record::{LeafId, LeafRecord, RecordError, ValidLeaf, WalletPolicy, MAX_VALUE};
@@ -272,6 +287,9 @@ pub struct NewLeaf {
 	/// A `vtxo-2` leaf ([`crate::collab`]); only with no `htlc` or `landing`
 	/// terms.
 	pub v2: bool,
+	/// `htlc-2`'s terms, for a lock between two holders whose payee is the
+	/// owner ([`crate::lock`]); `None` otherwise.
+	pub lock: Option<LockTerms>,
 }
 
 impl NewLeaf {
@@ -281,7 +299,7 @@ impl NewLeaf {
 			claim: None,
 			owner: self.owner, operator, salt: self.salt(), chain, exit_delay: self.exit_delay, htlc: self.htlc,
 			order: None, landing: self.landing,
-			channel: None, v2: self.v2,
+			channel: None, v2: self.v2, lock: self.lock,
 		}
 	}
 
@@ -416,6 +434,10 @@ pub struct TransferInput {
 	/// Whether the coin's checkpoint has its owner's exit
 	/// ([`crate::checkpoint`]).
 	pub exit: bool,
+	/// For a coin of an `htlc-2` lock, the path it is spent by: the claim,
+	/// with its preimage, or the refund ([`crate::lock`]); `None` for every
+	/// other coin.
+	pub lock: Option<LockSpend>,
 }
 
 /// Why a coin record does not decode or is not accepted.
@@ -497,6 +519,9 @@ pub enum TransferError {
 	Fill(String),
 	#[error("input {0}: a checkpoint with its owner's exit holds a coin of a plain leaf (vtxo-1 or vtxo-2) or a landing leaf only")]
 	CheckpointExit(usize),
+	#[error("input {0}: a coin of an htlc-2 lock is spent by its claim, with a preimage that opens its hash, or by its refund; \
+		no other coin names a path")]
+	LockSpend(usize),
 }
 
 impl TransferError {
@@ -541,6 +566,7 @@ impl TransferError {
 			NotATransfer | NotABoard | Checkpoints { .. } => "use",
 			NotAnOrder | Fill(_) => "fill",
 			CheckpointExit(_) => "template",
+			LockSpend(_) => "lock",
 		}
 	}
 }
@@ -602,6 +628,8 @@ pub struct ValidInput {
 	pub checkpoint_value: u64,
 	pub checkpoint_pair: Pair,
 	pub reassignment_pair: Pair,
+	/// For a coin of an `htlc-2` lock, the path its checkpoint pair spends.
+	pub lock: Option<LockSpend>,
 }
 
 /// What an output in a coin's lineage is.
@@ -779,6 +807,18 @@ impl ValidCoin {
 	/// least `value` less the coin's allowance, at the spending input's own
 	/// index for either landing leaf.
 	pub fn checkpoint_of(&self, exit: bool, value: u64) -> CheckpointPolicy {
+		self.checkpoint_spent(None, exit, value)
+	}
+
+	/// [`ValidCoin::checkpoint_of`] for a coin spent by `lock`: a coin of an
+	/// `htlc-2` lock moves into a checkpoint of the payee's when claimed and
+	/// of the payer's when refunded ([`crate::lock::LockSpend::signer`]),
+	/// without an exit.
+	pub fn checkpoint_spent(&self, lock: Option<LockSpend>, exit: bool, value: u64) -> CheckpointPolicy {
+		let owner = match (lock, self.leaf.lock_policy()) {
+			(Some(spend), Some(policy)) => spend.signer(&policy),
+			_ => self.leaf.owner,
+		};
 		let exit = exit.then(|| crate::checkpoint::CheckpointExit {
 			delay: self.leaf.exit_delay,
 			landing: self.leaf.landing.map(|l| crate::LandingTerms {
@@ -786,7 +826,7 @@ impl ValidCoin {
 			}),
 		});
 		CheckpointPolicy {
-			owner: self.leaf.owner, operator: self.leaf.operator, salt: checkpoint_salt(&self.leaf.salt),
+			owner, operator: self.leaf.operator, salt: checkpoint_salt(&self.leaf.salt),
 			chain: self.leaf.chain, sweep: self.sweep, v2: self.leaf.v2, exit,
 		}
 	}
@@ -855,6 +895,11 @@ impl ValidInput {
 
 	/// The checkpoint transaction, spending the coin's leaf at `coin`.
 	pub fn checkpoint_tx(&self, coin: OutPoint, fee: &FeeSource) -> Result<UnrollTx, TransferError> {
+		if let Some(policy) = self.coin.leaf.lock_policy() {
+			let spend = self.lock.ok_or(TransferError::LockSpend(0))?;
+			return Ok(collab_tx(&LockSpender { policy, spend }, coin, self.coin.asset, self.coin.value, &[self.checkpoint_output()],
+				&self.checkpoint_pair, fee)?);
+		}
 		Ok(collab_tx(&self.coin.leaf, coin, self.coin.asset, self.coin.value, &[self.checkpoint_output()],
 			&self.checkpoint_pair, fee)?)
 	}
@@ -1025,6 +1070,10 @@ pub struct TransferPlan {
 	/// reassignment of several owners' coins sets it, where every party
 	/// reads the record format it makes ([`COIN_RECORD_VERSION_EXIT`]).
 	pub checkpoint_exit: bool,
+	/// For each input that is a coin of an `htlc-2` lock, the path it is
+	/// spent by, by its index; empty, or `None` at an index, for every
+	/// other coin.
+	pub locks: Vec<Option<LockSpend>>,
 }
 
 impl TransferPlan {
@@ -1033,9 +1082,14 @@ impl TransferPlan {
 		self.checkpoint_exit && self.inputs[i].0.exit_allowed()
 	}
 
+	/// The path input `i` spends a lock by; `None` for a coin that is not one.
+	pub fn lock(&self, i: usize) -> Option<LockSpend> {
+		self.locks.get(i).copied().flatten()
+	}
+
 	/// The checkpoint of input `i`.
 	pub fn checkpoint(&self, i: usize) -> CheckpointPolicy {
-		self.inputs[i].0.checkpoint_of(self.exit(i), self.inputs[i].1)
+		self.inputs[i].0.checkpoint_spent(self.lock(i), self.exit(i), self.inputs[i].1)
 	}
 
 	/// The checkpoint output of input `i`.
@@ -1134,7 +1188,13 @@ fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[Expl
 		if input.exit && !coin.exit_allowed() {
 			return Err(TransferError::CheckpointExit(k + first));
 		}
-		named.push(ExplicitOutput::new(coin.asset, input.checkpoint_value, coin.checkpoint_of(input.exit, input.checkpoint_value).script_pubkey()).txout());
+		match (coin.leaf.lock_policy(), &input.lock) {
+			(Some(policy), Some(spend)) => spend.check(&policy).map_err(|_| TransferError::LockSpend(k + first))?,
+			(None, None) => {},
+			_ => return Err(TransferError::LockSpend(k + first)),
+		}
+		named.push(ExplicitOutput::new(coin.asset, input.checkpoint_value,
+			coin.checkpoint_spent(input.lock, input.exit, input.checkpoint_value).script_pubkey()).txout());
 	}
 	let mut out = Vec::with_capacity(inputs.len());
 	for (k, (input, coin)) in inputs.iter().zip(coins).enumerate() {
@@ -1142,16 +1202,18 @@ fn check_inputs(inputs: &[TransferInput], coins: Vec<ValidCoin>, outputs: &[Expl
 		if input.checkpoint_value == 0 || input.checkpoint_value > coin.value {
 			return Err(TransferError::CheckpointValue { value: input.checkpoint_value, coin: coin.value });
 		}
-		let checkpoint = coin.checkpoint_of(input.exit, input.checkpoint_value);
+		let checkpoint = coin.checkpoint_spent(input.lock, input.exit, input.checkpoint_value);
 		let cp_out = ExplicitOutput::new(coin.asset, input.checkpoint_value, checkpoint.script_pubkey());
-		coin.leaf.verify(coin.asset, coin.value, &[cp_out], &input.checkpoint)
-			.map_err(|error| TransferError::Pair { input: k, pair: "checkpoint", error })?;
+		match (coin.leaf.lock_policy(), input.lock) {
+			(Some(policy), Some(spend)) => LockSpender { policy, spend }.verify(coin.asset, coin.value, &[cp_out], &input.checkpoint),
+			_ => coin.leaf.verify(coin.asset, coin.value, &[cp_out], &input.checkpoint),
+		}.map_err(|error| TransferError::Pair { input: k, pair: "checkpoint", error })?;
 		checkpoint.verify_in(k as u32, &named, outputs, &input.reassignment)
 			.map_err(|error| TransferError::Pair { input: k, pair: "reassignment", error })?;
 		add_held(held, coin.asset, input.checkpoint_value)?;
 		out.push(ValidInput {
 			checkpoint, checkpoint_value: input.checkpoint_value, checkpoint_pair: input.checkpoint,
-			reassignment_pair: input.reassignment, coin,
+			reassignment_pair: input.reassignment, lock: input.lock, coin,
 		});
 	}
 	Ok(out)
@@ -1195,6 +1257,12 @@ fn check_outputs(outputs: &[ExplicitOutput]) -> Result<(), TransferError> {
 }
 
 impl CoinRecord {
+	/// Whether the coin is an `htlc-2` lock: an input that spends it names
+	/// its path ([`TransferInput::lock`]).
+	pub fn is_lock(&self) -> bool {
+		matches!(self, CoinRecord::Transfer(t) if t.leaf.lock.is_some())
+	}
+
 	/// The coin records this coin's own transaction spends: a reassignment's
 	/// inputs, or a fill's order coin and taker inputs; none for a batch leaf
 	/// or a board, which rest on the chain's own transactions.
@@ -1408,7 +1476,7 @@ impl CoinRecord {
 				// leaf is the policy's operator's, on the policy's chain.
 				let coins = t.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
 				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().zip(&t.inputs)
-					.map(|(c, i)| (c.id, c.checkpoint_of(i.exit, i.checkpoint_value).taproot().program())).collect();
+					.map(|(c, i)| (c.id, c.checkpoint_spent(i.lock, i.exit, i.checkpoint_value).taproot().program())).collect();
 				let values: Vec<u64> = t.inputs.iter().map(|i| i.checkpoint_value).collect();
 				let spend = spend_hash(&parts, &values, &t.outputs);
 				for (k, coin) in coins.iter().enumerate() {
@@ -1431,6 +1499,18 @@ impl CoinRecord {
 				}
 				let first = &inputs[0].coin;
 				let leaf = t.leaf.policy(first.leaf.operator, first.leaf.chain);
+				if let Some(lock) = leaf.lock_policy() {
+					if t.leaf.htlc.is_some() || t.leaf.landing.is_some() || t.leaf.v2 {
+						return Err(TransferError::Template("htlc-2 with another template's terms".into()));
+					}
+					lock.check_purchase().map_err(|e| SpendError::from(crate::Error::from(e)))?;
+					if !policy.exit_delay_ok(lock.terms.refund_delay) {
+						return Err(TransferError::LineageExitDelay {
+							hops: depth, delay: lock.terms.refund_delay.units(), min: policy.min_exit_delay.units(),
+							max: policy.max_exit_delay.units(),
+						});
+					}
+				}
 				let mine = &t.outputs[t.index as usize];
 				if mine.script_pubkey != leaf.script_pubkey() {
 					return Err(TransferError::LeafMismatch);
@@ -1471,7 +1551,7 @@ impl CoinRecord {
 				op.judge(&txouts, 0, order.value, fill.partial).map_err(|e| TransferError::Fill(e.to_string()))?;
 				let coins = fill.inputs.iter().map(|i| i.coin.resolve_in(rounds, policy, spent, depth + 1)).collect::<Result<Vec<_>, _>>()?;
 				let parts: Vec<(LeafId, [u8; 32])> = coins.iter().zip(&fill.inputs)
-					.map(|(c, i)| (c.id, c.checkpoint_of(i.exit, i.checkpoint_value).taproot().program())).collect();
+					.map(|(c, i)| (c.id, c.checkpoint_spent(i.lock, i.exit, i.checkpoint_value).taproot().program())).collect();
 				let mut values = vec![order.value];
 				values.extend(fill.inputs.iter().map(|i| i.checkpoint_value));
 				let hash = fill_hash((order.id, order.leaf.program()), &parts, &fill.outputs);
@@ -1493,7 +1573,7 @@ impl CoinRecord {
 					(0, _, FillLeaf::Credit { .. }) => op.credit_leaf().ok_or_else(|| TransferError::Fill("the order's credit keys are used up".into()))?,
 					(1, true, FillLeaf::Rest { .. }) => op.next().leaf(),
 					(i, partial, FillLeaf::New(l)) if i >= if partial { 2 } else { 1 } => {
-						if l.htlc.is_some() || l.landing.is_some() || l.v2 {
+						if l.htlc.is_some() || l.landing.is_some() || l.v2 || l.lock.is_some() {
 							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
 						}
 						if !policy.exit_delay_ok(l.exit_delay) {
@@ -1613,7 +1693,11 @@ impl CoinRecord {
 				if t.leaf.v2 && (t.leaf.htlc.is_some() || landing.is_some()) {
 					return Err(TransferError::Template("vtxo-2 with another template's terms".into()));
 				}
+				if t.leaf.lock.is_some() && (t.leaf.v2 || t.leaf.htlc.is_some() || landing.is_some()) {
+					return Err(TransferError::Template("htlc-2 with another template's terms".into()));
+				}
 				w.push(match (&landing, t.leaf.htlc.is_some()) {
+					_ if t.leaf.lock.is_some() => 10,
 					(_, true) => 3,
 					(Some(l), false) => if l.own_index { 9 } else { 5 },
 					(None, false) => if t.leaf.v2 { 8 } else { 1 },
@@ -1626,6 +1710,9 @@ impl CoinRecord {
 				w.extend(t.leaf.creator_nonce);
 				w.extend(t.leaf.exit_delay.units().to_le_bytes());
 				if let Some(terms) = &t.leaf.htlc {
+					terms.encode_to(w);
+				}
+				if let Some(terms) = &t.leaf.lock {
 					terms.encode_to(w);
 				}
 				if let Some(l) = landing {
@@ -1658,7 +1745,7 @@ impl CoinRecord {
 						w.extend(owner_nonce);
 					},
 					FillLeaf::New(l) => {
-						if l.htlc.is_some() || l.landing.is_some() {
+						if l.htlc.is_some() || l.landing.is_some() || l.lock.is_some() {
 							return Err(TransferError::Fill("a taker's leaf from a fill is vtxo-1".into()));
 						}
 						w.push(2);
@@ -1712,7 +1799,7 @@ impl CoinRecord {
 			},
 			// The retired enclave-1's tag, reserved.
 			7 => Err(DecodeError::Retired(crate::ENCLAVE_RETIRED).into()),
-			tag @ (1 | 3 | 5 | 8 | 9) => {
+			tag @ (1 | 3 | 5 | 8 | 9 | 10) => {
 				let inputs = read_inputs(r, depth, v2)?;
 				let outputs = read_outputs(r)?;
 				let m = outputs.len();
@@ -1722,8 +1809,11 @@ impl CoinRecord {
 				}
 				let mut leaf = NewLeaf {
 					owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
-					landing: None, v2: tag == 8,
+					landing: None, v2: tag == 8, lock: None,
 				};
+				if tag == 10 {
+					leaf.lock = Some(LockTerms::decode_from(r)?);
+				}
 				if tag == 3 {
 					let terms = HtlcTerms::decode_from(r)?;
 					terms.check(leaf.exit_delay).map_err(DecodeError::from)?;
@@ -1767,7 +1857,7 @@ impl CoinRecord {
 					1 => FillLeaf::Rest { owner_nonce: r.array32()? },
 					2 => FillLeaf::New(NewLeaf {
 						owner: r.key()?, owner_nonce: r.array32()?, creator_nonce: r.array32()?, exit_delay: r.relative_time()?, htlc: None,
-						landing: None, v2: false,
+						landing: None, v2: false, lock: None,
 					}),
 					f => return Err(DecodeError::Flag(f).into()),
 				};
@@ -1790,6 +1880,15 @@ fn write_inputs(w: &mut Vec<u8>, inputs: &[TransferInput], depth: usize, v2: boo
 			w.push(i.exit as u8);
 		} else if i.exit {
 			return Err(DecodeError::Flag(1).into());
+		}
+		match (i.coin.is_lock(), &i.lock) {
+			(true, Some(LockSpend::Claim { preimage })) => {
+				w.push(0);
+				w.extend(preimage);
+			},
+			(true, Some(LockSpend::Refund)) => w.push(1),
+			(false, None) => {},
+			_ => return Err(TransferError::LockSpend(0)),
 		}
 	}
 	Ok(())
@@ -1825,8 +1924,16 @@ fn read_inputs(r: &mut Reader, depth: usize, v2: bool) -> Result<Vec<TransferInp
 		}
 		let [a, b, c, d] = sigs.map(|s| s.expect("read"));
 		let exit = v2 && r.flag()?;
+		let lock = match coin.is_lock() {
+			false => None,
+			true => match r.u8()? {
+				0 => Some(LockSpend::Claim { preimage: r.array32()? }),
+				1 => Some(LockSpend::Refund),
+				f => return Err(DecodeError::Flag(f).into()),
+			},
+		};
 		inputs.push(TransferInput {
-			coin, checkpoint_value, checkpoint: Pair { operator: a, owner: b }, reassignment: Pair { operator: c, owner: d }, exit,
+			coin, checkpoint_value, checkpoint: Pair { operator: a, owner: b }, reassignment: Pair { operator: c, owner: d }, exit, lock,
 		});
 	}
 	Ok(inputs)

@@ -129,6 +129,9 @@ pub enum LockError {
 	#[error("an htlc-2 leaf's payer's delay of {refund} units is shorter than its payee's delay of {claim} units and {margin} more: \
 		a late unroll would let the payer's refund open before the payee's claim")]
 	RefundDelay { refund: u16, claim: u16, margin: u16 },
+	/// A claim's preimage does not open the lock's hash.
+	#[error("the preimage does not open the lock's payment hash")]
+	Preimage,
 }
 
 impl LockPolicy {
@@ -154,6 +157,18 @@ impl LockPolicy {
 			return Err(LockError::RefundDelay { refund, claim, margin });
 		}
 		Ok(())
+	}
+
+	/// The check of a lock made for a purchase, the one every party runs:
+	/// three keys ([`Self::check`]) and the payer's delay the payee's and
+	/// [`REFUND_DELAY_MARGIN_UNITS`] more ([`Self::check_delays`]). The coin
+	/// record's check of every `htlc-2` leaf in a lineage runs it, so a
+	/// receiver accepts no lock without it, and so does the operator before
+	/// it co-signs one; the scripts hold for any other lock, which no
+	/// receiver accepts.
+	pub fn check_purchase(&self) -> Result<(), LockError> {
+		self.check()?;
+		self.check_delays()
 	}
 
 	/// `K` for this leaf, over its salt.
@@ -305,5 +320,105 @@ mod tests {
 		assert_eq!(at(254, 261).check_delays(), Err(LockError::RefundDelay { refund: 261, claim: 254, margin: 8 }));
 		assert_eq!(at(254, 254).check_delays(), Err(LockError::RefundDelay { refund: 254, claim: 254, margin: 8 }));
 		assert!(at(254, 127).check_delays().is_err());
+	}
+}
+
+/// `htlc-2`'s terms: payment hash (32), timeout (u32), refunder (32), the
+/// refunder's delay units (u16).
+impl crate::encode::Encoding for LockTerms {
+	fn encode_to(&self, w: &mut Vec<u8>) {
+		w.extend(self.payment_hash);
+		w.extend(self.timeout.to_consensus_u32().to_le_bytes());
+		w.extend(self.refunder.serialize());
+		w.extend(self.refund_delay.units().to_le_bytes());
+	}
+
+	fn decode_from(r: &mut crate::encode::Reader) -> Result<LockTerms, crate::encode::DecodeError> {
+		Ok(LockTerms { payment_hash: r.array32()?, timeout: r.median_time()?, refunder: r.key()?, refund_delay: r.relative_time()? })
+	}
+}
+
+/// How an `htlc-2` coin is spent out of round: into a checkpoint of the
+/// payee's with the preimage (CLAIM-C), or into one of the payer's from the
+/// timeout on (REFUND-C). A coin record's input that spends a lock names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LockSpend {
+	/// CLAIM-C, with the preimage.
+	Claim { preimage: [u8; 32] },
+	/// REFUND-C, its transaction's lock time the timeout.
+	Refund,
+}
+
+impl LockSpend {
+	/// The path it spends by.
+	pub fn path(&self) -> LockPath {
+		match self {
+			LockSpend::Claim { .. } => LockPath::ClaimTogether,
+			LockSpend::Refund => LockPath::RefundTogether,
+		}
+	}
+
+	/// The key that signs beside the operator: the payee's for the claim,
+	/// the payer's for the refund. The checkpoint the spend makes is that
+	/// key's.
+	pub fn signer(&self, policy: &LockPolicy) -> XOnlyPublicKey {
+		match self {
+			LockSpend::Claim { .. } => policy.owner,
+			LockSpend::Refund => policy.terms.refunder,
+		}
+	}
+
+	/// Refuses a claim whose preimage does not open the lock's hash.
+	pub fn check(&self, policy: &LockPolicy) -> Result<(), LockError> {
+		match self {
+			LockSpend::Claim { preimage } if crate::script::sha256(preimage) != policy.terms.payment_hash => Err(LockError::Preimage),
+			_ => Ok(()),
+		}
+	}
+}
+
+/// An `htlc-2` coin as one of its collaborative paths spends it: the signer
+/// is that path's holder ([`LockSpend::signer`]), the message the leaf's
+/// ([`LockPolicy::collab_message`]), and the witness that path's. A refund
+/// carries the timeout as its lock time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LockSpender {
+	pub policy: LockPolicy,
+	pub spend: LockSpend,
+}
+
+impl crate::spend::Rebindable for LockSpender {
+	fn owner(&self) -> XOnlyPublicKey {
+		self.spend.signer(&self.policy)
+	}
+
+	fn operator(&self) -> XOnlyPublicKey {
+		self.policy.operator
+	}
+
+	fn tap(&self) -> TapOutput {
+		self.policy.taproot()
+	}
+
+	fn collab(&self) -> Script {
+		self.policy.script(self.spend.path())
+	}
+
+	fn message(&self, asset_in: AssetId, value_in: u64, outputs: &[ExplicitOutput]) -> Result<CsfsMessage, Error> {
+		self.policy.collab_message(asset_in, value_in, outputs)
+	}
+
+	fn witness(&self, pair: &crate::spend::Pair, m: u8) -> Vec<Vec<u8>> {
+		match self.spend {
+			LockSpend::Claim { preimage } => self.policy.claim_together_witness(&pair.operator, &pair.owner, m, &preimage),
+			LockSpend::Refund => self.policy.refund_together_witness(&pair.operator, &pair.owner, m),
+		}
+	}
+
+	fn lock_time(&self) -> elements::LockTime {
+		match self.spend {
+			LockSpend::Claim { .. } => elements::LockTime::ZERO,
+			LockSpend::Refund => elements::LockTime::from_consensus(self.policy.terms.timeout.to_consensus_u32()),
+		}
 	}
 }

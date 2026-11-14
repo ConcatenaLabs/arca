@@ -293,7 +293,7 @@ fn swap_case(c: &mut Arca, tag: &str, s: &Keypair, rounds: &[Transaction], (tz, 
 	let (_, ax_leaf) = party(&format!("{} A gets X", tag), delay());
 	let (az_v, ax_v) = (LEAF - MARGIN, LEAF - 2 * MARGIN);
 	cz_leaf.landing = Some(Landing { program: cz_leaf.landing.unwrap().program, allowance: ALLOWANCE, own_index: false }.terms(z, az_v).unwrap());
-	let plan = TransferPlan { checkpoint_exit: true, inputs: vec![(acoin.clone(), LEAF - MARGIN), (ccoin.clone(), LEAF - MARGIN)],
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: true, inputs: vec![(acoin.clone(), LEAF - MARGIN), (ccoin.clone(), LEAF - MARGIN)],
 		outputs: vec![ExplicitOutput::new(z, az_v, cz_leaf.policy(xonly(s), c.net.chain).script_pubkey()),
 			ExplicitOutput::new(x, ax_v, ax_leaf.policy(xonly(s), c.net.chain).script_pubkey())] };
 	assert!(plan.exit(0) && plan.exit(1), "a landing-1 coin's checkpoint has its exit");
@@ -319,7 +319,7 @@ fn swap_case(c: &mut Arca, tag: &str, s: &Keypair, rounds: &[Transaction], (tz, 
 	let ccp = OutPoint::new(c.net.pass(&format!("{}/C's checkpoint", tag), &ctx), 0);
 	if dead {
 		let back = vec![ExplicitOutput::new(x, inputs[1].checkpoint_value - MARGIN, thief())];
-		let bp = TransferPlan { checkpoint_exit: true, inputs: vec![(ccoin.clone(), inputs[1].checkpoint_value)], outputs: back.clone() };
+		let bp = TransferPlan { locks: vec![], checkpoint_exit: true, inputs: vec![(ccoin.clone(), inputs[1].checkpoint_value)], outputs: back.clone() };
 		let d = bp.reassignment_message(0).unwrap().digest;
 		let second = ValidInput { reassignment_pair: Pair { operator: sig(s, &d), owner: sig(ck, &d) }, ..inputs[1].clone() };
 		c.net.pass(&format!("{}/ATTACK C + operator: a second reassignment of C's checkpoint", tag),

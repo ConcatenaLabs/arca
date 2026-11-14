@@ -97,10 +97,10 @@ fn bring_all(c: &mut Arca, label: &str, senders: &[Sender]) -> Vec<OutPoint> {
 /// What a sender's wallet builds to pay `outputs` from its whole coin less a
 /// margin, and the record of output `index` for `leaf`, both pairs signed.
 fn pay(sd: &Sender, s: &Keypair, outputs: Vec<ExplicitOutput>, index: u8, leaf: NewLeaf) -> (TransferPlan, CoinRecord) {
-	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(sd.coin.clone(), sd.coin.value - MARGIN)], outputs };
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(sd.coin.clone(), sd.coin.value - MARGIN)], outputs };
 	let (cp, re) = (plan.checkpoint_message(0).unwrap().digest, plan.reassignment_message(0).unwrap().digest);
 	let rec = CoinRecord::Transfer(Box::new(Transfer {
-		inputs: vec![TransferInput { exit: false,
+		inputs: vec![TransferInput { lock: None, exit: false,
 			coin: sd.base.clone(), checkpoint_value: sd.coin.value - MARGIN,
 			checkpoint: Pair { operator: sig(s, &cp), owner: sig(&sd.key, &cp) },
 			reassignment: Pair { operator: sig(s, &re), owner: sig(&sd.key, &re) },
@@ -168,7 +168,7 @@ fn two_payments_to_one_request_make_two_leaves() {
 	// the creator nonce of the leaf it creates.
 	let r = keypair("merge 1 receiver");
 	let request = (xonly(&r), label32("merge 1 receive request nonce"));
-	let leaf = |i: usize| NewLeaf {
+	let leaf = |i: usize| NewLeaf { lock: None,
 		owner: request.0, owner_nonce: request.1, creator_nonce: label32(&format!("merge 1 sender {} creator nonce", i)),
 		exit_delay: delay(),
 		htlc: None,
@@ -243,7 +243,7 @@ fn outputs_repeated_by_a_sender_are_refused_and_would_merge() {
 	let v = LEAF - 2 * MARGIN;
 	let chain = c.net.chain;
 	let r = keypair("merge 2 receiver");
-	let new_leaf = |owner: &Keypair, label: &str| NewLeaf {
+	let new_leaf = |owner: &Keypair, label: &str| NewLeaf { lock: None,
 		owner: xonly(owner), owner_nonce: label32(&format!("merge 2 {} owner nonce", label)),
 		creator_nonce: label32(&format!("merge 2 {} creator nonce", label)), exit_delay: delay(),
 		htlc: None,
@@ -322,13 +322,13 @@ fn outputs_repeated_by_a_sender_are_refused_and_would_merge() {
 	let d_leaf = new_leaf(&d, "D");
 	let (c0, c1) = (v - MARGIN, v - 2 * MARGIN);
 	let d_out = ExplicitOutput::new(x, c0 + c1 - MARGIN, d_leaf.policy(xonly(&s), chain).script_pubkey());
-	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(k0.clone(), c0), (k1.clone(), c1)], outputs: vec![d_out] };
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(k0.clone(), c0), (k1.clone(), c1)], outputs: vec![d_out] };
 	let pairs: Vec<(Pair, Pair)> = (0..2).map(|i| {
 		let (cp, re) = (plan.checkpoint_message(i).unwrap().digest, plan.reassignment_message(i).unwrap().digest);
 		(Pair { operator: sig(&s, &cp), owner: sig(&r, &cp) }, Pair { operator: sig(&s, &re), owner: sig(&r, &re) })
 	}).collect();
 	let d_rec = CoinRecord::Transfer(Box::new(Transfer {
-		inputs: [(&rec0, c0), (&rec1, c1)].iter().zip(&pairs).map(|((rec, cv), (cp, re))| TransferInput { exit: false,
+		inputs: [(&rec0, c0), (&rec1, c1)].iter().zip(&pairs).map(|((rec, cv), (cp, re))| TransferInput { lock: None, exit: false,
 			coin: (*rec).clone(), checkpoint_value: *cv, checkpoint: *cp, reassignment: *re,
 		}).collect(),
 		outputs: plan.outputs.clone(), index: 0, leaf: d_leaf,
@@ -340,7 +340,7 @@ fn outputs_repeated_by_a_sender_are_refused_and_would_merge() {
 
 	// What D would have held: after the merge the leaf exists once, so one of
 	// the coin's two checkpoints has nothing to spend.
-	let d_inputs: Vec<ValidInput> = [(&k0, c0), (&k1, c1)].iter().zip(&pairs).map(|((k, cv), (cp, re))| ValidInput {
+	let d_inputs: Vec<ValidInput> = [(&k0, c0), (&k1, c1)].iter().zip(&pairs).map(|((k, cv), (cp, re))| ValidInput { lock: None,
 		coin: (*k).clone(), checkpoint: k.checkpoint(), checkpoint_value: *cv, checkpoint_pair: *cp, reassignment_pair: *re,
 	}).collect();
 	c.net.pass("merge 2/D's first checkpoint, on the merged leaf", &d_inputs[0].checkpoint_tx(merged_leaf, &FeeSource::Reserve).unwrap().tx);
@@ -364,7 +364,7 @@ fn a_leaf_rebuilt_under_a_spent_salt_follows_the_old_pairs() {
 
 	// Sender 0 pays R; R pays its coin on to D, signing pairs over its leaf.
 	let r = keypair("merge 3 receiver");
-	let leaf = NewLeaf {
+	let leaf = NewLeaf { lock: None,
 		owner: xonly(&r), owner_nonce: label32("merge 3 receive request nonce"),
 		creator_nonce: label32("merge 3 sender 0 creator nonce"), exit_delay: delay(),
 		htlc: None,

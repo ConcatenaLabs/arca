@@ -124,7 +124,7 @@ impl CheckpointExit {
 /// landing leaf (`landing-1`, `landing-2`), whose checkpoint lands as the
 /// leaf does, at its own index.
 pub fn exit_allowed(leaf: &LeafPolicy) -> bool {
-	leaf.htlc.is_none() && leaf.order.is_none() && leaf.channel.is_none() && leaf.claim.is_none()
+	leaf.htlc.is_none() && leaf.order.is_none() && leaf.channel.is_none() && leaf.claim.is_none() && leaf.lock.is_none()
 }
 
 impl CheckpointPolicy {

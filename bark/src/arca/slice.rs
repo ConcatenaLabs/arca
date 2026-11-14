@@ -69,7 +69,7 @@ pub const DEPOSITS_RESUME: &str = "deposits_resume";
 pub const RESUME_FOR: u32 = 600;
 
 /// The steps of `sync` after the witness, in the order they run.
-pub const STEPS: [&str; 23] = ["owed deposits", "held", "boards", "transfers", "lightning", "receives", "mailbox", "catch up", "history",
+pub const STEPS: [&str; 24] = ["owed deposits", "held", "boards", "transfers", "lightning", "receives", "mailbox", "locks", "catch up", "history",
 	"bound", "owed", "participations", "plans", "orders", "offboards", "resting", "receives again", "refresh", "forfeits", "deposits",
 	"home", "exits", "reboards"];
 /// The steps cut between two of their items. Every other step runs whole

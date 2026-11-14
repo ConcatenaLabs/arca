@@ -79,6 +79,12 @@ pub enum CoinError {
 	/// collaborative spend would move the operator's side too.
 	#[error("leaf {0} is a channel-1 coin: it is given up in a round's participation, and paid from by its channel's states alone")]
 	Channel(LeafId),
+	/// An `htlc-2` lock, ended only by a transfer of its claim or its
+	/// refund ([`crate::cosign`]): a round, a take, a plan or an order
+	/// would move it without the preimage before its timeout.
+	#[error("leaf {0} is an htlc-2 lock: it is ended only by its payee's claim with the preimage or its payer's refund from the \
+		timeout, each a transfer")]
+	Lock(LeafId),
 	/// A `claim-1` leaf past its distribution's deadline: it is its payer's
 	/// again ([`arca_covenant::claim`]), and the operator co-signs no spend
 	/// of it.
@@ -277,6 +283,30 @@ pub enum BoardDates {
 /// for the board's dates. A coin already spent by `holder` itself passes the
 /// rest, so a repeated request gets its answer.
 pub async fn check(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], dates: BoardDates)
+	-> Result<Checked, CoinError>
+{
+	let c = check_any(store, policy, id, holder, dates).await?;
+	if c.coin.leaf.lock.is_some() {
+		return Err(CoinError::Lock(*id));
+	}
+	Ok(c)
+}
+
+/// [`check`] for a transfer's input: an `htlc-2` lock passes, for the
+/// transfer to end it by its claim or its refund ([`crate::cosign`]), and a
+/// `channel-1` coin is refused ([`CoinError::Channel`]).
+pub async fn check_transfer_input(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], dates: BoardDates)
+	-> Result<Checked, CoinError>
+{
+	let c = check_any(store, policy, id, holder, dates).await?;
+	if c.coin.leaf.channel.is_some() {
+		return Err(CoinError::Channel(*id));
+	}
+	Ok(c)
+}
+
+/// [`check`] with every template allowed.
+async fn check_any(store: &Store, policy: &WalletPolicy, id: &LeafId, holder: &[u8; 32], dates: BoardDates)
 	-> Result<Checked, CoinError>
 {
 	let row = store.leaf(&id.0).await?.ok_or(CoinError::UnknownLeaf(*id))?;

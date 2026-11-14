@@ -853,7 +853,7 @@ fn fill_body(r: &Running, st: &Value, order: &Coin, paid: &Coin, filled: u64, go
 	outputs.extend(plan.rest.clone());
 	outputs.push(ExplicitOutput::new(r.x, filled, got.policy(s, r.chain).script_pubkey()));
 	outputs.push(ExplicitOutput::new(v.asset, change_value, change.policy(s, r.chain).script_pubkey()));
-	let tplan = arca_covenant::TransferPlan { checkpoint_exit: false, inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
+	let tplan = arca_covenant::TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
 	let mut named = vec![oc.output().txout()];
 	named.push(tplan.checkpoint_output(0).txout());
 	let cp = sign_digest(&paid.held.key, &tplan.checkpoint_message(0).unwrap().digest, &random32());
@@ -889,7 +889,7 @@ fn joined(coins: &[&Coin]) -> Vec<Transaction> {
 /// against `made` (a coin the fill made the maker) and signed by `signer`.
 fn maker_delegation(r: &Running, transfer: &str, made: &arca_covenant::ValidCoin, signer: &Keypair) -> Value {
 	let t = r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok();
-	let takers: Vec<NewLeaf> = t["takers"].as_array().unwrap().iter().map(|l| NewLeaf {
+	let takers: Vec<NewLeaf> = t["takers"].as_array().unwrap().iter().map(|l| NewLeaf { lock: None,
 		v2: false, htlc: None, landing: None,
 		owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&common::client::unhex(l["owner"].as_str().unwrap())).unwrap(),
 		owner_nonce: common::client::unhex(l["owner_nonce"].as_str().unwrap()).try_into().unwrap(),
@@ -1218,15 +1218,15 @@ async fn a_paid_sends_leaf_is_released_by_its_sender() {
 	let kept = v.value - 2_000;
 	let outs = [(x, 400_000, hl), (x, kept - 2_000 - 400_000, cl)];
 	let outputs: Vec<ExplicitOutput> = outs.iter().map(|(a, val, l)| ExplicitOutput::new(*a, *val, l.policy(xonly(&r.s), r.chain).script_pubkey())).collect();
-	let plan = TransferPlan { checkpoint_exit: false, inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false, inputs: vec![(v.clone(), kept)], outputs: outputs.clone() };
 	let sk = &c[0].held.key;
 	let d = Delegation::for_reassignment(&v, &outputs, &[hl, cl]).unwrap();
 	let req = TransferRequest { checkpoint_exit: false,
-		inputs: vec![InputRequest { leaf_id: v.id, checkpoint_value: kept,
+		inputs: vec![InputRequest { lock: None, leaf_id: v.id, checkpoint_value: kept,
 			checkpoint_sig: sign_digest(sk, &plan.checkpoint_message(0).unwrap().digest, &random32()),
 			reassignment_sig: sign_digest(sk, &plan.reassignment_message(0).unwrap().digest, &random32()),
 			delegation_sig: Some(sign_digest(sk, &d.message().digest, &random32())) }],
-		outputs: outs.iter().map(|(a, val, l)| OutputRequest { asset: *a, value: *val, leaf: *l, mailbox: None, until: None }).collect(),
+		outputs: outs.iter().map(|(a, val, l)| OutputRequest { payer_mailbox: None, asset: *a, value: *val, leaf: *l, mailbox: None, until: None }).collect(),
 	};
 	let done = r.server.cosigner.cosign_htlc(&req).await.unwrap();
 	let (htlc_id, htlc_record) = done.outputs[0].clone();
@@ -1294,7 +1294,7 @@ fn maker_delegation_unchecked(made: &arca_covenant::ValidCoin, takers: &[NewLeaf
 /// The taker's leaves of fill `transfer`, as the operator names them.
 fn takers_of(r: &Running, transfer: &str) -> Vec<NewLeaf> {
 	let t = r.http.post("order_fill_delegation_terms", &json!({"transfer_id": transfer})).ok();
-	t["takers"].as_array().unwrap().iter().map(|l| NewLeaf {
+	t["takers"].as_array().unwrap().iter().map(|l| NewLeaf { lock: None,
 		v2: false, htlc: None, landing: None,
 		owner: elements::secp256k1_zkp::XOnlyPublicKey::from_slice(&common::client::unhex(l["owner"].as_str().unwrap())).unwrap(),
 		owner_nonce: common::client::unhex(l["owner_nonce"].as_str().unwrap()).try_into().unwrap(),

@@ -218,6 +218,10 @@ pub(crate) struct Out {
 	pub leaf: NewLeaf,
 	pub mailbox: XOnlyPublicKey,
 	pub until: Option<u32>,
+	/// For an `htlc-2` lock the wallet makes as its payer, its own mailbox:
+	/// the lock's record goes there too, where the wallet and its restore
+	/// read it.
+	pub payer_mailbox: Option<XOnlyPublicKey>,
 }
 
 impl Out {
@@ -243,6 +247,14 @@ impl Out {
 		}
 		if self.leaf.v2 && self.leaf.landing.is_none() {
 			v["template"] = json!("vtxo-2");
+		}
+		if let Some(t) = &self.leaf.lock {
+			v["template"] = json!("htlc-2");
+			v["lock"] = json!({"payment_hash": hex(&t.payment_hash), "timeout": t.timeout.to_consensus_u32(),
+				"refunder": hex(&t.refunder.serialize()), "refund_delay_units": t.refund_delay.units()});
+			if let Some(m) = &self.payer_mailbox {
+				v["lock"]["payer_mailbox"] = json!(hex(&m.serialize()));
+			}
 		}
 		v
 	}
@@ -282,10 +294,10 @@ impl Out {
 			},
 			None => None,
 		};
-		Ok(Out {
+		Ok(Out { payer_mailbox: None,
 			asset,
 			value,
-			leaf: NewLeaf {
+			leaf: NewLeaf { lock: None,
 				owner: XOnlyPublicKey::from_slice(&unhex(v["owner"].as_str().unwrap_or(""))?).map_err(|e| Error::Parse(e.to_string()))?,
 				owner_nonce: unhex32(v["owner_nonce"].as_str().unwrap_or(""))?,
 				creator_nonce: unhex32(v["creator_nonce"].as_str().unwrap_or(""))?,
@@ -300,7 +312,7 @@ impl Out {
 		})
 	}
 
-	fn explicit(&self, w: &Wallet) -> ExplicitOutput {
+	pub(crate) fn explicit(&self, w: &Wallet) -> ExplicitOutput {
 		ExplicitOutput::new(self.asset, self.value, self.leaf.policy(w.operator, w.genesis).script_pubkey())
 	}
 }
@@ -310,6 +322,11 @@ pub(crate) struct In {
 	pub row: CoinRow,
 	pub coin: ValidCoin,
 	pub checkpoint_value: u64,
+	/// For a coin that is an `htlc-2` lock, the ending it is given up by:
+	/// the claim of the payee, whose row's nonce is its key's, or the refund
+	/// of the payer, whose row's nonce is that of its key for the lock. The
+	/// row's key signs either way.
+	pub lock: Option<arca_covenant::LockSpend>,
 }
 
 /// An offer of a swap, decoded and checked ([`Wallet::swap_read`]).
@@ -487,7 +504,7 @@ impl Wallet {
 		Ok(out)
 	}
 
-	fn check_chain(&self, v: &Value, what: &str) -> Result<(), Error> {
+	pub(crate) fn check_chain(&self, v: &Value, what: &str) -> Result<(), Error> {
 		if v["genesis_hash"].as_str() != Some(&self.genesis.genesis_hash().to_string()) {
 			return Err(Error::Refused(format!("the {} is for the chain of genesis {}, not this wallet's", what, v["genesis_hash"])));
 		}
@@ -506,7 +523,7 @@ impl Wallet {
 		let nonce = random32();
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
-		Ok(NewLeaf { owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None,
+		Ok(NewLeaf { lock: None, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None,
 			v2: self.asks_vtxo2() })
 	}
 
@@ -540,7 +557,7 @@ impl Wallet {
 	/// key of the wallet's and with nothing stored: to price a coin before
 	/// it is made.
 	fn leaf_traded_probe(&self, info: &Value, asset: AssetId, value: u64, other_reads: bool) -> Result<NewLeaf, Error> {
-		let mut leaf = NewLeaf { owner: self.operator, owner_nonce: [0; 32], creator_nonce: [0; 32], exit_delay: self.exit_delay(), htlc: None,
+		let mut leaf = NewLeaf { lock: None, owner: self.operator, owner_nonce: [0; 32], creator_nonce: [0; 32], exit_delay: self.exit_delay(), htlc: None,
 			landing: None, v2: self.asks_vtxo2() };
 		leaf.landing = self.landing_rule(info, asset)?.map(|l| l.terms(asset, value)).transpose().map_err(|e| Error::Refused(e.to_string()))?;
 		leaf.v2 &= leaf.landing.is_none();
@@ -724,7 +741,7 @@ impl Wallet {
 				continue;
 			}
 			let v = a.valid.value;
-			out.push(In { row, coin: a.valid, checkpoint_value: v });
+			out.push(In { lock: None, row, coin: a.valid, checkpoint_value: v });
 		}
 		out.sort_by_key(|i| (std::cmp::Reverse(i.row.expiry), std::cmp::Reverse(i.coin.value)));
 		Ok(out)
@@ -840,8 +857,10 @@ impl Wallet {
 	/// The checkpoint margin of `coin`, and the reassignment's of `inputs`
 	/// into `outputs`, each as the operator bounds them ([`Margins`]).
 	fn checkpoint_margin(&self, coin: &ValidCoin, m: &Margins) -> Result<u64, Error> {
-		let vi = ValidInput {
-			coin: coin.clone(), checkpoint: coin.checkpoint(), checkpoint_value: coin.value,
+		// A lock is sized by its larger ending, the claim with its preimage.
+		let lock = coin.leaf.lock.map(|_| arca_covenant::LockSpend::Claim { preimage: [0; 32] });
+		let vi = ValidInput { lock,
+			coin: coin.clone(), checkpoint: coin.checkpoint_spent(lock, false, coin.value), checkpoint_value: coin.value,
 			checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
 		};
 		let tx = vi.checkpoint_tx(OutPoint::default(), &FeeSource::Reserve).map_err(|e| Error::Refused(e.to_string()))?.tx;
@@ -864,7 +883,7 @@ impl Wallet {
 		let vis: Vec<ValidInput> = inputs.iter().map(|c| {
 			let mut coin = (*c).clone();
 			coin.asset = asset;
-			ValidInput {
+			ValidInput { lock: None,
 				checkpoint: coin.checkpoint(), checkpoint_value: coin.value, coin,
 				checkpoint_pair: Pair { operator: dummy_sig(), owner: dummy_sig() }, reassignment_pair: Pair { operator: dummy_sig(), owner: dummy_sig() },
 			}
@@ -942,7 +961,7 @@ impl Wallet {
 		other_inputs: usize, asset: AssetId) -> Result<Option<(Vec<In>, u64, u64)>, Error>
 	{
 		let m = self.checkpoint_margin(&c.coin, margins)?;
-		let input = In { checkpoint_value: c.coin.value - m.min(c.coin.value - 1), row: c.row.clone(), coin: c.coin.clone() };
+		let input = In { lock: None, checkpoint_value: c.coin.value - m.min(c.coin.value - 1), row: c.row.clone(), coin: c.coin.clone() };
 		let kept = input.checkpoint_value;
 		if kept < paid {
 			return Ok(None);
@@ -998,7 +1017,7 @@ impl Wallet {
 	/// quote takes nothing back and chooses from those coins as the trade
 	/// would.
 	#[allow(clippy::too_many_arguments)]
-	fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
+	pub(crate) fn choose(&self, info: &Value, asset: AssetId, paid: u64, others: &[ExplicitOutput], pays_margin: bool, min_leaf: u64,
 		other_inputs: usize, fit: bool, reads: Reads, spend: Spend) -> Result<(Vec<In>, u64, u64), Error>
 	{
 		// Coins the caller named ([`Self::paying_from`]): each one the wallet
@@ -1101,6 +1120,11 @@ impl Wallet {
 		// operator refuses it (#689). A round refreshes it.
 		if let Some(limit) = depth_limit(info) {
 			candidates.retain(|c| c.coin.hops < limit);
+			// A lock is followed by its claim or its refund, each one more
+			// reassignment: it is made only from a coin with room for both.
+			if self.locking.get() {
+				candidates.retain(|c| c.coin.hops + 2 <= limit);
+			}
 		}
 		if fit {
 			let now = self.now()?.to_consensus_u32();
@@ -1450,9 +1474,9 @@ impl Wallet {
 			},
 			None => None,
 		};
-		let to = Out {
+		let to = Out { payer_mailbox: None,
 			asset, value,
-			leaf: NewLeaf {
+			leaf: NewLeaf { lock: None,
 				owner: xonly(req["owner"].as_str().unwrap_or(""))?,
 				owner_nonce: unhex32(req["owner_nonce"].as_str().unwrap_or(""))?,
 				// Drawn fresh for this leaf: two payments to one request make
@@ -1488,7 +1512,7 @@ impl Wallet {
 			let mut leaf = self.own_leaf("change")?;
 			leaf.landing = rule.map(|own| own.terms(asset, change)).transpose().map_err(|e| Error::Refused(e.to_string()))?;
 			leaf.v2 &= leaf.landing.is_none();
-			outs.push(Out { asset, value: change, leaf, mailbox: self.keys.mailbox()?.x_only_public_key().0, until: None });
+			outs.push(Out { payer_mailbox: None, asset, value: change, leaf, mailbox: self.keys.mailbox()?.x_only_public_key().0, until: None });
 		}
 		let answer = self.transfer(&inputs, &outs, &[])?;
 		Ok(json!({
@@ -1547,7 +1571,7 @@ impl Wallet {
 		// Nothing is signed for the operator without a witness of its
 		// signer's record, whatever entry point led here.
 		self.witnessed_now()?;
-		let plan = TransferPlan { checkpoint_exit,
+		let plan = TransferPlan { locks: inputs.iter().map(|i| i.lock).collect(), checkpoint_exit,
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
@@ -1569,6 +1593,11 @@ impl Wallet {
 				"checkpoint_sig": hex(cp.as_ref()), "reassignment_sig": hex(re.as_ref())});
 			if let Some(d) = d {
 				j["delegation_sig"] = json!(hex(d.as_ref()));
+			}
+			match inputs[k].lock {
+				Some(arca_covenant::LockSpend::Claim { preimage }) => j["lock"] = json!({"path": "claim", "preimage": hex(&preimage)}),
+				Some(arca_covenant::LockSpend::Refund) => j["lock"] = json!({"path": "refund"}),
+				None => {},
 			}
 			ins.push(j);
 		}
@@ -1640,7 +1669,7 @@ impl Wallet {
 				for o in answer["outputs"].as_array().cloned().unwrap_or_default() {
 					let bytes = unhex(o["record"].as_str().unwrap_or(""))?;
 					let record = CoinRecord::from_bytes(&bytes).map_err(|e| Error::Refused(e.to_string()))?;
-					let (_, nonce) = owner_of(&record);
+					let (_, nonce, _) = self.holder_of(&record)?;
 					if self.store.nonce(&nonce)?.is_some() {
 						match self.accept_coin(&bytes, o["leaf_id"].as_str().unwrap_or(""), "transfer answer") {
 							Ok(v) => {
@@ -1697,9 +1726,22 @@ impl Wallet {
 						}
 					}
 				}
+				// A lock's coin goes back to its side's lock, never live: its
+				// payee holds it apart until claimed, its payer until refunded.
+				let mut lock_back: BTreeMap<String, &str> = BTreeMap::new();
+				for l in mine {
+					let Some(c) = self.store.coin(l)? else { continue };
+					let Ok(r) = Self::record_of(&c) else { continue };
+					if super::lock::lock_terms(&r).is_some() {
+						let refund = self.holder_of(&r)?.2;
+						lock_back.insert(l.clone(), if refund { super::lock::LOCK_OUT } else { super::lock::LOCK_IN });
+					}
+				}
 				self.store.atomically(|s| {
 					for l in mine {
-						if Some(l) == forfeited.as_ref() {
+						if let Some(b) = lock_back.get(l) {
+							s.set_coin_state(l, b, "")?;
+						} else if Some(l) == forfeited.as_ref() {
 							s.set_coin_state(l, "forfeited", &held_note)?;
 						} else if let Some(sid) = for_swap.get(l) {
 							s.set_coin_state(l, "offered", &format!("swap {}", sid))?;
@@ -1824,7 +1866,10 @@ impl Wallet {
 		} else {
 			Error::Refused(format!("the record does not decode: {}", e))
 		})?;
-		let (owner, nonce) = owner_of(&record);
+		// The key that holds the coin: its owner's, or the wallet's key for
+		// the refund of a lock it made ([`super::lock`]).
+		let (owner, nonce, payer) = self.holder_of(&record)?;
+		let (record_owner, record_nonce) = owner_of(&record);
 		let row = match self.store.nonce(&nonce)? {
 			Some(row) => row,
 			// A restore takes a coin paid to a key of the mnemonic that the
@@ -1851,15 +1896,15 @@ impl Wallet {
 		// still holds its path: the operator sweeps a batch only once its
 		// token has waited the notice. It is refused once the sweep that cut
 		// its path is final.
-		let (a, late, expired): (Assessed, bool, bool) = match self.assess(&record, &policy, Some((&owner, &nonce))) {
+		let (a, late, expired): (Assessed, bool, bool) = match self.assess(&record, &policy, Some((&record_owner, &record_nonce))) {
 			Ok(a) => (a, false, false),
-			Err(e) => match self.assess(&record, &WalletPolicy { horizon: 0, ..policy }, Some((&owner, &nonce))) {
+			Err(e) => match self.assess(&record, &WalletPolicy { horizon: 0, ..policy }, Some((&record_owner, &record_nonce))) {
 				Ok(a) => (a, true, false),
 				Err(_) => {
 					let as_of = first_expiry(&record).filter(|t| *t < now.to_consensus_u32())
 						.and_then(|t| arca_covenant::MedianTime::from_consensus(t).ok());
 					let Some(as_of) = as_of else { return Err(self.unkept(e, &record, claimed)) };
-					match self.assess(&record, &WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) }, Some((&owner, &nonce))) {
+					match self.assess(&record, &WalletPolicy { horizon: 0, ..self.receipt_policy(as_of) }, Some((&record_owner, &record_nonce))) {
 						Ok(a) => (a, true, true),
 						Err(_) => return Err(self.unkept(e, &record, claimed)),
 					}
@@ -1972,6 +2017,14 @@ impl Wallet {
 			}
 		}
 		let (state, mut note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		// A lock is held apart from the spendable coins: by its payee until
+		// it claims it with the preimage, by its payer until its payee claims
+		// it or it comes back from its timeout ([`super::lock`]).
+		let state = match (record.is_lock(), payer) {
+			(true, false) => super::lock::LOCK_IN,
+			(true, true) => super::lock::LOCK_OUT,
+			_ => state,
+		};
 		// A coin received out of round from an operator with no keeper rests
 		// on the operator's machine alone until it is refreshed.
 		if matches!(record, CoinRecord::Transfer(_)) && self.keepers()?.0.is_empty() {
@@ -1999,7 +2052,8 @@ impl Wallet {
 			};
 			note = if note.is_empty() { why } else { format!("{}; {}", note, why) };
 		}
-		let coin = self.row(&record, &a, state, &note)?;
+		let mut coin = self.row(&record, &a, state, &note)?;
+		coin.owner_nonce = nonce;
 		// The wallet's own coins this transfer spent (a swap's side).
 		let mut spent: Vec<String> = match &record {
 			CoinRecord::Transfer(t) => t.inputs.iter().filter_map(|i| {
@@ -2694,7 +2748,7 @@ impl Wallet {
 		// The taker is not known yet: a leaf it parses is landing-2 only once
 		// every client reads it.
 		let want_leaf = self.own_leaf_traded("swap", &info, want_asset, want, false)?;
-		let wanted = Out { asset: want_asset, value: want, leaf: want_leaf, mailbox, until: None };
+		let wanted = Out { payer_mailbox: None, asset: want_asset, value: want, leaf: want_leaf, mailbox, until: None };
 		// The taker's leaf of `give`, and its change, are not known yet: size
 		// with probes of the same shape.
 		let probe = |a: AssetId| ExplicitOutput::new(a, 1, leaf_probe());
@@ -2718,7 +2772,7 @@ impl Wallet {
 		let TradeCoins { mine: inputs, margin, change, .. } = made;
 		let mut outs = vec![wanted];
 		if change > 0 {
-			outs.push(Out { asset: give_asset, value: change, leaf: self.own_leaf_traded("change", &info, give_asset, change, false)?, mailbox,
+			outs.push(Out { payer_mailbox: None, asset: give_asset, value: change, leaf: self.own_leaf_traded("change", &info, give_asset, change, false)?, mailbox,
 				until: None });
 		}
 		let mut offer = json!({
@@ -2841,7 +2895,7 @@ impl Wallet {
 			}
 			let row = CoinRow { expiry: inputs.iter().map(|i| i.row.expiry).min().unwrap_or(u32::MAX), value: need, ..inputs[0].row.clone() };
 			let cost = Self::shaping_margins(&inputs, need, left);
-			let input = In { row, checkpoint_value: need - m.min(need - 1), coin };
+			let input = In { lock: None, row, checkpoint_value: need - m.min(need - 1), coin };
 			return Ok(TradeCoins { mine: vec![input], margin: r, change: 0, shaping: Some(Shaping { need, inputs, change: left, cost }) });
 		}
 		Err(Error::Refused(format!("the wallet could not price a coin of asset {} holding exactly what this trade gives; it trades from \
@@ -2993,9 +3047,9 @@ impl Wallet {
 		// The coin is given in the trade, so its leaf is one the other side
 		// reads.
 		let leaf = self.own_leaf_traded("shaped", info, asset, need, reads.landing_2)?;
-		let mut outs = vec![Out { asset, value: need, leaf, mailbox, until: None }];
+		let mut outs = vec![Out { payer_mailbox: None, asset, value: need, leaf, mailbox, until: None }];
 		if change > 0 {
-			outs.push(Out { asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });
+			outs.push(Out { payer_mailbox: None, asset, value: change, leaf: self.own_leaf_of("change", info, asset, change)?, mailbox, until: None });
 		}
 		self.transfer_back(&s.inputs, &outs)?;
 		Ok(())
@@ -3154,7 +3208,7 @@ impl Wallet {
 				asset: a.valid.asset.to_string(), value: a.valid.value, record: bytes, salt: a.valid.leaf.salt, state: "theirs".into(),
 				note: String::new(), expiry, bases: vec![], spent_by: None,
 			};
-			out.push(In { row, coin: a.valid, checkpoint_value: cp });
+			out.push(In { lock: None, row, coin: a.valid, checkpoint_value: cp });
 		}
 		Ok(out)
 	}
@@ -3458,10 +3512,10 @@ impl Wallet {
 		}
 		let TradeCoins { mine, change, .. } = made;
 		let gets = give - top_up;
-		outs.push(Out { asset: give_asset, value: gets, leaf: self.own_leaf_traded("swap", &info, give_asset, gets, maker_reads.landing_2)?,
+		outs.push(Out { payer_mailbox: None, asset: give_asset, value: gets, leaf: self.own_leaf_traded("swap", &info, give_asset, gets, maker_reads.landing_2)?,
 			mailbox, until: None });
 		if change > 0 {
-			outs.push(Out { asset: want_asset, value: change, leaf: self.own_leaf_traded("change", &info, want_asset, change,
+			outs.push(Out { payer_mailbox: None, asset: want_asset, value: change, leaf: self.own_leaf_traded("change", &info, want_asset, change,
 				maker_reads.landing_2)?, mailbox, until: None });
 		}
 		if outs.len() > arca_covenant::leaf::MAX_OUTPUTS as usize {
@@ -3476,7 +3530,7 @@ impl Wallet {
 		let n = theirs.len();
 		let mut inputs = theirs;
 		inputs.extend(mine);
-		let plan = TransferPlan { checkpoint_exit,
+		let plan = TransferPlan { locks: vec![], checkpoint_exit,
 			inputs: inputs.iter().map(|i| (i.coin.clone(), i.checkpoint_value)).collect(),
 			outputs: outs.iter().map(|o| o.explicit(self)).collect(),
 		};
@@ -3599,7 +3653,7 @@ impl Wallet {
 					return Err(Error::Refused(format!("coin {} is {} now, not held for the swap", leaf_id, row.state)));
 				}
 				let (_, a) = self.held(&row)?;
-				inputs.push(In { row, coin: a.valid, checkpoint_value: amount(&i["checkpoint_value"], "checkpoint_value")? });
+				inputs.push(In { lock: None, row, coin: a.valid, checkpoint_value: amount(&i["checkpoint_value"], "checkpoint_value")? });
 			}
 		}
 		let taker = self.offer_inputs(&json!({"inputs": acc_in[n..]}))?;
@@ -3968,14 +4022,14 @@ impl Wallet {
 			.map_err(|e| Error::Refused(e.to_string()))?;
 		leaf.v2 &= leaf.landing.is_none();
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		self.transfer(&inputs, &[Out { asset, value, leaf, mailbox, until: None }], &[])
+		self.transfer(&inputs, &[Out { payer_mailbox: None, asset, value, leaf, mailbox, until: None }], &[])
 	}
 
 	/// What [`Self::respend_to_self`] of `rows` would leave the wallet, and
 	/// its fee, before anything is signed: `(asset, value, fee)`.
 	pub(crate) fn respend_quote(&mut self, rows: Vec<CoinRow>) -> Result<(AssetId, u64, u64), Error> {
 		let n = random32();
-		let leaf = NewLeaf { v2: false, owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None };
+		let leaf = NewLeaf { lock: None, v2: false, owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None };
 		let held: u64 = rows.iter().map(|r| r.value).sum();
 		let (asset, _, value) = self.respend_plan(rows, &leaf)?;
 		Ok((asset, value, held.saturating_sub(value)))
@@ -3990,10 +4044,10 @@ impl Wallet {
 		for row in rows {
 			let (_, a) = self.held(&row)?;
 			let m = self.checkpoint_margin(&a.valid, &margins)?;
-			inputs.push(In { checkpoint_value: a.valid.value - m.min(a.valid.value - 1), row, coin: a.valid });
+			inputs.push(In { lock: None, checkpoint_value: a.valid.value - m.min(a.valid.value - 1), row, coin: a.valid });
 		}
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
-		let probe = Out { asset, value: 1, leaf: leaf.clone(), mailbox, until: None };
+		let probe = Out { payer_mailbox: None, asset, value: 1, leaf: leaf.clone(), mailbox, until: None };
 		let all: Vec<&ValidCoin> = inputs.iter().map(|i| &i.coin).collect();
 		let margin = self.reassignment_margin(&all, &[probe.explicit(self)], &margins)?;
 		let kept: u64 = inputs.iter().map(|i| i.checkpoint_value).sum();
@@ -4335,7 +4389,7 @@ mod tests {
 	fn a_landing_2_leaf_written_for_another_wallet_is_malformed_to_an_older_library() {
 		let key = xonly("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap();
 		let asset = AssetId::from_str(&"07".repeat(32)).unwrap();
-		let out = |own_index: bool| Out { asset, value: 100_000, mailbox: key, until: None, leaf: NewLeaf { owner: key,
+		let out = |own_index: bool| Out { payer_mailbox: None, asset, value: 100_000, mailbox: key, until: None, leaf: NewLeaf { lock: None, owner: key,
 			owner_nonce: [1; 32], creator_nonce: [2; 32], exit_delay: RelativeTime::from_units(1).unwrap(), htlc: None, v2: false,
 			landing: Some(arca_covenant::Landing { program: [3; 20], allowance: 1_000, own_index }.terms(asset, 100_000).unwrap()) } };
 		let older = |v: &Value| arca_covenant::record_json::landing_from_json(&v["landing"]);

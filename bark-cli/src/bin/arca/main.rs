@@ -718,6 +718,11 @@ enum Cmd {
 	/// the asset through the operator, the BTC through Bark.
 	#[command(subcommand, name = "btc-swap")]
 	BtcSwap(BtcSwapCmd),
+	/// A lock between two holders (`htlc-2`): a payer's coin locked to a
+	/// payee under a payment hash, out of round, claimed by the payee with
+	/// the preimage or refunded to the payer from its timeout.
+	#[command(subcommand)]
+	Lock(LockCmd),
 	/// Every refusal the wallet made, with its reason.
 	Refusals,
 	/// The Bitcoin side: Bark's wallet for Bitcoin arks, in `<datadir>/bitcoin`.
@@ -1002,6 +1007,51 @@ enum SwapCmd {
 	},
 	/// Cancels an offer or acceptance not completed.
 	Cancel { swap: String },
+}
+
+#[derive(Subcommand)]
+enum LockCmd {
+	/// As the payee: asks for a lock of `--amount` of `--asset` under
+	/// `--hash`, timing out no earlier than `--min-timeout` (a median time)
+	/// when named. Prints the request the payer locks to.
+	Request {
+		#[arg(long)]
+		asset: String,
+		#[arg(long)]
+		amount: u64,
+		#[arg(long)]
+		hash: String,
+		#[arg(long)]
+		min_timeout: Option<u32>,
+	},
+	/// As the payer: locks the request's amount to its payee under its hash,
+	/// out of round, until `--timeout` (a median time) or `--timeout-in`
+	/// seconds from the chain's median time.
+	To {
+		request: String,
+		#[arg(long)]
+		timeout: Option<u32>,
+		#[arg(long)]
+		timeout_in: Option<u32>,
+	},
+	/// As the payee: whether the lock under `hash` is held, its home date at
+	/// least `--need` seconds away.
+	Ready {
+		hash: String,
+		#[arg(long, default_value_t = 0)]
+		need: u64,
+	},
+	/// As the payee: claims the lock under `hash` with `preimage`.
+	Claim { hash: String, preimage: String },
+	/// As the payer: refunds the lock under `hash`, from its timeout.
+	Refund { hash: String },
+	/// As the payee: the preimage of `hash`, learnt elsewhere: kept, posted
+	/// to the operator, and the lock claimed when it is held.
+	Preimage { hash: String, preimage: String },
+	/// The operator's word on the locks under `hash`.
+	Status { hash: String },
+	/// Every lock the wallet takes part in.
+	List,
 }
 
 #[derive(Subcommand)]
@@ -1764,6 +1814,22 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Swap(SwapCmd::Complete { accept, accept_near_deadline }) => w.swap_complete(&accept, accept_near_deadline),
 		Cmd::Swap(SwapCmd::Cancel { swap }) => w.swap_cancel(&swap),
 		Cmd::BtcSwap(c) => btc_swap(&mut w, &datadir, c),
+		Cmd::Lock(LockCmd::Request { asset: a, amount, hash, min_timeout }) => w.lock_request(asset(&a)?, amount, unhex32(&hash)?, min_timeout),
+		Cmd::Lock(LockCmd::To { request, timeout, timeout_in }) => {
+			let req: Value = serde_json::from_str(&request).map_err(|e| bark::arca::Error::Parse(format!("the lock request: {}", e)))?;
+			let t = match (timeout, timeout_in) {
+				(Some(t), None) => t,
+				(None, Some(d)) => w.median_time()?.saturating_add(d),
+				_ => return Err(bark::arca::Error::Parse("name the lock's timeout: --timeout or --timeout-in".into())),
+			};
+			w.lock_to(&req, t)
+		},
+		Cmd::Lock(LockCmd::Ready { hash, need }) => w.lock_ready(&hash.to_lowercase(), need),
+		Cmd::Lock(LockCmd::Claim { hash, preimage }) => w.lock_claim(&hash.to_lowercase(), unhex32(&preimage)?),
+		Cmd::Lock(LockCmd::Refund { hash }) => w.lock_refund(&hash.to_lowercase()),
+		Cmd::Lock(LockCmd::Preimage { hash, preimage }) => w.lock_preimage_known(&hash.to_lowercase(), unhex32(&preimage)?),
+		Cmd::Lock(LockCmd::Status { hash }) => w.lock_status(&hash.to_lowercase()),
+		Cmd::Lock(LockCmd::List) => w.locks(),
 		Cmd::Refusals => w.refusals(),
 		Cmd::Participations => w.participations(),
 		Cmd::Distribute { list, asset: a, return_address, quote, shown, days, vest } => {

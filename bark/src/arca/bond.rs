@@ -116,7 +116,9 @@ pub const SLASH_MARGIN: u64 = 86_400;
 
 /// The states of a coin the wallet holds that rest on an out-of-round
 /// lineage the operator could double-sign.
-const HELD: [&str; 5] = ["live", "offered", "sending", "given", "forfeited"];
+// A lock the wallet holds as its payee is a coin received out of round,
+// counted at risk until it is claimed ([`super::lock`]).
+const HELD: [&str; 6] = ["live", "offered", "sending", "given", "forfeited", super::lock::LOCK_IN];
 
 /// Where the operator's bond stands, as the wallet's own node shows it.
 #[derive(Debug, Clone)]

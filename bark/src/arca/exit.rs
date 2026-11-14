@@ -122,12 +122,17 @@ pub(crate) struct Payer {
 	/// mempool ([`Wallet::speed_up`]). The wallet's own exits do; a
 	/// watchtower's and the operator's steps keep the reserve whole.
 	pub(crate) anchor: bool,
+	/// Whether every step must pay its fee from its own reserve: a step that
+	/// cannot is refused rather than given a fee coin, which would change
+	/// its txid. The endings a lock's watchtower holds are signed over the
+	/// leaf such steps make ([`Wallet::lock_deposit`]).
+	pub(crate) reserve_only: bool,
 }
 
 impl Payer {
 	/// A payer of fees in `asset`, when named.
 	pub(crate) fn new(asset: Option<AssetId>) -> Payer {
-		Payer { asset, moved: None, coin: None, change: None, used: vec![], min_fee: 0, anchor: false }
+		Payer { asset, moved: None, coin: None, change: None, used: vec![], min_fee: 0, anchor: false, reserve_only: false }
 	}
 }
 
@@ -169,8 +174,13 @@ pub(crate) fn bid_share_ppm(from: u32, timeout: u32, now: u32) -> u64 {
 /// output, about 227, priced at 240; an `htlc-1` leaf's claim or refund, its
 /// longer script and a received leaf's preimage in its witness, about 250,
 /// priced at 300.
+/// What a lock's ending alone on the chain weighs at most, in vbytes, into
+/// one output with its reserve paying (CLAIM, with its preimage, is the
+/// larger), for its fee.
+pub(crate) const LOCK_ENDING_VSIZE: u64 = 300;
+
 fn claim_vsize(leaf: &arca_covenant::LeafPolicy) -> u64 {
-	if leaf.htlc.is_some() { 300 } else if leaf.landing.is_some() { 240 } else { 220 }
+	if leaf.htlc.is_some() || leaf.lock.is_some() { 300 } else if leaf.landing.is_some() { 240 } else { 220 }
 }
 
 impl Wallet {
@@ -178,7 +188,7 @@ impl Wallet {
 	/// a landing leaf of a supervised asset, its landing, P2WPKH of the
 	/// wallet's landing key, the only output its exit can pay, where a freeze
 	/// of the asset binds on the chain.
-	fn claim_script(&self, coin: &ValidCoin, claim_index: u32) -> Result<Script, Error> {
+	pub(crate) fn claim_script(&self, coin: &ValidCoin, claim_index: u32) -> Result<Script, Error> {
 		match coin.leaf.landing {
 			Some(l) => Ok(l.script_pubkey()),
 			None => self.keys.onchain_script(super::keys::RECEIVE, claim_index),
@@ -193,7 +203,7 @@ impl Wallet {
 
 	/// Whether `tx`, as built, pays at least the node's floor in one asset the
 	/// node accepts.
-	fn pays_floor(&self, tx: &Transaction) -> Result<bool, Error> {
+	pub(crate) fn pays_floor(&self, tx: &Transaction) -> Result<bool, Error> {
 		let fees = txs_fee(tx);
 		if fees.len() != 1 {
 			return Ok(false);
@@ -241,6 +251,9 @@ impl Wallet {
 				}
 				return Ok(u.clone());
 			}
+		}
+		if payer.reserve_only {
+			return Err(Error::Refused("a step of the path does not pay the node's floor from its own reserve".into()));
 		}
 		let (op, coin, key) = self.fee_coin(payer)?;
 		let asset = payer.asset.expect("a fee coin has an asset");
@@ -323,6 +336,14 @@ impl Wallet {
 	/// leaf received over Lightning comes home by its owner's claim with the
 	/// payment's preimage (which the operator then reads there).
 	fn claim_witness(&self, coin: &ValidCoin, nonce: &[u8; 32]) -> Result<Vec<Vec<u8>>, Error> {
+		// A lock comes home to its payee by CLAIM with the preimage, to its
+		// payer by REFUND with nothing more.
+		if let Some(p) = coin.leaf.lock_policy() {
+			if self.keys.leaf_xonly(nonce)? == p.terms.refunder {
+				return Ok(vec![]);
+			}
+			return Ok(vec![self.lock_preimage(&hex(&p.terms.payment_hash))?.to_vec()]);
+		}
 		Ok(match coin.leaf.htlc {
 			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![self.received_preimage(&t.payment_hash, nonce)?.to_vec()],
 			_ => vec![],
@@ -335,7 +356,7 @@ impl Wallet {
 	/// wallet never splits its own claim. An `htlc-1` leaf of a payment out
 	/// of the tree comes home by its refund, after its timeout and its exit
 	/// delay on the chain.
-	fn claim_tx(&self, payer: &mut Payer, key: &Keypair, coin: &ValidCoin, leaf_at: OutPoint, to: &Script, after: &[Vec<u8>])
+	pub(crate) fn claim_tx(&self, payer: &mut Payer, key: &Keypair, coin: &ValidCoin, leaf_at: OutPoint, to: &Script, after: &[Vec<u8>])
 		-> Result<UnrollTx, Error>
 	{
 		let (asset, value, leaf) = (coin.asset, coin.value, coin.leaf);
@@ -347,8 +368,8 @@ impl Wallet {
 			return self.with_fee(payer, &|f| o.landing_tx(leaf_at, value, f).map_err(|e| Error::Refused(e.to_string())));
 		}
 		let min_fee = payer.min_fee;
-		self.key_spend_with(payer, key, after, &|f| {
-			let out = match f {
+		let out_for = |f: &FeeSource| -> Result<ExplicitOutput, Error> {
+			Ok(match f {
 				FeeSource::Reserve | FeeSource::Split { .. } => {
 					let fee = self.fee_for(asset, claim_vsize(&leaf))?.max(min_fee);
 					if fee >= value {
@@ -357,7 +378,31 @@ impl Wallet {
 					ExplicitOutput::new(asset, value - fee, to.clone())
 				},
 				FeeSource::Coin { .. } | FeeSource::Burning { .. } => ExplicitOutput::new(asset, value, to.clone()),
-			};
+			})
+		};
+		// A lock: CLAIM by its payee (with the preimage, past its delay),
+		// REFUND by its payer (from its timeout, past the payer's delay),
+		// each signing the message its script builds over its outputs.
+		if let Some(p) = leaf.lock_policy() {
+			let refund = key.x_only_public_key().0 == p.terms.refunder;
+			let preimage: Option<[u8; 32]> = after.first().and_then(|a| <[u8; 32]>::try_from(a.as_slice()).ok());
+			if !refund && preimage.is_none() {
+				return Err(Error::Refused("a lock's claim needs its preimage".into()));
+			}
+			return self.with_fee(payer, &|f| {
+				let out = [out_for(f)?];
+				let built = if refund {
+					let m = p.refund_message(asset, value, &out).map_err(|e| Error::Refused(e.to_string()))?;
+					p.refund_tx(leaf_at, asset, value, &out, f, &sign(key, &m.digest))
+				} else {
+					let m = p.claim_message(asset, value, &out).map_err(|e| Error::Refused(e.to_string()))?;
+					p.claim_tx(leaf_at, asset, value, &out, f, &sign(key, &m.digest), &preimage.expect("checked"))
+				};
+				built.map_err(|e| Error::Refused(e.to_string()))
+			});
+		}
+		self.key_spend_with(payer, key, after, &|f| {
+			let out = out_for(f)?;
 			match leaf.htlc {
 				Some(t) if t.direction == arca_covenant::HtlcDirection::Send => leaf.refund_tx(leaf_at, asset, value, &[out], f),
 				Some(_) => leaf.claim_tx(leaf_at, asset, value, &[out], f),
@@ -455,7 +500,7 @@ impl Wallet {
 		let key = self.keys.leaf(&row.owner_nonce)?;
 		let to = self.claim_script(coin, claim_index as u32)?;
 		let after = self.claim_witness(coin, &row.owner_nonce)?;
-		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false };
+		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false, reserve_only: false };
 		let new = self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after)?;
 		let txid = self.chain.broadcast_any_fee(&new.tx).map_err(|e| Error::Refused(format!("coin {}'s output is spent in the mempool \
 			by {}, which is not the wallet's; the node refused the claim that outbids it: {}", leaf_id, other.txid(), e)))?;
@@ -521,7 +566,7 @@ impl Wallet {
 			}
 			need = need.max(b);
 		}
-		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false };
+		let mut payer = Payer { asset: Some(asset), moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: need, anchor: false, reserve_only: false };
 		let new = match self.claim_tx(&mut payer, &key, coin, leaf_at, &to, &after) {
 			Ok(c) => c,
 			Err(e) => {
@@ -786,7 +831,8 @@ impl Wallet {
 	/// Refuses what the exit would refuse for the same reason.
 	pub fn exit_quote(&mut self, leaf_id: &str, fee_asset: Option<AssetId>) -> Result<Value, Error> {
 		let row = self.store.coin(leaf_id)?.ok_or_else(|| Error::Refused(format!("no coin {}", leaf_id)))?;
-		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving" | super::round::HANDED) {
+		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving" | super::lock::LOCK_IN | super::lock::LOCK_OUT
+			| super::round::HANDED) {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
 		if self.channel_worth(&row)?.is_some() {
@@ -822,7 +868,7 @@ impl Wallet {
 		// that of every P2WPKH change.
 		let dummy = self.keys.onchain(CHANGE, 0)?;
 		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None,
-			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![], min_fee: 0, anchor: true };
+			change: Some((super::keys::p2wpkh(&dummy), dummy)), used: vec![], min_fee: 0, anchor: true, reserve_only: false };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -846,8 +892,9 @@ impl Wallet {
 		// 32 bytes, whatever it is).
 		let (asset, value, leaf) = (coin.asset, coin.value, coin.leaf);
 		let to = Script::from(vec![0u8; 22]);
-		let after = match leaf.htlc {
-			Some(t) if t.direction == arca_covenant::HtlcDirection::Receive => vec![vec![0u8; 32]],
+		let after = match (leaf.htlc, leaf.lock_policy()) {
+			(Some(t), _) if t.direction == arca_covenant::HtlcDirection::Receive => vec![vec![0u8; 32]],
+			(_, Some(p)) if key.x_only_public_key().0 != p.terms.refunder => vec![vec![0u8; 32]],
 			_ => vec![],
 		};
 		// The claim pays to the wallet already: it needs no anchor.
@@ -897,7 +944,8 @@ impl Wallet {
 		// A coin handed over to a participation or a transfer is the wallet's
 		// until the chain shows otherwise: one taken by a round or a
 		// co-signed spend is `spent`, and is not exited.
-		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving" | super::round::HANDED) {
+		if !matches!(row.state.as_str(), "live" | "pending" | "exiting" | "offered" | "given" | "forfeited" | "sending" | "paying" | "receiving" | super::lock::LOCK_IN | super::lock::LOCK_OUT
+			| super::round::HANDED) {
 			return Err(Error::Refused(format!("coin {} is {}: there is nothing of the wallet's to exit", leaf_id, row.state)));
 		}
 		// A channel leaf closes on the chain by its own steps: its latest
@@ -933,7 +981,7 @@ impl Wallet {
 			Some(a) => Some(a),
 			None => prior["fee_asset"].as_str().map(AssetId::from_str).transpose().map_err(|e| Error::Store(e.to_string()))?,
 		};
-		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true };
+		let mut payer = Payer { asset: fee_asset, moved: Some(coin.asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true, reserve_only: false };
 		let mut path = vec![];
 		Self::path_outputs(&coin, &mut path);
 		let here = Here { outputs: path.clone(), at: self.chain.locate(&path)? };
@@ -1113,7 +1161,7 @@ impl Wallet {
 					"vsize": claim.tx.vsize(), "pays": claim.tx.output[0].value.explicit().map(|v| v.to_string()),
 					"to": self.chain.address(&to)?}}))
 			},
-			Err(e) if e.to_string().contains("non-BIP68-final") => {
+			Err(e) if e.to_string().contains("non-BIP68-final") || e.to_string().contains("non-final") => {
 				record_exit("waiting", payer.asset, self)?;
 				// When the claim's delay ends, from the leaf's block, for the
 				// schedule (`claim_from`); a refund of a payment out of the tree
@@ -1124,6 +1172,10 @@ impl Wallet {
 						if let Some(t) = leaf.htlc.filter(|t| t.direction == arca_covenant::HtlcDirection::Send) {
 							from = from.max(t.timeout.to_consensus_u32() as u64);
 						}
+						// A lock's payer refunds from its timeout and its own delay.
+						if let Some(p) = leaf.lock_policy().filter(|p| key.x_only_public_key().0 == p.terms.refunder) {
+							from = (mtp as u64 + p.terms.refund_delay.seconds()).max(p.terms.timeout.to_consensus_u32() as u64);
+						}
 						if let Some((st, j, c)) = self.store.exit(leaf_id)? {
 							let mut v: Value = serde_json::from_str(&j).map_err(|e| Error::Store(e.to_string()))?;
 							v["claim_from"] = json!(from);
@@ -1132,8 +1184,12 @@ impl Wallet {
 					}
 				}
 				Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps,
-					"next": format!("the exit delay of {} s runs from the leaf's confirmation; the node refused the claim before it: {}",
-						leaf.exit_delay.seconds(), e)}))
+					"next": match leaf.lock_policy().filter(|p| key.x_only_public_key().0 == p.terms.refunder) {
+						Some(p) => format!("the lock's refund opens at its timeout (median time {}) and {} s after the leaf's confirmation, \
+							whichever is later; the node refused it before: {}", p.terms.timeout.to_consensus_u32(), p.terms.refund_delay.seconds(), e),
+						None => format!("the exit delay of {} s runs from the leaf's confirmation; the node refused the claim before it: {}",
+							leaf.exit_delay.seconds(), e),
+					}}))
 			},
 			Err(e) => Ok(json!({"leaf_id": leaf_id, "state": "waiting", "broadcast": steps, "error": e.to_string()})),
 		}
@@ -1578,7 +1634,7 @@ impl Wallet {
 			}
 		}
 		let fee_asset = fee_asset.or(prior["fee_asset"].as_str().and_then(|a| AssetId::from_str(a).ok()));
-		let mut payer = Payer { asset: fee_asset, moved: Some(asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true };
+		let mut payer = Payer { asset: fee_asset, moved: Some(asset), coin: None, change: None, used: vec![], min_fee: 0, anchor: true, reserve_only: false };
 		let mut path = vec![];
 		Self::path_outputs(&i.coin, &mut path);
 		path.push(cp_out.clone());
@@ -2179,6 +2235,10 @@ impl Wallet {
 		// up as the wallet's own, a leaf the wallet holds claimed.
 		step!("receives", |w: &mut Self| if talk { arr(w.progress_receives()) } else { json!([]) });
 		step!("mailbox", |w: &mut Self| if talk || gone { w.mailbox().unwrap_or_else(err) } else { waiting() });
+		// Locks between two holders: a held one claimed once its preimage is
+		// known, one the wallet made marked paid once claimed, or refunded
+		// from its timeout.
+		step!("locks", |w: &mut Self| arr(w.progress_locks(talk)));
 		// What other stores of the mnemonic did: coins they made taken, coins
 		// held here that they gave up given up here too. At most once every
 		// ten minutes ([`super::restore::CATCH_UP_EVERY`]), and at every sync
@@ -2307,6 +2367,7 @@ impl Wallet {
 		let (mut lightning, receives, again) = (take("lightning"), take("receives"), take("receives again"));
 		let (offboards, owed, deposits, owed_deposits) = (take("offboards"), take("owed"), take("deposits"), take("owed deposits"));
 		let (reboards, orders, resting, plans, home) = (take("reboards"), take("orders"), take("resting"), take("plans"), take("home"));
+		let locks = take("locks");
 		let (unreachable, answering, bound) = (take("unreachable"), take("answering"), take("bound"));
 		let (early_home, early_exits) = (take("early home"), take("early exits"));
 		match (lightning.as_array_mut(), receives) {
@@ -2342,7 +2403,7 @@ impl Wallet {
 			out["history"] = history;
 		}
 		for (k, v) in [("refresh", refresh), ("held", held), ("lightning", lightning), ("offboards", offboards), ("owed", owed),
-			("deposits", deposits), ("reboards", reboards), ("orders", orders), ("resting", resting), ("plans", plans)]
+			("deposits", deposits), ("reboards", reboards), ("orders", orders), ("resting", resting), ("plans", plans), ("locks", locks)]
 		{
 			if some(&v) {
 				out[k] = v;

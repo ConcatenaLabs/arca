@@ -39,7 +39,8 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	{swap, result}, btc_swaps, btc_swap_cancel {swap}, lightning_pay_quote {invoice, asset?, max_fee_ppm?, timeout?, leaves?}, lightning_pay {invoice, \
 	asset?, max_fee_ppm?, timeout?, shown?, leaves?}, lightning_payments, lightning_receive_quote {asset, amount, max_fee_ppm?}, lightning_receive \
 	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
-	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
+	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, lock_request {asset, amount, hash, min_timeout?}, lock_to {request, timeout}, lock_ready {hash, \
+	need_seconds}, lock_claim {hash, preimage}, lock_refund {hash}, lock_preimage {hash, preimage}, lock_status {hash}, locks, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?, deadline?, vest?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, owed, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?, no_open?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
@@ -270,7 +271,8 @@ fn reads_only(command: &str) -> bool {
 		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
 		| "info" | "supply" | "leaf_template" | "require_checkpoint_exit" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
 		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
-		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed" | "coin_places")
+		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed" | "coin_places"
+		| "locks" | "lock_status")
 }
 
 /// What `arca` runs before a command: the witness (unless the command stays
@@ -627,6 +629,24 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"lightning_lookup" => w.lightning_lookup(&super::chain::hex(&super::chain::unhex32(req_str(&a["hash"], "the hash")?)?)),
 		"lightning_post_preimage" => w.lightning_post_preimage(&req_str(&a["hash"], "the hash")?.to_lowercase(),
 			&super::chain::unhex32(req_str(&a["preimage"], "the preimage")?)?),
+		// Locks between two holders (`super::lock`).
+		"lock_request" => w.lock_request(asset(req_str(&a["asset"], "the asset")?)?,
+			opt_u64(&a["amount"], "the amount")?.ok_or_else(|| Error::Parse("the amount is missing".into()))?,
+			super::chain::unhex32(req_str(&a["hash"], "the hash")?)?,
+			opt_u64(&a["min_timeout"], "the earliest timeout")?.map(|t| u32::try_from(t).unwrap_or(u32::MAX))),
+		"lock_to" => {
+			let t = opt_u64(&a["timeout"], "the timeout")?.ok_or_else(|| Error::Parse("the timeout is missing".into()))?;
+			w.lock_to(&a["request"], u32::try_from(t).map_err(|_| Error::Parse("a timeout past 2106".into()))?)
+		},
+		"lock_ready" => w.lock_ready(&req_str(&a["hash"], "the hash")?.to_lowercase(),
+			opt_u64(&a["need_seconds"], "the seconds needed")?.ok_or_else(|| Error::Parse("the seconds needed are missing".into()))?),
+		"lock_claim" => w.lock_claim(&req_str(&a["hash"], "the hash")?.to_lowercase(),
+			super::chain::unhex32(req_str(&a["preimage"], "the preimage")?)?),
+		"lock_refund" => w.lock_refund(&req_str(&a["hash"], "the hash")?.to_lowercase()),
+		"lock_preimage" => w.lock_preimage_known(&req_str(&a["hash"], "the hash")?.to_lowercase(),
+			super::chain::unhex32(req_str(&a["preimage"], "the preimage")?)?),
+		"lock_status" => w.lock_status(&req_str(&a["hash"], "the hash")?.to_lowercase()),
+		"locks" => w.locks(),
 		"distribute_quote" => {
 			let (asset, claims) = distribution_of(w, a)?;
 			w.distribute_quote(asset, &claims)

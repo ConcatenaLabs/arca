@@ -161,7 +161,7 @@ pub use gate::{GateCommitment, MemberProof, Members};
 pub use htlc::{HtlcDirection, HtlcPath, HtlcTerms};
 pub use landing::{Landing, LandingError, LandingTerms};
 pub use leaf::LeafPolicy;
-pub use lock::{LockError, LockPath, LockPolicy, LockTerms, REFUND_DELAY_MARGIN_UNITS};
+pub use lock::{LockError, LockPath, LockPolicy, LockSpend, LockSpender, LockTerms, REFUND_DELAY_MARGIN_UNITS};
 pub use limiter::{LimiterError, LimiterParams, LimiterSpend, LimiterState};
 pub use message::{Chain, CsfsMessage};
 pub use node::{NodePolicy, ReleaseTree};
@@ -225,6 +225,12 @@ pub enum Error {
 	CheckpointHasNoExit,
 	#[error("a vtxo-1 leaf has no {0} path")]
 	NotAnHtlc(&'static str),
+	#[error(transparent)]
+	Lock(#[from] lock::LockError),
+	#[error("an htlc-2 leaf has no exit: on the chain it is spent by its payee's claim or its payer's refund")]
+	LockHasNoExit,
+	#[error("this coin is an htlc-2 lock: it is spent by its claim with the preimage or its refund from the timeout, never by a plain collaborative spend")]
+	LockSpend,
 	#[error("a vtxo-2 pair names {0} inputs; it names 1 to {max}", max = collab::MAX_NAMED)]
 	NamedCount(usize),
 	#[error("named input {0}'s asset or amount is not explicit")]

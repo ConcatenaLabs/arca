@@ -198,6 +198,9 @@ pub struct Wallet {
 	/// owner nonce the store does not hold is taken when its key is the one
 	/// the mnemonic derives from that nonce, as the lost store would have.
 	pub(crate) adopting: std::cell::Cell<bool>,
+	/// While a lock chooses its coins ([`Wallet::lock_to`]): only coins with
+	/// room under the depth limit for the lock and its claim or refund.
+	pub(crate) locking: std::cell::Cell<bool>,
 	/// While a quote runs ([`Wallet::quoting`]): it signs, asks and stores
 	/// nothing, so it takes back no refresh that waits
 	/// ([`Wallet::withdraw_refreshes`]) when the live coins fall short.
@@ -985,7 +988,7 @@ impl Wallet {
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
-			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), pay_from: Default::default(), lock_until: Default::default(), exit_watch: Default::default(),
+			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), locking: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), pay_from: Default::default(), lock_until: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), slice: Default::default(), statuses_read: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
 	}
@@ -2428,6 +2431,12 @@ impl Wallet {
 	/// The states of a coin the wallet still has to bring home or spend ([`Self::homeward`]).
 	pub(crate) const HOMEWARD: &'static [&'static str] = &["live", "pending", "given", "forfeited", "offered", "sending", "paying", "receiving"];
 
+	/// The coins whose lineage the wallet watches on the chain
+	/// ([`Self::watch_lineages`]): every homeward coin, and each lock between
+	/// two holders, the payee's and the payer's.
+	pub(crate) const WATCHED: &'static [&'static str] =
+		&["live", "pending", "given", "forfeited", "offered", "sending", "paying", "receiving", super::lock::LOCK_IN, super::lock::LOCK_OUT];
+
 	/// The coins the wallet holds live whose latest refresh the operator
 	/// refused: given in a participation it refused, voided or let expire,
 	/// and not refreshed since (a coin refreshed since is spent, or given
@@ -3381,9 +3390,15 @@ impl Wallet {
 	/// where the chain holds it, publishing what it signed in advance (the
 	/// checkpoint from a converted board's leaf, then the reassignment) before
 	/// any exit delay runs out. One look at the chain covers every coin.
+	///
+	/// A lock between two holders is watched as any coin received out of
+	/// round, on both sides ([`Self::WATCHED`]): its payee's, whether or not
+	/// it knows the preimage yet (the answer brings the lock's leaf on the
+	/// chain, where its scripts decide, and its claim there waits for the
+	/// preimage), and its payer's.
 	fn watch_lineages(&mut self) -> Result<Vec<Value>, Error> {
 		let policy = WalletPolicy { horizon: 0, ..self.receipt_policy(self.now()?) };
-		let coins: Vec<CoinRow> = self.store.coins_in_states(Self::HOMEWARD)?;
+		let coins: Vec<CoinRow> = self.store.coins_in_states(Self::WATCHED)?;
 		// Everything this watch looks for (a leaf or checkpoint of a coin's
 		// lineage, its own leaf, a board it rests on spent) is made only by
 		// spends that start at an output the coin descends from: a coin whose

@@ -79,7 +79,7 @@ impl Holder {
 
 	/// A landing leaf of `z` and `V`, `landing-2` when `own_index`.
 	fn leaf(&self, net: &Net, salt: &str, own_index: bool, z: AssetId) -> LeafPolicy {
-		LeafPolicy { claim: None,
+		LeafPolicy { lock: None, claim: None,
 			owner: xonly(&self.a), operator: xonly(&self.s), salt: label32(salt), chain: net.chain, exit_delay: delay(), htlc: None,
 			order: None, landing: Some(Landing { program: self.program, allowance: ALLOWANCE, own_index }.terms(z, V).unwrap()),
 			channel: None, v2: false,
@@ -284,7 +284,7 @@ fn landings_never_share_an_output_with_another_covenant() {
 
 	// ---- a claim-1 lapse paying the landing key ------------------------------
 	let deadline = mt(net.mtp() - 60);
-	let ql = LeafPolicy { owner: xonly(&h.a), operator: xonly(&h.s), salt: label32("collision claim"), chain: net.chain,
+	let ql = LeafPolicy { lock: None, owner: xonly(&h.a), operator: xonly(&h.s), salt: label32("collision claim"), chain: net.chain,
 		exit_delay: delay(), htlc: None, order: None, landing: None, channel: None, v2: false,
 		claim: Some(LapseTerms { deadline, pin: script_pin(&land), asset: z, min_value: min, vest: None }),
 	};

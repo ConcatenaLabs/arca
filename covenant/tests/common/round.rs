@@ -193,14 +193,14 @@ pub fn base(tree: &Tree, i: usize, owner: &Keypair, preimage: [u8; 32], t: Media
 /// One hop: `coin`, held under `prev`, paid by `owner` to the leaf `to`.
 pub fn one_hop(prev: &CoinRecord, coin: &ValidCoin, owner: &Keypair, s: &Keypair, to: NewLeaf, chain: Chain) -> CoinRecord {
 	let cpv = coin.value - MARGIN;
-	let plan = TransferPlan { checkpoint_exit: false,
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: false,
 		inputs: vec![(coin.clone(), cpv)],
 		outputs: vec![ExplicitOutput::new(coin.asset, cpv - MARGIN, to.policy(xonly(s), chain).script_pubkey())],
 	};
 	let cp = plan.checkpoint_message(0).unwrap().digest;
 	let re = plan.reassignment_message(0).unwrap().digest;
 	CoinRecord::Transfer(Box::new(Transfer {
-		inputs: vec![TransferInput { exit: false,
+		inputs: vec![TransferInput { lock: None, exit: false,
 			coin: prev.clone(), checkpoint_value: cpv,
 			checkpoint: Pair { operator: sig(s, &cp), owner: sig(owner, &cp) },
 			reassignment: Pair { operator: sig(s, &re), owner: sig(owner, &re) },
@@ -213,7 +213,7 @@ pub fn one_hop(prev: &CoinRecord, coin: &ValidCoin, owner: &Keypair, s: &Keypair
 /// and owner nonce it publishes, and the creator nonce the sender draws.
 pub fn party(label: &str, d: RelativeTime) -> (Keypair, NewLeaf) {
 	let k = keypair(&format!("party {} key", label));
-	let leaf = NewLeaf {
+	let leaf = NewLeaf { lock: None,
 		owner: xonly(&k), owner_nonce: label32(&format!("party {} owner nonce", label)),
 		creator_nonce: label32(&format!("party {} creator nonce", label)), exit_delay: d,
 		htlc: None,
@@ -233,7 +233,7 @@ pub fn inputs(coin: &ValidCoin) -> Vec<ValidInput> {
 /// A leaf funded straight on-chain, standing for an old leaf being given
 /// up, and its id in the board form.
 pub fn funded_leaf(net: &mut Net, owner: &Keypair, s: &Keypair, label: &str, value: u64) -> (LeafPolicy, Coin, LeafId) {
-	let leaf = LeafPolicy { claim: None,
+	let leaf = LeafPolicy { lock: None, claim: None,
 		owner: xonly(owner), operator: xonly(s),
 		salt: arca_covenant::leaf::leaf_salt(&label32(&format!("{} owner nonce", label)), &label32(&format!("{} operator nonce", label))),
 		chain: net.chain, exit_delay: delay(),

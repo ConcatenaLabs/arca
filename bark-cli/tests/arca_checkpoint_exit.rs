@@ -311,7 +311,7 @@ async fn kill_input(r: &mut Running, made: &ValidCoin, w: &Arca, board: &str, ta
 	let ck = board_key(w, board);
 	let (op, out, key) = fee_coin(r, &format!("{} attack fee", tag)).await;
 	let back = vec![ExplicitOutput::new(ci.coin.asset, ci.checkpoint_value, Script::from(vec![0x51]))];
-	let plan = TransferPlan { checkpoint_exit: true, inputs: vec![(ci.coin.clone(), ci.checkpoint_value)], outputs: back.clone() };
+	let plan = TransferPlan { locks: vec![], checkpoint_exit: true, inputs: vec![(ci.coin.clone(), ci.checkpoint_value)], outputs: back.clone() };
 	let d = plan.reassignment_message(0).unwrap().digest;
 	let sig = |k: &elements::secp256k1_zkp::Keypair| arca_covenant::sign::sign_digest(k, &d, &[0; 32]);
 	let second = ValidInput { reassignment_pair: Pair { operator: sig(&keypair("operator")), owner: sig(&ck) }, ..ci.clone() };

@@ -33,14 +33,14 @@ pub const REFUSAL_CODES: &[&str] = &[
 	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
 	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "internal", "invalid_coin",
 	"invalid_leaf", "invalid_record", "invoice",
-	"invalid_transaction", "key_reused", "lapsed", "leaf_set", "lightning_unavailable", "malformed", "margin", "merge", "no_lightning",
+	"invalid_transaction", "key_reused", "lapsed", "leaf_set", "lightning_unavailable", "lock", "malformed", "margin", "merge", "no_lightning",
 	"no_lowest_node", "nonce_unknown",
 	"nonce_used", "not_accepted", "not_an_order", "not_declined", "not_in_round", "not_live", "not_on_node", "not_participating", "not_synced", "not_withdrawable", "on_chain", "open_reassignment",
 	"operator_key", "order", "order_expiring", "order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed",
 	"owed_withdrawn", "planned", "rate_limited", "rate_stale", "receive_cap", "release_early", "request_lapsed", "request_too_large",
 	"round_not_final", "salt",
 	"script_reused", "signer_replaced", "signer_unavailable", "template", "unauthenticated", "unbalanced", "unknown_batch", "unknown_board",
-	"unknown_fill", "unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "vesting", "wrong_chain", "wrong_operator", "wrong_round",
+	"unknown_fill", "unknown_leaf", "unknown_lock", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "vesting", "wrong_chain", "wrong_operator", "wrong_round",
 ];
 
 /// `GET /v1/chain`: where the operator's finality service stands, so an
@@ -215,6 +215,10 @@ pub struct Info {
 	/// to their destinations.
 	#[serde(default)]
 	pub offboards: OffboardsInfo,
+	/// How the operator bounds `htlc-2` locks; it co-signs them when
+	/// `templates.list` names `htlc-2`.
+	#[serde(default)]
+	pub locks: LocksInfo,
 }
 
 /// How the operator moves a released participation's offboard outputs to
@@ -1017,6 +1021,92 @@ pub struct TransferInput {
 	/// output order, `SHA256("Arca/delegate" ‖ genesis_hash ‖ K_1 ‖ … ‖ K_m)`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub delegation_sig: Option<String>,
+	/// For a coin that is an `htlc-2` lock, the ending it is given up by
+	/// ([`crate::locks`]): `{"path": "claim", "preimage": hex}` or
+	/// `{"path": "refund"}`. Its signatures are then that path's holder's.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lock: Option<LockSpendJson>,
+}
+
+/// How an `htlc-2` lock is ended: its claim, with the preimage, or its refund.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockSpendJson {
+	/// `claim` or `refund`.
+	pub path: String,
+	/// The claim's preimage; absent for a refund.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preimage: Option<String>,
+}
+
+/// An `htlc-2` leaf's terms beside its owner's (the payee's) key, nonces
+/// and exit delay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockTermsJson {
+	pub payment_hash: String,
+	/// `T`, the median time from which the refund opens.
+	pub timeout: u32,
+	/// The payer's key for this lock, x-only.
+	pub refunder: String,
+	pub refund_delay_units: u16,
+	/// The mailbox the lock's record goes to for the payer, beside the
+	/// payee's: the one its wallet and its restore read. The payer's key
+	/// for the lock when absent. Not part of the leaf.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub payer_mailbox: Option<String>,
+}
+
+/// `POST /v1/lock_status`: the locks under a payment hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockStatusRequest {
+	pub payment_hash: String,
+}
+
+/// `POST /v1/lock_preimage`: the preimage of a lock's hash, from anyone who
+/// has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockPreimage {
+	pub payment_hash: String,
+	pub preimage: String,
+}
+
+/// The answer to `lock_status` and `lock_preimage`: every lock the operator
+/// keeps under the hash, and the preimage once it knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockStatus {
+	pub payment_hash: String,
+	pub locks: Vec<LockInfo>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub preimage: Option<String>,
+}
+
+/// One lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockInfo {
+	pub leaf_id: String,
+	pub payee: String,
+	pub payer: String,
+	pub timeout: u32,
+	/// `open`, `claimed` or `refunded`.
+	pub state: String,
+}
+
+/// How the operator bounds `htlc-2` locks ([`crate::locks`]); zeros from a
+/// server that predates them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocksInfo {
+	/// The furthest a lock's timeout may lie, in seconds from now.
+	pub max_seconds: u32,
+	/// How long before its timeout a lock's claim is no longer co-signed.
+	pub claim_margin_seconds: u32,
+	/// What the operator allows for unrolling a lock's lineage on the chain:
+	/// a lock's timeout lies at least its payee's delay and this out, and
+	/// its timeout, its payer's delay and this fit before the batches' expiry.
+	pub unroll_seconds: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1056,9 +1146,13 @@ pub struct TransferOutput {
 	/// is `arca/collab-2` (its receive request asks for it); absent or
 	/// `vtxo-1` for the tapscript path; `landing-2` for a landing leaf that
 	/// lands at its own index (its receive request asks for it).
-	/// `htlc-1` and `landing-1` are named by their terms.
+	/// `htlc-1`, `htlc-2` and `landing-1` are named by their terms.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub template: Option<String>,
+	/// The terms of an `htlc-2` leaf, a lock between two holders whose
+	/// payee is the owner ([`crate::locks`]).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lock: Option<LockTermsJson>,
 	/// Reserved: an output naming it is refused as malformed with
 	/// [`arca_covenant::ENCLAVE_RETIRED`].
 	#[serde(default, skip_serializing_if = "Option::is_none")]

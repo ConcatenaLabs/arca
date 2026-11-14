@@ -494,7 +494,7 @@ impl Wallet {
 		}
 		let mut takers = vec![];
 		for l in t["takers"].as_array().into_iter().flatten() {
-			takers.push(NewLeaf {
+			takers.push(NewLeaf { lock: None,
 				v2: false, htlc: None, landing: None,
 				owner: parse_key(&l["owner"], "a taker's leaf")?,
 				owner_nonce: unhex32(l["owner_nonce"].as_str().unwrap_or(""))?,
@@ -609,7 +609,7 @@ impl Wallet {
 		self.resting_exit(&info, &o)?;
 		let leaf = |w: &Wallet| -> Result<NewLeaf, Error> {
 			let n = random32();
-			Ok(NewLeaf { v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
+			Ok(NewLeaf { lock: None, v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
 		};
 		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
 		let f = self.resting_fill_plan(&info, order, &o, amount, &got, &change_leaf)?;
@@ -775,7 +775,7 @@ impl Wallet {
 		// complete then gives them back (`arca_covenant::checkpoint`). The
 		// maker's order coin is spent only if the fill confirms.
 		let checkpoint_exit = self.resting_exit(&info, &o)?;
-		let tplan = TransferPlan { checkpoint_exit, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
+		let tplan = TransferPlan { locks: vec![], checkpoint_exit, inputs: chosen.iter().map(|c| (c.coin.clone(), c.checkpoint_value)).collect(), outputs: outputs.clone() };
 		// The fill spends the order's coin at input 0 and the checkpoints
 		// after it: a vtxo-2 checkpoint's pair names them all, its own index
 		// one past its place among the checkpoints (`fill_tx`).
@@ -992,7 +992,7 @@ fn fill_margin(oc: &arca_covenant::ValidCoin, plan: &arca_covenant::order::Order
 {
 	let dummy = Signature::from_slice(&[1; 64]).expect("64 bytes");
 	let pair = Pair { operator: dummy, owner: dummy };
-	let sized: Vec<ValidInput> = chosen.iter().map(|c| ValidInput {
+	let sized: Vec<ValidInput> = chosen.iter().map(|c| ValidInput { lock: None,
 		coin: c.coin.clone(), checkpoint: c.coin.checkpoint(), checkpoint_value: c.checkpoint_value, checkpoint_pair: pair,
 		reassignment_pair: pair,
 	}).collect();
