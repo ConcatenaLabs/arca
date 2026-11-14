@@ -1896,7 +1896,11 @@ once on the lock's lineage, and otherwise by time:
   /v1/lock_preimage`, `{"payment_hash", "preimage"}`, sent by `lock
   preimage` and by a BTC swap whose payment settled), or the one the
   operator serves (`lock_status`). While neither has it, the watchtower does
-  nothing, and says so: the payee was not paid against;
+  nothing, and says so. The watchtower cannot read the Bitcoin leg: a seller
+  who claims the BTC and posts nothing reveals the preimage only to the
+  buyer's own payment, which the buyer's wallet reads (a BTC swap's
+  `pay_status`) when it next runs. So a buyer away from paying until past
+  its lock's home date depends on the seller posting the preimage;
 - the payer's, an hour past the lock's timeout, while the lock is open;
 - the payer's never for a lock the operator shows claimed with a preimage
   that opens its hash, nor, from the timeout on, for one it records as
