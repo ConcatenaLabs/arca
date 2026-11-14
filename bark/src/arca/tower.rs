@@ -1283,9 +1283,13 @@ impl Wallet {
 	/// One pass over a lock's deposit `row` (its lock JSON `lk`). The
 	/// watchtower acts from the deposit's `act_from` (the payee's home date;
 	/// for the payer its timeout and [`super::lock::TOWER_REFUND_GRACE`]),
-	/// or, for the payee, as soon as the lock's leaf is on the chain; and
-	/// only while the lock is open: never for one the operator records as
-	/// claimed or refunded out of round. The payee's side acts only with the
+	/// or, for the payee, as soon as the lock's leaf is on the chain; and,
+	/// for either, at once when a sender up the lock's lineage takes an
+	/// earlier coin on the chain (it brings the path; the ending waits for
+	/// its own conditions). The payer's side stops on the operator's word
+	/// only where it proves itself (a claim with a preimage that opens the
+	/// hash; a refund from the timeout on); the payee's side never stops on
+	/// it. The payee's side ends the lock only with the
 	/// preimage, its wallet's (handed in, [`Self::tower_lock_preimage`]) or
 	/// the operator's (`lock_status`); while neither has it, nothing is done,
 	/// and said. Acting is bringing the leaf's path on the chain, as for any
