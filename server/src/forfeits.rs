@@ -215,6 +215,7 @@ impl ForfeitError {
 	pub fn code(&self) -> &'static str {
 		use ForfeitError::*;
 		match self {
+			Store(e) | Coin(CoinError::Store(e)) if e.is_busy() => "busy",
 			Unknown(_) => "unknown_participation",
 			NotInRound(_) => "not_in_round",
 			RoundNotFinal(_) => "round_not_final",

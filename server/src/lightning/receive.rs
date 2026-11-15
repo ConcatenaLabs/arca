@@ -194,6 +194,7 @@ pub enum ReceiveError {
 impl ReceiveError {
 	pub fn code(&self) -> &'static str {
 		match self {
+			ReceiveError::Store(e) if e.is_busy() => "busy",
 			ReceiveError::Malformed(_) => "malformed",
 			ReceiveError::BadSignature => "bad_signature",
 			ReceiveError::Leg(l) => l.code(),

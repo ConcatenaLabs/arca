@@ -135,6 +135,7 @@ impl Running {
 			max_request_bytes: 64 * 1024,
 			challenge_ttl_seconds: 120,
 			holding_back_unauthenticated: false,
+			database_pool: Default::default(),
 			// The test builds each round when it wants one.
 			round_interval_seconds: 0,
 			node: NodeConfig {
@@ -161,6 +162,8 @@ impl Running {
 				issue_per_second: 10_000, issue_burst: 10_000, source_per_second: 10_000, source_burst: 10_000,
 				witness_per_second: 10_000, witness_burst: 10_000, witness_source_per_second: 10_000, witness_source_burst: 10_000,
 				read_per_second: 10_000, read_burst: 10_000, read_source_per_second: 10_000, read_source_burst: 10_000,
+				// The tests read `chain` right after what they check.
+				chain_pool_seconds: 0,
 				..Default::default()
 			},
 			metrics_listen: None,

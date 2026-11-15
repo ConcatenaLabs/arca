@@ -131,17 +131,31 @@ impl Store {
 			 reclaimed_node AS (
 			   SELECT DISTINCT w.subject AS node_hash, w.txid FROM watcher_tx w JOIN nursery_tx n USING (txid)
 			   WHERE w.kind = 'reclaim' AND n.state <> 'lost'),
+			 -- Each leaf's standing comes from a set of leaf ids built once and
+			 -- joined by hash, never from a subquery run for every leaf: a
+			 -- subquery per leaf over the reclaimed nodes grows with the
+			 -- product of the two, and held a connection for most of a minute
+			 -- once the operator kept some 50,000 batch leaves.
+			 released_ids AS (
+			   SELECT leaf_id FROM node_release WHERE NOT retired
+			   UNION
+			   SELECT leaf_id FROM slot_release WHERE NOT retired),
+			 reclaimed_ids AS (
+			   SELECT nr.leaf_id FROM node_release nr JOIN reclaimed_node k USING (node_hash)
+			   UNION
+			   SELECT rl.leaf_id FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid) WHERE n.state <> 'lost'),
+			 transferred_ids AS (
+			   SELECT leaf_id FROM transfer_input
+			   UNION
+			   SELECT order_leaf FROM order_fill WHERE signature IS NOT NULL),
 			 leaves AS (
 			   SELECT bl.round_id, bl.vout, bl.idx, bl.value, live.radix, live.kind,
-			          (EXISTS (SELECT 1 FROM node_release nr WHERE nr.leaf_id = bl.leaf_id AND NOT nr.retired)
-			           OR EXISTS (SELECT 1 FROM slot_release sr WHERE sr.leaf_id = bl.leaf_id AND NOT sr.retired)) AS released,
-			          (EXISTS (SELECT 1 FROM node_release nr JOIN reclaimed_node k USING (node_hash)
-			                  WHERE nr.leaf_id = bl.leaf_id)
-			           OR EXISTS (SELECT 1 FROM reclaimed_leaf rl JOIN nursery_tx n USING (txid)
-			                      WHERE rl.leaf_id = bl.leaf_id AND n.state <> 'lost')) AS reclaimed,
-			          (EXISTS (SELECT 1 FROM transfer_input ti WHERE ti.leaf_id = bl.leaf_id)
-			           OR EXISTS (SELECT 1 FROM order_fill f WHERE f.order_leaf = bl.leaf_id AND f.signature IS NOT NULL)) AS transferred
-			   FROM batch_leaf bl JOIN live USING (round_id, vout)),
+			          rel.leaf_id IS NOT NULL AS released, rec.leaf_id IS NOT NULL AS reclaimed,
+			          tr.leaf_id IS NOT NULL AS transferred
+			   FROM batch_leaf bl JOIN live USING (round_id, vout)
+			   LEFT JOIN released_ids rel ON rel.leaf_id = bl.leaf_id
+			   LEFT JOIN reclaimed_ids rec ON rec.leaf_id = bl.leaf_id
+			   LEFT JOIN transferred_ids tr ON tr.leaf_id = bl.leaf_id),
 			 per_batch AS (
 			   SELECT l.round_id, l.vout,
 			          coalesce(sum(l.value) FILTER (WHERE l.released AND NOT l.reclaimed), 0) AS released,
@@ -207,6 +221,9 @@ impl Store {
 			 LEFT JOIN locked l USING (asset) LEFT JOIN drawn d USING (asset) LEFT JOIN returned r USING (asset)",
 			&[],
 		).await?;
+		// Given back before the next read takes one: one task holds one
+		// connection at a time.
+		drop(conn);
 		let mut out = BTreeMap::new();
 		for r in &rows {
 			let n = |i: usize| r.get::<_, i64>(i).max(0) as u64;

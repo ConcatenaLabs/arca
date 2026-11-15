@@ -48,14 +48,15 @@
 
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use bb8::{Pool, PooledConnection};
-use bb8_postgres::PostgresConnectionManager;
 use tokio_postgres::error::SqlState;
-use tokio_postgres::NoTls;
 
 mod boards;
 mod chain;
 mod channels;
+mod connections;
 mod coins;
 mod delegations;
 mod distributions;
@@ -77,6 +78,7 @@ mod watcher;
 pub use boards::{BoardRow, BoardState};
 pub use channels::{Begun, ChannelNoteRow, ChannelSeen, ChannelStateRow, NewChannelState};
 pub use chain::{BlockRow, Scan, ScannedOutput};
+pub use connections::{ConnError, PoolSettings, CHECK_WITHIN};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
 pub use delegations::{DelegationRow, HolderReleaseRow, SpentBy};
 pub use distributions::{ClaimRow, DistributionRow, NewDistribution, ReturnRow};
@@ -185,8 +187,12 @@ const MIGRATION_LOCK: i64 = 0x4172_6361_5363_6865;
 pub enum StoreError {
 	#[error("cannot get a database connection: {0}")]
 	Pool(String),
-	#[error("database error: {0}")]
-	Db(#[from] tokio_postgres::Error),
+	/// Every connection was in use for the whole of the pool's wait: the
+	/// server is busy, and the same request can be made again in a moment.
+	#[error("the server is busy: no database connection came free within {0:?}; try again in a moment")]
+	Busy(Duration),
+	#[error("database error at {0}")]
+	Db(DbFailure),
 	#[error("the database holds a value this server cannot read: {0}")]
 	Corrupt(String),
 	#[error("an output script is already known to the server: a leaf script is never funded twice")]
@@ -245,9 +251,81 @@ pub enum StoreError {
 	UnlockHashReused,
 }
 
+/// A database error with where the store met it: the place of the `?` that
+/// raised it, which names the statement.
+#[derive(Debug)]
+pub struct DbFailure {
+	error: tokio_postgres::Error,
+	at: &'static std::panic::Location<'static>,
+}
+
+impl DbFailure {
+	/// Where the store met it, `store/pool.rs:240`.
+	pub fn at(&self) -> String {
+		let file = self.at.file();
+		format!("{}:{}", file.rsplit_once("src/").map_or(file, |(_, f)| f), self.at.line())
+	}
+
+	/// Whether PostgreSQL cancelled the statement: it ran past the
+	/// statement limit, or an administrator cancelled it.
+	pub fn cancelled(&self) -> bool {
+		self.error.code() == Some(&SqlState::QUERY_CANCELED)
+	}
+}
+
+impl std::ops::Deref for DbFailure {
+	type Target = tokio_postgres::Error;
+
+	fn deref(&self) -> &tokio_postgres::Error {
+		&self.error
+	}
+}
+
+impl std::fmt::Display for DbFailure {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}: ", self.at())?;
+		match self.error.as_db_error() {
+			Some(d) => write!(f, "{} {}: {}", d.severity(), d.code().code(), d.message()),
+			None => match std::error::Error::source(&self.error) {
+				Some(cause) => write!(f, "{}: {}", self.error, cause),
+				None => write!(f, "{}", self.error),
+			},
+		}
+	}
+}
+
+/// Statements PostgreSQL cancelled, as this process's store met them
+/// ([`PoolStatus::statements_cancelled`]).
+static STATEMENTS_CANCELLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl From<tokio_postgres::Error> for StoreError {
+	/// Keeps the place of the `?` that raised the error (`?` hands its own
+	/// place on), and counts and logs a statement PostgreSQL cancelled: one
+	/// that grew past the statement limit is named the first time it does.
+	#[track_caller]
+	fn from(error: tokio_postgres::Error) -> StoreError {
+		let e = DbFailure { error, at: std::panic::Location::caller() };
+		if e.cancelled() {
+			STATEMENTS_CANCELLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			log::warn!("database: a statement was cancelled at {} (past the statement limit, `statement_timeout_seconds`, unless an \
+				administrator cancelled it); its transaction is rolled back", e);
+		}
+		StoreError::Db(e)
+	}
+}
+
 impl StoreError {
-	fn from_pool(e: bb8::RunError<tokio_postgres::Error>) -> StoreError {
-		StoreError::Pool(e.to_string())
+	fn from_pool(e: bb8::RunError<ConnError>, waited: Duration) -> StoreError {
+		match e {
+			bb8::RunError::TimedOut => StoreError::Busy(waited),
+			bb8::RunError::User(e) => StoreError::Pool(e.to_string()),
+		}
+	}
+
+	/// Whether this is the pool's wait running out ([`StoreError::Busy`]):
+	/// nothing failed, and the request can be made again.
+	pub fn is_busy(&self) -> bool {
+		matches!(self, StoreError::Busy(_))
 	}
 
 	/// Whether `e` is a violation of the unique constraint `constraint`.
@@ -258,7 +336,7 @@ impl StoreError {
 	}
 }
 
-type Conn<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
+type Conn<'a> = PooledConnection<'a, connections::Manager>;
 
 /// Turns JIT compilation off for every connection of `config`, beside
 /// whatever options it carries. The planner overestimates the recursive
@@ -267,9 +345,22 @@ type Conn<'a> = PooledConnection<'a, PostgresConnectionManager<NoTls>>;
 /// seven times as long as the query (1.8 s against 0.26 s on the public
 /// testnet's operator), on a path the rounds take for every round they build.
 fn without_jit(config: &mut tokio_postgres::Config) {
+	add_option(config, "-c jit=off");
+}
+
+/// Limits every statement of `config`'s connections to `limit`
+/// (PostgreSQL's `statement_timeout`), beside whatever options it carries;
+/// a zero `limit` leaves it as the server's own setting.
+fn with_statement_timeout(config: &mut tokio_postgres::Config, limit: Duration) {
+	if !limit.is_zero() {
+		add_option(config, &format!("-c statement_timeout={}", limit.as_millis()));
+	}
+}
+
+fn add_option(config: &mut tokio_postgres::Config, option: &str) {
 	let options = match config.get_options() {
-		Some(o) if !o.trim().is_empty() => format!("{} -c jit=off", o),
-		_ => "-c jit=off".to_string(),
+		Some(o) if !o.trim().is_empty() => format!("{} {}", o, option),
+		_ => option.to_string(),
 	};
 	config.options(&options);
 }
@@ -292,10 +383,42 @@ mod jit_tests {
 	}
 }
 
+/// The pool's settings and counters ([`Store::pool_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolStatus {
+	pub size: u32,
+	pub wait_ms: u64,
+	pub statement_timeout_ms: u64,
+	/// Connections open now, and of them idle.
+	pub connections: u32,
+	pub idle: u32,
+	/// Since the server started: tasks that asked for a connection, those
+	/// that had to wait for one, those whose wait ran out, and the time
+	/// spent waiting in all.
+	pub gets: u64,
+	pub waited: u64,
+	pub timed_out: u64,
+	pub wait_ms_total: u64,
+	/// Connections taken out of the pool for not answering their check (a
+	/// statement abandoned on them still running; closed once it ends), of
+	/// them the ones still set aside now, connections found broken, and
+	/// connections made.
+	pub closed_stuck: u64,
+	pub set_aside: u64,
+	/// Statements PostgreSQL cancelled, by this process since it started:
+	/// each ran past the statement limit, or was cancelled by an
+	/// administrator. The log names each with where the store ran it.
+	pub statements_cancelled: u64,
+	pub closed_broken: u64,
+	pub created: u64,
+}
+
 /// The server's database.
 #[derive(Clone)]
 pub struct Store {
-	pool: Pool<PostgresConnectionManager<NoTls>>,
+	pool: Pool<connections::Manager>,
+	settings: PoolSettings,
+	counters: Arc<connections::Counters>,
 	/// The latest head of the signer's record this process gave the
 	/// database or read from it ([`Store::signer_head_latest`]).
 	head_seen: std::sync::Arc<std::sync::Mutex<Option<HeadSeen>>>,
@@ -315,21 +438,56 @@ impl Store {
 	/// `postgres://user@host:port/db` or the key-value form) and brings its
 	/// schema up to date.
 	pub async fn connect(url: &str) -> Result<Store, StoreError> {
+		Store::connect_with(url, PoolSettings::DEFAULT).await
+	}
+
+	/// [`Store::connect`] with a pool of `settings`.
+	pub async fn connect_with(url: &str, settings: PoolSettings) -> Result<Store, StoreError> {
 		let mut config: tokio_postgres::Config = url.parse()?;
 		without_jit(&mut config);
-		let manager = PostgresConnectionManager::new(config, NoTls);
+		with_statement_timeout(&mut config, settings.statement_timeout);
+		let counters = Arc::new(connections::Counters::default());
+		let manager = connections::Manager::new(config, CHECK_WITHIN, settings.size.max(1), counters.clone());
 		let pool = Pool::builder()
-			.max_size(16)
-			.connection_timeout(Duration::from_secs(10))
+			.max_size(settings.size.max(1))
+			.connection_timeout(if settings.wait.is_zero() { Duration::from_millis(1) } else { settings.wait })
+			.error_sink(Box::new(connections::LogSink))
 			.build(manager)
-			.await?;
-		let store = Store { pool, head_seen: Default::default() };
+			.await
+			.map_err(|e| StoreError::Pool(e.to_string()))?;
+		let store = Store { pool, settings, counters, head_seen: Default::default() };
 		store.migrate().await?;
 		Ok(store)
 	}
 
 	async fn conn(&self) -> Result<Conn<'_>, StoreError> {
-		self.pool.get().await.map_err(StoreError::from_pool)
+		self.pool.get().await.map_err(|e| StoreError::from_pool(e, self.settings.wait))
+	}
+
+	/// The pool's settings and what it has been through since the server
+	/// started: how many tasks waited for a connection, how many waited in
+	/// vain ([`StoreError::Busy`]), how many connections were set aside for
+	/// not answering their check ([`CHECK_WITHIN`]) and how many still are,
+	/// and how many statements PostgreSQL cancelled.
+	pub fn pool_status(&self) -> PoolStatus {
+		let state = self.pool.state();
+		let s = &state.statistics;
+		PoolStatus {
+			size: self.settings.size,
+			wait_ms: self.settings.wait.as_millis() as u64,
+			statement_timeout_ms: self.settings.statement_timeout.as_millis() as u64,
+			connections: state.connections,
+			idle: state.idle_connections,
+			gets: s.get_started,
+			waited: s.get_waited,
+			timed_out: s.get_timed_out,
+			wait_ms_total: s.get_wait_time.as_millis() as u64,
+			closed_stuck: self.counters.stuck.load(std::sync::atomic::Ordering::SeqCst),
+			set_aside: self.counters.set_aside.load(std::sync::atomic::Ordering::SeqCst),
+			statements_cancelled: STATEMENTS_CANCELLED.load(std::sync::atomic::Ordering::SeqCst),
+			closed_broken: s.connections_closed_broken,
+			created: s.connections_created,
+		}
 	}
 
 	/// Applies every migration the database has not seen, in order, each in
@@ -338,6 +496,9 @@ impl Store {
 	pub async fn migrate(&self) -> Result<(), StoreError> {
 		let mut conn = self.conn().await?;
 		let tx = conn.transaction().await?;
+		// A migration may rewrite a table, or wait for another server's:
+		// it runs without the statement limit the pool sets.
+		tx.batch_execute("SET LOCAL statement_timeout = 0").await?;
 		tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK]).await?;
 		tx.batch_execute(
 			"CREATE TABLE IF NOT EXISTS arca_schema (

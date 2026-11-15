@@ -5,8 +5,9 @@
 //! A reader is handed the value held at once. When it is older than the
 //! reader allows, that reader is also handed the turn to read it again, in
 //! the background, and the next readers are handed the same value until the
-//! new one is put. Only the first reader, before anything was read, waits on
-//! the read. So a node that takes seconds to answer, or a table held by a
+//! new one is put. Before anything was read, the first reader is handed the
+//! read and the readers after it wait for what it puts: one read, however
+//! many wait. So a node that takes seconds to answer, or a table held by a
 //! long write, makes the value older, never the reader slower.
 
 use std::sync::Mutex;
@@ -20,6 +21,9 @@ pub const READ_GIVE_UP: Duration = Duration::from_secs(60);
 /// A value kept for readers that must not wait on its read.
 pub struct Fresh<T> {
 	state: Mutex<State<T>>,
+	/// Woken at each [`Fresh::put`], for the readers waiting on the first
+	/// read ([`Turn::Pending`]).
+	put: tokio::sync::Notify,
 }
 
 struct State<T> {
@@ -43,6 +47,9 @@ pub enum Turn<T> {
 	/// Nothing was read yet, or the value was dropped: this reader reads it
 	/// and puts it.
 	Empty,
+	/// Nothing was read yet, and another reader is reading it: this one
+	/// waits for the put ([`Fresh::next_put`]).
+	Pending,
 }
 
 impl<T: Clone> Default for Fresh<T> {
@@ -53,7 +60,7 @@ impl<T: Clone> Default for Fresh<T> {
 
 impl<T: Clone> Fresh<T> {
 	pub fn new() -> Fresh<T> {
-		Fresh { state: Mutex::new(State { value: None, reading: None }) }
+		Fresh { state: Mutex::new(State { value: None, reading: None }), put: tokio::sync::Notify::new() }
 	}
 
 	fn state(&self) -> std::sync::MutexGuard<'_, State<T>> {
@@ -63,7 +70,15 @@ impl<T: Clone> Fresh<T> {
 	/// What a reader that allows a value up to `max_age` old is handed.
 	pub fn turn(&self, max_age: Duration) -> Turn<T> {
 		let mut s = self.state();
-		let Some((at, v)) = s.value.as_ref() else { return Turn::Empty };
+		let Some((at, v)) = s.value.as_ref() else {
+			return match s.reading {
+				Some(since) if since.elapsed() < READ_GIVE_UP => Turn::Pending,
+				_ => {
+					s.reading = Some(Instant::now());
+					Turn::Empty
+				},
+			};
+		};
 		if at.elapsed() < max_age {
 			return Turn::Fresh(v.clone());
 		}
@@ -84,9 +99,23 @@ impl<T: Clone> Fresh<T> {
 
 	/// Keeps `v`, read now, and ends the read handed out.
 	pub fn put(&self, v: T) {
-		let mut s = self.state();
-		s.value = Some((Instant::now(), v));
-		s.reading = None;
+		{
+			let mut s = self.state();
+			s.value = Some((Instant::now(), v));
+			s.reading = None;
+		}
+		self.put.notify_waiters();
+	}
+
+	/// Waits for the next [`Fresh::put`], at most [`READ_GIVE_UP`]. It
+	/// counts from this call, not from the first poll: a put between the
+	/// call and the await is not missed.
+	pub fn next_put(&self) -> impl std::future::Future<Output = ()> + '_ {
+		let mut notified = Box::pin(self.put.notified());
+		notified.as_mut().enable();
+		async move {
+			let _ = tokio::time::timeout(READ_GIVE_UP, notified).await;
+		}
 	}
 
 	/// Drops the value: the next reader reads it ([`Turn::Empty`]).
@@ -105,6 +134,7 @@ mod tests {
 	fn a_stale_value_is_read_again_by_one_reader_alone() {
 		let f: Fresh<u32> = Fresh::new();
 		assert_eq!(f.turn(Duration::from_secs(5)), Turn::Empty, "nothing read yet");
+		assert_eq!(f.turn(Duration::from_secs(5)), Turn::Pending, "the next readers wait for the first read");
 		f.put(1);
 		assert_eq!(f.turn(Duration::from_secs(5)), Turn::Fresh(1));
 		assert_eq!(f.turn(Duration::ZERO), Turn::Stale(1), "the first reader past the age reads it again");
@@ -115,6 +145,7 @@ mod tests {
 		assert_eq!(f.peek(), Some(2));
 		f.clear();
 		assert_eq!(f.turn(Duration::ZERO), Turn::Empty, "a dropped value is read by the next reader");
+		assert_eq!(f.turn(Duration::ZERO), Turn::Pending);
 		assert_eq!(f.peek(), None);
 	}
 }

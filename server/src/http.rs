@@ -94,6 +94,9 @@ pub struct App {
 	/// Whether `holding_back` answers a request that proves no key
 	/// (`Config::holding_back_unauthenticated`).
 	pub holding_back_unauthenticated: bool,
+	/// How long `chain` serves the pool's flow before it reads it again
+	/// (`[limits] chain_pool_seconds`, [`POOL_FOR`] by default).
+	pub chain_pool_for: Duration,
 	/// Bounds the operator nonces handed out.
 	pub nonces: Limiter,
 	/// Bounds the witnesses answered: each reads the signer's record under
@@ -156,30 +159,152 @@ pub struct InfoParts {
 	pub owed: Arc<Fresh<Option<BTreeMap<[u8; 32], (u64, u64)>>>>,
 	/// What is in flight of each asset.
 	pub in_flight: Arc<Fresh<Option<BTreeMap<[u8; 32], u64>>>>,
+	/// `chain`'s reads of the database: the rounds waiting for finality and
+	/// the wallet's holdings ([`CHAIN_FOR`]), and each asset's pool flow
+	/// ([`POOL_FOR`]).
+	pub chain_waiting: Arc<Fresh<Kept<Vec<(elements::Txid, crate::chain::Finality)>>>>,
+	pub chain_holdings: Arc<Fresh<Kept<BTreeMap<AssetId, u64>>>>,
+	pub chain_pool: Arc<Fresh<Kept<BTreeMap<[u8; 32], crate::store::PoolFlow>>>>,
 }
 
-/// What `cell` holds, read again with `read` once older than `max_age`: in a
-/// task of its own when the cell holds a value, which is handed out
-/// meanwhile, so the caller never waits on the read; in this call only when
-/// nothing was read yet.
+/// Why one of `chain`'s reads failed: every database connection was in use
+/// for the pool's whole wait ([`crate::store::StoreError::Busy`]), or
+/// anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFailed {
+	Busy,
+	Other,
+}
+
+impl From<&RoundError> for ReadFailed {
+	fn from(e: &RoundError) -> ReadFailed {
+		match e {
+			RoundError::Store(s) => s.into(),
+			_ => ReadFailed::Other,
+		}
+	}
+}
+
+impl From<&crate::store::StoreError> for ReadFailed {
+	fn from(e: &crate::store::StoreError) -> ReadFailed {
+		if e.is_busy() { ReadFailed::Busy } else { ReadFailed::Other }
+	}
+}
+
+/// What `chain` keeps of one of its reads: the last value read and when,
+/// and why the latest read failed, when it did. A read that fails never
+/// takes the last good value's place: figures an operator or a script acts
+/// on (what the wallet holds, where the pool's value is) are shown as last
+/// read, with their age, never as empty.
+#[derive(Debug, Clone)]
+pub struct Kept<T> {
+	good: Option<(T, std::time::Instant)>,
+	failed: Option<ReadFailed>,
+}
+
+impl<T> Kept<T> {
+	/// The last value read and its age in seconds; when nothing was ever
+	/// read, the refusal `chain` answers with: `busy` (503, to be asked
+	/// again) only when the pool was busy, `internal` for any other failure.
+	fn figures(&self, what: &str) -> Result<(&T, u64), Refusal> {
+		match (&self.good, self.failed) {
+			(Some((v, at)), _) => Ok((v, at.elapsed().as_secs())),
+			(None, Some(ReadFailed::Busy)) => Err(Refusal::new(status_of("busy"), "busy",
+				format!("{} could not be read yet, the server is busy; try again in a moment", what))),
+			(None, _) => Err(Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal",
+				format!("{} could not be read; try again in a moment", what))),
+		}
+	}
+}
+
+/// How soon a read of `chain`'s that failed is tried again.
+pub const FAILED_FOR: Duration = Duration::from_secs(2);
+
+/// [`served`] for a read that can fail: a failed read keeps the last value
+/// read ([`Kept`]) and is tried again after [`FAILED_FOR`] at the latest.
+async fn kept<T, F, Fut>(cell: &Arc<Fresh<Kept<T>>>, max_age: Duration, read: F) -> Kept<T>
+where
+	T: Clone + Send + Sync + 'static,
+	F: FnOnce() -> Fut,
+	Fut: std::future::Future<Output = Result<T, ReadFailed>> + Send + 'static,
+{
+	let age = match cell.peek() {
+		Some(k) if k.failed.is_some() => max_age.min(FAILED_FOR),
+		_ => max_age,
+	};
+	let last = cell.clone();
+	served(cell, age, move || {
+		let read = read();
+		async move {
+			match read.await {
+				Ok(v) => Kept { good: Some((v, std::time::Instant::now())), failed: None },
+				Err(why) => Kept { good: last.peek().and_then(|k| k.good), failed: Some(why) },
+			}
+		}
+	}).await
+}
+
+/// How long `chain` publishes the rounds waiting for finality and the
+/// wallet's holdings before it reads them again.
+pub const CHAIN_FOR: Duration = Duration::from_secs(5);
+
+/// How long `chain` publishes the pool's flow before it reads it again: a
+/// statement over every live batch leaf, which takes a second or more on a
+/// large store, and whose figures move by the round.
+pub const POOL_FOR: Duration = Duration::from_secs(30);
+
+/// What `cell` holds, read again with `read` once older than `max_age`; a
+/// zero `max_age` reads it on every call, in a task of its own (tests only).
+/// Every read runs in a task of its own, never in the caller's: a caller that
+/// gives up (an HTTP client closing its connection drops the handler) never
+/// cuts a read off halfway, which would leave its statement running on a
+/// connection handed back to the pool. When the cell holds a value it is
+/// handed out at once and the read runs in the background; when nothing was
+/// read yet, the first caller's read is the one every caller waits for.
 async fn served<T, F, Fut>(cell: &Arc<Fresh<T>>, max_age: Duration, read: F) -> T
 where
 	T: Clone + Send + Sync + 'static,
 	F: FnOnce() -> Fut,
 	Fut: std::future::Future<Output = T> + Send + 'static,
 {
-	match cell.turn(max_age) {
-		Turn::Fresh(v) | Turn::Reading(v) => v,
-		Turn::Stale(v) => {
-			let (cell, read) = (cell.clone(), read());
-			tokio::spawn(async move { cell.put(read.await) });
-			v
-		},
-		Turn::Empty => {
-			let v = read().await;
+	if max_age.is_zero() {
+		let (cell, read) = (cell.clone(), read());
+		return match tokio::spawn(async move {
+			let v = read.await;
 			cell.put(v.clone());
 			v
-		},
+		}).await {
+			Ok(v) => v,
+			Err(e) => std::panic::resume_unwind(e.into_panic()),
+		};
+	}
+	let mut read = Some(read);
+	loop {
+		let next = cell.next_put();
+		match cell.turn(max_age) {
+			Turn::Fresh(v) | Turn::Reading(v) => return v,
+			Turn::Stale(v) => {
+				if let Some(read) = read.take() {
+					let (cell, read) = (cell.clone(), read());
+					tokio::spawn(async move { cell.put(read.await) });
+				}
+				return v;
+			},
+			Turn::Empty => {
+				// Handed the turn once per call at most: `read` is spent.
+				let Some(read) = read.take() else { continue };
+				let (cell, read) = (cell.clone(), read());
+				match tokio::spawn(async move {
+					let v = read.await;
+					cell.put(v.clone());
+					v
+				}).await {
+					Ok(v) => return v,
+					Err(e) => std::panic::resume_unwind(e.into_panic()),
+				}
+			},
+			Turn::Pending => next.await,
+		}
 	}
 }
 
@@ -440,10 +565,21 @@ impl Refusal {
 	}
 }
 
+/// How long a client asked to try again ([`StoreError::Busy`]) waits first,
+/// in seconds: the `Retry-After` of a `busy` refusal.
+///
+/// [`StoreError::Busy`]: crate::store::StoreError::Busy
+pub const BUSY_RETRY_AFTER: u64 = 2;
+
 impl IntoResponse for Refusal {
 	fn into_response(self) -> Response {
+		let busy = self.code == "busy";
 		let body = api::ErrorBody { error: api::ErrorDetail { code: self.code, message: self.message } };
-		(self.status, Json(body)).into_response()
+		let mut response = (self.status, Json(body)).into_response();
+		if busy {
+			response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(BUSY_RETRY_AFTER));
+		}
+		response
 	}
 }
 
@@ -462,6 +598,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"policy_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+		"busy" => StatusCode::SERVICE_UNAVAILABLE,
 		"signer_unavailable" | "not_synced" | "signer_replaced" | "rate_stale" | "lightning_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
 		"internal" => StatusCode::INTERNAL_SERVER_ERROR,
 		_ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -536,6 +673,12 @@ impl From<ForfeitError> for Refusal {
 
 impl From<RoundError> for Refusal {
 	fn from(e: RoundError) -> Refusal {
+		// `busy` for a busy pool alone: any other failure of the database is
+		// `internal`, which no wallet takes for a request to ask again.
+		if matches!(&e, RoundError::Store(s) if s.is_busy()) {
+			log::warn!("rounds: {}", e);
+			return Refusal::new(status_of("busy"), "busy", e.to_string());
+		}
 		log::error!("rounds: {}", e);
 		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
 	}
@@ -543,6 +686,10 @@ impl From<RoundError> for Refusal {
 
 impl From<crate::store::StoreError> for Refusal {
 	fn from(e: crate::store::StoreError) -> Refusal {
+		if e.is_busy() {
+			log::warn!("store: {}", e);
+			return Refusal::new(status_of("busy"), "busy", e.to_string());
+		}
 		log::error!("store: {}", e);
 		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the server's database failed")
 	}
@@ -745,10 +892,42 @@ async fn bond_info(app: &Arc<App>) -> Option<api::BondInfo> {
 async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainProgress>, Refusal> {
 	use crate::chain::Finality;
 	let p = app.rounds.finality().progress();
-	let waiting = app.rounds.waiting().await.map_err(|e| {
-		log::warn!("the rounds waiting for finality: {}", e);
-		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the rounds waiting for finality could not be read")
-	})?;
+	// Every read of the database below is served from memory, read again in
+	// the background once older than its age, and by one task however many
+	// ask: anyone may call `chain`, as often as it likes. A read that fails
+	// leaves the last one standing; before the first good read of a part
+	// the call is refused, never answered with empty figures.
+	let (chain_for, pool_for) = (CHAIN_FOR.min(app.chain_pool_for), app.chain_pool_for);
+	let a = app.clone();
+	let waiting = kept(&app.info_parts.chain_waiting, chain_for, move || async move {
+		a.rounds.waiting().await.map_err(|e| {
+			log::warn!("the rounds waiting for finality: {}", e);
+			ReadFailed::from(&e)
+		})
+	}).await;
+	let a = app.clone();
+	let holdings = kept(&app.info_parts.chain_holdings, chain_for, move || async move {
+		a.rounds.holdings().await.map_err(|e| {
+			log::warn!("the wallet's holdings: {}", e);
+			ReadFailed::from(&e)
+		})
+	}).await;
+	let a = app.clone();
+	let pool = kept(&app.info_parts.chain_pool, pool_for, move || async move {
+		a.store.pool_flow().await.map_err(|e| {
+			log::warn!("the pool's flow: {}", e);
+			ReadFailed::from(&e)
+		})
+	}).await;
+	let reads = api::ChainReads {
+		rounds_waiting_age_seconds: waiting.figures("the rounds waiting for finality")?.1,
+		holdings_age_seconds: holdings.figures("what the wallet holds")?.1,
+		pool_age_seconds: pool.figures("the pool's flow")?.1,
+		failed: [("rounds_waiting", waiting.failed), ("holdings", holdings.failed), ("pool", pool.failed)].into_iter()
+			.filter(|(_, f)| f.is_some()).map(|(n, _)| n.to_string()).collect(),
+	};
+	let (waiting, holdings, pool) = (waiting.good.map(|g| g.0).unwrap_or_default(), holdings.good.map(|g| g.0).unwrap_or_default(),
+		pool.good.map(|g| g.0).unwrap_or_default());
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
 	let waiting_on = if p.failing_passes > 0 || p.node_height.saturating_sub(p.height) >= crate::chain::finality::LAG_BLOCKS {
 		"follower"
@@ -767,8 +946,8 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 		anchor_ok: p.anchor_ok, mempool_behind: p.mempool_behind, failing_passes: p.failing_passes,
 		anchor_height: p.anchor_height, anchor_unchanged_seconds: if p.anchor_since > 0 { now.saturating_sub(p.anchor_since) } else { 0 },
 		waiting_on: waiting_on.into(),
-		holdings: app.rounds.holdings().await.map(|h| h.iter().map(|(a, v)| (a.to_string(), v.to_string())).collect()).unwrap_or_default(),
-		pool: app.store.pool_flow().await.map_err(|e| log::warn!("the pool's flow: {}", e)).unwrap_or_default().into_iter()
+		holdings: holdings.iter().map(|(a, v)| (a.to_string(), v.to_string())).collect(),
+		pool: pool.into_iter()
 			.map(|(a, f)| (AssetId::from_byte_array(a).to_string(), api::PoolFlowInfo {
 				locked: f.locked.to_string(), released: f.released.to_string(), reclaimable: f.reclaimable.to_string(),
 				transferred: f.transferred.to_string(),
@@ -779,6 +958,15 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 				net_drawn_last_hour: (f.drawn_last_hour as i128 - f.reclaimed_last_hour as i128 - f.swept_last_hour as i128).to_string(),
 			})).collect(),
 		rounds_waiting_count: waiting.len() as u64,
+		reads: Some(reads),
+		database_pool: Some({
+			let p = app.store.pool_status();
+			api::DatabasePoolInfo {
+				size: p.size, wait_ms: p.wait_ms, statement_timeout_ms: p.statement_timeout_ms, connections: p.connections, idle: p.idle,
+				gets: p.gets, waited: p.waited, timed_out: p.timed_out, wait_ms_total: p.wait_ms_total, closed_stuck: p.closed_stuck,
+				set_aside: p.set_aside, statements_cancelled: p.statements_cancelled, closed_broken: p.closed_broken, created: p.created,
+			}
+		}),
 		rounds_waiting: waiting.iter().take(20).map(|(t, f)| {
 			let (height, depth) = match f {
 				Finality::NotInChain => (None, None),
@@ -2513,5 +2701,102 @@ mod tests {
 		assert!(l.take(ip("2001:db8:1:2::ffff")).is_err());
 		assert!(l.take(ip("2001:db8:1:3::1")).is_err(), "another /64 of the same /48");
 		assert!(l.take(ip("2001:db8:2::1")).is_ok(), "another /48");
+	}
+
+	/// `chain`'s reads: one read however many callers find nothing read yet,
+	/// none while the value is fresh, and a read whose caller gives up runs
+	/// to its end.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn served_reads_once_for_every_caller_and_finishes_a_read_given_up() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		let cell: Arc<Fresh<u32>> = Arc::new(Fresh::new());
+		let reads = Arc::new(AtomicUsize::new(0));
+		let finished = Arc::new(AtomicUsize::new(0));
+		let read = |reads: Arc<AtomicUsize>, finished: Arc<AtomicUsize>| move || async move {
+			reads.fetch_add(1, Ordering::SeqCst);
+			tokio::time::sleep(Duration::from_millis(300)).await;
+			finished.fetch_add(1, Ordering::SeqCst);
+			7u32
+		};
+		// The first caller gives up halfway; sixteen more come meanwhile.
+		let first = {
+			let (c, r) = (cell.clone(), read(reads.clone(), finished.clone()));
+			tokio::spawn(async move { served(&c, Duration::from_secs(30), r).await })
+		};
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		first.abort();
+		let mut set = tokio::task::JoinSet::new();
+		for _ in 0..16 {
+			let (c, r) = (cell.clone(), read(reads.clone(), finished.clone()));
+			set.spawn(async move { served(&c, Duration::from_secs(30), r).await });
+		}
+		while let Some(v) = set.join_next().await {
+			assert_eq!(v.unwrap(), 7);
+		}
+		assert_eq!(reads.load(Ordering::SeqCst), 1, "one read for seventeen callers");
+		assert_eq!(finished.load(Ordering::SeqCst), 1, "the read its caller gave up ran to its end");
+		// Warm: answered from memory, nothing read.
+		for _ in 0..100 {
+			assert_eq!(served(&cell, Duration::from_secs(30), read(reads.clone(), finished.clone())).await, 7);
+		}
+		assert_eq!(reads.load(Ordering::SeqCst), 1, "no read while the value is fresh");
+	}
+
+	/// `chain`'s figures: a read that fails leaves the last good one
+	/// standing, with its age and the failure named; with nothing ever read
+	/// the call is refused, `busy` for a busy pool alone.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_failed_read_keeps_the_last_good_figures() {
+		let ok = |v: u32| move || async move { Ok::<u32, ReadFailed>(v) };
+		let fails = |why: ReadFailed| move || async move { Err::<u32, ReadFailed>(why) };
+		// Read on every call (as the tests' servers do).
+		let cell: Arc<Fresh<Kept<u32>>> = Arc::new(Fresh::new());
+		let k = kept(&cell, Duration::ZERO, ok(7)).await;
+		assert_eq!((k.figures("it").unwrap().0, k.failed), (&7, None));
+		let k = kept(&cell, Duration::ZERO, fails(ReadFailed::Other)).await;
+		assert_eq!((k.figures("it").unwrap().0, k.failed), (&7, Some(ReadFailed::Other)), "the last good value, and the failure");
+		let k = kept(&cell, Duration::ZERO, ok(8)).await;
+		assert_eq!((k.figures("it").unwrap().0, k.failed), (&8, None), "a good read takes its place again");
+
+		// Read in the background once older than its age.
+		let cell: Arc<Fresh<Kept<u32>>> = Arc::new(Fresh::new());
+		let age = Duration::from_millis(100);
+		assert_eq!(kept(&cell, age, ok(7)).await.figures("it").unwrap().0, &7);
+		tokio::time::sleep(Duration::from_millis(1100)).await;
+		// Stale: handed out as it is, the read that fails runs behind it.
+		let k = kept(&cell, age, fails(ReadFailed::Busy)).await;
+		assert_eq!(k.figures("it").unwrap().0, &7);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		let k = cell.peek().expect("kept");
+		let (v, old) = k.figures("it").unwrap();
+		assert_eq!((v, k.failed), (&7, Some(ReadFailed::Busy)), "still the last good value after the failed read");
+		assert!(old >= 1, "and its age says how old it is: {} s", old);
+
+		// Nothing ever read: an explicit refusal, never a default.
+		for (why, status, code) in [(ReadFailed::Busy, 503, "busy"), (ReadFailed::Other, 500, "internal")] {
+			let cell: Arc<Fresh<Kept<u32>>> = Arc::new(Fresh::new());
+			let k = kept(&cell, Duration::from_secs(30), fails(why)).await;
+			let refusal = k.figures("what the wallet holds").expect_err("no figures to show");
+			assert_eq!((refusal.status.as_u16(), refusal.code.as_str()), (status, code));
+			assert!(refusal.message.contains("what the wallet holds"), "{}", refusal.message);
+		}
+	}
+
+	/// `busy` is for a busy pool alone: any other failure of the database
+	/// is `internal`, which the wallet library does not send again.
+	#[test]
+	fn only_a_busy_pool_is_answered_busy() {
+		use crate::store::StoreError;
+		let busy = StoreError::Busy(Duration::from_secs(10));
+		let other = StoreError::Corrupt("x".into());
+		assert_eq!(Refusal::from(StoreError::Busy(Duration::from_secs(10))).status.as_u16(), 503);
+		assert_eq!(Refusal::from(StoreError::Corrupt("x".into())).code, "internal");
+		assert_eq!((ReadFailed::from(&busy), ReadFailed::from(&other)), (ReadFailed::Busy, ReadFailed::Other));
+		let r = Refusal::from(RoundError::Store(busy));
+		assert_eq!((r.status.as_u16(), r.code.as_str()), (503, "busy"));
+		let r = Refusal::from(RoundError::Store(other));
+		assert_eq!((r.status.as_u16(), r.code.as_str()), (500, "internal"));
+		let r = Refusal::from(RoundError::Chain("the node".into()));
+		assert_eq!((r.status.as_u16(), r.code.as_str()), (500, "internal"));
 	}
 }

@@ -115,6 +115,7 @@ pub enum OwedError {
 impl OwedError {
 	pub fn code(&self) -> &'static str {
 		match self {
+			OwedError::Store(e) if e.is_busy() => "busy",
 			OwedError::Unknown(_) => "unknown_leaf",
 			OwedError::Withdrawn(..) => "owed_withdrawn",
 			OwedError::Claimed(..) => "owed_claimed",

@@ -601,7 +601,7 @@ impl Store {
 	/// fill), is not among them.
 	pub async fn coin_lineage(&self, ids: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;
-		lineage_in(&*conn, ids).await
+		lineage_in(&**conn, ids).await
 	}
 
 	/// Strikes each coin of `ids` ([`Rounds`]' held-round back-off): each
@@ -638,7 +638,7 @@ impl Store {
 	/// they wait until. `None` when none is struck.
 	pub async fn strike_of(&self, ids: &[[u8; 32]]) -> Result<Option<(u32, u32)>, StoreError> {
 		let conn = self.conn().await?;
-		let lineage = lineage_in(&*conn, ids).await?;
+		let lineage = lineage_in(&**conn, ids).await?;
 		let ids: Vec<&[u8]> = lineage.iter().map(|i| &i[..]).collect();
 		let r = conn.query_one("SELECT MAX(strikes), MAX(until_mtp) FROM held_strike WHERE leaf_id = ANY($1)", &[&ids]).await?;
 		let n: Option<i32> = r.get(0);
@@ -650,7 +650,7 @@ impl Store {
 	/// a round with them went out.
 	pub async fn clear_strikes(&self, ids: &[[u8; 32]]) -> Result<u64, StoreError> {
 		let conn = self.conn().await?;
-		let lineage = lineage_in(&*conn, ids).await?;
+		let lineage = lineage_in(&**conn, ids).await?;
 		let ids: Vec<&[u8]> = lineage.iter().map(|i| &i[..]).collect();
 		Ok(conn.execute("DELETE FROM held_strike WHERE leaf_id = ANY($1)", &[&ids]).await?)
 	}

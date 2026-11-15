@@ -1355,14 +1355,20 @@ impl Rounds {
 	/// block of the active chain. A round's change is held from the block it is in; `fundable`
 	/// counts it only once it is final.
 	pub async fn holdings(&self) -> Result<BTreeMap<AssetId, u64>, RoundError> {
-		self.wallet.holdings().await.map_err(|e| RoundError::Chain(e.to_string()))
+		self.wallet.holdings().await.map_err(|e| match e {
+			crate::wallet::WalletError::Store(s) => RoundError::Store(s),
+			e => RoundError::Chain(e.to_string()),
+		})
 	}
 
 	pub async fn waiting(&self) -> Result<Vec<(Txid, crate::chain::Finality)>, RoundError> {
 		let mut out = vec![];
 		for r in self.store.rounds_in(RoundState::Broadcast).await? {
 			let txid = Txid::from_byte_array(r.txid);
-			out.push((txid, self.finality.status(&txid).await.map_err(|e| RoundError::Chain(e.to_string()))?));
+			out.push((txid, self.finality.status(&txid).await.map_err(|e| match e {
+				crate::chain::finality::FinalityError::Store(s) => RoundError::Store(s),
+				e => RoundError::Chain(e.to_string()),
+			})?));
 		}
 		Ok(out)
 	}

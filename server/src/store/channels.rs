@@ -182,7 +182,7 @@ impl Store {
 	/// The latest state of channel `leaf` past its opening, signed or not.
 	pub async fn channel_latest(&self, leaf: &[u8; 32]) -> Result<Option<ChannelStateRow>, StoreError> {
 		let conn = self.conn().await?;
-		latest_state(&*conn, leaf).await
+		latest_state(&**conn, leaf).await
 	}
 
 	/// The latest signed state of channel `leaf` past its opening.
@@ -224,7 +224,7 @@ impl Store {
 	/// The highest credit note of channel `leaf`, signed or not.
 	pub async fn channel_note(&self, leaf: &[u8; 32]) -> Result<Option<ChannelNoteRow>, StoreError> {
 		let conn = self.conn().await?;
-		latest_note(&*conn, leaf).await
+		latest_note(&**conn, leaf).await
 	}
 
 	/// The highest signed credit note of channel `leaf`.

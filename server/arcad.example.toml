@@ -73,6 +73,22 @@ checkpoint_exit = false
 # other. The served assets, in the order listed below, when absent.
 # fee_assets = ["<asset id>"]
 
+# The database's connection pool. A task that cannot get a connection within
+# the wait is refused, and an HTTP request answered `busy` (503, with a
+# Retry-After), never 500. A statement running longer than the limit is
+# cancelled by PostgreSQL and its transaction rolled back, named in the log
+# and counted; migrations and the start-up rewrite after a restore run
+# without it, and it never ends a COMMIT's wait for a synchronous standby. A
+# connection handed back with a statement still running on it (its caller
+# gone) is set aside at its next checkout, never cancelled, and closed once
+# the statement ends; it keeps its place of `size` until then, so `size` is
+# the most connections the server ever holds. `chain` reports the pool's use
+# (`database_pool`).
+[database_pool]
+size = 32
+wait_seconds = 10
+statement_timeout_seconds = 30
+
 [node]
 # sequentiad, with -txindex and -validateanchor.
 rpc_url = "http://127.0.0.1:18884/"
@@ -161,6 +177,12 @@ read_per_second = 500
 read_burst = 2000
 read_source_per_second = 10
 read_source_burst = 200
+# How long `chain` serves the pool's flow it read from the database before it
+# reads it again, in seconds (the rounds waiting and the wallet's holdings at
+# most every 5 s, or this when it is less): anyone may call `chain`, and it
+# reads the database at this pace whoever calls it. 0 reads them on every
+# call, for tests only.
+chain_pool_seconds = 30
 # The reverse proxies in front of the server: a request from one of these
 # addresses is counted against the address its X-Forwarded-For names (the
 # proxy appends the address that connected to it), any other request against
