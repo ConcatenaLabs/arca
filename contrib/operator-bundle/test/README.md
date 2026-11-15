@@ -106,3 +106,20 @@ so every exit runs to its claim in the run.
 
 `timing-proxy.py` is the reverse proxy the load test puts between the
 wallets and the operator, to time each call the operator answers.
+
+## The price server and the node's fee whitelist
+
+`price-server.sh` configures the bundle's price server and Sequentia node with
+`install.sh`'s own functions, in a throwaway Ubuntu 24.04 container, and runs
+them on a regtest chain as the bundle's user, with a stand-in price feed and
+asset registry:
+
+    SEQUENTIA=<a Sequentia Core build or checkout> contrib/operator-bundle/test/price-server.sh
+
+For a node that reads a price server (`-feepriceserver`) it checks that the
+price server holds no login to the node and publishes on loopback at
+`PRICE_SERVER_PORT`, that the node is connected to it and holds the feed's
+assets in a dynamic whitelist, and that the node keeps that list while the
+price server is down and across its own restart. For a node without that
+option it checks that the price server writes the list with the node's
+cookie. Either way, configuring a second time changes nothing.

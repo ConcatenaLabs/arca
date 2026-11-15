@@ -64,6 +64,7 @@ fi
 : "${SEQ_RPC_PORT:=18884}" "${SEQ_P2P_PORT:=18885}" "${BTC_RPC_PORT:=48332}" "${BTC_P2P_PORT:=48333}" "${FEE_PROXY_PORT:=48342}"
 : "${PG_PORT:=5433}" "${ARCAD_PORT:=3535}" "${ARCAD_METRICS_PORT:=3536}" "${SEQLN_PORT:=9835}" "${CLN_PORT:=9935}"
 : "${CLN_GRPC_PORT:=9937}" "${HOLD_GRPC_PORT:=9938}" "${CAPTAIND_PORT:=3545}" "${CAPTAIND_ADMIN_PORT:=3546}" "${CAPTAIND_INTEGRATION_PORT:=3547}"
+: "${PRICE_SERVER_PORT:=18890}"
 # A test chain (README: "A rehearsal on test chains"): the custom chain's
 # consensus settings, one per line; a node each chain's node connects to; and
 # the anchor's parent node, when it is not this bundle's Bitcoin node.
@@ -103,13 +104,26 @@ export CARGO_HOME=$CACHE/toolchain/cargo RUSTUP_HOME=$CACHE/toolchain/rustup
 export PATH=$CARGO_HOME/bin:$PATH
 export CARGO_BUILD_JOBS=$BUILD_JOBS CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=symbols
 U() { printf '%s-%s.service' "$NAME" "$1"; }
-# Where the node's fee rates come from: the node's own price server, reading a
-# public price feed and the asset registry. The public testnet's by default
-# there; on another chain none, and the operator sets the rates himself
-# (sequentia-cli setfeeexchangerates).
+# Where the node's fee rates come from: the bundle's own price server, reading
+# a public price feed and the asset registry. It publishes its list on
+# loopback, at PRICE_SERVER_PORT, and the node is connected to it and reads
+# that list: the node's fee whitelist is dynamic. The public testnet's feed by
+# default there; on another chain none, and the operator writes the list by
+# hand (sequentia-cli setfeeexchangerates): a static whitelist.
 [ "$SEQ_CHAIN" = test ] && : "${PRICE_FEED_URL:=http://sequentiatestnet.com/prices}"
 [ "${PRICE_FEED_URL:-}" = none ] && PRICE_FEED_URL=""
 : "${PRICE_FEED_URL:=}" "${ASSET_REGISTRY_INDEX:=http://sequentiatestnet.com/registry/index.minimal.json}"
+PRICE_SERVER_LIST=http://127.0.0.1:$PRICE_SERVER_PORT/feewhitelist
+# Whether the installed Sequentia Core reads a price server's published list
+# (-feepriceserver). A release without it has its price server write the list
+# into the node over RPC instead, with the node's cookie.
+# The help is read whole first: grep -q leaving the pipe early would fail the
+# pipeline under pipefail (SIGPIPE).
+node_reads_price_server() { local h; h=$("$OPT/sequentia/bin/sequentiad" -help 2>/dev/null) || true; grep -q -- '-feepriceserver=' <<<"$h"; }
+price_server_cmd() {
+  printf '%s' "/usr/bin/python3 -I $OPT/sequentia/price-server/price_server.py --config $LIB/price-server.json"
+  if node_reads_price_server; then printf ' --ui-host 127.0.0.1 --ui-port %s' "$PRICE_SERVER_PORT"; fi
+}
 UNITS="bitcoind feeproxy sequentiad $( [ -n "$PRICE_FEED_URL" ] && echo priceserver ) arca-signer arcad seqln cln captaind watchmand${PEER_ARCA_URL:+ watchtower} btc-watchtower"
 # PostgreSQL names a cluster's unit postgresql@<version>-<cluster>, where a dash
 # in the cluster name would read as a path: the cluster takes underscores.
@@ -275,6 +289,16 @@ mainchainrpcport=$BTC_RPC_PORT
 mainchainrpcuser=$NAME
 mainchainrpcpassword=$(cat "$ETC/btc-rpc.password")"
 fi
+fee_list_conf=""
+if [ -n "$PRICE_FEED_URL" ] && node_reads_price_server; then
+  fee_list_conf="# The fee whitelist is the list the bundle's own price server publishes:
+# the node reads it at start and every minute, and keeps the last one while
+# the price server is down.
+feepriceserver=$PRICE_SERVER_LIST"
+elif node_reads_price_server; then
+  fee_list_conf="# No price server: the fee whitelist is written by hand (setfeeexchangerates).
+nofeepriceserver=1"
+fi
 testnet_rules=""; [ "$SEQ_CHAIN" = test ] && testnet_rules="# The public testnet's network-wide rules.
 pospubliccommittee=1
 poscommitteesize=250"
@@ -308,6 +332,7 @@ rpccookieperms=group
 rpcauth=$(cat "$ETC/seq-rpcauth")
 debuglogfile=$LOG/sequentiad.log
 shrinkdebugfile=0
+$fee_list_conf
 EOF
 write_conf cln 640 "$LIB/cln/config" <<EOF
 # The Bitcoin gateway: Core Lightning with the hold-invoice plugin, driven by
@@ -358,15 +383,21 @@ log-level=info
 rpc-file-mode=0660
 EOF
 if [ -n "$PRICE_FEED_URL" ]; then
-  # The node's own price server (it comes with Sequentia Core): its example
-  # configuration, pointed at this node, the feed and the registry.
+  # The bundle's own price server (it comes with Sequentia Core): its example
+  # configuration, pointed at the feed and the registry. It holds no login to
+  # the node, which reads its list; a release whose node does not read one
+  # has the price server write it with the node's cookie.
+  node_rpc=""; node_reads_price_server || node_rpc="$LIB/sequentia/$SEQ_SUB/.cookie"
   write_conf priceserver 640 "$LIB/price-server.json" < <(python3 -I -c '
 import json, sys
 c = json.load(open(sys.argv[1]))
-c["node_rpc"] = {"host": "127.0.0.1", "port": int(sys.argv[2]), "cookie": sys.argv[3]}
-c["source"]["url"] = sys.argv[4]
-c["registry_url"] = sys.argv[5]
-print(json.dumps(c, indent=2))' "$OPT/sequentia/price-server/config.example.json" "$SEQ_RPC_PORT" "$LIB/sequentia/$SEQ_SUB/.cookie" "$PRICE_FEED_URL" "$ASSET_REGISTRY_INDEX")
+for key in ("node_rpc", "node_rpcs", "clear_whitelist_on_shutdown"):
+    c.pop(key, None)
+if sys.argv[5]:
+    c["node_rpc"] = {"host": "127.0.0.1", "port": int(sys.argv[4]), "cookie": sys.argv[5]}
+c["source"]["url"] = sys.argv[2]
+c["registry_url"] = sys.argv[3]
+print(json.dumps(c, indent=2))' "$OPT/sequentia/price-server/config.example.json" "$PRICE_FEED_URL" "$ASSET_REGISTRY_INDEX" "$SEQ_RPC_PORT" "$node_rpc")
 fi
 }
 
@@ -727,7 +758,7 @@ for u in $UNITS caddy; do
   cg=$(systemctl show -p ControlGroup --value "$(U "$u")" 2>/dev/null || true)
   if [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/cgroup.procs" ]; then mine+="$(tr '\n' ' ' < "/sys/fs/cgroup$cg/cgroup.procs")"; fi
 done
-for port in $SEQ_RPC_PORT $SEQ_P2P_PORT $BTC_RPC_PORT $BTC_P2P_PORT $FEE_PROXY_PORT $PG_PORT $ARCAD_PORT $ARCAD_METRICS_PORT \
+for port in $SEQ_RPC_PORT $SEQ_P2P_PORT $BTC_RPC_PORT $BTC_P2P_PORT $FEE_PROXY_PORT $PG_PORT $ARCAD_PORT $ARCAD_METRICS_PORT $PRICE_SERVER_PORT \
             $SEQLN_PORT $CLN_PORT $CLN_GRPC_PORT $HOLD_GRPC_PORT $CAPTAIND_PORT $CAPTAIND_ADMIN_PORT $CAPTAIND_INTEGRATION_PORT $WATCHTOWER_PORT $BTC_WATCHTOWER_PORT; do
   l=$(ss -ltnpH "sport = :$port" 2>/dev/null || true)
   [ -n "$l" ] || continue
@@ -1005,8 +1036,9 @@ unit sequentiad "Sequentia Core" "$(U bitcoind)" "$OPT/sequentia/bin/sequentiad 
   "TimeoutStopSec=600
 $RUNDIR"
 if [ -n "$PRICE_FEED_URL" ]; then
-  unit priceserver "the node's price server: its fee rates from the price feed" "$(U sequentiad)" \
-    "/usr/bin/python3 -I $OPT/sequentia/price-server/price_server.py --config $LIB/price-server.json" "$RUNDIR"
+  ps_after=""; node_reads_price_server || ps_after=$(U sequentiad)
+  unit priceserver "the price server: the fee whitelist the node reads, from the price feed" "$ps_after" \
+    "$(price_server_cmd)" "$RUNDIR"
 fi
 unit arca-signer "the Arca signer: holds the operator key" "" \
   "$BIN/arca-signer --key-file $ETC/operator.key --genesis \${ARCA_GENESIS} --socket /run/$NAME/signer.sock --record $LIB/arca/signer.record" \
@@ -1056,7 +1088,7 @@ step "the ports, kept from the kernel's ephemeral ports"
 # reserved (the union with any other bundle's, in one file).
 f=/etc/sysctl.d/60-arca-bundles.conf
 have=""; [ -f "$f" ] && have=$(sed -n 's/^net.ipv4.ip_local_reserved_ports *= *//p' "$f" | tr ',' ' ')
-want=$(printf '%s\n' $have $SEQ_RPC_PORT $SEQ_P2P_PORT $BTC_RPC_PORT $BTC_P2P_PORT $FEE_PROXY_PORT $PG_PORT $ARCAD_PORT $ARCAD_METRICS_PORT \
+want=$(printf '%s\n' $have $SEQ_RPC_PORT $SEQ_P2P_PORT $BTC_RPC_PORT $BTC_P2P_PORT $FEE_PROXY_PORT $PG_PORT $ARCAD_PORT $ARCAD_METRICS_PORT $PRICE_SERVER_PORT \
   $SEQLN_PORT $CLN_PORT $CLN_GRPC_PORT $HOLD_GRPC_PORT $CAPTAIND_PORT $CAPTAIND_ADMIN_PORT $CAPTAIND_INTEGRATION_PORT $WATCHTOWER_PORT $BTC_WATCHTOWER_PORT | sort -n -u | paste -sd, -)
 printf '# Ports the Arca operator bundles on this machine listen on (install.sh).\nnet.ipv4.ip_local_reserved_ports = %s\n' "$want" > "$f.new"
 mv "$f.new" "$f"
@@ -1070,17 +1102,21 @@ restart_if feeproxy fee-proxy.py
 say "$(btc_cli getblockchaininfo | jq -r '"\(.chain): \(.blocks) of \(.headers) blocks, \(.verificationprogress * 100 | floor)% verified"')"
 
 step "the Sequentia node"
+# The price server first, when the node reads it: its list is there to read
+# as the node starts.
+if [ -n "$PRICE_FEED_URL" ] && node_reads_price_server; then restart_if priceserver; fi
 restart_if sequentiad
 WAIT_UNIT=$(U sequentiad) wait_for 300 "the Sequentia node answering" seq_cli getblockchaininfo
 GENESIS=$(seq_cli getblockhash 0)
 say "$(seq_cli getblockchaininfo | jq -r '"\(.chain): \(.blocks) of \(.headers) blocks"'), genesis $GENESIS"
 write_conf arca-signer 640 "$ETC/signer.env" < <(printf 'ARCA_GENESIS=%s\n' "$GENESIS")
 if [ -n "$PRICE_FEED_URL" ]; then
-  restart_if priceserver sequentiad
+  node_reads_price_server || restart_if priceserver sequentiad
   # The rates the gateway opens its channels with and arcad values each asset
-  # at. A price server that stops clears the node's whole list, so after its
-  # restart the node takes no fee at all until its first publish (the feed and
-  # the registry read first): up to a few minutes.
+  # at. A node keeps the last list it read while its price server restarts; a
+  # fresh one takes no fee at all until the price server's first list (the
+  # feed and the registry read, and a second round for the price-jump rule):
+  # up to a few minutes.
   for ((i = 0; i < 360; i++)); do
     r=$(node_rates); missing=""
     for id in "${ASSET_IDS[@]}"; do jq -e --arg a "$id" 'has($a)' <<<"$r" >/dev/null || missing+=" ${id:0:12}…"; done

@@ -88,9 +88,12 @@ sequentiad)
   run_as "$OPT/sequentia/bin/sequentiad" -conf="$ETC/sequentia.conf" -datadir="$LIB/sequentia" -daemon=0 -printtoconsole=1
   ;;
 priceserver)
-  [ -n "$PRICE_FEED_URL" ] || { echo "priceserver: no PRICE_FEED_URL, so the node's fee rates are the operator's own (setfeeexchangerates)"; exec sleep infinity; }
-  until_up "the Sequentia node" seq_cli getblockchaininfo
-  run_as /usr/bin/python3 -I "$OPT/sequentia/price-server/price_server.py" --config "$LIB/price-server.json"
+  [ -n "$PRICE_FEED_URL" ] || { echo "priceserver: no PRICE_FEED_URL, so the node's fee whitelist is the operator's own, written by hand (setfeeexchangerates)"; exec sleep infinity; }
+  # The node reads this server's list; a release whose node does not has the
+  # server write to it, which waits for the node.
+  node_reads_price_server || until_up "the Sequentia node" seq_cli getblockchaininfo
+  # shellcheck disable=SC2046
+  run_as $(price_server_cmd)
   ;;
 seqln)
   until_up "the Sequentia node" seq_cli getblockchaininfo
