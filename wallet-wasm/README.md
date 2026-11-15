@@ -425,11 +425,15 @@ spends nothing it does not have to on reading the chain again.
   never answered), each repeat a hand-over of its own. The forfeits of a round
   take theirs before the wallet marks them signed, and then only local work
   lies before their post. The other signatures that commit the wallet to
-  something (a plan and its cancellation, a withdrawal or a decline of a participation,
-  a payment asked over Lightning, a claim, a mailbox binding) are handed over
-  the same way. Without that witness nothing is posted, and what would
+  something (a plan and its cancellation, a withdrawal or a decline of a
+  participation, a payment asked over Lightning, a claim, a mailbox binding)
+  are handed over the same way. Without that witness nothing is posted, and what would
   have been handed over stands for the next `sync`, as a post the operator
-  never answered does. Authentication proofs are outside the rule: the
+  never answered does. A witness that fails, or that finds the operator's
+  signer's record rolled back, leaves no earlier one standing either, however
+  recent: the next step asks the operator again before it starts, and after a
+  rollback the next `sync` says it and takes on the chain the coins that rest
+  on it. Authentication proofs are outside the rule: the
   signatures over the operator's challenge that a mailbox read, a leaf read,
   an owed lookup or a `holding_back` read carries prove which key asks, and
   authorize nothing but that read's answer.

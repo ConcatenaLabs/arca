@@ -51,7 +51,9 @@
 //! pass's work with the operator: no request leaves after it, nothing is
 //! handed to the operator, what is left of the pass runs to its end in the
 //! same call as it does when the operator cannot be reached, and the pass
-//! says why (`unreachable`).
+//! says why (`unreachable`). No witness from before it stands after it, in
+//! this pass or the next: the next one asks the operator again, and when the
+//! witness found the signer's record rolled back, acts on that.
 //!
 //! What a step asks the operator before its items is kept with the resume
 //! point only where a stale answer can cost the wallet nothing. Which coins

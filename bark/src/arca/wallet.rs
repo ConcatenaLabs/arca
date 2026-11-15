@@ -183,7 +183,9 @@ pub struct Wallet {
 	/// What witnessing the operator's signer's record found, and when
 	/// ([`Wallet::witness`]): once a command, again after [`WITNESS_FOR`] in
 	/// a process that runs longer, and anew at each hand-over
-	/// ([`Wallet::witnessed_anew`]).
+	/// ([`Wallet::witnessed_anew`]). Only the last one asked is kept: a
+	/// success, or a rollback with its exits, never a success from before a
+	/// witness that failed or found a rollback.
 	pub(crate) witnessed: std::cell::RefCell<Option<(web_time::Instant, Value)>>,
 	/// How long `sync` keeps trying to reach the operator, with back-off,
 	/// before it takes it for unreachable ([`WITNESS_PATIENCE`] unless set).
@@ -1410,8 +1412,12 @@ impl Wallet {
 	}
 
 	/// Keeps the rollback found, `why`, the record agreeing with the wallet
-	/// up to entry `at`: the lowest such entry found stands.
+	/// up to entry `at`: the lowest such entry found stands. A witness kept
+	/// as succeeded stands no more ([`Self::witness_fell`]), so the wallet's
+	/// next [`Self::witness`] asks, and takes on the chain what rests on the
+	/// rollback.
 	fn found_rollback(&self, at: u64, why: &str) -> Result<(), Error> {
+		self.witness_fell();
 		let prior = self.rolled_back()?;
 		let at = prior.as_ref().map_or(at, |(was, _)| (*was).min(at));
 		if prior.is_some_and(|(was, w)| was == at && w == why) {
@@ -1565,7 +1571,10 @@ impl Wallet {
 	/// whatever the age of the last one, and judged as [`Self::witnessed_now`]
 	/// judges one: what every hand-over of a signature runs last
 	/// ([`Self::hand_over`]), with nothing but local work between its answer
-	/// and the post.
+	/// and the post. When it fails or finds a rollback, no earlier witness
+	/// stands either: the next step that would start on one asks again, and
+	/// the wallet's next [`Self::witness`] takes on the chain what rests on
+	/// the rollback.
 	pub(crate) fn witnessed_anew(&self) -> Result<(), Error> {
 		self.witnessed_by(false)
 	}
@@ -1650,9 +1659,24 @@ impl Wallet {
 	}
 
 	/// Whether a witness of the operator's signer's record succeeded within
-	/// [`WITNESS_FOR`] in this process and found no rollback: asks nothing.
+	/// [`WITNESS_FOR`] in this process and found no rollback, and none asked
+	/// since failed or found one ([`Self::witness_fell`]): asks nothing.
 	pub(crate) fn witness_stands(&self) -> bool {
 		self.witnessed.borrow().as_ref().is_some_and(|(at, v)| at.elapsed() < WITNESS_FOR && v["rolled_back"].is_null())
+	}
+
+	/// A witness kept as succeeded stands no more: the operator is asked
+	/// again, or a rollback of its signer's record was found. Whatever the
+	/// kept one's age, what comes after it decides: a witness that succeeds
+	/// is kept in its place, and one that fails or finds a rollback leaves
+	/// none, so the next step asks, and the next [`Self::witness`] acts on
+	/// the rollback. A rollback kept with its exits stays as it is: it is
+	/// what the wallet says of the operator until it witnesses again.
+	fn witness_fell(&self) {
+		let mut kept = self.witnessed.borrow_mut();
+		if kept.as_ref().is_some_and(|(_, v)| v["rolled_back"].is_null()) {
+			*kept = None;
+		}
 	}
 
 	/// The witness itself ([`Self::witness`]), without acting on a
@@ -1664,7 +1688,9 @@ impl Wallet {
 	}
 
 	/// [`Self::witness_check`], asking the operator even while the last
-	/// witness stands unless `reuse`.
+	/// witness stands unless `reuse`. Once the operator is asked, a witness
+	/// kept as succeeded stands no more ([`Self::witness_fell`]): only this
+	/// one's success keeps one again.
 	fn witness_ask(&self, reuse: bool) -> Result<Value, Error> {
 		if reuse {
 			if let Some((at, v)) = self.witnessed.borrow().as_ref() {
@@ -1673,6 +1699,7 @@ impl Wallet {
 				}
 			}
 		}
+		self.witness_fell();
 		let held = self.store.seen_heads()?;
 		let mut ask: Vec<(u64, String, Option<String>)> = vec![];
 		// The signer answers few heads without its signature, which prove

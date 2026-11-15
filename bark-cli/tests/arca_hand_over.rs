@@ -17,6 +17,10 @@
 //!    of the channel.
 //! 5. A plan, after its quote.
 //!
+//! And what a witness that fails at a hand-over leaves behind: none stands
+//! after it, so the next sync on the same wallet, at once, asks the operator
+//! for a witness before anything else.
+//!
 //! Needs `SEQUENTIAD_EXEC`, `ARCA_TEST_POSTGRES` and `arca-signer` (see
 //! `tests/common/mod.rs`).
 
@@ -372,4 +376,75 @@ async fn no_plan_is_submitted_when_the_witness_fails_at_its_quote() {
 	assert_eq!(count(&calls, "/v1/submit_plan"), 0, "the plan was handed over after the witness started failing: {:?}", calls);
 	assert!(failed_witness(&calls), "the wallet did not witness again before the hand-over: {:?}", calls);
 	let _ = std::fs::remove_dir_all(&w.dir);
+}
+
+/// A's forfeits are refused their witness, as above, on a wallet kept open:
+/// the witness its sync began on had succeeded a moment before. No witness
+/// stands after the failure: the next sync, at once and with the witness
+/// still failing, asks the operator for a witness first and starts no work
+/// with it. (Its one other call is the read of `info` for the watchtowers'
+/// list, which the deposits step makes on no witness whenever the operator's
+/// signer cannot be witnessed: it carries nothing of the wallet's.)
+#[tokio::test(flavor = "multi_thread")]
+async fn no_witness_stands_after_one_failed_at_a_hand_over() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x;
+	r.fund_server(x, 100_000_000).await;
+	let url = r.url();
+	let p = Proxy::start(&url);
+	let (a, d) = (Arca::new("hand-over failed witness A"), Arca::new("hand-over failed witness D"));
+	boarded(&mut r, &a, &p.url, x, 2_000_000).await;
+	boarded(&mut r, &d, &url, x, 2_000_000).await;
+	for w in [&a, &d] {
+		w.ok(&["participate"]);
+	}
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.len(), 1);
+	assert!(failed.is_empty());
+	assert!(built[0].broadcast.starts_with("held"), "{}", built[0].broadcast);
+	let mut w = Wallet::open(&a.dir).expect("open the wallet");
+	// One try of the witness as a sync starts, no waiting on a server down.
+	w.witness_patience = Duration::ZERO;
+	let sync = |w: &mut Wallet| -> Value {
+		tokio::task::block_in_place(|| command::run(w, "sync", &json!({}))).map(|v| v["result"].clone()).expect("sync answers")
+	};
+	let before = p.calls().len();
+	p.rewrite(Some(then_no_witness(&p, "/v1/tree", None)));
+	let started = std::time::Instant::now();
+	let first = sync(&mut w);
+	let calls = calls_since(&p, before);
+	let between = p.calls().len();
+	let gap = started.elapsed();
+	let second = sync(&mut w);
+	let later = calls_since(&p, between);
+	println!("failed witness: the first sync's calls {:?}; unreachable {}", calls, first["unreachable"]);
+	// The steps of the second sync that asked the operator anything.
+	let asked: Vec<&String> = second["cost_by_step"].as_object().into_iter().flatten()
+		.filter(|(_, c)| c["operator"].as_u64().unwrap_or(0) > 0).map(|(step, _)| step).collect();
+	println!("failed witness: the second sync {} ms after the first began; its calls {:?}, made by the steps {:?}; witness {}",
+		gap.as_millis(), later, asked, second["witness"]);
+	p.lose("/v1/witness", false);
+	p.rewrite(None);
+	assert_eq!(count(&calls, "/v1/forfeit_leaves") + count(&later, "/v1/forfeit_leaves"), 0, "a forfeit was handed over: {:?} {:?}",
+		calls, later);
+	assert!(first["witness"]["error"].is_null(), "the first sync began on a witness that succeeded: {}", first["witness"]);
+	assert!(failed_witness(&calls), "the forfeits' witness failed in the first sync: {:?}", calls);
+	assert_eq!(later.first().map(|(path, _)| path.as_str()), Some("/v1/witness"),
+		"the next sync took the witness from before the failure as standing: {:?}", later);
+	assert!(later.iter().all(|(path, status)| (path == "/v1/witness" && *status == 502) || path == "/v1/info"),
+		"the next sync worked with the operator on no witness: {:?}", later);
+	assert!(asked.iter().all(|step| ["witness", "deposits", "owed deposits"].contains(&step.as_str())),
+		"a step other than the witness and the deposits asked the operator: {:?}", asked);
+	assert!(second["witness"]["error"].is_string(), "the next sync says a witness it did not get: {}", second["witness"]);
+	// The witness back: the forfeits go.
+	let third = sync(&mut w);
+	assert!(common::cli::handed_over(&third), "{}", third);
+	drop(w);
+	for w in [&a, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
 }

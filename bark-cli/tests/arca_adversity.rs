@@ -8012,3 +8012,102 @@ async fn pv1_fix_a_coin_whose_path_a_final_spend_cut_is_refused() {
 	assert_eq!(again["waiting"], json!([]), "{}", again);
 	cleanup(&l);
 }
+
+/// The operator is put back to a copy of its database and its signer's
+/// record while the answer to A's read of a published tree is on its way: the
+/// witness A takes anew for its forfeits finds the rollback, and no forfeit
+/// leaves. The witness A took as that sync started had succeeded and still
+/// stands by its age when the next sync runs, on the same wallet kept open;
+/// that sync must say the rollback all the same, and take on the chain the
+/// coin a transfer recorded after the copy made. (The case bites while the
+/// restore takes less than the time a witness stands; the time from the
+/// first sync's start to the second's is printed.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_found_at_a_hand_over_is_acted_on_by_the_next_sync() {
+	let mut r = Running::start_with(|c, _, _| {
+		c.batches.no_sweep = true;
+		c.batches.delegated_reclaim = true;
+		c.batches.holder_batches = Some(0);
+	}).await;
+	let x = r.x;
+	r.fund_server(x, 100_000_000).await;
+	let url = r.url();
+	let p = Proxy::start(&url);
+	let (a, d) = (Arca::new("hand-over rollback A"), Arca::new("hand-over rollback D"));
+	boarded(&mut r, &a, &p.url, &[(x, 2_000_000)]).await;
+	boarded(&mut r, &d, &url, &[(x, 3_000_000)]).await;
+	let board = a.ok(&["boards"])[0]["leaf_id"].as_str().unwrap().to_string();
+	let backup = Backup::take(&mut r).await;
+	// A transfer after the copy: a head of the record, signed, that the
+	// restore loses, and a coin the rollback takes on the chain.
+	let request = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let paid = d.ok(&["send", &request, "--amount", "300000", "--asset", &x.to_string()]);
+	let d_change = paid["transfer"]["kept"][0]["leaf_id"].as_str().unwrap().to_string();
+	let transfer = a.ok(&["mailbox"])["accepted"][0]["leaf_id"].as_str().unwrap().to_string();
+	for (w, leaf) in [(&a, &board), (&d, &d_change)] {
+		w.ok(&["participate", "--leaf", leaf]);
+	}
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert_eq!(built.len(), 1);
+	assert!(failed.is_empty());
+	assert!(built[0].broadcast.starts_with("held"), "{}", built[0].broadcast);
+	let before = p.calls().len();
+	// The first answer to a read of the tree waits in the proxy until the
+	// operator is restored.
+	let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+	let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+	let (held, once) = (gate.clone(), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+	p.rewrite(Some(Arc::new(move |path, _, _, _| {
+		if path == "/v1/tree" && !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+			seen_tx.send(()).unwrap();
+			let (lock, cv) = &*held;
+			let mut open = lock.lock().unwrap();
+			while !*open {
+				open = cv.wait(open).unwrap();
+			}
+		}
+		None
+	})));
+	let dir = a.dir.clone();
+	let q = p.clone();
+	let syncing = std::thread::spawn(move || {
+		let mut w = bark::arca::Wallet::open(&dir).expect("open the wallet");
+		let started = std::time::Instant::now();
+		let first = bark::arca::command::run(&mut w, "sync", &json!({})).expect("the first sync answers")["result"].clone();
+		let (between, gap) = (q.calls().len(), started.elapsed());
+		let second = bark::arca::command::run(&mut w, "sync", &json!({})).expect("the second sync answers")["result"].clone();
+		(first, second, between, gap)
+	});
+	tokio::task::block_in_place(|| seen_rx.recv()).expect("the tree's answer arrived");
+	backup.restore(&mut r).await;
+	{
+		let (lock, cv) = &*gate;
+		*lock.lock().unwrap() = true;
+		cv.notify_all();
+	}
+	let (first, second, between, gap) = tokio::task::block_in_place(|| syncing.join()).expect("the wallet's thread");
+	p.rewrite(None);
+	let paths = |from: usize, to: usize| p.calls()[from..to].iter().map(|(path, _, status, _)| (path.clone(), *status)).collect::<Vec<_>>();
+	let (calls, later) = (paths(before, between), paths(between, p.calls().len()));
+	let coin = coin_of(&a, &transfer);
+	println!("rollback at a hand-over: the first sync's calls {:?}; held {}", calls, first["held"]);
+	println!("rollback at a hand-over: the second sync {} ms after the first began; its calls {:?}; witness {}; the transfer's coin {} is {}: {}",
+		gap.as_millis(), later, second["witness"], transfer, coin["state"], coin["note"]);
+	assert!(!calls.iter().chain(&later).any(|(path, _)| path == "/v1/forfeit_leaves"), "a forfeit left after the rollback: {:?} {:?}",
+		calls, later);
+	// The rollback was found by the forfeits' own witness, after the tree.
+	let tree = calls.iter().position(|(path, _)| path == "/v1/tree").expect("the tree was read");
+	assert!(calls[tree + 1..].iter().any(|(path, _)| path == "/v1/witness"), "a witness was asked anew after the tree: {:?}", calls);
+	assert!(first["held"][0]["refused"].as_str().is_some_and(|e| e.contains("rolled back or replaced past entry")), "{}", first["held"]);
+	assert!(first["witness"]["rolled_back"].is_null(), "the first sync's own witness had succeeded: {}", first["witness"]);
+	// The next sync, on a wallet that still holds that witness.
+	assert_eq!(second["witness"]["rolled_back"]["at"].as_u64(), Some(backup.entries),
+		"the next sync does not say the rollback its wallet found: {}", second["witness"]);
+	let exits = second["witness"]["exits"].as_array().cloned().unwrap_or_default();
+	assert!(exits.iter().any(|e| e["leaf_id"] == transfer.as_str() && e["exit"].is_object()),
+		"the next sync does not take the later transfer's coin on the chain: {}", second["witness"]);
+	assert_eq!(coin["state"], "exiting", "{}", coin);
+	for w in [&a, &d] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
