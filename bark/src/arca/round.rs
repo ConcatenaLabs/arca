@@ -2382,12 +2382,12 @@ impl Wallet {
 			None => self.chain.tip()?.height.saturating_sub(100),
 		};
 		// The forfeits go to the operator below, after the tree's read and
-		// the checks that took what time they took: on a witness current now
-		// ([`Self::hand_over`]), taken before the store marks them signed, so
-		// that without one the participation stands as it was and the next
-		// sync completes it again. Nothing but local work from here to the
-		// post.
-		self.witnessed_now()?;
+		// the checks that took what time they took: on a witness asked anew
+		// for them ([`Self::hand_over`]), whatever the age of the last one,
+		// taken before the store marks them signed, so that without one the
+		// participation stands as it was and the next sync completes it
+		// again. Nothing but local work from here to the post.
+		self.witnessed_anew()?;
 		self.store.put_tx(&round_txid.to_string(), &elements::encode::serialize(&round), "round")?;
 		self.store.atomically(|s| {
 			for (l, margin) in &signed {

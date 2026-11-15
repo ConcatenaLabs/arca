@@ -44,8 +44,9 @@
 //! process opened afresh among them, takes them again, patiently, after its
 //! re-check. The record of an earlier witness is never good on its own. In
 //! one call as in slices, each step that works with the operator starts on a
-//! witness that stands, taking one again when the last is older, and every
-//! signature the wallet hands the operator follows the rule stated at
+//! witness that stands, taking one again when the last is older; every
+//! signature the wallet hands the operator goes on a witness asked anew for
+//! that hand-over, whatever the age of the last one, the rule stated at
 //! [`Wallet::hand_over`]. A witness that fails while the pass runs ends the
 //! pass's work with the operator: no request leaves after it, nothing is
 //! handed to the operator, what is left of the pass runs to its end in the

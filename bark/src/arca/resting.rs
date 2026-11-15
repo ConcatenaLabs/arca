@@ -889,9 +889,9 @@ impl Wallet {
 		for p in pending {
 			let given: Vec<String> = p["given"].as_array().into_iter().flatten().filter_map(|g| g.as_str().map(String::from)).collect();
 			// The fill carries the wallet's signatures: its post is a
-			// hand-over ([`Wallet::hand_over`]); checked here as well, so a
-			// fill without a current witness is said to stand, left to the
-			// next sync.
+			// hand-over ([`Wallet::hand_over`]), on a witness asked anew;
+			// checked here as well, so a fill while no witness succeeds is
+			// said to stand, left to the next sync.
 			if let Err(e) = self.witnessed_now() {
 				out.push(json!({"fill_of": p["body"]["order"], "answer": {"state": "sent", "error": e.to_string()}}));
 				continue;

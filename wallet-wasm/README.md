@@ -395,11 +395,11 @@ spends nothing it does not have to on reading the chain again.
   of the operator's signer's record (`start.witness`), unless the command stays
   on the machine and the node or witnesses itself (`hand_over_forfeits`, and
   `sync`: as its pass starts, and again before each step that works with the
-  operator once the last is older, and at each hand-over of a signature, [as
-  below](#hand-over)); a witness stands for ten seconds. A command
-  given `"recheck": "coins"` among its arguments runs only the part of the
-  re-check that concerns the coins (each coin against the chain and its
-  lineage watch), leaving the following of its participations' rounds (a round
+  operator once the last is older, and anew at each hand-over of a signature,
+  [as below](#hand-over)); a witness stands for ten seconds for the start of a
+  step, never for a hand-over. A command given `"recheck": "coins"` among its
+  arguments runs only the part of the re-check that concerns the coins (each
+  coin against the chain and its lineage watch), leaving the following of its participations' rounds (a round
   that can never return, a re-run whose round stands), which gives coins back
   and guards no spend, to the next `sync` or `recheck`: a program that answers
   others from the wallet, such as a maker's firm offer, asks for it on its
@@ -417,14 +417,17 @@ spends nothing it does not have to on reading the chain again.
   coins as a receiver does; fees in what the node accepts now.
 - <a id="hand-over"></a>**When a signature is handed to the operator:** every
   signature that authorizes a spend, a forfeit, a release or a delegation is
-  handed to the operator only on a witness that is current at that moment:
-  the wallet witnesses again after the last operator wait before the
+  handed to the operator only on a witness asked of the operator for that
+  hand-over, whatever the age of the last one, with nothing but local work
+  between its answer and the post: so after the last operator wait before the
   hand-over, and before each repeat of a kept signature (a transfer, a fill, a
   board, a participation or a release posted again after a post the operator
-  never answered). The other signatures that commit the wallet to something
-  (a plan and its cancellation, a withdrawal or a decline of a participation,
+  never answered), each repeat a hand-over of its own. The forfeits of a round
+  take theirs before the wallet marks them signed, and then only local work
+  lies before their post. The other signatures that commit the wallet to
+  something (a plan and its cancellation, a withdrawal or a decline of a participation,
   a payment asked over Lightning, a claim, a mailbox binding) are handed over
-  the same way. Without a current witness nothing is posted, and what would
+  the same way. Without that witness nothing is posted, and what would
   have been handed over stands for the next `sync`, as a post the operator
   never answered does. Authentication proofs are outside the rule: the
   signatures over the operator's challenge that a mailbox read, a leaf read,

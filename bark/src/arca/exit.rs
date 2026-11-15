@@ -2289,9 +2289,9 @@ impl Wallet {
 		let talk = witnessed && !gone;
 		// From here the pass works with the operator on a witness that
 		// succeeded. Each step that does so takes one again when the last is
-		// older than a witness stands ([`Self::talks`]), as does each
-		// signature it hands over; one that fails ends the pass's work with
-		// the operator ([`Self::pass_lost`]).
+		// older than a witness stands ([`Self::talks`]); each signature it
+		// hands over takes one anew ([`Self::hand_over`]); one that fails
+		// ends the pass's work with the operator ([`Self::pass_lost`]).
 		self.pass_works(talk);
 		let waiting = || json!({"note": "the witness of the operator's signer's record did not succeed: the wallet takes no coin and \
 			signs no spend through the operator until one does"});

@@ -181,8 +181,9 @@ pub struct Wallet {
 	pub(crate) cfg: Config,
 	pub(crate) secp: Secp256k1<elements::secp256k1_zkp::All>,
 	/// What witnessing the operator's signer's record found, and when
-	/// ([`Wallet::witness`]): once a command, and again after
-	/// [`WITNESS_FOR`] in a process that runs longer.
+	/// ([`Wallet::witness`]): once a command, again after [`WITNESS_FOR`] in
+	/// a process that runs longer, and anew at each hand-over
+	/// ([`Wallet::witnessed_anew`]).
 	pub(crate) witnessed: std::cell::RefCell<Option<(web_time::Instant, Value)>>,
 	/// How long `sync` keeps trying to reach the operator, with back-off,
 	/// before it takes it for unreachable ([`WITNESS_PATIENCE`] unless set).
@@ -1551,12 +1552,28 @@ impl Wallet {
 	/// point that takes a coin or signs a spend through the operator runs
 	/// first (`send`, `participate`, `board`, the swap calls, `sync`'s work
 	/// with the server, `mailbox`), so a client built on the library cannot
-	/// forget it, and what every hand-over of a signature runs last
-	/// ([`Self::hand_over`]). A witness that fails is an unreachable server; one that
-	/// finds a rollback refuses, and the wallet's next [`Self::witness`] takes
-	/// the coins resting on what was lost on the chain.
+	/// forget it; a hand-over of a signature asks one anew instead
+	/// ([`Self::witnessed_anew`]). A witness that fails is an unreachable
+	/// server; one that finds a rollback refuses, and the wallet's next
+	/// [`Self::witness`] takes the coins resting on what was lost on the
+	/// chain.
 	pub(crate) fn witnessed_now(&self) -> Result<(), Error> {
-		let v = self.witness_check().and_then(|v| match v["rolled_back"]["at"].as_u64() {
+		self.witnessed_by(true)
+	}
+
+	/// A witness of the operator's signer's record asked of the operator now,
+	/// whatever the age of the last one, and judged as [`Self::witnessed_now`]
+	/// judges one: what every hand-over of a signature runs last
+	/// ([`Self::hand_over`]), with nothing but local work between its answer
+	/// and the post.
+	pub(crate) fn witnessed_anew(&self) -> Result<(), Error> {
+		self.witnessed_by(false)
+	}
+
+	/// [`Self::witnessed_now`] (`reuse`: a witness that succeeded within
+	/// [`WITNESS_FOR`] is taken as it is) or [`Self::witnessed_anew`].
+	fn witnessed_by(&self, reuse: bool) -> Result<(), Error> {
+		let v = self.witness_ask(reuse).and_then(|v| match v["rolled_back"]["at"].as_u64() {
 			Some(at) => Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the \
 				wallet goes no further with this operator, and takes on the chain every coin resting on what it signed after", at,
 				v["rolled_back"]["why"].as_str().unwrap_or("")))),
@@ -1568,31 +1585,33 @@ impl Wallet {
 		v
 	}
 
-	/// Posts `body` to the operator's `call` on a witness that is current
-	/// now ([`Self::witnessed_now`]), else posts nothing and fails as a
-	/// server not reached ([`Error::Unreachable`]), whatever the witness
-	/// said, so the caller keeps what it would hand over as it keeps a post
-	/// the operator never answered.
+	/// Posts `body` to the operator's `call` on a witness asked of the
+	/// operator for this post ([`Self::witnessed_anew`]), else posts nothing
+	/// and fails as a server not reached ([`Error::Unreachable`]), whatever
+	/// the witness said, so the caller keeps what it would hand over as it
+	/// keeps a post the operator never answered.
 	///
 	/// **The rule.** Every signature that authorizes a spend, a forfeit, a
 	/// release or a delegation is handed to the operator only on a witness
-	/// that is current at that moment: the wallet witnesses again after the
+	/// asked anew for that hand-over, whatever the age of the last one, with
+	/// nothing but local work between its answer and the post: so after the
 	/// last operator wait before the hand-over, and before each repeat of a
-	/// kept signature. Every such post goes through here, and so do the other
-	/// signatures that commit the wallet to something (a plan, its
-	/// cancellation, a withdrawal or a decline of a participation, a board,
-	/// a payment asked over Lightning, a claim, a mailbox binding). The one
-	/// site that must check before its own local work, the forfeits (before
-	/// the store marks them signed), runs [`Self::witnessed_now`] itself,
-	/// with nothing but local work between it and the post. Authentication
-	/// proofs are outside the rule:
+	/// kept signature, each repeat being a hand-over of its own. A witness
+	/// that stands is never taken for one. Every such post goes through here,
+	/// and so do the other signatures that commit the wallet to something (a
+	/// plan, its cancellation, a withdrawal or a decline of a participation,
+	/// a board, a payment asked over Lightning, a claim, a mailbox binding).
+	/// The one site that must check before its own local work, the forfeits
+	/// (before the store marks them signed), runs [`Self::witnessed_anew`]
+	/// itself, with nothing but local work between its answer and the post.
+	/// Authentication proofs are outside the rule:
 	/// the challenge signatures ([`super::client::ServerClient::auth`],
 	/// `holding_back`'s one proof over its calls, the mailbox and leaf
 	/// reads, the owed lookup) prove which key asks for a read and authorize
 	/// none of those; the operator can do nothing with one but answer that
 	/// read.
 	pub(crate) fn hand_over(&self, call: &str, body: &Value) -> Result<Value, Error> {
-		self.witnessed_now().map_err(|e| match e {
+		self.witnessed_anew().map_err(|e| match e {
 			e @ Error::Unreachable(_) => e,
 			e => Error::Unreachable(e.to_string()),
 		})?;
@@ -1641,9 +1660,17 @@ impl Wallet {
 	/// the rollback found, now or before (kept in the store), its exits not
 	/// yet made.
 	fn witness_check(&self) -> Result<Value, Error> {
-		if let Some((at, v)) = self.witnessed.borrow().as_ref() {
-			if at.elapsed() < WITNESS_FOR {
-				return Ok(v.clone());
+		self.witness_ask(true)
+	}
+
+	/// [`Self::witness_check`], asking the operator even while the last
+	/// witness stands unless `reuse`.
+	fn witness_ask(&self, reuse: bool) -> Result<Value, Error> {
+		if reuse {
+			if let Some((at, v)) = self.witnessed.borrow().as_ref() {
+				if at.elapsed() < WITNESS_FOR {
+					return Ok(v.clone());
+				}
 			}
 		}
 		let held = self.store.seen_heads()?;
