@@ -104,6 +104,7 @@ impl From<ChainError> for SupervisionError {
 impl SupervisionError {
 	pub fn code(&self) -> &'static str {
 		match self {
+			SupervisionError::Store(e) if e.is_busy() => "busy",
 			SupervisionError::Frozen { .. } => "frozen",
 			SupervisionError::NotLanding { .. } => "out_of_bounds",
 			SupervisionError::Chain(_) => "not_synced",

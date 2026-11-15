@@ -147,6 +147,7 @@ pub enum SendError {
 impl SendError {
 	pub fn code(&self) -> &'static str {
 		match self {
+			SendError::Store(e) if e.is_busy() => "busy",
 			SendError::Malformed(_) => "malformed",
 			SendError::Leg(l) => l.code(),
 			SendError::Invoice(_) => "invoice",

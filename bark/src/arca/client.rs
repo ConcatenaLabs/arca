@@ -385,7 +385,7 @@ pub fn check_server_url(base: &str) -> Result<(), Error> {
 
 /// The codes with which the server refuses a request outright, with a 4xx
 /// status: the request was not taken. A busy server's `rate_limited`, and
-/// `not_synced`, `signer_unavailable`, `signer_replaced` and `internal`
+/// `busy`, `not_synced`, `signer_unavailable`, `signer_replaced` and `internal`
 /// (5xx), are not among them: the request may be taken later, or may have
 /// been.
 ///
@@ -403,6 +403,17 @@ pub const REFUSALS: &[&str] = &[
 	"unknown_batch", "unknown_board", "unknown_fill", "unknown_leaf", "unknown_lock", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "vesting", "wrong_chain",
 	"wrong_operator", "wrong_round",
 ];
+
+/// How long the wallet waits before it sends again a request the server
+/// answered `busy`: the server's `Retry-After` for it. A build without the
+/// `arca` feature (the browser's) sends it again at once, as it cannot wait
+/// without blocking its page.
+pub const BUSY_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether `text`, a server's answer, is its `busy` refusal.
+fn is_busy(text: &str) -> bool {
+	serde_json::from_str::<Value>(text).is_ok_and(|v| v["error"]["code"] == "busy")
+}
 
 /// The most bindings one `bind_mailbox` takes: the server's bound.
 pub const MAX_BINDINGS: usize = 64;
@@ -524,10 +535,22 @@ impl ServerClient {
 
 	/// [`Self::send`], unless the client is stopped ([`Self::stop`]): then
 	/// nothing is sent, and the call fails as one the server did not answer.
+	/// A request the server answers `busy` (503: every database connection
+	/// was in use for the whole of its wait) is sent once more, after
+	/// [`BUSY_RETRY`]; a second `busy` is the answer, which says in words
+	/// that the server is busy. Sending it again is safe as sending any
+	/// request again is: one the server may or may not have taken stays
+	/// standing, to be posted again byte for byte.
 	fn asked(&self, method: &str, call: &str, body: Option<&Value>) -> Result<(i32, String), String> {
 		if let Some(why) = self.stopped.lock().expect("the stop").as_ref() {
 			return Err(why.clone());
 		}
+		let first = self.send(method, call, body);
+		if !matches!(&first, Ok((503, text)) if is_busy(text)) {
+			return first;
+		}
+		#[cfg(feature = "arca")]
+		std::thread::sleep(BUSY_RETRY);
 		self.send(method, call, body)
 	}
 
@@ -657,6 +680,59 @@ impl ServerClient {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A server on this machine that answers each of `answers` (status and
+	/// body) to one request in turn; the number of requests it read.
+	#[cfg(feature = "arca")]
+	fn answering(answers: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<usize>) {
+		use std::io::{Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+		let base = format!("http://{}", listener.local_addr().expect("its address"));
+		let handle = std::thread::spawn(move || {
+			let mut n = 0;
+			for (status, body) in answers {
+				let Ok((mut stream, _)) = listener.accept() else { break };
+				let mut buf = [0u8; 4096];
+				let _ = stream.read(&mut buf);
+				n += 1;
+				let reason = if status == 200 { "OK" } else { "Service Unavailable" };
+				let _ = write!(stream, "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 2\r\n\
+					Connection: close\r\n\r\n{}", status, reason, body.len(), body);
+			}
+			n
+		});
+		(base, handle)
+	}
+
+	#[cfg(feature = "arca")]
+	const BUSY: &str = r#"{"error":{"code":"busy","message":"the server is busy: no database connection came free within 10s; try again in a moment"}}"#;
+
+	#[cfg(feature = "arca")]
+	#[test]
+	fn a_busy_answer_is_asked_again_once() {
+		let (base, server) = answering(vec![(503, BUSY), (200, r#"{"ok":true}"#)]);
+		let client = ServerClient::new(&base).unwrap();
+		let t = web_time::Instant::now();
+		let v = client.get("info").expect("the second answer");
+		assert_eq!(v["ok"], true);
+		assert!(t.elapsed() >= BUSY_RETRY, "asked again after the wait");
+		assert_eq!(server.join().unwrap(), 2);
+
+		let (base, server) = answering(vec![(503, BUSY), (503, BUSY), (200, r#"{"ok":true}"#)]);
+		let client = ServerClient::new(&base).unwrap();
+		match client.post("store", &json!({})) {
+			Err(Error::Unreachable(m)) => assert!(m.contains("503 busy") && m.contains("the server is busy"), "{}", m),
+			other => panic!("a second busy is the answer: {:?}", other),
+		}
+		// The third answer is never asked for: unblock the server's accept.
+		let _ = std::net::TcpStream::connect(base.trim_start_matches("http://"));
+		assert_eq!(server.join().unwrap(), 3, "two requests and the unblocking connection");
+
+		let (base, server) = answering(vec![(503, r#"{"error":{"code":"internal","message":"x"}}"#)]);
+		let client = ServerClient::new(&base).unwrap();
+		assert!(matches!(client.get("info"), Err(Error::Unreachable(_))), "another 503 is not asked again");
+		assert_eq!(server.join().unwrap(), 1);
+	}
 
 	#[test]
 	fn plain_http_only_to_this_machine() {

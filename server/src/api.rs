@@ -30,7 +30,7 @@ pub struct ErrorDetail {
 /// codes out of the source and compares them with this list, and the wallet's
 /// own test compares it with the codes the wallet knows.
 pub const REFUSAL_CODES: &[&str] = &[
-	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "channel_state", "conflict",
+	"bad_attestation", "bad_forfeit", "bad_signature", "board_exists", "board_not_final", "board_output", "busy", "channel_state", "conflict",
 	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "internal", "invalid_coin",
 	"invalid_leaf", "invalid_record", "invoice",
 	"invalid_transaction", "key_reused", "lapsed", "leaf_set", "lightning_unavailable", "lock", "malformed", "margin", "merge", "no_lightning",
@@ -91,6 +91,35 @@ pub struct ChainProgress {
 	pub rounds_waiting: Vec<RoundWaiting>,
 	/// How many rounds are broadcast and not yet final.
 	pub rounds_waiting_count: u64,
+	/// The database's connection pool: its settings, and how often tasks
+	/// waited for a connection or were refused one since the server started.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub database_pool: Option<DatabasePoolInfo>,
+}
+
+/// The database's connection pool, in `/v1/chain`: its settings, what is
+/// open now, and counts since the server started. `timed_out` is the line to
+/// watch: each is a task or a request refused because every connection was
+/// in use for the whole of `wait_ms` (a request is answered `busy`).
+/// `waited` and `wait_ms_total` rising faster than `gets` say the pool is
+/// near that point before anyone is refused. `closed_stuck` counts
+/// connections handed back with a statement still running on them, whose
+/// statement was cancelled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabasePoolInfo {
+	pub size: u32,
+	pub wait_ms: u64,
+	pub statement_timeout_ms: u64,
+	pub connections: u32,
+	pub idle: u32,
+	pub gets: u64,
+	pub waited: u64,
+	pub timed_out: u64,
+	pub wait_ms_total: u64,
+	pub closed_stuck: u64,
+	pub closed_broken: u64,
+	pub created: u64,
 }
 
 /// One asset's pool flow, in atoms as decimal strings.

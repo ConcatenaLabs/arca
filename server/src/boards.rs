@@ -72,6 +72,7 @@ impl BoardError {
 	/// A stable name for the refusal.
 	pub fn code(&self) -> &'static str {
 		match self {
+			BoardError::Store(e) if e.is_busy() => "busy",
 			BoardError::Record(e) => match e {
 				RecordError::WrongChain => "wrong_chain",
 				RecordError::WrongOperator => "wrong_operator",

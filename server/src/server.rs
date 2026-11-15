@@ -40,6 +40,9 @@ pub struct Config {
 	pub listen: String,
 	/// The PostgreSQL connection string.
 	pub database: String,
+	/// The database's connection pool ([`DatabasePool`]).
+	#[serde(default)]
+	pub database_pool: DatabasePool,
 	/// The signer's socket (`arca-signer --socket`).
 	pub signer_socket: PathBuf,
 	/// A file holding the on-chain wallet's BIP39 mnemonic.
@@ -475,6 +478,13 @@ pub struct LimitsSection {
 	pub read_source_per_second: u32,
 	#[serde(default = "default_read_source_burst")]
 	pub read_source_burst: u32,
+	/// How long `chain` serves the pool's flow it read from the database
+	/// before it reads it again, in seconds; the rounds waiting and the
+	/// wallet's holdings are read at most every 5 s, or this when it is
+	/// less. Anyone may call `chain`, so it reads the database at this pace
+	/// whoever calls it. 0 reads them on every call: for tests only.
+	#[serde(default = "default_chain_pool_seconds")]
+	pub chain_pool_seconds: u64,
 }
 
 impl Default for LimitsSection {
@@ -489,6 +499,7 @@ impl Default for LimitsSection {
 			witness_source_per_second: default_witness_source_per_second(), witness_source_burst: default_witness_source_burst(),
 			read_per_second: default_read_per_second(), read_burst: default_read_burst(),
 			read_source_per_second: default_read_source_per_second(), read_source_burst: default_read_source_burst(),
+			chain_pool_seconds: default_chain_pool_seconds(),
 		}
 	}
 }
@@ -507,6 +518,10 @@ fn default_read_source_per_second() -> u32 {
 
 fn default_read_source_burst() -> u32 {
 	200
+}
+
+fn default_chain_pool_seconds() -> u64 {
+	crate::http::POOL_FOR.as_secs()
 }
 
 fn default_witness_per_second() -> u32 {
@@ -648,6 +663,39 @@ pub struct FeesSection {
 	/// accepts for fees, one atom in one it does not); 25 when absent.
 	#[serde(default)]
 	pub max_margin_multiple: Option<u64>,
+}
+
+/// The database's connection pool: how many connections it keeps, how long a
+/// task waits for one, and the longest a statement may run
+/// ([`crate::store::PoolSettings`], whose defaults these are).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct DatabasePool {
+	/// The most connections open at once.
+	pub size: u32,
+	/// How long a task waits for a connection, in seconds, before a request
+	/// is answered `busy` (503, with a `Retry-After`).
+	pub wait_seconds: u64,
+	/// The longest a statement may run, in seconds, before PostgreSQL
+	/// cancels it; 0 for no limit. Migrations run without one.
+	pub statement_timeout_seconds: u64,
+}
+
+impl Default for DatabasePool {
+	fn default() -> DatabasePool {
+		let d = crate::store::PoolSettings::DEFAULT;
+		DatabasePool { size: d.size, wait_seconds: d.wait.as_secs(), statement_timeout_seconds: d.statement_timeout.as_secs() }
+	}
+}
+
+impl DatabasePool {
+	pub fn settings(&self) -> crate::store::PoolSettings {
+		crate::store::PoolSettings {
+			size: self.size.max(1),
+			wait: Duration::from_secs(self.wait_seconds.max(1)),
+			statement_timeout: Duration::from_secs(self.statement_timeout_seconds),
+		}
+	}
 }
 
 fn default_fee_multiple() -> u64 {
@@ -950,7 +998,7 @@ pub async fn expired_salts(config: &Config) -> Result<Vec<[u8; 32]>, StartError>
 			_ => {},
 		}
 	}
-	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let store = Store::connect_with(&config.database, config.database_pool.settings()).await.map_err(err("the database"))?;
 	let now = store.tip_block().await.map_err(err("the database"))?
 		.ok_or_else(|| StartError("the database has followed no block yet".into()))?.median_time;
 	let mut out = vec![];
@@ -989,7 +1037,7 @@ pub async fn expired_salts(config: &Config) -> Result<Vec<[u8; 32]>, StartError>
 /// coin is found only in a block it connects after the address was handed
 /// out and after that first start.
 pub async fn receive_address(config: &Config) -> Result<(u32, elements::Script, String), StartError> {
-	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let store = Store::connect_with(&config.database, config.database_pool.settings()).await.map_err(err("the database"))?;
 	let mnemonic = std::fs::read_to_string(&config.wallet_mnemonic_file)
 		.map_err(err("wallet_mnemonic_file"))?.trim().to_string();
 	let (index, script) = Wallet::hand_out_receive_script(&store, &mnemonic).await.map_err(err("the wallet"))?;
@@ -1090,7 +1138,7 @@ pub async fn signed_twice(config: &Config) -> Result<Vec<String>, StartError> {
 		out.push(format!("the signer's record holds two different messages under {} salt(s), {} the first",
 			twice.len(), crate::signer::hex(first)));
 	}
-	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let store = Store::connect_with(&config.database, config.database_pool.settings()).await.map_err(err("the database"))?;
 	let (leaves, total) = store.leaves_forfeited_twice(1).await.map_err(err("the database"))?;
 	if let Some(first) = leaves.first() {
 		out.push(format!("the database holds operator-signed forfeits for more than one round of {} leaf (leaves), {} the first",
@@ -1154,7 +1202,7 @@ pub async fn bond_post(config: &Config, wallet: &str, asset: AssetId, atoms: u64
 /// operator's on-chain wallet (which pays their fees) and the bond.
 async fn bond_spender(config: &Config) -> Result<(crate::bond::Bond, Arc<FinalityService>, Wallet), StartError> {
 	let (bond, client) = configured_bond(config).await?;
-	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let store = Store::connect_with(&config.database, config.database_pool.settings()).await.map_err(err("the database"))?;
 	let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(client));
 	let certification = match config.finality.certification.as_str() {
 		"required" => Certification::Required,
@@ -1277,7 +1325,7 @@ pub async fn withdraw(config: &Config, asset: &str, atoms: &str, to: &str, fee_a
 	}
 	let spk = elements::Script::from(crate::signer::unhex(info["scriptPubKey"].as_str().unwrap_or_default()).map_err(err("the address's script"))?);
 	let operator = SignerClient::new(&config.signer_socket).pubkey().await.map_err(err("the signer"))?;
-	let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+	let store = Store::connect_with(&config.database, config.database_pool.settings()).await.map_err(err("the database"))?;
 	let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(client));
 	let certification = match config.finality.certification.as_str() {
 		"required" => Certification::Required,
@@ -1547,6 +1595,7 @@ fn restart_only(a: &Config, b: &Config) -> Vec<String> {
 	let mut differ = |name: &str, same: bool| if !same { out.push(name.to_string()) };
 	differ("listen", a.listen == b.listen);
 	differ("database", a.database == b.database);
+	differ("database_pool", a.database_pool == b.database_pool);
 	differ("signer_socket", a.signer_socket == b.signer_socket);
 	differ("wallet_mnemonic_file", a.wallet_mnemonic_file == b.wallet_mnemonic_file);
 	differ("fee_multiple", a.fee_multiple == b.fee_multiple);
@@ -1778,7 +1827,7 @@ impl Server {
 	/// boards, the co-signer, the rounds, the watcher, their tasks, and the
 	/// HTTP listener.
 	pub async fn start(config: &Config) -> Result<Server, StartError> {
-		let store = Store::connect(&config.database).await.map_err(err("the database"))?;
+		let store = Store::connect_with(&config.database, config.database_pool.settings()).await.map_err(err("the database"))?;
 		retired_enclave_coins(&store).await?;
 		let source: Arc<dyn ChainSource> = Arc::new(NodeSource::new(node_client(config)?));
 		let certification = match config.finality.certification.as_str() {
@@ -2149,6 +2198,7 @@ impl Server {
 			channels, certification, anchor_depth: config.finality.anchor_depth, max_request: config.max_request_bytes,
 			challenge_ttl: Duration::from_secs(config.challenge_ttl_seconds),
 			holding_back_unauthenticated: config.holding_back_unauthenticated,
+			chain_pool_for: Duration::from_secs(config.limits.chain_pool_seconds),
 			nonces: Limiter::new(config.limits.issue_per_second, config.limits.issue_burst, config.limits.source_per_second,
 				config.limits.source_burst),
 			witnesses: Limiter::new(config.limits.witness_per_second, config.limits.witness_burst, config.limits.witness_source_per_second,

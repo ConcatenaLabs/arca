@@ -203,6 +203,35 @@ overestimates the cost of the server's recursive lineage walks by hundreds of
 times and would compile them on every call, which takes several times as long
 as the query itself.
 
+The server's tasks and requests share a pool of connections
+(`[database_pool]`: 32 connections by default). A task holds one connection at
+a time and waits for one at most `wait_seconds` (10 by default); a request
+whose wait runs out is answered `busy` (503, with `Retry-After: 2`), which the
+wallet library sends once more after that wait before it reports the server
+busy in words. Every statement runs within `statement_timeout_seconds` (30 by
+default, 0 for no limit; PostgreSQL's `statement_timeout`): one that runs
+longer is cancelled, its caller gets the error, and its transaction is rolled
+back whole, as every operation that changes more than one row runs in one
+transaction. Migrations run without the limit. The slowest reads the server
+makes take a few seconds on a store of some 50,000 batch leaves (the
+in-flight reads of a round's cap, the pool's flow), well within it.
+
+A connection can come back to the pool with a statement still running on it:
+when the task that sent it is dropped halfway, as an HTTP handler is when its
+client closes the connection, PostgreSQL goes on running the statement, and
+whatever is sent next on that connection waits behind it. Before the pool
+hands a connection out it asks it an empty statement, and a connection that
+does not answer within a second has its statement cancelled and is closed;
+the task takes another. So one abandoned statement costs the next task a
+second, never every task that draws that connection until the statement ends.
+`GET chain` reports the pool (`database_pool`): its settings, the connections
+open and idle, and since the start how many tasks asked for a connection
+(`gets`), waited for one (`waited`, `wait_ms_total`), were refused one
+(`timed_out`, each a `busy` answer or a task's pass failed), and how many
+connections were closed with a statement abandoned on them (`closed_stuck`)
+or broken (`closed_broken`). `timed_out` above zero means the pool was full
+for a whole wait; `waited` climbing toward `gets` says it is getting there.
+
 ## Finality
 
 The server never counts confirmations. One component, the finality service
@@ -252,7 +281,12 @@ or finality. A pass that fails, or panics, is logged and the next one runs. A
 pass that takes longer than ten seconds, or that starts three or more blocks
 behind the node, is logged at info.
 
-`GET /v1/chain` says where the service stands and what finality waits on: the
+`GET /v1/chain` says where the service stands and what finality waits on,
+answered from memory: what it reads of the database (the rounds waiting and
+the wallet's holdings, at most every 5 s; the pool's flow, at most every
+30 s, `[limits] chain_pool_seconds`) is read again in the background by one task, however many ask; only
+the first call after a start waits, and every call made meanwhile waits for
+that one read. It says the
 height it has followed to and the node's, how long its last pass took and how
 long ago it ended, passes failing in a row, whether the node reports its tip's
 anchor as ok, the Bitcoin height the tip's anchor commits to and how long it
@@ -3176,6 +3210,11 @@ is deleted, so what the call holds in the database is bounded by the overall
 rate times the lifetime. A board naming a deleted nonce is refused
 (`nonce_unknown`): a wallet registers its board right after it takes the
 nonce.
+
+A request the server cannot serve because every database connection stayed
+in use for the whole of the pool's wait is refused `busy` (503, with
+`Retry-After`; see Keeping the database). As with any 5xx, the request may
+or may not have been taken, and the wallet sends it again as it was.
 
 ## The signer
 

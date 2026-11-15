@@ -239,6 +239,7 @@ impl CosignError {
 	pub fn code(&self) -> &'static str {
 		use CosignError::*;
 		match self {
+			Store(e) if e.is_busy() => "busy",
 			Malformed(_) => "malformed",
 			UnknownLeaf(_) => "unknown_leaf",
 			NotLive(..) => "not_live",

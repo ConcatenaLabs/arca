@@ -96,6 +96,9 @@ pub struct App {
 	/// Whether `holding_back` answers a request that proves no key
 	/// (`Config::holding_back_unauthenticated`).
 	pub holding_back_unauthenticated: bool,
+	/// How long `chain` serves the pool's flow before it reads it again
+	/// (`[limits] chain_pool_seconds`, [`POOL_FOR`] by default).
+	pub chain_pool_for: Duration,
 	/// Bounds the operator nonces handed out.
 	pub nonces: Limiter,
 	/// Bounds the witnesses answered: each reads the signer's record under
@@ -158,30 +161,75 @@ pub struct InfoParts {
 	pub owed: Arc<Fresh<Option<BTreeMap<[u8; 32], (u64, u64)>>>>,
 	/// What is in flight of each asset.
 	pub in_flight: Arc<Fresh<Option<BTreeMap<[u8; 32], u64>>>>,
+	/// `chain`'s reads of the database: the rounds waiting for finality and
+	/// the wallet's holdings ([`CHAIN_FOR`]), and each asset's pool flow
+	/// ([`POOL_FOR`]).
+	pub chain_waiting: Arc<Fresh<Option<Vec<(elements::Txid, crate::chain::Finality)>>>>,
+	pub chain_holdings: Arc<Fresh<Option<BTreeMap<AssetId, u64>>>>,
+	pub chain_pool: Arc<Fresh<Option<BTreeMap<[u8; 32], crate::store::PoolFlow>>>>,
 }
 
-/// What `cell` holds, read again with `read` once older than `max_age`: in a
-/// task of its own when the cell holds a value, which is handed out
-/// meanwhile, so the caller never waits on the read; in this call only when
-/// nothing was read yet.
+/// How long `chain` publishes the rounds waiting for finality and the
+/// wallet's holdings before it reads them again.
+pub const CHAIN_FOR: Duration = Duration::from_secs(5);
+
+/// How long `chain` publishes the pool's flow before it reads it again: a
+/// statement over every live batch leaf, which takes a second or more on a
+/// large store, and whose figures move by the round.
+pub const POOL_FOR: Duration = Duration::from_secs(30);
+
+/// What `cell` holds, read again with `read` once older than `max_age`; a
+/// zero `max_age` reads it on every call, in a task of its own (tests only).
+/// Every read runs in a task of its own, never in the caller's: a caller that
+/// gives up (an HTTP client closing its connection drops the handler) never
+/// cuts a read off halfway, which would leave its statement running on a
+/// connection handed back to the pool. When the cell holds a value it is
+/// handed out at once and the read runs in the background; when nothing was
+/// read yet, the first caller's read is the one every caller waits for.
 async fn served<T, F, Fut>(cell: &Arc<Fresh<T>>, max_age: Duration, read: F) -> T
 where
 	T: Clone + Send + Sync + 'static,
 	F: FnOnce() -> Fut,
 	Fut: std::future::Future<Output = T> + Send + 'static,
 {
-	match cell.turn(max_age) {
-		Turn::Fresh(v) | Turn::Reading(v) => v,
-		Turn::Stale(v) => {
-			let (cell, read) = (cell.clone(), read());
-			tokio::spawn(async move { cell.put(read.await) });
-			v
-		},
-		Turn::Empty => {
-			let v = read().await;
+	if max_age.is_zero() {
+		let (cell, read) = (cell.clone(), read());
+		return match tokio::spawn(async move {
+			let v = read.await;
 			cell.put(v.clone());
 			v
-		},
+		}).await {
+			Ok(v) => v,
+			Err(e) => std::panic::resume_unwind(e.into_panic()),
+		};
+	}
+	let mut read = Some(read);
+	loop {
+		let next = cell.next_put();
+		match cell.turn(max_age) {
+			Turn::Fresh(v) | Turn::Reading(v) => return v,
+			Turn::Stale(v) => {
+				if let Some(read) = read.take() {
+					let (cell, read) = (cell.clone(), read());
+					tokio::spawn(async move { cell.put(read.await) });
+				}
+				return v;
+			},
+			Turn::Empty => {
+				// Handed the turn once per call at most: `read` is spent.
+				let Some(read) = read.take() else { continue };
+				let (cell, read) = (cell.clone(), read());
+				match tokio::spawn(async move {
+					let v = read.await;
+					cell.put(v.clone());
+					v
+				}).await {
+					Ok(v) => return v,
+					Err(e) => std::panic::resume_unwind(e.into_panic()),
+				}
+			},
+			Turn::Pending => next.await,
+		}
 	}
 }
 
@@ -442,10 +490,21 @@ impl Refusal {
 	}
 }
 
+/// How long a client asked to try again ([`StoreError::Busy`]) waits first,
+/// in seconds: the `Retry-After` of a `busy` refusal.
+///
+/// [`StoreError::Busy`]: crate::store::StoreError::Busy
+pub const BUSY_RETRY_AFTER: u64 = 2;
+
 impl IntoResponse for Refusal {
 	fn into_response(self) -> Response {
+		let busy = self.code == "busy";
 		let body = api::ErrorBody { error: api::ErrorDetail { code: self.code, message: self.message } };
-		(self.status, Json(body)).into_response()
+		let mut response = (self.status, Json(body)).into_response();
+		if busy {
+			response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(BUSY_RETRY_AFTER));
+		}
+		response
 	}
 }
 
@@ -465,6 +524,7 @@ pub fn status_of(code: &str) -> StatusCode {
 		"policy_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
 		"request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
 		"rate_limited" => StatusCode::TOO_MANY_REQUESTS,
+		"busy" => StatusCode::SERVICE_UNAVAILABLE,
 		"signer_unavailable" | "not_synced" | "signer_replaced" | "rate_stale" | "lightning_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
 		"internal" => StatusCode::INTERNAL_SERVER_ERROR,
 		_ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -539,6 +599,9 @@ impl From<ForfeitError> for Refusal {
 
 impl From<RoundError> for Refusal {
 	fn from(e: RoundError) -> Refusal {
+		if let RoundError::Store(s) = e {
+			return s.into();
+		}
 		log::error!("rounds: {}", e);
 		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
 	}
@@ -546,6 +609,10 @@ impl From<RoundError> for Refusal {
 
 impl From<crate::store::StoreError> for Refusal {
 	fn from(e: crate::store::StoreError) -> Refusal {
+		if e.is_busy() {
+			log::warn!("store: {}", e);
+			return Refusal::new(status_of("busy"), "busy", e.to_string());
+		}
 		log::error!("store: {}", e);
 		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the server's database failed")
 	}
@@ -748,10 +815,24 @@ async fn bond_info(app: &Arc<App>) -> Option<api::BondInfo> {
 async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainProgress>, Refusal> {
 	use crate::chain::Finality;
 	let p = app.rounds.finality().progress();
-	let waiting = app.rounds.waiting().await.map_err(|e| {
-		log::warn!("the rounds waiting for finality: {}", e);
-		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the rounds waiting for finality could not be read")
+	// Every read of the database below is served from memory, read again in
+	// the background once older than its age, and by one task however many
+	// ask: anyone may call `chain`, as often as it likes.
+	let (chain_for, pool_for) = (CHAIN_FOR.min(app.chain_pool_for), app.chain_pool_for);
+	let a = app.clone();
+	let waiting = served(&app.info_parts.chain_waiting, chain_for, move || async move {
+		a.rounds.waiting().await.map_err(|e| log::warn!("the rounds waiting for finality: {}", e)).ok()
+	}).await.ok_or_else(|| {
+		Refusal::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "the rounds waiting for finality could not be read; try again in a moment")
 	})?;
+	let a = app.clone();
+	let holdings = served(&app.info_parts.chain_holdings, chain_for, move || async move {
+		a.rounds.holdings().await.map_err(|e| log::warn!("the wallet's holdings: {}", e)).ok()
+	}).await.unwrap_or_default();
+	let a = app.clone();
+	let pool = served(&app.info_parts.chain_pool, pool_for, move || async move {
+		a.store.pool_flow().await.map_err(|e| log::warn!("the pool's flow: {}", e)).ok()
+	}).await.unwrap_or_default();
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
 	let waiting_on = if p.failing_passes > 0 || p.node_height.saturating_sub(p.height) >= crate::chain::finality::LAG_BLOCKS {
 		"follower"
@@ -770,8 +851,8 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 		anchor_ok: p.anchor_ok, mempool_behind: p.mempool_behind, failing_passes: p.failing_passes,
 		anchor_height: p.anchor_height, anchor_unchanged_seconds: if p.anchor_since > 0 { now.saturating_sub(p.anchor_since) } else { 0 },
 		waiting_on: waiting_on.into(),
-		holdings: app.rounds.holdings().await.map(|h| h.iter().map(|(a, v)| (a.to_string(), v.to_string())).collect()).unwrap_or_default(),
-		pool: app.store.pool_flow().await.map_err(|e| log::warn!("the pool's flow: {}", e)).unwrap_or_default().into_iter()
+		holdings: holdings.iter().map(|(a, v)| (a.to_string(), v.to_string())).collect(),
+		pool: pool.into_iter()
 			.map(|(a, f)| (AssetId::from_byte_array(a).to_string(), api::PoolFlowInfo {
 				locked: f.locked.to_string(), released: f.released.to_string(), reclaimable: f.reclaimable.to_string(),
 				transferred: f.transferred.to_string(),
@@ -782,6 +863,14 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 				net_drawn_last_hour: (f.drawn_last_hour as i128 - f.reclaimed_last_hour as i128 - f.swept_last_hour as i128).to_string(),
 			})).collect(),
 		rounds_waiting_count: waiting.len() as u64,
+		database_pool: Some({
+			let p = app.store.pool_status();
+			api::DatabasePoolInfo {
+				size: p.size, wait_ms: p.wait_ms, statement_timeout_ms: p.statement_timeout_ms, connections: p.connections, idle: p.idle,
+				gets: p.gets, waited: p.waited, timed_out: p.timed_out, wait_ms_total: p.wait_ms_total, closed_stuck: p.closed_stuck,
+				closed_broken: p.closed_broken, created: p.created,
+			}
+		}),
 		rounds_waiting: waiting.iter().take(20).map(|(t, f)| {
 			let (height, depth) = match f {
 				Finality::NotInChain => (None, None),
@@ -2578,5 +2667,44 @@ mod tests {
 		assert!(l.take(ip("2001:db8:1:2::ffff")).is_err());
 		assert!(l.take(ip("2001:db8:1:3::1")).is_err(), "another /64 of the same /48");
 		assert!(l.take(ip("2001:db8:2::1")).is_ok(), "another /48");
+	}
+
+	/// `chain`'s reads: one read however many callers find nothing read yet,
+	/// none while the value is fresh, and a read whose caller gives up runs
+	/// to its end.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+	async fn served_reads_once_for_every_caller_and_finishes_a_read_given_up() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		let cell: Arc<Fresh<u32>> = Arc::new(Fresh::new());
+		let reads = Arc::new(AtomicUsize::new(0));
+		let finished = Arc::new(AtomicUsize::new(0));
+		let read = |reads: Arc<AtomicUsize>, finished: Arc<AtomicUsize>| move || async move {
+			reads.fetch_add(1, Ordering::SeqCst);
+			tokio::time::sleep(Duration::from_millis(300)).await;
+			finished.fetch_add(1, Ordering::SeqCst);
+			7u32
+		};
+		// The first caller gives up halfway; sixteen more come meanwhile.
+		let first = {
+			let (c, r) = (cell.clone(), read(reads.clone(), finished.clone()));
+			tokio::spawn(async move { served(&c, Duration::from_secs(30), r).await })
+		};
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		first.abort();
+		let mut set = tokio::task::JoinSet::new();
+		for _ in 0..16 {
+			let (c, r) = (cell.clone(), read(reads.clone(), finished.clone()));
+			set.spawn(async move { served(&c, Duration::from_secs(30), r).await });
+		}
+		while let Some(v) = set.join_next().await {
+			assert_eq!(v.unwrap(), 7);
+		}
+		assert_eq!(reads.load(Ordering::SeqCst), 1, "one read for seventeen callers");
+		assert_eq!(finished.load(Ordering::SeqCst), 1, "the read its caller gave up ran to its end");
+		// Warm: answered from memory, nothing read.
+		for _ in 0..100 {
+			assert_eq!(served(&cell, Duration::from_secs(30), read(reads.clone(), finished.clone())).await, 7);
+		}
+		assert_eq!(reads.load(Ordering::SeqCst), 1, "no read while the value is fresh");
 	}
 }
