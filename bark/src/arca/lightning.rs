@@ -600,6 +600,7 @@ impl Wallet {
 			done(self, &mut rec)?;
 			return Ok(json!({"payment_hash": hash, "state": "paid", "preimage": rec["preimage"]}));
 		}
+		self.witnessed_now()?;
 		let t = self.server.post("lightning_send_release_terms", &json!({"payment_hash": hash}))?;
 		let nodes: Vec<&str> = t["nodes"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
 		let released: Vec<&str> = t["released"].as_array().into_iter().flatten().filter_map(|n| n.as_str()).collect();
@@ -616,7 +617,7 @@ impl Wallet {
 		let key = self.coin_key(&row.owner_nonce)?;
 		let releases: Vec<Value> = rels.iter().map(|r| json!({"node": hex(&r.node_hash),
 			"signature": hex(sign(&key, &r.message().digest).as_ref())})).collect();
-		let a = self.server.post("lightning_send_release", &json!({"payment_hash": hash, "round_txid": round.txid().to_string(),
+		let a = self.hand_over("lightning_send_release", &json!({"payment_hash": hash, "round_txid": round.txid().to_string(),
 			"releases": releases}))?;
 		done(self, &mut rec)?;
 		Ok(json!({"payment_hash": hash, "state": "paid", "released": a["released"]}))
@@ -805,7 +806,7 @@ impl Wallet {
 			rec["hash_given"] = json!(true);
 		}
 		self.set_receive(&hash_hex, rec)?;
-		let r = match self.server.post("lightning_receive", &body) {
+		let r = match self.hand_over("lightning_receive", &body) {
 			Ok(r) => r,
 			Err(e @ Error::Server { .. }) => {
 				let mut m = self.receives()?;
@@ -1136,7 +1137,8 @@ impl Wallet {
 			}
 			let state = rec["state"].as_str().unwrap_or("").to_string();
 			let step = match state.as_str() {
-				"requested" => match self.server.post("lightning_receive", &rec["request"]) {
+				// The request carries the wallet's signature: a hand-over.
+				"requested" => match self.hand_over("lightning_receive", &rec["request"]) {
 					Ok(r) => self.receive_answered(&hash, &r).map(|r| json!({"payment_hash": hash, "state": r["state"]})),
 					Err(e) => Err(e),
 				},

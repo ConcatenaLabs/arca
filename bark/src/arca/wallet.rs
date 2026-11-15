@@ -181,12 +181,19 @@ pub struct Wallet {
 	pub(crate) cfg: Config,
 	pub(crate) secp: Secp256k1<elements::secp256k1_zkp::All>,
 	/// What witnessing the operator's signer's record found, and when
-	/// ([`Wallet::witness`]): once a command, and again after
-	/// [`WITNESS_FOR`] in a process that runs longer.
+	/// ([`Wallet::witness`]): once a command, again after [`WITNESS_FOR`] in
+	/// a process that runs longer, and anew at each hand-over
+	/// ([`Wallet::witnessed_anew`]). Only the last one asked is kept: a
+	/// success, or a rollback with its exits, never a success from before a
+	/// witness that failed or found a rollback.
 	pub(crate) witnessed: std::cell::RefCell<Option<(web_time::Instant, Value)>>,
 	/// How long `sync` keeps trying to reach the operator, with back-off,
 	/// before it takes it for unreachable ([`WITNESS_PATIENCE`] unless set).
 	pub witness_patience: std::time::Duration,
+	/// While a pass of `sync` works with the operator on a witness that
+	/// succeeded: whether it does (`.0`), and why it stopped, once a witness
+	/// failed while it ran (`.1`; [`Wallet::witnessed_now`]).
+	pub(crate) pass: std::cell::RefCell<(bool, Option<String>)>,
 	/// The change of every fee coin this process's exits spent, not in a
 	/// block yet: a later exit of the same `sync` pays its fees from it, as
 	/// the steps of one exit do.
@@ -987,7 +994,7 @@ impl Wallet {
 		chain.follow_anchor_depth(opt(ANCHOR_DEPTH_META)?.and_then(|d| d.parse().ok()), &get("chain_name")?);
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
-			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, change_in_flight: Default::default(),
+			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, pass: Default::default(), change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), locking: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), pay_from: Default::default(), lock_until: Default::default(), exit_watch: Default::default(),
 			exits_done: Default::default(), slice: Default::default(), statuses_read: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
@@ -1079,7 +1086,9 @@ impl Wallet {
 				let (mailbox, proof) = self.binding(&key)?;
 				bindings.push(json!({"owner": hex(&key.x_only_public_key().0.serialize()), "mailbox": mailbox, "proof": proof}));
 			}
-			let answer = self.server.bind_mailbox(&bindings)?;
+			// Each binding is signed by its coin's key: a hand-over
+			// ([`Self::hand_over`]).
+			let answer = self.hand_over("bind_mailbox", &json!({"bindings": bindings}))?;
 			let shown = answer["bound"].as_array().cloned().unwrap_or_default();
 			for (c, b) in chunk.iter().zip(bindings.iter()) {
 				let at = shown.iter().find(|x| x["owner"] == b["owner"]).map(|x| x["mailbox"].clone()).unwrap_or(Value::Null);
@@ -1403,8 +1412,12 @@ impl Wallet {
 	}
 
 	/// Keeps the rollback found, `why`, the record agreeing with the wallet
-	/// up to entry `at`: the lowest such entry found stands.
+	/// up to entry `at`: the lowest such entry found stands. A witness kept
+	/// as succeeded stands no more ([`Self::witness_fell`]), so the wallet's
+	/// next [`Self::witness`] asks, and takes on the chain what rests on the
+	/// rollback.
 	fn found_rollback(&self, at: u64, why: &str) -> Result<(), Error> {
+		self.witness_fell();
 		let prior = self.rolled_back()?;
 		let at = prior.as_ref().map_or(at, |(was, _)| (*was).min(at));
 		if prior.is_some_and(|(was, w)| was == at && w == why) {
@@ -1545,16 +1558,124 @@ impl Wallet {
 	/// point that takes a coin or signs a spend through the operator runs
 	/// first (`send`, `participate`, `board`, the swap calls, `sync`'s work
 	/// with the server, `mailbox`), so a client built on the library cannot
-	/// forget it. A witness that fails is an unreachable server; one that
-	/// finds a rollback refuses, and the wallet's next [`Self::witness`] takes
-	/// the coins resting on what was lost on the chain.
+	/// forget it; a hand-over of a signature asks one anew instead
+	/// ([`Self::witnessed_anew`]). A witness that fails is an unreachable
+	/// server; one that finds a rollback refuses, and the wallet's next
+	/// [`Self::witness`] takes the coins resting on what was lost on the
+	/// chain.
 	pub(crate) fn witnessed_now(&self) -> Result<(), Error> {
-		let v = self.witness_check()?;
-		match v["rolled_back"]["at"].as_u64() {
+		self.witnessed_by(true)
+	}
+
+	/// A witness of the operator's signer's record asked of the operator now,
+	/// whatever the age of the last one, and judged as [`Self::witnessed_now`]
+	/// judges one: what every hand-over of a signature runs last
+	/// ([`Self::hand_over`]), with nothing but local work between its answer
+	/// and the post. When it fails or finds a rollback, no earlier witness
+	/// stands either: the next step that would start on one asks again, and
+	/// the wallet's next [`Self::witness`] takes on the chain what rests on
+	/// the rollback.
+	pub(crate) fn witnessed_anew(&self) -> Result<(), Error> {
+		self.witnessed_by(false)
+	}
+
+	/// [`Self::witnessed_now`] (`reuse`: a witness that succeeded within
+	/// [`WITNESS_FOR`] is taken as it is) or [`Self::witnessed_anew`].
+	fn witnessed_by(&self, reuse: bool) -> Result<(), Error> {
+		let v = self.witness_ask(reuse).and_then(|v| match v["rolled_back"]["at"].as_u64() {
 			Some(at) => Err(Error::Refused(format!("the operator's signer's record was rolled back or replaced past entry {} ({}): the \
 				wallet goes no further with this operator, and takes on the chain every coin resting on what it signed after", at,
 				v["rolled_back"]["why"].as_str().unwrap_or("")))),
 			None => Ok(()),
+		});
+		if let Err(e) = &v {
+			self.pass_lost(e);
+		}
+		v
+	}
+
+	/// Posts `body` to the operator's `call` on a witness asked of the
+	/// operator for this post ([`Self::witnessed_anew`]), else posts nothing
+	/// and fails as a server not reached ([`Error::Unreachable`]), whatever
+	/// the witness said, so the caller keeps what it would hand over as it
+	/// keeps a post the operator never answered.
+	///
+	/// **The rule.** Every signature that authorizes a spend, a forfeit, a
+	/// release or a delegation is handed to the operator only on a witness
+	/// asked anew for that hand-over, whatever the age of the last one, with
+	/// nothing but local work between its answer and the post: so after the
+	/// last operator wait before the hand-over, and before each repeat of a
+	/// kept signature, each repeat being a hand-over of its own. A witness
+	/// that stands is never taken for one. Every such post goes through here,
+	/// and so do the other signatures that commit the wallet to something (a
+	/// plan, its cancellation, a withdrawal or a decline of a participation,
+	/// a board, a payment asked over Lightning, a claim, a mailbox binding).
+	/// The one site that must check before its own local work, the forfeits
+	/// (before the store marks them signed), runs [`Self::witnessed_anew`]
+	/// itself, with nothing but local work between its answer and the post.
+	/// Authentication proofs are outside the rule:
+	/// the challenge signatures ([`super::client::ServerClient::auth`],
+	/// `holding_back`'s one proof over its calls, the mailbox and leaf
+	/// reads, the owed lookup) prove which key asks for a read and authorize
+	/// none of those; the operator can do nothing with one but answer that
+	/// read.
+	pub(crate) fn hand_over(&self, call: &str, body: &Value) -> Result<Value, Error> {
+		self.witnessed_anew().map_err(|e| match e {
+			e @ Error::Unreachable(_) => e,
+			e => Error::Unreachable(e.to_string()),
+		})?;
+		self.server.post(call, body)
+	}
+
+	/// A witness failed while a pass of `sync` worked with the operator on
+	/// one that had succeeded: the pass asks the operator nothing more and
+	/// hands it nothing more, whatever step or item comes next. Every
+	/// request fails from here as one the operator did not answer
+	/// ([`super::client::ServerClient::stop`]) until the pass ends, the
+	/// first failure kept as its reason. Nothing outside such a pass.
+	fn pass_lost(&self, e: &Error) {
+		let mut pass = self.pass.borrow_mut();
+		if pass.0 && pass.1.is_none() {
+			let why = format!("a witness of the operator's signer's record failed while this sync ran ({}): the wallet asks the \
+				operator nothing more, and signs nothing more for it, until its next sync", e);
+			self.server.stop(&why);
+			pass.1 = Some(why);
+		}
+	}
+
+	/// Why the pass of `sync` under way stopped working with the operator,
+	/// when a witness failed while it ran ([`Self::pass_lost`]).
+	pub(crate) fn pass_stopped(&self) -> Option<String> {
+		self.pass.borrow().1.clone()
+	}
+
+	/// A pass of `sync` works with the operator from here, its witness
+	/// having succeeded (`on`), or no longer does: a pass that ended.
+	pub(crate) fn pass_works(&self, on: bool) {
+		*self.pass.borrow_mut() = (on, None);
+		if !on {
+			self.server.resume();
+		}
+	}
+
+	/// Whether a witness of the operator's signer's record succeeded within
+	/// [`WITNESS_FOR`] in this process and found no rollback, and none asked
+	/// since failed or found one ([`Self::witness_fell`]): asks nothing.
+	pub(crate) fn witness_stands(&self) -> bool {
+		self.witnessed.borrow().as_ref().is_some_and(|(at, v)| at.elapsed() < WITNESS_FOR && v["rolled_back"].is_null())
+	}
+
+	/// A witness kept as succeeded stands no more: the operator is asked
+	/// again, or a rollback of its signer's record was found. Whatever the
+	/// kept one's age, what comes after it decides: a witness that succeeds
+	/// is kept in its place, and one that fails or finds a rollback leaves
+	/// none, so the next step asks, and the next [`Self::witness`] acts on
+	/// the rollback. A rollback kept with its exits stays as it is: it is
+	/// what the wallet says of the operator until it witnesses again.
+	fn witness_fell(&self) {
+		let mut kept = self.witnessed.borrow_mut();
+		if kept.as_ref().is_some_and(|(_, v)| v["rolled_back"].is_null()) {
+			*kept = None;
 		}
 	}
 
@@ -1563,11 +1684,22 @@ impl Wallet {
 	/// the rollback found, now or before (kept in the store), its exits not
 	/// yet made.
 	fn witness_check(&self) -> Result<Value, Error> {
-		if let Some((at, v)) = self.witnessed.borrow().as_ref() {
-			if at.elapsed() < WITNESS_FOR {
-				return Ok(v.clone());
+		self.witness_ask(true)
+	}
+
+	/// [`Self::witness_check`], asking the operator even while the last
+	/// witness stands unless `reuse`. Once the operator is asked, a witness
+	/// kept as succeeded stands no more ([`Self::witness_fell`]): only this
+	/// one's success keeps one again.
+	fn witness_ask(&self, reuse: bool) -> Result<Value, Error> {
+		if reuse {
+			if let Some((at, v)) = self.witnessed.borrow().as_ref() {
+				if at.elapsed() < WITNESS_FOR {
+					return Ok(v.clone());
+				}
 			}
 		}
+		self.witness_fell();
 		let held = self.store.seen_heads()?;
 		let mut ask: Vec<(u64, String, Option<String>)> = vec![];
 		// The signer answers few heads without its signature, which prove
@@ -2031,15 +2163,27 @@ impl Wallet {
 		}
 		let mailbox = self.keys.mailbox()?;
 		let x = mailbox.x_only_public_key().0;
-		let proof = self.server.post("challenge", &json!({})).ok()
-			.and_then(|v| unhex32(v["challenge"].as_str().unwrap_or("")).ok())
-			.map(|c| (c, sign(&mailbox, &super::client::auth_digest(&self.genesis, "holding_back", &c, &x, &[]))));
 		let coins: Vec<String> = live.iter().map(|c| c.leaf_id.clone()).collect();
 		let batch: Vec<String> = live.iter().filter(|c| c.kind == "batch").map(|c| c.leaf_id.clone()).collect();
-		let mut out = vec![];
+		// In a pass of `sync` in slices each call is an item of its step: what
+		// the calls before named is kept for the pass, and a slice may stop
+		// between two calls (each costs the operator about a second).
+		let mut out: Vec<String> = self.slice_memo("holding back").and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+		let mut proof = None;
 		// The operator's bound on one call (`holding_back`).
 		for (k, chunk) in coins.chunks(64).enumerate() {
-			let proven = proof.as_ref().and_then(|(c, sig)| self.server.post("holding_back", &json!({"leaf_ids": chunk,
+			match self.slice_item(&format!("holding back {}", chunk[0])) {
+				super::slice::Item::Go => {},
+				super::slice::Item::Skip => continue,
+				super::slice::Item::Stop => break,
+			}
+			// The proof, once a call of this command reads.
+			if proof.is_none() {
+				proof = Some(self.server.post("challenge", &json!({})).ok()
+					.and_then(|v| unhex32(v["challenge"].as_str().unwrap_or("")).ok())
+					.map(|c| (c, sign(&mailbox, &super::client::auth_digest(&self.genesis, "holding_back", &c, &x, &[])))));
+			}
+			let proven = proof.as_ref().and_then(|p| p.as_ref()).and_then(|(c, sig)| self.server.post("holding_back", &json!({"leaf_ids": chunk,
 				"challenge": hex(c), "keys": [{"key": hex(&x.serialize()), "signature": hex(sig.as_ref())}]})).ok());
 			let a = match proven {
 				Some(a) => a,
@@ -2062,6 +2206,7 @@ impl Wallet {
 					out.push(id.to_string());
 				}
 			}
+			self.slice_memo_keep("holding back", json!(out));
 		}
 		Ok(out)
 	}
@@ -2099,8 +2244,33 @@ impl Wallet {
 		// alone keeps its node's fronted value from coming back: on a batch
 		// without a sweep nothing else ever asks for its refresh, and the
 		// operator's capital stays out until the batch's horizon.
-		let mut uncovered = self.uncovered()?;
+		// What the operator names (`holding_back`, once for every 64 coins,
+		// each call an item a slice may stop after): asked once a pass and
+		// kept for it whatever the tip (`slice_memo`), so that a pass in
+		// slices does not ask it again in each slice that goes on with this
+		// step. It is the operator's word about its own capital, not the
+		// chain's, and all a stale one can do is ask the refresh at no fee
+		// ([`Self::named_refresh_quote`]) of a coin no longer named: the
+		// participation the wallet signs there pays no fee whatever the
+		// schedule says, so the operator takes it for nothing or refuses it,
+		// and the coin stays live. A coin newly named waits for the next
+		// pass. Nothing else is decided on it.
 		let named = self.holding_back()?;
+		// A slice that stopped inside the operator's answer goes on with it
+		// in the next.
+		if self.slice_cut() {
+			return Ok(vec![]);
+		}
+		// What the bond leaves uncovered: a coin it names is refreshed at
+		// once through the ordinary quote, which may ask a fee. Computed in
+		// every slice that reaches the step's coins, never kept: it depends
+		// on the bond's standing, the operator's terms and budgets and the
+		// node's rates as well as on the store, and costs a few milliseconds
+		// of reads, and one read of the operator's `info` when the one the
+		// client keeps is older than five seconds ([`Self::uncovered`]).
+		// After `holding_back`, so a slice that stops inside the operator's
+		// answer pays nothing for it.
+		let mut uncovered = self.uncovered()?;
 		uncovered.extend(named.iter().cloned());
 		// The named coins due, by asset, each with whether the six-hour wait
 		// holds it.
@@ -4521,7 +4691,10 @@ impl Wallet {
 	/// byte for byte: the server answers a board it already holds with its
 	/// status. Returns the coin's state.
 	fn post_board(&mut self, leaf_id: &str, body: &Value, tx: &Transaction) -> Result<&'static str, Error> {
-		match self.server.post("register_board", body) {
+		// The registration, and the board's broadcast after it: on a witness
+		// that stands now. Without one the registration stands, to be posted
+		// again, as when the server's answer is not seen.
+		match self.hand_over("register_board", body) {
 			Ok(status) => {
 				self.store.set_board_request(leaf_id, "done", &status.to_string())?;
 				if status["state"].as_str() == Some("lost") {

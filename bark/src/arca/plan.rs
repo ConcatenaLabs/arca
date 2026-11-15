@@ -500,7 +500,7 @@ impl Wallet {
 		})?;
 		let body = json!({"quote": q["quote"], "coin": c.leaf_id, "mailbox": hex(&mailbox.x_only_public_key().0.serialize()),
 			"attestation": hex(sign(&key, &id).as_ref()), "steps": body_steps});
-		let st = self.server.post("submit_plan", &body)?;
+		let st = self.hand_over("submit_plan", &body)?;
 		if st["plan_id"].as_str() != Some(hex(&id).as_str()) {
 			return Err(Error::Refused(format!("the operator answers for another plan than the wallet made: {}", st)));
 		}
@@ -696,7 +696,7 @@ impl Wallet {
 	fn cancel_at_operator(&mut self, id: &str) -> Result<Value, Error> {
 		let pid = unhex32(id)?;
 		let mailbox = self.keys.mailbox()?;
-		let st = self.server.post("cancel_plan", &json!({"plan_id": id,
+		let st = self.hand_over("cancel_plan", &json!({"plan_id": id,
 			"signature": hex(sign(&mailbox, &cancel_digest(&self.genesis, &self.operator, &pid)).as_ref())}))?;
 		let state = st["state"].as_str().unwrap_or("cancelled").to_string();
 		self.store.set_plan(id, &state, Some(&st.to_string()))?;
@@ -1017,7 +1017,7 @@ impl Wallet {
 		// to answer with that step's refund, whose record it built itself.
 		let kept_on = s_next_done(body, j);
 		if !kept_on {
-			self.server.post("plan_leaf", &json!({"leaf_id": valid.leaf_id().to_string(), "auths": auths.iter().map(|(sg, t)|
+			self.hand_over("plan_leaf", &json!({"leaf_id": valid.leaf_id().to_string(), "auths": auths.iter().map(|(sg, t)|
 				json!({"signature": hex(sg.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))?;
 		}
 		let coin = record.coin(preimage, auths)?;

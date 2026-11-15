@@ -714,7 +714,7 @@ impl Wallet {
 		}
 		let t = MedianTime::from_consensus(now.to_consensus_u32().saturating_sub(3600)).map_err(|e| Error::Node(e.to_string()))?;
 		let auths = valid.sign_auths(&key, t);
-		let answer = self.server.post("claim_leaf", &json!({"leaf_id": valid.leaf_id().to_string(),
+		let answer = self.hand_over("claim_leaf", &json!({"leaf_id": valid.leaf_id().to_string(),
 			"auths": auths.iter().map(|(s, t)| json!({"signature": hex(s.as_ref()), "time": t.to_consensus_u32()})).collect::<Vec<_>>()}))?;
 		let coin = record.coin(preimage, auths)?;
 		let first = record.first_expiry();
