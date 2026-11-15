@@ -76,10 +76,14 @@ checkpoint_exit = false
 # The database's connection pool. A task that cannot get a connection within
 # the wait is refused, and an HTTP request answered `busy` (503, with a
 # Retry-After), never 500. A statement running longer than the limit is
-# cancelled by PostgreSQL and its transaction rolled back; migrations run
-# without it. A connection handed back with a statement still running on it
-# (its caller gone) has the statement cancelled and is closed at its next
-# checkout. `chain` reports the pool's use (`database_pool`).
+# cancelled by PostgreSQL and its transaction rolled back, named in the log
+# and counted; migrations and the start-up rewrite after a restore run
+# without it, and it never ends a COMMIT's wait for a synchronous standby. A
+# connection handed back with a statement still running on it (its caller
+# gone) is set aside at its next checkout, never cancelled, and closed once
+# the statement ends; it keeps its place of `size` until then, so `size` is
+# the most connections the server ever holds. `chain` reports the pool's use
+# (`database_pool`).
 [database_pool]
 size = 32
 wait_seconds = 10

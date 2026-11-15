@@ -91,10 +91,28 @@ pub struct ChainProgress {
 	pub rounds_waiting: Vec<RoundWaiting>,
 	/// How many rounds are broadcast and not yet final.
 	pub rounds_waiting_count: u64,
+	/// How old the figures read from the database are, and which of them
+	/// could not be read again at the last try.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub reads: Option<ChainReads>,
 	/// The database's connection pool: its settings, and how often tasks
 	/// waited for a connection or were refused one since the server started.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub database_pool: Option<DatabasePoolInfo>,
+}
+
+/// `chain`'s reads of the database: the age of each part in seconds
+/// (`rounds_waiting`, `holdings`, `pool`), and the parts whose latest read
+/// failed (`failed`). A part named there is shown as last read, however old
+/// its age says it is; a part never read yet is not shown at all, the call
+/// refused (`busy` when the database's pool was busy, else `internal`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainReads {
+	pub rounds_waiting_age_seconds: u64,
+	pub holdings_age_seconds: u64,
+	pub pool_age_seconds: u64,
+	pub failed: Vec<String>,
 }
 
 /// The database's connection pool, in `/v1/chain`: its settings, what is
@@ -103,8 +121,11 @@ pub struct ChainProgress {
 /// in use for the whole of `wait_ms` (a request is answered `busy`).
 /// `waited` and `wait_ms_total` rising faster than `gets` say the pool is
 /// near that point before anyone is refused. `closed_stuck` counts
-/// connections handed back with a statement still running on them, whose
-/// statement was cancelled.
+/// connections handed back with a statement still running on them and
+/// taken out of the pool, `set_aside` those of them still waiting for
+/// their statement to end (each keeps a place of `size`), and
+/// `statements_cancelled` the statements PostgreSQL cancelled: past the
+/// statement limit, unless an administrator cancelled them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabasePoolInfo {
@@ -118,6 +139,10 @@ pub struct DatabasePoolInfo {
 	pub timed_out: u64,
 	pub wait_ms_total: u64,
 	pub closed_stuck: u64,
+	#[serde(default)]
+	pub set_aside: u64,
+	#[serde(default)]
+	pub statements_cancelled: u64,
 	pub closed_broken: u64,
 	pub created: u64,
 }

@@ -416,3 +416,36 @@ async fn a_released_lowest_node_comes_back_beside_owners_who_have_not_released()
 	assert_eq!(common::flow::of_kind(&r, "reclaim").await.len(), 1, "a lowest node with a coin paid on out of round waits");
 	let _ = maker2;
 }
+
+/// `/v1/chain` while one of its reads fails: the figures last read stay,
+/// named as not read again, and are never shown empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_read_leaves_the_chain_figures_as_last_read() {
+	let (r, coins) = one_coin_pool(server::wallet::POOL_COINS).await;
+	let x = r.x;
+	let (_, _) = submit(&r, &[&coins[0]], &[keypair("P0 new")], None);
+	let b1 = r.server.rounds.run_round().await.unwrap().expect("a round");
+	r.produce().await;
+	r.bury().await;
+	round_final(&r, &b1.tx.txid()).await;
+	let before = r.http.get("chain").json;
+	assert!(pool(&r, x).0 > 0, "the round's batch is locked value: {}", before["pool"]);
+	assert_eq!(before["reads"]["failed"], json!([]));
+
+	// The pool's flow cannot be read: one of the tables it reads is away.
+	let (admin, conn) = tokio_postgres::connect(&r.db.url, tokio_postgres::NoTls).await.unwrap();
+	tokio::spawn(async move {
+		let _ = conn.await;
+	});
+	admin.batch_execute("ALTER TABLE node_release RENAME TO node_release_away").await.unwrap();
+	let during = r.http.get("chain").json;
+	println!("while the pool's flow cannot be read: reads {}", during["reads"]);
+	assert_eq!(during["pool"], before["pool"], "the pool's figures as last read");
+	assert_eq!(during["holdings"], before["holdings"]);
+	assert_eq!(during["reads"]["failed"], json!(["pool"]), "and named as not read again");
+
+	admin.batch_execute("ALTER TABLE node_release_away RENAME TO node_release").await.unwrap();
+	let after = r.http.get("chain").json;
+	assert_eq!(after["reads"]["failed"], json!([]));
+	assert_eq!(after["pool"], before["pool"]);
+}

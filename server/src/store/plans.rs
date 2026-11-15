@@ -368,7 +368,7 @@ impl Store {
 	/// The plan `id`, with its steps.
 	pub async fn plan(&self, id: &[u8; 32]) -> Result<Option<PlanRow>, StoreError> {
 		let conn = self.conn().await?;
-		read_plan(&*conn, id).await
+		read_plan(&**conn, id).await
 	}
 
 	/// The plans whose leaves are bound to the mailbox `key`, the newest

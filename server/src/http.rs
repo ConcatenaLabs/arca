@@ -164,9 +164,86 @@ pub struct InfoParts {
 	/// `chain`'s reads of the database: the rounds waiting for finality and
 	/// the wallet's holdings ([`CHAIN_FOR`]), and each asset's pool flow
 	/// ([`POOL_FOR`]).
-	pub chain_waiting: Arc<Fresh<Option<Vec<(elements::Txid, crate::chain::Finality)>>>>,
-	pub chain_holdings: Arc<Fresh<Option<BTreeMap<AssetId, u64>>>>,
-	pub chain_pool: Arc<Fresh<Option<BTreeMap<[u8; 32], crate::store::PoolFlow>>>>,
+	pub chain_waiting: Arc<Fresh<Kept<Vec<(elements::Txid, crate::chain::Finality)>>>>,
+	pub chain_holdings: Arc<Fresh<Kept<BTreeMap<AssetId, u64>>>>,
+	pub chain_pool: Arc<Fresh<Kept<BTreeMap<[u8; 32], crate::store::PoolFlow>>>>,
+}
+
+/// Why one of `chain`'s reads failed: every database connection was in use
+/// for the pool's whole wait ([`crate::store::StoreError::Busy`]), or
+/// anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFailed {
+	Busy,
+	Other,
+}
+
+impl From<&RoundError> for ReadFailed {
+	fn from(e: &RoundError) -> ReadFailed {
+		match e {
+			RoundError::Store(s) => s.into(),
+			_ => ReadFailed::Other,
+		}
+	}
+}
+
+impl From<&crate::store::StoreError> for ReadFailed {
+	fn from(e: &crate::store::StoreError) -> ReadFailed {
+		if e.is_busy() { ReadFailed::Busy } else { ReadFailed::Other }
+	}
+}
+
+/// What `chain` keeps of one of its reads: the last value read and when,
+/// and why the latest read failed, when it did. A read that fails never
+/// takes the last good value's place: figures an operator or a script acts
+/// on (what the wallet holds, where the pool's value is) are shown as last
+/// read, with their age, never as empty.
+#[derive(Debug, Clone)]
+pub struct Kept<T> {
+	good: Option<(T, std::time::Instant)>,
+	failed: Option<ReadFailed>,
+}
+
+impl<T> Kept<T> {
+	/// The last value read and its age in seconds; when nothing was ever
+	/// read, the refusal `chain` answers with: `busy` (503, to be asked
+	/// again) only when the pool was busy, `internal` for any other failure.
+	fn figures(&self, what: &str) -> Result<(&T, u64), Refusal> {
+		match (&self.good, self.failed) {
+			(Some((v, at)), _) => Ok((v, at.elapsed().as_secs())),
+			(None, Some(ReadFailed::Busy)) => Err(Refusal::new(status_of("busy"), "busy",
+				format!("{} could not be read yet, the server is busy; try again in a moment", what))),
+			(None, _) => Err(Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal",
+				format!("{} could not be read; try again in a moment", what))),
+		}
+	}
+}
+
+/// How soon a read of `chain`'s that failed is tried again.
+pub const FAILED_FOR: Duration = Duration::from_secs(2);
+
+/// [`served`] for a read that can fail: a failed read keeps the last value
+/// read ([`Kept`]) and is tried again after [`FAILED_FOR`] at the latest.
+async fn kept<T, F, Fut>(cell: &Arc<Fresh<Kept<T>>>, max_age: Duration, read: F) -> Kept<T>
+where
+	T: Clone + Send + Sync + 'static,
+	F: FnOnce() -> Fut,
+	Fut: std::future::Future<Output = Result<T, ReadFailed>> + Send + 'static,
+{
+	let age = match cell.peek() {
+		Some(k) if k.failed.is_some() => max_age.min(FAILED_FOR),
+		_ => max_age,
+	};
+	let last = cell.clone();
+	served(cell, age, move || {
+		let read = read();
+		async move {
+			match read.await {
+				Ok(v) => Kept { good: Some((v, std::time::Instant::now())), failed: None },
+				Err(why) => Kept { good: last.peek().and_then(|k| k.good), failed: Some(why) },
+			}
+		}
+	}).await
 }
 
 /// How long `chain` publishes the rounds waiting for finality and the
@@ -599,8 +676,11 @@ impl From<ForfeitError> for Refusal {
 
 impl From<RoundError> for Refusal {
 	fn from(e: RoundError) -> Refusal {
-		if let RoundError::Store(s) = e {
-			return s.into();
+		// `busy` for a busy pool alone: any other failure of the database is
+		// `internal`, which no wallet takes for a request to ask again.
+		if matches!(&e, RoundError::Store(s) if s.is_busy()) {
+			log::warn!("rounds: {}", e);
+			return Refusal::new(status_of("busy"), "busy", e.to_string());
 		}
 		log::error!("rounds: {}", e);
 		Refusal::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
@@ -817,22 +897,40 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 	let p = app.rounds.finality().progress();
 	// Every read of the database below is served from memory, read again in
 	// the background once older than its age, and by one task however many
-	// ask: anyone may call `chain`, as often as it likes.
+	// ask: anyone may call `chain`, as often as it likes. A read that fails
+	// leaves the last one standing; before the first good read of a part
+	// the call is refused, never answered with empty figures.
 	let (chain_for, pool_for) = (CHAIN_FOR.min(app.chain_pool_for), app.chain_pool_for);
 	let a = app.clone();
-	let waiting = served(&app.info_parts.chain_waiting, chain_for, move || async move {
-		a.rounds.waiting().await.map_err(|e| log::warn!("the rounds waiting for finality: {}", e)).ok()
-	}).await.ok_or_else(|| {
-		Refusal::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "the rounds waiting for finality could not be read; try again in a moment")
-	})?;
+	let waiting = kept(&app.info_parts.chain_waiting, chain_for, move || async move {
+		a.rounds.waiting().await.map_err(|e| {
+			log::warn!("the rounds waiting for finality: {}", e);
+			ReadFailed::from(&e)
+		})
+	}).await;
 	let a = app.clone();
-	let holdings = served(&app.info_parts.chain_holdings, chain_for, move || async move {
-		a.rounds.holdings().await.map_err(|e| log::warn!("the wallet's holdings: {}", e)).ok()
-	}).await.unwrap_or_default();
+	let holdings = kept(&app.info_parts.chain_holdings, chain_for, move || async move {
+		a.rounds.holdings().await.map_err(|e| {
+			log::warn!("the wallet's holdings: {}", e);
+			ReadFailed::from(&e)
+		})
+	}).await;
 	let a = app.clone();
-	let pool = served(&app.info_parts.chain_pool, pool_for, move || async move {
-		a.store.pool_flow().await.map_err(|e| log::warn!("the pool's flow: {}", e)).ok()
-	}).await.unwrap_or_default();
+	let pool = kept(&app.info_parts.chain_pool, pool_for, move || async move {
+		a.store.pool_flow().await.map_err(|e| {
+			log::warn!("the pool's flow: {}", e);
+			ReadFailed::from(&e)
+		})
+	}).await;
+	let reads = api::ChainReads {
+		rounds_waiting_age_seconds: waiting.figures("the rounds waiting for finality")?.1,
+		holdings_age_seconds: holdings.figures("what the wallet holds")?.1,
+		pool_age_seconds: pool.figures("the pool's flow")?.1,
+		failed: [("rounds_waiting", waiting.failed), ("holdings", holdings.failed), ("pool", pool.failed)].into_iter()
+			.filter(|(_, f)| f.is_some()).map(|(n, _)| n.to_string()).collect(),
+	};
+	let (waiting, holdings, pool) = (waiting.good.map(|g| g.0).unwrap_or_default(), holdings.good.map(|g| g.0).unwrap_or_default(),
+		pool.good.map(|g| g.0).unwrap_or_default());
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
 	let waiting_on = if p.failing_passes > 0 || p.node_height.saturating_sub(p.height) >= crate::chain::finality::LAG_BLOCKS {
 		"follower"
@@ -863,12 +961,13 @@ async fn chain_progress(State(app): State<Arc<App>>) -> Result<Json<api::ChainPr
 				net_drawn_last_hour: (f.drawn_last_hour as i128 - f.reclaimed_last_hour as i128 - f.swept_last_hour as i128).to_string(),
 			})).collect(),
 		rounds_waiting_count: waiting.len() as u64,
+		reads: Some(reads),
 		database_pool: Some({
 			let p = app.store.pool_status();
 			api::DatabasePoolInfo {
 				size: p.size, wait_ms: p.wait_ms, statement_timeout_ms: p.statement_timeout_ms, connections: p.connections, idle: p.idle,
 				gets: p.gets, waited: p.waited, timed_out: p.timed_out, wait_ms_total: p.wait_ms_total, closed_stuck: p.closed_stuck,
-				closed_broken: p.closed_broken, created: p.created,
+				set_aside: p.set_aside, statements_cancelled: p.statements_cancelled, closed_broken: p.closed_broken, created: p.created,
 			}
 		}),
 		rounds_waiting: waiting.iter().take(20).map(|(t, f)| {
@@ -2706,5 +2805,63 @@ mod tests {
 			assert_eq!(served(&cell, Duration::from_secs(30), read(reads.clone(), finished.clone())).await, 7);
 		}
 		assert_eq!(reads.load(Ordering::SeqCst), 1, "no read while the value is fresh");
+	}
+
+	/// `chain`'s figures: a read that fails leaves the last good one
+	/// standing, with its age and the failure named; with nothing ever read
+	/// the call is refused, `busy` for a busy pool alone.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn a_failed_read_keeps_the_last_good_figures() {
+		let ok = |v: u32| move || async move { Ok::<u32, ReadFailed>(v) };
+		let fails = |why: ReadFailed| move || async move { Err::<u32, ReadFailed>(why) };
+		// Read on every call (as the tests' servers do).
+		let cell: Arc<Fresh<Kept<u32>>> = Arc::new(Fresh::new());
+		let k = kept(&cell, Duration::ZERO, ok(7)).await;
+		assert_eq!((k.figures("it").unwrap().0, k.failed), (&7, None));
+		let k = kept(&cell, Duration::ZERO, fails(ReadFailed::Other)).await;
+		assert_eq!((k.figures("it").unwrap().0, k.failed), (&7, Some(ReadFailed::Other)), "the last good value, and the failure");
+		let k = kept(&cell, Duration::ZERO, ok(8)).await;
+		assert_eq!((k.figures("it").unwrap().0, k.failed), (&8, None), "a good read takes its place again");
+
+		// Read in the background once older than its age.
+		let cell: Arc<Fresh<Kept<u32>>> = Arc::new(Fresh::new());
+		let age = Duration::from_millis(100);
+		assert_eq!(kept(&cell, age, ok(7)).await.figures("it").unwrap().0, &7);
+		tokio::time::sleep(Duration::from_millis(1100)).await;
+		// Stale: handed out as it is, the read that fails runs behind it.
+		let k = kept(&cell, age, fails(ReadFailed::Busy)).await;
+		assert_eq!(k.figures("it").unwrap().0, &7);
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		let k = cell.peek().expect("kept");
+		let (v, old) = k.figures("it").unwrap();
+		assert_eq!((v, k.failed), (&7, Some(ReadFailed::Busy)), "still the last good value after the failed read");
+		assert!(old >= 1, "and its age says how old it is: {} s", old);
+
+		// Nothing ever read: an explicit refusal, never a default.
+		for (why, status, code) in [(ReadFailed::Busy, 503, "busy"), (ReadFailed::Other, 500, "internal")] {
+			let cell: Arc<Fresh<Kept<u32>>> = Arc::new(Fresh::new());
+			let k = kept(&cell, Duration::from_secs(30), fails(why)).await;
+			let refusal = k.figures("what the wallet holds").expect_err("no figures to show");
+			assert_eq!((refusal.status.as_u16(), refusal.code.as_str()), (status, code));
+			assert!(refusal.message.contains("what the wallet holds"), "{}", refusal.message);
+		}
+	}
+
+	/// `busy` is for a busy pool alone: any other failure of the database
+	/// is `internal`, which the wallet library does not send again.
+	#[test]
+	fn only_a_busy_pool_is_answered_busy() {
+		use crate::store::StoreError;
+		let busy = StoreError::Busy(Duration::from_secs(10));
+		let other = StoreError::Corrupt("x".into());
+		assert_eq!(Refusal::from(StoreError::Busy(Duration::from_secs(10))).status.as_u16(), 503);
+		assert_eq!(Refusal::from(StoreError::Corrupt("x".into())).code, "internal");
+		assert_eq!((ReadFailed::from(&busy), ReadFailed::from(&other)), (ReadFailed::Busy, ReadFailed::Other));
+		let r = Refusal::from(RoundError::Store(busy));
+		assert_eq!((r.status.as_u16(), r.code.as_str()), (503, "busy"));
+		let r = Refusal::from(RoundError::Store(other));
+		assert_eq!((r.status.as_u16(), r.code.as_str()), (500, "internal"));
+		let r = Refusal::from(RoundError::Chain("the node".into()));
+		assert_eq!((r.status.as_u16(), r.code.as_str()), (500, "internal"));
 	}
 }

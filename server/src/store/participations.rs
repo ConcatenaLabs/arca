@@ -503,7 +503,7 @@ impl Store {
 	/// The participation `id`, with its inputs, outputs and fees.
 	pub async fn participation(&self, id: &[u8; 32]) -> Result<Option<ParticipationRow>, StoreError> {
 		let conn = self.conn().await?;
-		read_participation(&*conn, id).await
+		read_participation(&**conn, id).await
 	}
 
 	/// Begins the forfeit step of participation `id` at `attempt`, in the

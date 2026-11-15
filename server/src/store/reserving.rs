@@ -173,7 +173,7 @@ impl Store {
 			&format!("SELECT {} FROM leaf l WHERE l.seq > $2 AND l.leaf_id IN ({}) ORDER BY l.seq LIMIT $3", SERVED_COLUMNS, SERVED_TO),
 			&[&&key[..], &after, &limit],
 		).await?;
-		served_rows(&*conn, &rows).await
+		served_rows(&**conn, &rows).await
 	}
 
 	/// Up to `limit` leaves served to `key` past the settled cursor `since`
@@ -201,7 +201,7 @@ impl Store {
 			let x: String = r.get(11);
 			made.push((x.parse::<u64>().map_err(|_| StoreError::Corrupt(format!("transaction id {}", x)))?, r.get::<_, i64>(10)));
 		}
-		Ok(served_rows(&*conn, &rows).await?.into_iter().zip(made).collect())
+		Ok(served_rows(&**conn, &rows).await?.into_iter().zip(made).collect())
 	}
 
 	/// Where a read of every leaf served to a key from the first
@@ -256,8 +256,14 @@ impl Store {
 	/// A wallet holding a cursor of the old epoch reads from the first leaf.
 	pub async fn cursor_epoch_at_start(&self) -> Result<[u8; 8], StoreError> {
 		let mut conn = self.conn().await?;
-		let identity = database_identity(&*conn).await;
+		let identity = database_identity(&**conn).await;
 		let tx = conn.transaction().await?;
+		// After a restore this rewrites whole tables (every served leaf, every
+		// leaf, every mailbox binding). Like a migration it runs without the
+		// statement limit the pool sets: cut off at the limit it would roll
+		// back, fail the start, and do the same at the next, on the one day
+		// the server must start.
+		tx.batch_execute("SET LOCAL statement_timeout = 0").await?;
 		tx.batch_execute("LOCK TABLE leaf_cursor_epoch IN EXCLUSIVE MODE").await?;
 		let behind: bool = tx.query_one(
 			"SELECT pg_current_xact_id() < COALESCE((SELECT max(served_xid) FROM leaf_served), '0'::xid8)", &[]).await?.get(0);
@@ -320,7 +326,7 @@ impl Store {
 			&format!("SELECT {} FROM leaf l WHERE l.leaf_id = ANY($2) AND l.leaf_id IN ({}) ORDER BY l.seq", SERVED_COLUMNS, SERVED_TO),
 			&[&&key[..], &ids],
 		).await?;
-		served_rows(&*conn, &rows).await
+		served_rows(&**conn, &rows).await
 	}
 
 	/// Of the leaves `ids`, those served to `key`, each with its state and

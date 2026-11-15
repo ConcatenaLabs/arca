@@ -10,9 +10,29 @@
 //! task's wait, and then hand the connection back, still busy, to the next
 //! task, so one abandoned statement of a minute fails every task that draws
 //! that connection for a minute. Here the check has a short limit of its own
-//! ([`CHECK_WITHIN`]): a connection that does not answer within it has the
-//! statement on it cancelled and is closed, and the task takes another
-//! connection or a new one.
+//! ([`CHECK_WITHIN`]): a connection that does not answer within it is set
+//! aside, out of the pool, until PostgreSQL answers on it, and then closed;
+//! the task takes another connection or a new one.
+//!
+//! Nothing here ever cancels the statement left running. What waits on such
+//! a connection may be a COMMIT: an operator that keeps every commit off the
+//! machine (a synchronous standby, or WAL archiving through a synchronous
+//! receiver) has each COMMIT wait until the standby holds it, and a cancel
+//! sent to a backend in that wait ends the wait, not the transaction.
+//! PostgreSQL then answers "canceling wait for synchronous replication due
+//! to user request; the transaction has already committed locally, but
+//! might not have been replicated to the standby", and the server would go
+//! on from a commit its backup never got. So the statement is left to end
+//! by itself: a COMMIT when the standby has it, anything else at the
+//! statement limit ([`PoolSettings::statement_timeout`]), which ends a
+//! runaway statement and never a commit's wait for the standby.
+//!
+//! A connection set aside still counts toward the pool's size: the pool and
+//! what is set aside never hold more than [`PoolSettings::size`] connections
+//! together, so a standby that stalls while clients give up cannot use up
+//! PostgreSQL's connections, which other databases of the cluster share.
+//! With every connection set aside, a task waits out its wait and is
+//! refused `busy`, until a statement ends.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,7 +50,10 @@ pub struct PoolSettings {
 	/// ([`crate::store::StoreError::Busy`]).
 	pub wait: Duration,
 	/// The longest a statement may run before PostgreSQL cancels it
-	/// (`statement_timeout`); zero for no limit. Migrations run without one.
+	/// (`statement_timeout`); zero for no limit. Migrations and the start-up
+	/// rewrite after a restore run without one. A COMMIT waiting for a
+	/// synchronous standby is not a statement running: the limit never ends
+	/// that wait.
 	pub statement_timeout: Duration,
 }
 
@@ -68,71 +91,134 @@ pub enum ConnError {
 	#[error(transparent)]
 	Db(#[from] tokio_postgres::Error),
 	#[error("a connection did not answer its check within {0:?}, a statement abandoned on it still running: \
-		the statement was cancelled and the connection closed")]
+		it is set aside until the statement ends, and closed then")]
 	Stuck(Duration),
+	#[error("every connection the pool may hold is in use or set aside with a statement still running on it ({0} set aside): \
+		none is opened until one ends")]
+	Full(u64),
 }
 
 /// What the pool has been through since the server started, beside what
 /// bb8 counts itself ([`crate::store::Store::pool_status`]).
 #[derive(Debug, Default)]
 pub(crate) struct Counters {
-	/// Connections closed because they did not answer their check in time.
+	/// Connections taken out of the pool because they did not answer their
+	/// check in time.
 	pub stuck: AtomicU64,
+	/// Of those, the ones still waiting for PostgreSQL to answer.
+	pub set_aside: AtomicU64,
+	/// Connections open: the pool's and the ones set aside.
+	open: AtomicU64,
+}
+
+/// One of the connections the pool may hold ([`PoolSettings::size`]), from
+/// before it is opened until it is closed.
+struct Slot(Arc<Counters>);
+
+impl Slot {
+	fn take(counters: &Arc<Counters>, size: u32) -> Option<Slot> {
+		if counters.open.fetch_add(1, Ordering::SeqCst) >= u64::from(size) {
+			counters.open.fetch_sub(1, Ordering::SeqCst);
+			return None;
+		}
+		Some(Slot(counters.clone()))
+	}
+}
+
+impl Drop for Slot {
+	fn drop(&mut self) {
+		self.0.open.fetch_sub(1, Ordering::SeqCst);
+	}
+}
+
+/// A connection of the pool. It reads as the client it holds.
+pub struct Pooled(Option<(tokio_postgres::Client, Slot)>);
+
+impl std::ops::Deref for Pooled {
+	type Target = tokio_postgres::Client;
+
+	fn deref(&self) -> &tokio_postgres::Client {
+		// Emptied only by a failed check, after which bb8 drops it unused.
+		&self.0.as_ref().expect("a connection handed out holds its client").0
+	}
+}
+
+impl std::ops::DerefMut for Pooled {
+	fn deref_mut(&mut self) -> &mut tokio_postgres::Client {
+		&mut self.0.as_mut().expect("a connection handed out holds its client").0
+	}
 }
 
 /// bb8's manager for PostgreSQL with a time limit on the check
-/// ([`CHECK_WITHIN`]).
+/// ([`CHECK_WITHIN`]) and a bound on the connections open, set aside ones
+/// included.
 pub(crate) struct Manager {
 	inner: PostgresConnectionManager<NoTls>,
 	check_within: Duration,
+	size: u32,
 	counters: Arc<Counters>,
 }
 
 impl Manager {
-	pub(crate) fn new(config: tokio_postgres::Config, check_within: Duration, counters: Arc<Counters>) -> Manager {
-		Manager { inner: PostgresConnectionManager::new(config, NoTls), check_within, counters }
+	pub(crate) fn new(config: tokio_postgres::Config, check_within: Duration, size: u32, counters: Arc<Counters>) -> Manager {
+		Manager { inner: PostgresConnectionManager::new(config, NoTls), check_within, size, counters }
 	}
 }
 
 impl bb8::ManageConnection for Manager {
-	type Connection = tokio_postgres::Client;
+	type Connection = Pooled;
 	type Error = ConnError;
 
-	async fn connect(&self) -> Result<tokio_postgres::Client, ConnError> {
-		Ok(bb8::ManageConnection::connect(&self.inner).await?)
+	async fn connect(&self) -> Result<Pooled, ConnError> {
+		let Some(slot) = Slot::take(&self.counters, self.size) else {
+			return Err(ConnError::Full(self.counters.set_aside.load(Ordering::SeqCst)));
+		};
+		let client = bb8::ManageConnection::connect(&self.inner).await?;
+		Ok(Pooled(Some((client, slot))))
 	}
 
-	async fn is_valid(&self, conn: &mut tokio_postgres::Client) -> Result<(), ConnError> {
-		match tokio::time::timeout(self.check_within, conn.simple_query("")).await {
+	async fn is_valid(&self, conn: &mut Pooled) -> Result<(), ConnError> {
+		let Some((client, _)) = conn.0.as_ref() else { return Err(ConnError::Stuck(self.check_within)) };
+		match tokio::time::timeout(self.check_within, client.simple_query("")).await {
 			Ok(r) => r.map(|_| ()).map_err(ConnError::from),
 			Err(_) => {
-				// Whatever runs on it is a statement nobody waits for: ask
-				// PostgreSQL to cancel it, on a connection of its own, and
-				// let bb8 close this one.
-				let token = conn.cancel_token();
+				// Never cancelled (see the module's note): taken out of the
+				// pool, and closed once PostgreSQL answers on it, when the
+				// statement left on it has ended, or the connection breaks.
+				// Until then it keeps its slot of the pool's size.
+				let (client, slot) = conn.0.take().expect("checked above");
+				self.counters.stuck.fetch_add(1, Ordering::SeqCst);
+				self.counters.set_aside.fetch_add(1, Ordering::SeqCst);
+				let counters = self.counters.clone();
 				tokio::spawn(async move {
-					if let Err(e) = token.cancel_query(NoTls).await {
-						log::warn!("database: cancelling a statement left running on a connection: {}", e);
-					}
+					let since = std::time::Instant::now();
+					let _ = client.simple_query("").await;
+					counters.set_aside.fetch_sub(1, Ordering::SeqCst);
+					log::info!("database: a connection set aside is closed, the statement left on it over after {:?}", since.elapsed());
+					drop((client, slot));
 				});
-				self.counters.stuck.fetch_add(1, Ordering::Relaxed);
 				Err(ConnError::Stuck(self.check_within))
 			},
 		}
 	}
 
-	fn has_broken(&self, conn: &mut tokio_postgres::Client) -> bool {
-		conn.is_closed()
+	fn has_broken(&self, conn: &mut Pooled) -> bool {
+		conn.0.as_ref().is_some_and(|(client, _)| client.is_closed())
 	}
 }
 
-/// Logs what bb8 reports of connections it could not make or closed.
+/// Logs what bb8 reports of connections it could not make or closed. A pool
+/// held full by connections set aside is not logged here, once for every
+/// task that waits: the tasks' own refusals say it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LogSink;
 
 impl bb8::ErrorSink<ConnError> for LogSink {
 	fn sink(&self, error: ConnError) {
-		log::warn!("database: {}", error);
+		match error {
+			ConnError::Full(_) => log::debug!("database: {}", error),
+			_ => log::warn!("database: {}", error),
+		}
 	}
 
 	fn boxed_clone(&self) -> Box<dyn bb8::ErrorSink<ConnError>> {

@@ -194,8 +194,8 @@ pub enum StoreError {
 	/// server is busy, and the same request can be made again in a moment.
 	#[error("the server is busy: no database connection came free within {0:?}; try again in a moment")]
 	Busy(Duration),
-	#[error("database error: {0}")]
-	Db(#[from] tokio_postgres::Error),
+	#[error("database error at {0}")]
+	Db(DbFailure),
 	#[error("the database holds a value this server cannot read: {0}")]
 	Corrupt(String),
 	#[error("an output script is already known to the server: a leaf script is never funded twice")]
@@ -252,6 +252,69 @@ pub enum StoreError {
 	CoinPlanned(String),
 	#[error("the unlock hash is one the server knows already: every participation and plan step has a hash of its own")]
 	UnlockHashReused,
+}
+
+/// A database error with where the store met it: the place of the `?` that
+/// raised it, which names the statement.
+#[derive(Debug)]
+pub struct DbFailure {
+	error: tokio_postgres::Error,
+	at: &'static std::panic::Location<'static>,
+}
+
+impl DbFailure {
+	/// Where the store met it, `store/pool.rs:240`.
+	pub fn at(&self) -> String {
+		let file = self.at.file();
+		format!("{}:{}", file.rsplit_once("src/").map_or(file, |(_, f)| f), self.at.line())
+	}
+
+	/// Whether PostgreSQL cancelled the statement: it ran past the
+	/// statement limit, or an administrator cancelled it.
+	pub fn cancelled(&self) -> bool {
+		self.error.code() == Some(&SqlState::QUERY_CANCELED)
+	}
+}
+
+impl std::ops::Deref for DbFailure {
+	type Target = tokio_postgres::Error;
+
+	fn deref(&self) -> &tokio_postgres::Error {
+		&self.error
+	}
+}
+
+impl std::fmt::Display for DbFailure {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}: ", self.at())?;
+		match self.error.as_db_error() {
+			Some(d) => write!(f, "{} {}: {}", d.severity(), d.code().code(), d.message()),
+			None => match std::error::Error::source(&self.error) {
+				Some(cause) => write!(f, "{}: {}", self.error, cause),
+				None => write!(f, "{}", self.error),
+			},
+		}
+	}
+}
+
+/// Statements PostgreSQL cancelled, as this process's store met them
+/// ([`PoolStatus::statements_cancelled`]).
+static STATEMENTS_CANCELLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl From<tokio_postgres::Error> for StoreError {
+	/// Keeps the place of the `?` that raised the error (`?` hands its own
+	/// place on), and counts and logs a statement PostgreSQL cancelled: one
+	/// that grew past the statement limit is named the first time it does.
+	#[track_caller]
+	fn from(error: tokio_postgres::Error) -> StoreError {
+		let e = DbFailure { error, at: std::panic::Location::caller() };
+		if e.cancelled() {
+			STATEMENTS_CANCELLED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			log::warn!("database: a statement was cancelled at {} (past the statement limit, `statement_timeout_seconds`, unless an \
+				administrator cancelled it); its transaction is rolled back", e);
+		}
+		StoreError::Db(e)
+	}
 }
 
 impl StoreError {
@@ -339,9 +402,16 @@ pub struct PoolStatus {
 	pub waited: u64,
 	pub timed_out: u64,
 	pub wait_ms_total: u64,
-	/// Connections closed for not answering their check (a statement
-	/// abandoned on them, cancelled) or found broken, and connections made.
+	/// Connections taken out of the pool for not answering their check (a
+	/// statement abandoned on them still running; closed once it ends), of
+	/// them the ones still set aside now, connections found broken, and
+	/// connections made.
 	pub closed_stuck: u64,
+	pub set_aside: u64,
+	/// Statements PostgreSQL cancelled, by this process since it started:
+	/// each ran past the statement limit, or was cancelled by an
+	/// administrator. The log names each with where the store ran it.
+	pub statements_cancelled: u64,
 	pub closed_broken: u64,
 	pub created: u64,
 }
@@ -380,7 +450,7 @@ impl Store {
 		without_jit(&mut config);
 		with_statement_timeout(&mut config, settings.statement_timeout);
 		let counters = Arc::new(connections::Counters::default());
-		let manager = connections::Manager::new(config, CHECK_WITHIN, counters.clone());
+		let manager = connections::Manager::new(config, CHECK_WITHIN, settings.size.max(1), counters.clone());
 		let pool = Pool::builder()
 			.max_size(settings.size.max(1))
 			.connection_timeout(if settings.wait.is_zero() { Duration::from_millis(1) } else { settings.wait })
@@ -399,8 +469,9 @@ impl Store {
 
 	/// The pool's settings and what it has been through since the server
 	/// started: how many tasks waited for a connection, how many waited in
-	/// vain ([`StoreError::Busy`]), and how many connections were closed for
-	/// not answering their check ([`CHECK_WITHIN`]).
+	/// vain ([`StoreError::Busy`]), how many connections were set aside for
+	/// not answering their check ([`CHECK_WITHIN`]) and how many still are,
+	/// and how many statements PostgreSQL cancelled.
 	pub fn pool_status(&self) -> PoolStatus {
 		let state = self.pool.state();
 		let s = &state.statistics;
@@ -414,7 +485,9 @@ impl Store {
 			waited: s.get_waited,
 			timed_out: s.get_timed_out,
 			wait_ms_total: s.get_wait_time.as_millis() as u64,
-			closed_stuck: self.counters.stuck.load(std::sync::atomic::Ordering::Relaxed),
+			closed_stuck: self.counters.stuck.load(std::sync::atomic::Ordering::SeqCst),
+			set_aside: self.counters.set_aside.load(std::sync::atomic::Ordering::SeqCst),
+			statements_cancelled: STATEMENTS_CANCELLED.load(std::sync::atomic::Ordering::SeqCst),
 			closed_broken: s.connections_closed_broken,
 			created: s.connections_created,
 		}
