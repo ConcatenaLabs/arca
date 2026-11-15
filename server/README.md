@@ -203,6 +203,63 @@ overestimates the cost of the server's recursive lineage walks by hundreds of
 times and would compile them on every call, which takes several times as long
 as the query itself.
 
+The server's tasks and requests share a pool of connections
+(`[database_pool]`: 32 connections by default). A task holds one connection at
+a time and waits for one at most `wait_seconds` (10 by default); a request
+whose wait runs out is answered `busy` (503, with `Retry-After: 2`), which the
+wallet library sends once more after that wait before it reports the server
+busy in words. Every statement runs within `statement_timeout_seconds` (30 by
+default, 0 for no limit; PostgreSQL's `statement_timeout`): one that runs
+longer is cancelled, its caller gets the error, and its transaction is rolled
+back whole, as every operation that changes more than one row runs in one
+transaction. The server's log names it (`database: a statement was cancelled
+at store/pool.rs:125: ERROR 57014: canceling statement due to statement
+timeout`: the place in the store that ran it), and `database_pool` counts it
+(`statements_cancelled`), so a statement that grows with the operator's
+history is known by name the first time it reaches the limit. Migrations run
+without the limit, and so does the rewrite the server makes when it starts on
+a restored database (every served leaf's cursor, over whole tables), which
+must not be cut off on the day the server has to start. The limit ends a
+statement that runs; it never ends a COMMIT's wait for a synchronous
+standby. The slowest reads the server makes take a few seconds on a store of
+some 50,000 batch leaves (the in-flight reads of a round's cap, the pool's
+flow), well within it.
+
+A connection can come back to the pool with a statement still running on it:
+when the task that sent it is dropped halfway, as an HTTP handler is when its
+client closes the connection, PostgreSQL goes on running the statement, and
+whatever is sent next on that connection waits behind it. Before the pool
+hands a connection out it asks it an empty statement, and a connection that
+does not answer within a second is set aside, out of the pool, until
+PostgreSQL answers on it (its statement has ended), and closed then; the
+task takes another. So one abandoned statement costs the next task a second,
+never every task that draws that connection until the statement ends.
+
+The server never cancels the statement left running. It may be a COMMIT
+waiting for the synchronous standby that keeps every commit off the machine
+(above), and a cancel sent to a backend in that wait ends the wait, not the
+transaction: PostgreSQL answers that the transaction "has already committed
+locally, but might not have been replicated to the standby", and the server
+would go on from a commit its backup never got. Left alone, a COMMIT is done
+when the standby holds it, and any other statement ends at the statement
+limit. A connection set aside keeps its place of the pool's `size`: the pool
+and what is set aside never hold more connections than that, so a standby
+that stalls while clients give up cannot use up the cluster's connections;
+with every connection set aside, requests are refused `busy` until a
+statement ends.
+`GET chain` reports the pool (`database_pool`): its settings, the connections
+open and idle, and since the start how many tasks asked for a connection
+(`gets`), waited for one (`waited`, `wait_ms_total`), were refused one
+(`timed_out`, each a `busy` answer or a task's pass failed), how many
+connections were taken out of the pool with a statement abandoned on them
+(`closed_stuck`) and how many of them still wait for it to end (`set_aside`),
+how many were found broken (`closed_broken`), and how many statements
+PostgreSQL cancelled (`statements_cancelled`). `timed_out` above zero means
+the pool was full for a whole wait; `waited` climbing toward `gets` says it
+is getting there; `set_aside` standing above zero says statements are stuck
+(a stalled standby, a lock held); `statements_cancelled` rising says a
+statement has reached the limit, and the log says which.
+
 ## Finality
 
 The server never counts confirmations. One component, the finality service
@@ -252,7 +309,18 @@ or finality. A pass that fails, or panics, is logged and the next one runs. A
 pass that takes longer than ten seconds, or that starts three or more blocks
 behind the node, is logged at info.
 
-`GET /v1/chain` says where the service stands and what finality waits on: the
+`GET /v1/chain` says where the service stands and what finality waits on,
+answered from memory: what it reads of the database (the rounds waiting and
+the wallet's holdings, at most every 5 s; the pool's flow, at most every
+30 s, `[limits] chain_pool_seconds`) is read again in the background by one task, however many ask; only
+the first call after a start waits, and every call made meanwhile waits for
+that one read. A read that fails leaves the figures last read standing:
+`reads` gives each part's age in seconds (`rounds_waiting_age_seconds`,
+`holdings_age_seconds`, `pool_age_seconds`) and names the parts not read
+again (`failed`), and the failed read is tried again within 2 s. Figures are
+never shown empty for want of a read: until a part has been read once the
+call is refused, `busy` (503) when the database's pool was busy and
+`internal` (500) for any other failure. It says the
 height it has followed to and the node's, how long its last pass took and how
 long ago it ended, passes failing in a row, whether the node reports its tip's
 anchor as ok, the Bitcoin height the tip's anchor commits to and how long it
@@ -3177,6 +3245,11 @@ rate times the lifetime. A board naming a deleted nonce is refused
 (`nonce_unknown`): a wallet registers its board right after it takes the
 nonce.
 
+A request the server cannot serve because every database connection stayed
+in use for the whole of the pool's wait is refused `busy` (503, with
+`Retry-After`; see Keeping the database). As with any 5xx, the request may
+or may not have been taken, and the wallet sends it again as it was.
+
 ## The signer
 
 The operator key `S` lives in `arca-signer`, a process of its own; the server
@@ -3884,6 +3957,19 @@ produce on demand (a block without its certificate, a certificate arriving
 late, a stale anchor, a rollback below where the service started) run against
 a chain held in memory. One signer test watches the signer's system calls
 with `strace`, which must be on the `PATH`.
+
+`tests/pool_connections.rs` holds the pool's cases against statements held
+running by a lock: a statement its caller gave up on, which fails no later
+request and is never cancelled; connections set aside counting toward the
+pool's size; a statement past the limit, named and counted; the start-up
+rewrite running past the limit; a pool held full answering `busy`. One of
+its tests shows a COMMIT waiting for a synchronous standby that is not there
+left to wait, its transaction not forced through. For that it sets the
+cluster's `synchronous_standby_names` (and `synchronous_commit` to `local`
+for every other session) while it runs and resets both after, as a
+superuser: one more reason `ARCA_TEST_POSTGRES` names a throwaway server. On
+a cluster that requires standbys of its own the test prints `SKIPPED` and
+changes nothing.
 
     ARCA_TEST_POSTGRES=postgres://user@127.0.0.1:5432/postgres \
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-server

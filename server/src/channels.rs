@@ -88,6 +88,7 @@ impl ChannelError {
 	/// The refusal's code.
 	pub fn code(&self) -> &'static str {
 		match self {
+			ChannelError::Store(e) | ChannelError::Coin(CoinError::Store(e)) if e.is_busy() => "busy",
 			ChannelError::NotAChannel(_) => "template",
 			ChannelError::Coin(CoinError::UnknownLeaf(_)) => "unknown_leaf",
 			ChannelError::Coin(CoinError::Spent(_)) => "in_use",

@@ -486,6 +486,7 @@ impl ParticipationError {
 	pub fn code(&self) -> &'static str {
 		use ParticipationError::*;
 		match self {
+			Store(e) | Coin(CoinError::Store(e)) if e.is_busy() => "busy",
 			Malformed(_) => "malformed",
 			Coin(CoinError::UnknownLeaf(_)) => "unknown_leaf",
 			Coin(CoinError::NotLive(..)) => "not_live",
