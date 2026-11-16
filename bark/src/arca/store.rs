@@ -180,6 +180,17 @@ CREATE TABLE IF NOT EXISTS tower_lock (id TEXT PRIMARY KEY, hash TEXT NOT NULL, 
 CREATE INDEX IF NOT EXISTS tower_lock_hash ON tower_lock(hash);
 CREATE TABLE IF NOT EXISTS chain_seen (hash BLOB PRIMARY KEY, height INTEGER NOT NULL, prev BLOB NOT NULL, pays BLOB NOT NULL, spends BLOB NOT NULL);
 CREATE INDEX IF NOT EXISTS chain_seen_height ON chain_seen(height);
+CREATE TABLE IF NOT EXISTS refused_writes (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL);
+INSERT OR IGNORE INTO refused_writes (id, n) VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS refused_writes_insert AFTER INSERT ON participation
+	WHEN NEW.state IN ('refused', 'void', 'expired')
+	BEGIN UPDATE refused_writes SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS refused_writes_update AFTER UPDATE OF id, state, given, created_at ON participation
+	WHEN OLD.state IN ('refused', 'void', 'expired') OR NEW.state IN ('refused', 'void', 'expired')
+	BEGIN UPDATE refused_writes SET n = n + 1 WHERE id = 1; END;
+CREATE TRIGGER IF NOT EXISTS refused_writes_delete AFTER DELETE ON participation
+	WHEN OLD.state IN ('refused', 'void', 'expired')
+	BEGIN UPDATE refused_writes SET n = n + 1 WHERE id = 1; END;
 ";
 
 /// A deposit a watchtower holds ([`super::tower`]).
@@ -315,6 +326,33 @@ impl Store {
 	/// Opens (creating if needed) the database at `path`.
 	pub fn open(path: &Path) -> Result<Store, Error> {
 		Store::open_connection(Connection::open(path).map_err(db)?)
+	}
+
+	/// Opens the store at `path` to read only: no table is made or changed,
+	/// and SQLite writes nothing to the file ([`super::size`]).
+	pub fn open_read_only(path: &std::path::Path) -> Result<Store, Error> {
+		let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI
+			| rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(db)?;
+		Ok(Store { conn })
+	}
+
+	/// [`Self::open_read_only`] for a connection a program opened itself (a
+	/// browser worker's, on its own storage).
+	pub fn read_only_connection(conn: Connection) -> Store {
+		Store { conn }
+	}
+
+	/// The store's size and the rows of its largest tables.
+	pub fn shape(&self) -> Result<serde_json::Value, Error> {
+		let one = |q: &str| -> Result<i64, Error> { self.conn.query_row(q, [], |r| r.get(0)).map_err(db) };
+		let mut rows = serde_json::Map::new();
+		for t in ["coin", "participation", "transfer", "swap", "nonce", "forfeit", "refusal", "tx"] {
+			if let Ok(n) = one(&format!("SELECT count(*) FROM {}", t)) {
+				rows.insert(t.into(), n.into());
+			}
+		}
+		let live = one("SELECT count(*) FROM coin WHERE state = 'live'")?;
+		Ok(serde_json::json!({"bytes": one("PRAGMA page_count")? * one("PRAGMA page_size")?, "rows": rows, "live_coins": live}))
 	}
 
 	/// Opens the database `conn` holds (creating its tables if needed): a
@@ -1019,6 +1057,33 @@ impl Store {
 			(SELECT rowid FROM participation INDEXED BY participation_state WHERE state NOT IN ({})) ORDER BY created_at", marks)).map_err(db)?;
 		let rows = st.query_map(rusqlite::params_from_iter(states.iter()), Self::participation_row).map_err(db)?
 			.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// How many times a participation has entered, left or changed within
+	/// the states `refused`, `void` and `expired`, as the store's own
+	/// triggers count it (`refused_writes`): whatever writes the store, this
+	/// library, an older one or another process, moves it. What is read from
+	/// those participations alone ([`Self::refused_givens`]) stands while it
+	/// does not move.
+	pub fn refused_writes(&self) -> Result<i64, Error> {
+		self.conn.query_row("SELECT n FROM refused_writes WHERE id = 1", [], |r| r.get(0)).map_err(db)
+	}
+
+	/// The participations in `refused`, `void` or `expired`, in the order
+	/// [`Self::participations`] gives: each id, its coins given up (the JSON
+	/// list as stored) and its state, nothing else of the row.
+	pub fn refused_givens(&self) -> Result<Vec<(String, String, String)>, Error> {
+		let mut st = self.conn.prepare("SELECT id, given, state FROM participation WHERE state IN ('refused', 'void', 'expired') \
+			ORDER BY created_at").map_err(db)?;
+		let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(db)?.collect::<Result<Vec<_>, _>>().map_err(db)?;
+		Ok(rows)
+	}
+
+	/// The ids of the coins in `state`, read by the state's index (no record).
+	pub fn coin_ids_in(&self, state: &str) -> Result<BTreeSet<String>, Error> {
+		let mut st = self.conn.prepare("SELECT leaf_id FROM coin WHERE state = ?1").map_err(db)?;
+		let rows = st.query_map(params![state], |r| r.get::<_, String>(0)).map_err(db)?.collect::<Result<BTreeSet<_>, _>>().map_err(db)?;
 		Ok(rows)
 	}
 

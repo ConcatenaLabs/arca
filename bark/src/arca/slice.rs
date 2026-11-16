@@ -71,7 +71,12 @@
 //! first step (the command's start, the re-check) and the witness's own time
 //! are not counted, so each slice advances the pass by about its budget
 //! whatever that fixed work costs; a budget of 0 stops at the first safe
-//! point after the slice's first step or item. A slice whose witness fails
+//! point after the slice's first step or item. A slice that reaches the
+//! first item of a step past its deadline (the step's own reads before its
+//! items, or the steps before it, took the budget) gives its items the
+//! budget again and says so (`budget_again`, the steps it did it in): the
+//! pass then moves on by a budget's worth of items in every slice, never by
+//! one item for a whole preparation. A slice whose witness fails
 //! has waited out the witness's patience: it runs the rest of the pass, as
 //! one call does, so the patience is paid once a pass and the steps that
 //! take coins home when the operator cannot be reached come in every pass.
@@ -79,9 +84,13 @@
 //! A resume point is kept for each set of arguments, so a caller that syncs
 //! in slices with other arguments than another (`catch_up`, `deposits`)
 //! goes on with its own pass and never drops the other's. A resume point
-//! older than [`RESUME_FOR`] seconds of median time is dropped: the next
-//! call with its arguments starts a whole pass, re-check included, and
-//! answers `more` until that pass is done. A call without `budget_ms` runs
+//! whose last slice is older than [`RESUME_FOR`] seconds of median time is
+//! dropped: the next call with its arguments starts a whole pass, re-check
+//! included, and answers `more` until that pass is done. A pass whose slices
+//! keep coming keeps its place however long it runs: each slice takes the
+//! re-check at its start, and what the pass keeps across slices (above)
+//! costs nothing when stale, so its age alone is no reason to start again,
+//! and a pass longer than the lifetime would otherwise never end. A call without `budget_ms` runs
 //! a whole pass at once and drops every resume point.
 //!
 //! **What a sliced pass answers.** Each slice but the last answers
@@ -102,8 +111,9 @@ use super::{Error, Wallet};
 pub const SYNC_RESUME: &str = "sync_resume";
 /// The store key of a sliced `deposits`'s done items.
 pub const DEPOSITS_RESUME: &str = "deposits_resume";
-/// How long a resume point is good for, in seconds of median time: past
-/// it the chain has moved on, and the pass starts again from the re-check.
+/// How long a resume point is kept after its last slice, in seconds of
+/// median time: a pass nobody goes on with for this long starts again from
+/// the re-check.
 pub const RESUME_FOR: u32 = 600;
 
 /// The steps of `sync` after the witness, in the order they run.
@@ -121,6 +131,12 @@ pub const LAST: &str = "schedule";
 #[derive(Debug)]
 pub(crate) struct Slice {
 	pub deadline: web_time::Instant,
+	/// The slice's budget: what its items get again when the slice reaches
+	/// its first item past its deadline ([`Wallet::slice_item`]).
+	pub budget: std::time::Duration,
+	/// Whether the slice reached its first item past its deadline, and gave
+	/// its items its budget again.
+	pub again: bool,
 	/// The items of the step done in this pass, by key.
 	pub done: BTreeSet<String>,
 	/// Items started in this slice of the step.
@@ -147,6 +163,9 @@ pub(crate) struct Resume {
 	pub args: Value,
 	/// The median time the pass started.
 	pub started: u32,
+	/// The median time its last slice ended: the pass keeps its place while
+	/// slices keep coming ([`RESUME_FOR`]).
+	pub progressed: u32,
 	/// The exit steps' watch, as the last slice left it.
 	pub watch: u32,
 	/// The step to run next ([`STEPS`], or [`LAST`]).
@@ -161,6 +180,8 @@ pub(crate) struct Resume {
 	pub slices: u64,
 	/// What each step cost in this slice alone.
 	pub last: serde_json::Map<String, Value>,
+	/// The steps of this slice whose items got its budget again.
+	pub again: Vec<String>,
 	/// The chain's tip the pass's witness and `info` succeeded at: a slice
 	/// resumed on that tip takes them as the pass found them while a witness
 	/// stands in the process, and never on this record alone.
@@ -174,13 +195,13 @@ pub(crate) struct Resume {
 
 impl Resume {
 	pub fn new(args: Value, started: u32) -> Resume {
-		Resume { args, started, watch: started, next: STEPS[0].into(), done: BTreeSet::new(), out: serde_json::Map::new(),
-			cost: serde_json::Map::new(), slices: 1, last: serde_json::Map::new(), witnessed: None,
+		Resume { args, started, progressed: started, watch: started, next: STEPS[0].into(), done: BTreeSet::new(), out: serde_json::Map::new(),
+			cost: serde_json::Map::new(), slices: 1, last: serde_json::Map::new(), again: vec![], witnessed: None,
 			memo: serde_json::Map::new() }
 	}
 
 	fn to_json(&self) -> Value {
-		json!({"args": self.args, "started": self.started, "watch": self.watch, "next": self.next, "done": self.done,
+		json!({"args": self.args, "started": self.started, "progressed": self.progressed, "watch": self.watch, "next": self.next, "done": self.done,
 			"out": self.out, "cost": self.cost, "slices": self.slices, "witnessed": self.witnessed,
 			"memo": self.memo})
 	}
@@ -189,6 +210,7 @@ impl Resume {
 		Some(Resume {
 			args: v["args"].clone(),
 			started: v["started"].as_u64()? as u32,
+			progressed: v["progressed"].as_u64().or(v["started"].as_u64())? as u32,
 			watch: v["watch"].as_u64()? as u32,
 			next: v["next"].as_str()?.to_string(),
 			done: serde_json::from_value(v["done"].clone()).ok()?,
@@ -196,6 +218,7 @@ impl Resume {
 			cost: v["cost"].as_object()?.clone(),
 			slices: v["slices"].as_u64()?,
 			last: serde_json::Map::new(),
+			again: vec![],
 			witnessed: v["witnessed"].as_str().map(str::to_string),
 			memo: v["memo"].as_object().cloned().unwrap_or_default(),
 		})
@@ -246,15 +269,15 @@ impl Wallet {
 	}
 
 	/// The resume point of a sliced `sync` with arguments `args`, at median
-	/// time `now`: `None` when there is none. Every resume point older than
-	/// [`RESUME_FOR`], or that cannot be read, is dropped. A pass is kept for
+	/// time `now`: `None` when there is none. Every resume point whose last
+	/// slice is older than [`RESUME_FOR`], or that cannot be read, is dropped. A pass is kept for
 	/// each argument set, so a caller never drops another's: two programs, or
 	/// two loops of one, that sync in slices with other arguments each end
 	/// their own passes.
 	pub(crate) fn sync_resume(&self, now: u32, args: &Value) -> Result<Option<Resume>, Error> {
 		let mut m = self.resumes()?;
 		let before = m.len();
-		m.retain(|_, v| Resume::from_json(v).is_some_and(|r| now >= r.started && now - r.started <= RESUME_FOR));
+		m.retain(|_, v| Resume::from_json(v).is_some_and(|r| now >= r.progressed && now - r.progressed <= RESUME_FOR));
 		if m.len() != before {
 			self.keep_resumes(&m)?;
 		}
@@ -296,6 +319,15 @@ impl Wallet {
 		// more: what is left of it runs to its end in this call
 		// ([`Wallet::pass_stopped`]).
 		let stopped = self.pass.borrow().1.is_some();
+		// A slice that reaches its first item past its deadline spent its
+		// budget before any item (a step's own reads before its items, or
+		// steps run whole): its items get the budget again, so that every
+		// slice moves the pass on by a budget's worth of items and a step
+		// whose preparation outlasts the budget still ends.
+		if s.ran == 0 && !s.cut && web_time::Instant::now() >= s.deadline {
+			s.deadline = web_time::Instant::now() + s.budget;
+			s.again = true;
+		}
 		if s.cut || (s.ran > 0 && !stopped && web_time::Instant::now() >= s.deadline) {
 			s.cut = true;
 			return Item::Stop;
@@ -341,17 +373,20 @@ impl Wallet {
 		};
 		let now = self.now()?.to_consensus_u32();
 		let kept: Value = self.store.meta(DEPOSITS_RESUME)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or(Value::Null);
-		let fresh = kept["started"].as_u64().is_some_and(|t| (now as u64) >= t && (now as u64) - t <= RESUME_FOR as u64);
+		// Kept while slices keep coming: from the last slice, not the pass's start.
+		let last = kept["progressed"].as_u64().or(kept["started"].as_u64());
+		let fresh = last.is_some_and(|t| (now as u64) >= t && (now as u64) - t <= RESUME_FOR as u64);
 		let (started, done) = if fresh {
 			(kept["started"].as_u64().unwrap_or(now as u64), serde_json::from_value(kept["done"].clone()).unwrap_or_default())
 		} else { (now as u64, BTreeSet::new()) };
-		*self.slice.borrow_mut() = Some(Slice { deadline: web_time::Instant::now() + std::time::Duration::from_millis(b), done, ran: 0,
+		*self.slice.borrow_mut() = Some(Slice { deadline: web_time::Instant::now() + std::time::Duration::from_millis(b),
+			budget: std::time::Duration::from_millis(b), again: false, done, ran: 0,
 			cut: false, memo: serde_json::Map::new() });
 		let out = self.progress_deposits();
 		let s = self.slice.borrow_mut().take().expect("set above");
 		let out = out?;
 		if s.cut {
-			self.store.set_meta(DEPOSITS_RESUME, &json!({"started": started, "done": s.done}).to_string())?;
+			self.store.set_meta(DEPOSITS_RESUME, &json!({"started": started, "progressed": now, "done": s.done}).to_string())?;
 			return Ok(json!({"deposits": out, "more": true}));
 		}
 		self.store.delete_meta(DEPOSITS_RESUME)?;

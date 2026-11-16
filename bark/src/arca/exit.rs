@@ -2146,8 +2146,12 @@ impl Wallet {
 			},
 		};
 		if let Some(next) = more {
+			r.progressed = now;
 			self.keep_resume(&r)?;
 			let mut v = json!({"more": true, "next": next, "slice": r.slices, "cost_by_step": std::mem::take(&mut r.last)});
+			if !r.again.is_empty() {
+				v["budget_again"] = json!(std::mem::take(&mut r.again));
+			}
 			if !again.is_null() {
 				v["recheck"] = again;
 			}
@@ -2161,7 +2165,8 @@ impl Wallet {
 	/// spent and a step ran in it: `Some(answer)` when it ran (stored in
 	/// `r`), `None` when it was done before; `Err(())` when the slice stops
 	/// before it, or inside it.
-	fn step(&mut self, r: &mut super::slice::Resume, ran: &mut usize, deadline: Option<web_time::Instant>, steps: &mut Steps, name: &str,
+	fn step(&mut self, r: &mut super::slice::Resume, ran: &mut usize, deadline: Option<web_time::Instant>, budget: Option<std::time::Duration>,
+		steps: &mut Steps, name: &str,
 		run: impl FnOnce(&mut Self) -> Value) -> Result<(), ()>
 	{
 		let (at, next) = (super::slice::Resume::index(name), super::slice::Resume::index(&r.next));
@@ -2174,13 +2179,17 @@ impl Wallet {
 		// Only a step cut between its items runs in the slice; another runs
 		// whole, a nested loop over items included.
 		if let Some(d) = deadline.filter(|_| super::slice::ITEMS.contains(&name)) {
-			*self.slice.borrow_mut() = Some(super::slice::Slice { deadline: d, done: std::mem::take(&mut r.done), ran: 0, cut: false,
+			*self.slice.borrow_mut() = Some(super::slice::Slice { deadline: d, budget: budget.unwrap_or_default(), again: false,
+				done: std::mem::take(&mut r.done), ran: 0, cut: false,
 				memo: std::mem::take(&mut r.memo) });
 		}
 		let v = run(self);
 		let mut slice = self.slice.borrow_mut().take();
 		if let Some(s) = slice.as_mut() {
 			r.memo = std::mem::take(&mut s.memo);
+			if s.again {
+				r.again.push(name.to_string());
+			}
 		}
 		steps.lap(self, name);
 		self.exits_meanwhile();
@@ -2226,7 +2235,7 @@ impl Wallet {
 		let arr = |v: Result<Vec<Value>, Error>| v.map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
 		macro_rules! step {
 			($name:expr, $run:expr) => {
-				if self.step(r, &mut ran, deadline, &mut steps, $name, $run).is_err() {
+				if self.step(r, &mut ran, deadline, budget, &mut steps, $name, $run).is_err() {
 					r.add_cost(steps.done());
 					return Ok(Some(r.next.clone()));
 				}

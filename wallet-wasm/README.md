@@ -247,14 +247,20 @@ between two items of a long step (a participation, a coin's refresh, deposit,
 journey home or exit, a call asking the operator which of 64 coins hold its
 capital back, a payment over Lightning, a plan, an order); an item that
 has started runs to its end. What a slice does before its first step (the
-command's start, its re-check) is not counted in `n`. The witness of the
+command's start, its re-check) is not counted in `n`, and a slice that reaches
+the first item of a step already past `n` (the step's own reads before its items
+took it) gives its items `n` again and names that step in `budget_again`, so
+every slice moves the pass on by about `n` of items. The witness of the
 operator's signer's record and the operator's `info` are taken at a pass's
 start, and a slice that goes on with the pass takes them as the pass found them
 only on the chain's tip they were taken at and while a witness stands in the
 wallet kept open (ten seconds); any other slice takes them again. Which coins
 hold the operator's capital back is asked once a pass; what the bond leaves
 uncovered is computed again in every slice that reaches the refresh step's
-coins. So a pass in slices costs about what one call does. In one call as in
+coins. Which coins the operator refused, voided or let expire a refresh of is
+read again only when the store has recorded a change to such participations
+since (its own count of them), whatever wrote it, and is matched against the
+coins live at each call. So a pass in slices costs about what one call does. In one call as in
 slices, every step that works with the operator starts on a witness that
 stands, and every signature handed to it follows [the hand-over
 rule](#hand-over); a witness that fails while a pass runs ends the pass's work
@@ -269,8 +275,10 @@ whole `sync` answers, with `slices`, and each step's `cost_by_step` entry names
 the slice it ran in (`slice`): each part says what its step did then, not the
 coins as they stand now. `sync`'s `schedule` stays `due` while a pass in slices
 is under way. Each set of arguments has a pass of its own, so two callers that
-sync in slices with other arguments each go on with theirs. A pass left
-unfinished for ten minutes of median time starts again from the beginning; a
+sync in slices with other arguments each go on with theirs. A pass nobody goes
+on with for ten minutes of median time after its last slice starts again from
+the beginning, and one whose slices keep coming keeps its place however long it
+runs; a
 `sync` without `budget_ms` runs a whole pass at once and ends every pass under
 way. `deposits` with `budget_ms` answers
 `{"deposits": [...], "more": true}` until its last slice, which answers
@@ -377,6 +385,17 @@ the library names the act rather than a command ("run sync", "an exit takes
 it now", "send one to the wallet's address"), and prefixes the texts it hands
 out `request:`, `swap-offer:` and `swap-accept:`. It reads a text whatever its
 prefix, the command line's `arca:…` included.
+
+`arcaSyncSize(name)` sizes a pass of `sync` in slices on the store whose
+storage file carries `name` (the text at the start of the file's 4,096-byte
+header), before a library goes onto it: for each step a slice can stop inside,
+the items a pass would look at and the store reads the step makes before its
+first item, timed, `refresh`'s as this library makes them and as one that read
+every refused participation in every slice did (the command line's `arca
+sync-size` says the same of a SQLite file). It opens the store read-only, needs
+no phrase, asks no operator or node and writes nothing; installing the storage
+can write to the directory, so it is run on a copy of a wallet's storage, never
+on the storage a running wallet holds.
 
 ## What is checked when
 

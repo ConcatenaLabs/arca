@@ -127,6 +127,20 @@ enum Cmd {
 		#[arg(long)]
 		restore_at_once: bool,
 	},
+	/// What a pass of `sync` in slices would cost on the store at `store`
+	/// (a wallet's SQLite file, opened read-only; with `offset`, the bytes
+	/// before the database, as a browser's storage file has, are passed
+	/// over by reading a copy): the items of each step and the reads it
+	/// makes before its first, timed. Needs no wallet or phrase, asks no
+	/// operator or node and writes nothing to the store.
+	SyncSize {
+		/// The store's SQLite file.
+		store: std::path::PathBuf,
+		/// Bytes before the database in the file (4096 in a browser's
+		/// storage file).
+		#[arg(long, default_value_t = 0)]
+		offset: u64,
+	},
 	/// The operators the registry lists, each record's signature checked
 	/// here; needs no wallet.
 	Operators {
@@ -1459,6 +1473,9 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		},
 		_ => {},
 	}
+	if let Cmd::SyncSize { store, offset } = &cli.command {
+		return sync_size(store, *offset);
+	}
 	if let Cmd::Operators { registry, genesis } = &cli.command {
 		return bark::arca::command::operators(registry, genesis.as_deref());
 	}
@@ -1579,7 +1596,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		}
 	}
 	let out = match cli.command {
-		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } | Cmd::BtcWatchtower(_) => unreachable!("handled above"),
+		Cmd::Create { .. } | Cmd::Bitcoin { .. } | Cmd::Operators { .. } | Cmd::SyncSize { .. } | Cmd::BtcWatchtower(_) => unreachable!("handled above"),
 		Cmd::Info => w.info(),
 		Cmd::Supply { asset: a } => w.supply(asset(&a)?),
 		Cmd::LeafTemplate { template } => w.leaf_template(template.as_deref()),
@@ -1970,6 +1987,25 @@ fn read_order(arg: &str) -> Result<String, bark::arca::Error> {
 		Some(path) => std::fs::read_to_string(path).map_err(|e| bark::arca::Error::Io(format!("the order {}: {}", path, e))),
 		None => Ok(arg.to_string()),
 	}
+}
+
+/// `arca sync-size`: the store read where it is, or from a private copy of
+/// what follows `offset`, removed after.
+fn sync_size(path: &std::path::Path, offset: u64) -> Result<serde_json::Value, bark::arca::Error> {
+	use std::io::{Read, Seek};
+	let io = |e: std::io::Error| bark::arca::Error::Store(format!("{}: {}", path.display(), e));
+	if offset == 0 {
+		return bark::arca::size::sync_size(&bark::arca::store::Store::open_read_only(path)?);
+	}
+	let copy = std::env::temp_dir().join(format!("arca-sync-size-{}.sqlite", std::process::id()));
+	let mut f = std::fs::File::open(path).map_err(io)?;
+	f.seek(std::io::SeekFrom::Start(offset)).map_err(io)?;
+	let mut out = std::fs::File::create(&copy).map_err(io)?;
+	std::io::copy(&mut f.take(u64::MAX), &mut out).map_err(io)?;
+	drop(out);
+	let sized = bark::arca::store::Store::open_read_only(&copy).and_then(|s| bark::arca::size::sync_size(&s));
+	let _ = std::fs::remove_file(&copy);
+	sized
 }
 
 fn main() {
