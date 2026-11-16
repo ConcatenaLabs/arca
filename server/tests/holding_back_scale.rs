@@ -8,6 +8,16 @@
 //!
 //! `a_read_of_64_coins_takes_a_few_statements` runs in every suite: the
 //! number of statements one read makes does not grow with the coins asked.
+//! So do the two lineage tests: below a node, a slot moved on in a tree of
+//! payments four ways at every step, 87,380 coins in all, without
+//! delegations or with them. The walk stops at the first undelegated step,
+//! and a delegated tree past its steps' budget keeps the node; a read
+//! ahead of it reads no more coins than the walk can
+//! ([`server::delegations::WALK_READS`]), and takes a few milliseconds.
+//! And `a_round_ending_is_seen_whole_or_not_at_all`: while a round ends in
+//! one transaction (a refresh's participation released, with the releases
+//! of the two coins it gave up), every read answers as before it or as
+//! after it, never a mix of the two.
 //! `holding_back_at_scale` is the measurement, run by hand: it prints what
 //! each read of 64 coins and one read of every coin take, writes every
 //! answer to `HB_ANSWERS` when set (so two revisions' answers can be
@@ -476,4 +486,180 @@ async fn holding_back_at_scale() {
 	assert!(named > 0, "some coins are named, so the read follows every path");
 	assert!(sorted[sorted.len() / 2] <= bar, "a read of 64 coins takes {:?} at the median, over the bar of {:?}",
 		sorted[sorted.len() / 2], bar);
+}
+
+/// A node of two slots, `a` live and `b` moved on in a tree of payments
+/// `depth` steps deep, each payment taking one coin and making four, with
+/// the delegation of every coin into the payment that took it when
+/// `delegated`: `(4^(depth+1) - 4) / 3` coins below `b`. Returns `a` and a
+/// coin at the tree's last step.
+async fn fanned_out(c: &tokio_postgres::Client, depth: u32, delegated: bool) -> ([u8; 32], [u8; 32]) {
+	let secp = Secp256k1::new();
+	let asset = AssetId::from_byte_array(h("holding back asset"));
+	let operator = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&h("operator")).unwrap()).x_only_public_key().0;
+	let params = TreeParams {
+		asset, chain: Chain::new(BlockHash::all_zeros()), schedule: ClockSchedule::never(operator), burn: false, delegated_reclaim: true,
+		radix: 4, reserve: ReserveRule::Fixed { node: 330, entry: 330 }, min_leaf: 1,
+	};
+	let owners: Vec<_> = ["fan owner a", "fan owner b"].iter()
+		.map(|l| Keypair::from_secret_key(&secp, &SecretKey::from_slice(&h(l)).unwrap()).x_only_public_key().0).collect();
+	let specs: Vec<LeafSpec> = owners.iter().enumerate().map(|(i, o)| LeafSpec {
+		template: Template::Vtxo1, owner: *o, value: 50_000, owner_nonce: h(&format!("fan owner nonce {}", i)),
+		operator_nonce: h(&format!("fan operator nonce {}", i)), exit_delay: RelativeTime::from_units(4).unwrap(),
+		unlock_hash: h(&format!("fan unlock {}", i)), htlc: None, order: None, landing: None, channel: None, claim: None,
+	}).collect();
+	let tree = Tree::build(params, &specs).expect("a tree");
+	let records: Vec<Vec<u8>> = tree.records().iter().map(|r| r.to_bytes().unwrap()).collect();
+	let (a, b) = (h("fan.a"), h("fan.0.0"));
+	let mut rows = Rows::default();
+	// Round 1 is the one `prepared` writes after its holder's.
+	rows.round.push((2, "final"));
+	rows.batch.push((2, 1, true));
+	for (i, (id, state, by)) in [(a, "live", None), (b, "spent", Some(h("fant.0.0").to_vec()))].into_iter().enumerate() {
+		rows.batch_leaf.push((id.to_vec(), 2, 1, i as i32, owners[i].serialize().to_vec(), 50_000, records[i].clone()));
+		rows.leaf.push((id.to_vec(), "batch", 50_000, owners[i].serialize().to_vec(), records[i].clone(), state, by));
+	}
+	write(c, &rows).await;
+	// The coin `i` of step `l` is `fan.l.i`, and the payment that took it
+	// `fant.l.i`, making the coins `4i` to `4i + 3` of step `l + 1`.
+	c.batch_execute(&format!(r#"
+CREATE TEMP TABLE fan AS SELECT l, i FROM generate_series(0, {last}) l CROSS JOIN LATERAL generate_series(0, (4 ^ l)::int - 1) i;
+INSERT INTO transfer (transfer_id, request_hash, state) SELECT hb('fant.'||l||'.'||i), hb('fant.'||l||'.'||i), 'signed' FROM fan;
+INSERT INTO transfer_input (transfer_id, idx, leaf_id, checkpoint_value, checkpoint_owner_sig, reassignment_owner_sig)
+  SELECT hb('fant.'||l||'.'||i), 0, hb('fan.'||l||'.'||i), 1, decode(repeat('00', 64), 'hex'), decode(repeat('00', 64), 'hex') FROM fan;
+INSERT INTO leaf (leaf_id, kind, asset, value, owner_key, script_pubkey, hops, record, state, spent_by)
+  SELECT hb('fan.'||(l + 1)||'.'||(4 * i + j)), 'transfer', hb('asset'), 100, hb('fan key '||(l + 1)||'.'||(4 * i + j)), hb('fan.'||(l + 1)||'.'||(4 * i + j)), 0,
+    decode(repeat('ab', 200), 'hex'),
+    CASE WHEN l < {last} THEN 'spent'::leaf_state ELSE 'live'::leaf_state END,
+    CASE WHEN l < {last} THEN hb('fant.'||(l + 1)||'.'||(4 * i + j)) END
+  FROM fan, generate_series(0, 3) j;
+INSERT INTO transfer_output (transfer_id, idx, leaf_id, mailbox_key)
+  SELECT hb('fant.'||l||'.'||i), j, hb('fan.'||(l + 1)||'.'||(4 * i + j)), hb('fan mailbox') FROM fan, generate_series(0, 3) j;
+{delegations}
+ANALYZE;
+"#, last = depth - 1, delegations = if delegated {
+		"INSERT INTO delegation (leaf_id, transfer_id, signature) SELECT hb('fan.'||l||'.'||i), hb('fant.'||l||'.'||i), decode(repeat('00', 64), 'hex') FROM fan;"
+	} else { "" })).await.expect("the tree of payments");
+	(a, h(&format!("fan.{}.0", depth)))
+}
+
+/// A read of `a` (the node's live slot) and of `deep` (a coin at the last
+/// step under its other slot) answers nothing, reads ahead no more coins
+/// than the node's walk can, and takes a few milliseconds, as a read of a
+/// node with no lineage does (the bar, 250 ms, is far above either and far
+/// below a read of the whole tree).
+async fn bounded_by_the_walk(delegated: bool) {
+	let (db, _) = prepared(0.0, 0).await;
+	let c = session(&db.url).await;
+	let none = ActiveCoins::default();
+	let depth = 8;
+	let (a, deep) = fanned_out(&c, depth, delegated).await;
+	let coins: i64 = c.query_one("SELECT count(*) FROM leaf", &[]).await.unwrap().get(0);
+	assert!(coins >= 87_380, "the tree is written: {} coins", coins);
+	for (what, ids) in [("the live slot", vec![a]), ("a coin at the last step", vec![deep]), ("both", vec![a, deep])] {
+		let mut times = vec![];
+		for _ in 0..5 {
+			let before = db.store.coins_read_ahead();
+			let t = Instant::now();
+			let answer = holding_back(&db.store, &ids, &none).await.expect("holding_back");
+			times.push(t.elapsed());
+			let read = db.store.coins_read_ahead() - before;
+			assert_eq!(answer, vec![], "{}: nothing is named", what);
+			assert!(read as usize <= server::delegations::WALK_READS,
+				"{} (delegated {}): {} coins read ahead, past the {} a walk can read", what, delegated, read, server::delegations::WALK_READS);
+		}
+		times.sort();
+		eprintln!("{} (delegated {}): median {:?}, slowest {:?}", what, delegated, times[2], times[4]);
+		assert!(times[2] <= Duration::from_millis(250), "{} (delegated {}): a read takes {:?} at the median", what, delegated, times[2]);
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_undelegated_lineage_is_not_read_ahead() {
+	bounded_by_the_walk(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegated_lineage_is_read_ahead_only_as_far_as_its_walk() {
+	bounded_by_the_walk(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_round_ending_is_seen_whole_or_not_at_all() {
+	let (db, _) = prepared(0.0, 0).await;
+	let c = session(&db.url).await;
+	let secp = Secp256k1::new();
+	let operator = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&h("operator")).unwrap()).x_only_public_key().0;
+	let params = TreeParams {
+		asset: AssetId::from_byte_array(h("holding back asset")), chain: Chain::new(BlockHash::all_zeros()),
+		schedule: ClockSchedule::never(operator), burn: false, delegated_reclaim: true, radix: 4,
+		reserve: ReserveRule::Fixed { node: 330, entry: 330 }, min_leaf: 1,
+	};
+	let owners: Vec<_> = (0..3).map(|i| Keypair::from_secret_key(&secp, &SecretKey::from_slice(&h(&format!("ending owner {}", i))).unwrap())
+		.x_only_public_key().0).collect();
+	let specs: Vec<LeafSpec> = owners.iter().enumerate().map(|(i, o)| LeafSpec {
+		template: Template::Vtxo1, owner: *o, value: 10_000 + 1_000 * i as u64, owner_nonce: h(&format!("ending owner nonce {}", i)),
+		operator_nonce: h(&format!("ending operator nonce {}", i)), exit_delay: RelativeTime::from_units(4).unwrap(),
+		unlock_hash: h(&format!("ending unlock {}", i)), htlc: None, order: None, landing: None, channel: None, claim: None,
+	}).collect();
+	let tree = Tree::build(params, &specs).expect("a tree");
+	let records: Vec<Vec<u8>> = tree.records().iter().map(|r| r.to_bytes().unwrap()).collect();
+	let node = arca_covenant::LeafRecord::from_bytes(&records[1]).unwrap().branch().unwrap().nodes.last().unwrap().children_hash();
+	let ids: Vec<[u8; 32]> = (0..3).map(|i| h(&format!("ending.{}", i))).collect();
+	let p = h("ending participation");
+	// The holder's coin, live; the node's two other coins given up in one
+	// refresh, still pending.
+	let mut rows = Rows::default();
+	rows.round.push((2, "final"));
+	rows.batch.push((2, 1, true));
+	for i in 0..3 {
+		let (state, by) = if i == 0 { ("live", None) } else { ("spent", Some(p.to_vec())) };
+		rows.batch_leaf.push((ids[i].to_vec(), 2, 1, i as i32, owners[i].serialize().to_vec(), specs[i].value as i64, records[i].clone()));
+		rows.leaf.push((ids[i].to_vec(), "batch", specs[i].value as i64, owners[i].serialize().to_vec(), records[i].clone(), state, by));
+	}
+	rows.participation.push((p.to_vec(), "pending"));
+	write(&c, &rows).await;
+	c.execute("INSERT INTO participation_input (participation_id, idx, leaf_id, active, asset, value, margin, attestation)
+		SELECT $1, i, l, true, hb('asset'), 1, 0, '\\x00' FROM unnest($2::bytea[], $3::smallint[]) AS u(l, i)",
+		&[&&p[..], &vec![ids[1].to_vec(), ids[2].to_vec()], &vec![0i16, 1]]).await.unwrap();
+	let before = format!("BEGIN; UPDATE participation SET state = 'pending' WHERE participation_id = '\\x{p}';
+		DELETE FROM node_release WHERE participation_id = '\\x{p}'; COMMIT", p = hex(&p));
+	let after = format!("BEGIN; UPDATE participation SET state = 'released' WHERE participation_id = '\\x{p}';
+		INSERT INTO node_release (leaf_id, round_id, participation_id, node_hash, connector_asset, signature, retired)
+		SELECT l, 2, '\\x{p}', '\\x{n}', hb('c2'), decode(repeat('00', 64), 'hex'), false FROM unnest(ARRAY['\\x{a}'::bytea, '\\x{b}'::bytea]) l;
+		COMMIT", p = hex(&p), n = hex(&node), a = hex(&ids[1]), b = hex(&ids[2]));
+	let none = ActiveCoins::default();
+	let whole = vec![(ids[0], specs[1].value + specs[2].value)];
+	for state in [&before, &after, &before] {
+		c.batch_execute(state).await.unwrap();
+		assert_eq!(holding_back(&db.store, &[ids[0]], &none).await.unwrap(), whole, "before and after the round ends, the coin is named");
+	}
+	let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let flipper = {
+		let (url, stop) = (db.url.clone(), stop.clone());
+		tokio::spawn(async move {
+			let c = session(&url).await;
+			let mut n = 0u64;
+			while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+				c.batch_execute(if n % 2 == 0 { &after } else { &before }).await.unwrap();
+				n += 1;
+			}
+			n
+		})
+	};
+	let (mut reads, mut mixed) = (0u32, vec![]);
+	let t = Instant::now();
+	while t.elapsed() < Duration::from_secs(5) {
+		let a = holding_back(&db.store, &[ids[0]], &none).await.unwrap();
+		reads += 1;
+		if a != whole {
+			mixed.push(a);
+		}
+	}
+	stop.store(true, std::sync::atomic::Ordering::SeqCst);
+	let flips = flipper.await.unwrap();
+	eprintln!("a round ending: {} reads over {} flips, {} answered neither as before nor as after", reads, flips, mixed.len());
+	assert!(flips > 100 && reads > 100, "the round ended and came back {} times over {} reads", flips, reads);
+	assert!(mixed.is_empty(), "{} of {} reads answered neither as before nor as after the round ended: {:?}", mixed.len(), reads,
+		mixed.first());
 }

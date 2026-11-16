@@ -39,10 +39,11 @@
 //!    sync, coin places): the wallet's value is whole after.
 //! 12. On a store as large as a busy maker's (seven assets, about six
 //!    hundred live coins, a long history), a pass in slices of a second
-//!    ends, costs about what one call costs, and no slice holds the wallet
-//!    for more than a part of it: what a pass reads once (the operator's
-//!    witness and `info`, the coins it holds capital back for) is not read
-//!    again in every slice.
+//!    ends, costs about what one call costs, and each slice stops at its
+//!    first safe point past its budget (the work its budget counts is the
+//!    budget and one step or item it cannot cut): what a pass reads once
+//!    (the operator's witness and `info`, the coins it holds capital back
+//!    for) is not read again in every slice.
 //! 13. A slice that resumes its pass once no witness stands in the process
 //!    any more witnesses again, and with every witness failing signs
 //!    nothing.
@@ -1373,11 +1374,23 @@ async fn a_pass_in_slices_on_a_large_store_costs_about_one_call() {
 		println!("SL12 slices of {} ms: {} slices{}, {} ms in all, the longest {} ms, node {}, operator {}; {:.2} times one call", b, n,
 			if ended { "" } else { " (not ended)" }, ms, longest, node, op, ms as f64 / one_ms.max(1) as f64);
 		println!("SL12 slices of {} ms by step (ms, node, operator, the slice it ended in): {:?}", b, by_step(&s));
-		for (k, (v, ms, c)) in s.iter().enumerate().take(4) {
-			println!("SL12 slice {} of {} ms: {} ms, start {}, cost {}, steps {:?}", k + 1, b, ms, c["cost"]["start"], c["cost"]["command"],
-				v["cost_by_step"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default());
+		for (k, (v, ms, c)) in s.iter().enumerate() {
+			println!("SL12 slice {} of {} ms: {} ms, start {}, cost {}, steps {}", k + 1, b, ms, c["cost"]["start"], c["cost"]["command"],
+				v["cost_by_step"]);
 		}
-		results.push((b, n, ms, longest, node, op, ended));
+		// The work each slice's budget counts: its steps but the witness.
+		// What a slice does before its first step (the command's start and
+		// the re-check) and the witness's own time are not counted, by
+		// design (`slice`'s module note).
+		// The last slice answers every step of the pass, summed over the
+		// slices: it is counted whole.
+		let counted = s.iter().map(|(v, ms, _)| match v["more"] == json!(true) {
+			true => v["cost_by_step"].as_object().map(|o| o.iter().filter(|(k, _)| k.as_str() != "witness")
+				.map(|(_, st)| st["ms"].as_u64().unwrap_or(0)).sum::<u64>()).unwrap_or(0),
+			false => *ms,
+		}).max().unwrap_or(0);
+		println!("SL12 slices of {} ms: the most work a budget counted in one slice {} ms", b, counted);
+		results.push((b, n, ms, longest, counted, node, op, ended));
 		let _ = std::fs::remove_dir_all(&c.dir);
 	}
 	p.delay(Duration::ZERO);
@@ -1386,14 +1399,24 @@ async fn a_pass_in_slices_on_a_large_store_costs_about_one_call() {
 	}
 	// Bounded against the one call on the same machine at the same moment, so
 	// that a loaded machine slows both alike: the pass ends, costs at most
-	// about twice the one call, asks the operator little more than it, and no
-	// slice holds the wallet for more than a fraction of it.
-	for (b, n, ms, longest, _, op, ended) in results {
+	// about twice the one call, and asks the operator little more than it.
+	// And a slice stops at its first safe point past its budget: the work
+	// its budget counts is the budget and at most one thing it cannot cut,
+	// a step that runs whole (the longest of them in the one call) or one
+	// item of a step cut between its items (a call or two to the operator
+	// over the far link). Not a part of the one call: how long one call
+	// takes depends on how fast the operator answers, which says nothing of
+	// whether the slices cut the pass.
+	let whole = by_step(&one).iter().filter(|(k, _)| !ITEMS.contains(&k.as_str()) && k.as_str() != "witness")
+		.map(|(_, (ms, _, _, _))| *ms).max().unwrap_or(0);
+	for (b, n, ms, longest, counted, _, op, ended) in results {
 		assert!(ended, "slices of {} ms: the pass ends ({} slices)", b, n);
 		assert!(ms <= 2 * one_ms + 5_000, "slices of {} ms: {} ms in all against {} ms in one call", b, ms, one_ms);
 		assert!(op <= one_op + 2 * n as u64 + 10, "slices of {} ms: {} requests of the operator against {} in one call, in {} slices", b, op,
 			one_op, n);
-		assert!(longest * 4 <= one_ms, "slices of {} ms: a slice held the wallet {} ms, against {} ms in one call", b, longest, one_ms);
+		let most = b + whole + 2 * delay + 100;
+		assert!(counted <= most, "slices of {} ms: a slice's budget counted {} ms of work (the longest slice {} ms), past {} ms: its \
+			budget, the longest step that runs whole ({} ms) and an item at the operator's delay ({} ms)", b, counted, longest, most, whole, delay);
 	}
 }
 
