@@ -230,9 +230,38 @@ pub fn consent<'a>(store: &'a Store, leaf_id: [u8; 32], key: XOnlyPublicKey, nod
 /// one before wallets stopped signing them may be in the store; it is never
 /// followed.
 async fn is_rest(reads: Reads<'_>, leaf: &[u8; 32]) -> Result<Option<bool>, StoreError> {
-	Ok(reads.leaf(leaf).await?.map(|row| matches!(arca_covenant::CoinRecord::from_bytes(&row.record),
-		Ok(arca_covenant::CoinRecord::Fill(f)) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. }))))
+	Ok(reads.leaf(leaf).await?.map(|row| rests(&row.record)))
 }
+
+/// Whether the coin of leaf record `record` is an order resting again
+/// ([`is_rest`]).
+fn rests(record: &[u8]) -> bool {
+	matches!(arca_covenant::CoinRecord::from_bytes(record),
+		Ok(arca_covenant::CoinRecord::Fill(f)) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. }))
+}
+
+/// The coins a reclaim's walk ([`can_complete`]) steps on to from `leaf`,
+/// found in `ahead` alone: the outputs of the one signed reassignment that
+/// spent it, when it is no order resting again and its delegation names
+/// that reassignment. `None` wherever the walk stops there, and wherever
+/// `ahead` lacks a row it would need or holds one the walk would find
+/// corrupt (the walk then reads the store itself, and stops or fails as it
+/// does). A read ahead of the walk follows only these, so it never reads
+/// more than the walk could.
+pub fn steps_from(ahead: &CoinReads, leaf: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+	let Ok(SpentBy::Reassignment { transfer_id, outputs }) = ahead.spent_by(leaf)? else { return None };
+	let row = ahead.leaf(leaf)?.ok()??;
+	if rests(&row.record) {
+		return None;
+	}
+	let d = ahead.delegation(leaf)?.ok()??;
+	(d.transfer_id == transfer_id && !outputs.is_empty()).then(|| outputs.into_iter().map(|(o, _)| o).collect())
+}
+
+/// The most coins a reclaim's walk of one node reads ([`can_complete`]):
+/// every coin it reads costs at least a step of [`RECLAIM_STEPS`], shared by
+/// the node's slots, but the one at which it stops.
+pub const WALK_READS: usize = RECLAIM_STEPS + 1;
 
 /// `key`'s consent by the latest of its releases `rows`, if any.
 fn release_of(key: XOnlyPublicKey, rows: Vec<HolderReleaseRow>) -> Result<Option<Consent>, StoreError> {

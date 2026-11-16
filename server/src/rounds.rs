@@ -430,15 +430,21 @@ const LOWEST_KEPT: usize = 1 << 17;
 /// those coins is at hand, and to none while a holder is away.
 pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]], active: &ActiveCoins) -> Result<Vec<([u8; 32], u64)>, StoreError> {
 	let asked: HashSet<[u8; 32]> = leaf_ids.iter().copied().collect();
-	let under = store.batch_leaves_under(leaf_ids).await?;
-	// Everything the walks below read, read ahead in a few statements: the
-	// rounds and batches of the nodes, then every coin those nodes' slots
-	// became, a step of reassignments at a time ([`HoldingReads`]).
+	// Everything the walks below read, read ahead in a few statements from
+	// one snapshot of the store: the batch leaves under the coins asked
+	// after, the rounds and batches of their nodes, then the coins those
+	// nodes' slots became, a step of reassignments at a time, as far as
+	// each node's walk can follow ([`HoldingReads`]).
+	let mut reader = store.reader().await?;
+	let snapshot = reader.snapshot().await?;
+	let under = snapshot.batch_leaves_under(leaf_ids).await?;
 	let mut lowest: HashMap<[u8; 32], Option<[u8; 32]>> = HashMap::new();
 	for (_, bl) in &under {
 		lowest.entry(bl.leaf_id).or_insert_with(|| lowest_of(&bl.record));
 	}
-	let ahead = HoldingReads::read(store, &under, &mut lowest).await?;
+	let ahead = HoldingReads::read(&snapshot, &under, &mut lowest).await?;
+	snapshot.end().await?;
+	drop(reader);
 	let reads = crate::delegations::Reads::ahead(store, &ahead.coins);
 	let mut served: HashMap<Vec<[u8; 32]>, bool> = HashMap::new();
 	let mut nodes: BTreeMap<[u8; 32], Option<(Vec<[u8; 32]>, u64)>> = BTreeMap::new();
@@ -459,16 +465,26 @@ pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]], active: &ActiveC
 	Ok(leaf_ids.iter().filter_map(|id| back.get(id).map(|b| (*id, *b))).collect())
 }
 
-/// What [`holding_back`] reads, read ahead of its walks: the rounds and the
-/// batches (with their leaves) of the batch leaves under the coins asked
-/// after, and the rows of every coin the slots of those batches' lowest
-/// nodes became ([`crate::store::CoinReads`]), down their reassignments as
-/// far as a walk can go ([`arca_covenant::node::RECLAIM_STEPS`]), each step's
-/// statements sent together. A read of 64 coins costs some twenty
-/// statements over a few connections, where a statement for each step of
-/// each walk, each on a connection of its own, cost several hundred. A row a
-/// walk needs and that is not here is read by the walk itself, so the answer
-/// never depends on what was read ahead.
+/// What [`holding_back`] reads, read ahead of its walks from one snapshot
+/// of the store: the rounds and the batches (with their leaves) of the batch
+/// leaves under the coins asked after, and the rows of the coins the slots
+/// of those batches' lowest nodes became ([`crate::store::CoinReads`]), each
+/// step's statements sent together.
+///
+/// A step follows only what a node's walk can follow
+/// ([`crate::delegations::steps_from`]): a coin no order resting again,
+/// spent by the reassignment its delegation names; and no more coins for a
+/// node, its slots included, than its walk can read
+/// ([`crate::delegations::WALK_READS`], the steps of
+/// [`arca_covenant::node::RECLAIM_STEPS`] being shared by the node's slots).
+/// So a read ahead never costs more rows than the walks would read
+/// themselves, however large a lineage below a node grows. A read of 64
+/// coins costs some ten statements on one connection, where a statement for
+/// each step of each walk, each on a connection of its own, cost several
+/// hundred. A row a walk needs and that is not here is read by the walk
+/// itself, so the answer never depends on what was read ahead; and every
+/// row read ahead is of the one snapshot, so a write committed while it
+/// reads (a round ending, a delegation signed) is seen whole or not at all.
 struct HoldingReads {
 	rounds: HashMap<i64, crate::store::RoundRow>,
 	batches: HashMap<(i64, u32), (crate::store::BatchRow, Vec<crate::store::BatchLeafRow>)>,
@@ -476,44 +492,63 @@ struct HoldingReads {
 }
 
 impl HoldingReads {
-	async fn read(store: &Store, under: &[([u8; 32], crate::store::BatchLeafRow)], lowest: &mut HashMap<[u8; 32], Option<[u8; 32]>>)
+	async fn read(snapshot: &crate::store::Snapshot<'_>, under: &[([u8; 32], crate::store::BatchLeafRow)],
+		lowest: &mut HashMap<[u8; 32], Option<[u8; 32]>>)
 		-> Result<HoldingReads, StoreError>
 	{
+		use crate::delegations::{steps_from, WALK_READS};
 		let round_ids: Vec<i64> = under.iter().map(|(_, bl)| bl.round_id).collect::<BTreeSet<_>>().into_iter().collect();
 		// The batches of every node, whatever its round's state: a walk
 		// starts only from a round broadcast or final, and reads only those.
 		let outputs: Vec<(i64, u32)> = under.iter()
 			.filter(|(_, bl)| lowest.get(&bl.leaf_id).is_some_and(Option::is_some))
 			.map(|(_, bl)| (bl.round_id, bl.vout)).collect::<BTreeSet<_>>().into_iter().collect();
-		let (rounds, batches) = store.rounds_and_batches(&round_ids, &outputs).await?;
+		let (rounds, batches) = snapshot.rounds_and_batches(&round_ids, &outputs).await?;
 		let rounds: HashMap<i64, crate::store::RoundRow> = rounds.into_iter().map(|r| (r.round_id, r)).collect();
 		let batches: HashMap<(i64, u32), _> = batches.into_iter().map(|(b, l)| ((b.round_id, b.vout), (b, l))).collect();
 		// Every slot of every node a walk may start from: the leaves of the
 		// batches read whose lowest node is one under a coin asked after.
+		// `next` holds each coin to read at the next step with the nodes
+		// whose walks may reach it, `given` the coins each node's walks have
+		// been given so far, slots included.
 		let starting: HashSet<[u8; 32]> = under.iter().filter_map(|(_, bl)| lowest[&bl.leaf_id]).collect();
-		let mut next: Vec<[u8; 32]> = vec![];
+		let mut next: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>> = BTreeMap::new();
+		let mut given: HashMap<[u8; 32], usize> = HashMap::new();
 		for ((round_id, _), (_, leaves)) in &batches {
 			if !rounds.get(round_id).is_some_and(|r| matches!(r.state, RoundState::Broadcast | RoundState::Final)) {
 				continue;
 			}
 			for l in leaves {
 				let h = *lowest.entry(l.leaf_id).or_insert_with(|| lowest_of(&l.record));
-				if h.is_some_and(|h| starting.contains(&h)) {
-					next.push(l.leaf_id);
+				if let Some(h) = h.filter(|h| starting.contains(h)) {
+					next.entry(l.leaf_id).or_default().insert(h);
+					*given.entry(h).or_default() += 1;
 				}
 			}
 		}
 		let mut coins = crate::store::CoinReads::default();
-		for _ in 0..=arca_covenant::node::RECLAIM_STEPS {
-			next.sort();
-			next.dedup();
-			next.retain(|c| !coins.has(c));
-			if next.is_empty() {
-				break;
+		while !next.is_empty() {
+			let unread: Vec<[u8; 32]> = next.keys().filter(|c| !coins.has(c)).copied().collect();
+			if !unread.is_empty() {
+				coins.extend(snapshot.coin_reads(&unread).await?);
 			}
-			let level = store.coin_reads(&next).await?;
-			next = level.outputs_of_spent().collect();
-			coins.extend(level);
+			let mut after: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>> = BTreeMap::new();
+			for (c, nodes) in &next {
+				let Some(steps) = steps_from(&coins, c) else { continue };
+				for h in nodes {
+					// Past what the node's walk can read, its walk reads
+					// the rest itself, and stops there.
+					let n = given.entry(*h).or_default();
+					if *n + steps.len() > WALK_READS {
+						continue;
+					}
+					*n += steps.len();
+					for s in &steps {
+						after.entry(*s).or_default().insert(*h);
+					}
+				}
+			}
+			next = after;
 		}
 		Ok(HoldingReads { rounds, batches, coins })
 	}

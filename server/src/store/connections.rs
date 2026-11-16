@@ -107,6 +107,8 @@ pub(crate) struct Counters {
 	pub stuck: AtomicU64,
 	/// Of those, the ones still waiting for PostgreSQL to answer.
 	pub set_aside: AtomicU64,
+	/// Coins whose rows were read ahead of a walk ([`crate::store::Store::coins_read_ahead`]).
+	pub read_ahead: AtomicU64,
 	/// Connections open: the pool's and the ones set aside.
 	open: AtomicU64,
 }

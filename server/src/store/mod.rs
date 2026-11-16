@@ -424,6 +424,55 @@ pub struct Store {
 	head_seen: std::sync::Arc<std::sync::Mutex<Option<HeadSeen>>>,
 }
 
+/// A connection taken for reads from one snapshot ([`Store::reader`]).
+pub struct Reader<'a> {
+	conn: Conn<'a>,
+	counters: &'a connections::Counters,
+}
+
+impl Reader<'_> {
+	/// Opens a read-only transaction at `REPEATABLE READ`: every read of the
+	/// [`Snapshot`] sees the store as it stood at its first statement, none
+	/// a write committed after it. Dropped unended, it is rolled back.
+	pub async fn snapshot(&mut self) -> Result<Snapshot<'_>, StoreError> {
+		let tx = self.conn.build_transaction().isolation_level(tokio_postgres::IsolationLevel::RepeatableRead).read_only(true)
+			.start().await?;
+		Ok(Snapshot { tx, counters: self.counters })
+	}
+}
+
+/// Reads of the store from one snapshot of it ([`Reader::snapshot`]), as
+/// the store's own reads of the same name find the rows.
+pub struct Snapshot<'a> {
+	tx: tokio_postgres::Transaction<'a>,
+	counters: &'a connections::Counters,
+}
+
+impl Snapshot<'_> {
+	/// [`Store::batch_leaves_under`].
+	pub async fn batch_leaves_under(&self, ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], BatchLeafRow)>, StoreError> {
+		rounds::batch_leaves_under_on(&self.tx, ids).await
+	}
+
+	/// [`Store::rounds_and_batches`].
+	pub async fn rounds_and_batches(&self, round_ids: &[i64], outputs: &[(i64, u32)])
+		-> Result<(Vec<RoundRow>, Vec<(BatchRow, Vec<BatchLeafRow>)>), StoreError>
+	{
+		rounds::rounds_and_batches_on(&self.tx, round_ids, outputs).await
+	}
+
+	/// [`Store::coin_reads`].
+	pub async fn coin_reads(&self, ids: &[[u8; 32]]) -> Result<CoinReads, StoreError> {
+		self.counters.read_ahead.fetch_add(ids.len() as u64, std::sync::atomic::Ordering::SeqCst);
+		delegations::coin_reads_on(&self.tx, ids).await
+	}
+
+	/// Ends the snapshot.
+	pub async fn end(self) -> Result<(), StoreError> {
+		Ok(self.tx.commit().await?)
+	}
+}
+
 /// A head of the signer's record: its entry, running hash, and the signer's
 /// signature over them when the signer gave one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +511,19 @@ impl Store {
 
 	async fn conn(&self) -> Result<Conn<'_>, StoreError> {
 		self.pool.get().await.map_err(|e| StoreError::from_pool(e, self.settings.wait))
+	}
+
+	/// A connection for a read from one snapshot of the store
+	/// ([`Reader::snapshot`]).
+	pub async fn reader(&self) -> Result<Reader<'_>, StoreError> {
+		Ok(Reader { conn: self.conn().await?, counters: &self.counters })
+	}
+
+	/// The coins whose rows were read ahead of a walk since the server
+	/// started ([`Store::coin_reads`], [`Snapshot::coin_reads`]): what a read
+	/// ahead costs the database, in coins.
+	pub fn coins_read_ahead(&self) -> u64 {
+		self.counters.read_ahead.load(std::sync::atomic::Ordering::SeqCst)
 	}
 
 	/// The pool's settings and what it has been through since the server

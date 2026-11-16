@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tokio_postgres::Row;
+use tokio_postgres::{GenericClient, Row};
 
 use super::{array32, LeafRow, SendRow, Store, StoreError};
 
@@ -113,12 +113,6 @@ impl CoinReads {
 		self.sends.extend(other.sends);
 	}
 
-	/// The coins the reassignments that spent the coins read made: the next
-	/// step down from them.
-	pub fn outputs_of_spent(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
-		self.spending.values().filter(|t| t.len() == 1).filter_map(|t| self.outputs.get(&t[0])).flatten().map(|(l, _)| *l)
-	}
-
 	/// [`Store::spent_by`].
 	pub fn spent_by(&self, id: &[u8; 32]) -> Option<Result<SpentBy, StoreError>> {
 		if !self.has(id) {
@@ -175,82 +169,89 @@ fn id_at(r: &Row, i: usize) -> Result<[u8; 32], StoreError> {
 	array32(r.get(i), "coin id")
 }
 
+/// [`Store::coin_reads`] on `conn`: a connection, or a transaction whose
+/// snapshot every read of it sees ([`super::Snapshot`]).
+pub(super) async fn coin_reads_on(conn: &(impl GenericClient + Sync), ids: &[[u8; 32]]) -> Result<CoinReads, StoreError> {
+	let mut out = CoinReads { read: ids.iter().copied().collect(), ..CoinReads::default() };
+	if ids.is_empty() {
+		return Ok(out);
+	}
+	let asked: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+	// Sent together, so the connection carries them one after another
+	// without waiting for each answer.
+	let leaf_sql = format!("SELECT {} FROM leaf WHERE leaf_id = ANY($1::bytea[])", super::coins::LEAF_COLUMNS);
+	let send_sql = format!("SELECT {} FROM lightning_send WHERE htlc_leaf_id = ANY($1::bytea[])", super::lightning::COLUMNS);
+	let by: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&asked];
+	let (spending, leaves, delegations, releases, paid, open, sends) = tokio::try_join!(
+		// As `spent_by`'s first statement, for every coin at once.
+		conn.query(
+			"SELECT DISTINCT leaf, transfer_id FROM (
+			   SELECT ti.leaf_id AS leaf, ti.transfer_id FROM transfer_input ti JOIN transfer t USING (transfer_id)
+			   WHERE ti.leaf_id = ANY($1::bytea[]) AND (t.state = 'signed'
+			     OR EXISTS (SELECT 1 FROM order_fill f WHERE f.transfer_id = ti.transfer_id AND f.signature IS NOT NULL))
+			   UNION
+			   SELECT f.order_leaf, f.transfer_id FROM order_fill f WHERE f.order_leaf = ANY($1::bytea[]) AND f.signature IS NOT NULL) s",
+			&by),
+		conn.query(leaf_sql.as_str(), &by),
+		conn.query("SELECT transfer_id, signature, leaf_id FROM delegation WHERE leaf_id = ANY($1::bytea[])", &by),
+		conn.query(
+			"SELECT round_id, connector_asset, signature, leaf_id, node_hash FROM node_release
+			 WHERE leaf_id = ANY($1::bytea[]) AND NOT retired ORDER BY leaf_id, round_id",
+			&by),
+		conn.query(
+			"SELECT nr.round_id, nr.connector_asset, nr.signature, nr.leaf_id, nr.node_hash FROM node_release nr JOIN round r USING (round_id)
+			 WHERE nr.leaf_id = ANY($1::bytea[]) AND nr.participation_id IS NULL AND r.state = 'final' ORDER BY nr.leaf_id, nr.round_id",
+			&by),
+		conn.query(
+			"SELECT DISTINCT pi.leaf_id FROM participation_input pi JOIN participation p USING (participation_id)
+			 WHERE pi.leaf_id = ANY($1::bytea[]) AND pi.active AND p.state IN ('pending', 'issued')",
+			&by),
+		conn.query(send_sql.as_str(), &by),
+	)?;
+	for r in &spending {
+		out.spending.entry(id_at(r, 0)?).or_default().push(array32(r.get(1), "transfer id")?);
+	}
+	// As `spent_by`'s second statement, for every reassignment found.
+	let transfers: Vec<Vec<u8>> = out.spending.values().flatten().map(|t| t.to_vec()).collect::<HashSet<_>>().into_iter().collect();
+	if !transfers.is_empty() {
+		for r in conn.query(
+			"SELECT o.transfer_id, o.leaf_id, l.owner_key FROM transfer_output o JOIN leaf l USING (leaf_id)
+			 WHERE o.transfer_id = ANY($1::bytea[]) ORDER BY o.transfer_id, o.idx",
+			&[&transfers]).await?
+		{
+			out.outputs.entry(array32(r.get(0), "transfer id")?).or_default()
+				.push((array32(r.get(1), "leaf id")?, array32(r.get(2), "owner key")?));
+		}
+	}
+	for r in leaves {
+		out.leaves.insert(id_at(&r, 0)?, r);
+	}
+	for r in delegations {
+		out.delegations.insert(id_at(&r, 2)?, r);
+	}
+	for r in releases {
+		out.releases.entry(id_at(&r, 3)?).or_default().push((array32(r.get(4), "node hash")?, r));
+	}
+	for r in paid {
+		out.paid_releases.entry(id_at(&r, 3)?).or_default().push((array32(r.get(4), "node hash")?, r));
+	}
+	for r in &open {
+		out.refresh_open.insert(id_at(r, 0)?);
+	}
+	for r in sends {
+		out.sends.insert(id_at(&r, 6)?, r);
+	}
+	Ok(out)
+}
+
 impl Store {
 	/// The rows of each coin of `ids` that the one-coin reads of a reclaim's
 	/// walk find ([`CoinReads`]), in one round of statements over one
 	/// connection.
 	pub async fn coin_reads(&self, ids: &[[u8; 32]]) -> Result<CoinReads, StoreError> {
-		let mut out = CoinReads { read: ids.iter().copied().collect(), ..CoinReads::default() };
-		if ids.is_empty() {
-			return Ok(out);
-		}
-		let asked: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
+		self.counters.read_ahead.fetch_add(ids.len() as u64, std::sync::atomic::Ordering::SeqCst);
 		let conn = self.conn().await?;
-		// Sent together, so the connection carries them one after another
-		// without waiting for each answer.
-		let leaf_sql = format!("SELECT {} FROM leaf WHERE leaf_id = ANY($1::bytea[])", super::coins::LEAF_COLUMNS);
-		let send_sql = format!("SELECT {} FROM lightning_send WHERE htlc_leaf_id = ANY($1::bytea[])", super::lightning::COLUMNS);
-		let by: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&asked];
-		let (spending, leaves, delegations, releases, paid, open, sends) = tokio::try_join!(
-			// As `spent_by`'s first statement, for every coin at once.
-			conn.query(
-				"SELECT DISTINCT leaf, transfer_id FROM (
-				   SELECT ti.leaf_id AS leaf, ti.transfer_id FROM transfer_input ti JOIN transfer t USING (transfer_id)
-				   WHERE ti.leaf_id = ANY($1::bytea[]) AND (t.state = 'signed'
-				     OR EXISTS (SELECT 1 FROM order_fill f WHERE f.transfer_id = ti.transfer_id AND f.signature IS NOT NULL))
-				   UNION
-				   SELECT f.order_leaf, f.transfer_id FROM order_fill f WHERE f.order_leaf = ANY($1::bytea[]) AND f.signature IS NOT NULL) s",
-				&by),
-			conn.query(leaf_sql.as_str(), &by),
-			conn.query("SELECT transfer_id, signature, leaf_id FROM delegation WHERE leaf_id = ANY($1::bytea[])", &by),
-			conn.query(
-				"SELECT round_id, connector_asset, signature, leaf_id, node_hash FROM node_release
-				 WHERE leaf_id = ANY($1::bytea[]) AND NOT retired ORDER BY leaf_id, round_id",
-				&by),
-			conn.query(
-				"SELECT nr.round_id, nr.connector_asset, nr.signature, nr.leaf_id, nr.node_hash FROM node_release nr JOIN round r USING (round_id)
-				 WHERE nr.leaf_id = ANY($1::bytea[]) AND nr.participation_id IS NULL AND r.state = 'final' ORDER BY nr.leaf_id, nr.round_id",
-				&by),
-			conn.query(
-				"SELECT DISTINCT pi.leaf_id FROM participation_input pi JOIN participation p USING (participation_id)
-				 WHERE pi.leaf_id = ANY($1::bytea[]) AND pi.active AND p.state IN ('pending', 'issued')",
-				&by),
-			conn.query(send_sql.as_str(), &by),
-		)?;
-		for r in &spending {
-			out.spending.entry(id_at(r, 0)?).or_default().push(array32(r.get(1), "transfer id")?);
-		}
-		// As `spent_by`'s second statement, for every reassignment found.
-		let transfers: Vec<Vec<u8>> = out.spending.values().flatten().map(|t| t.to_vec()).collect::<HashSet<_>>().into_iter().collect();
-		if !transfers.is_empty() {
-			for r in conn.query(
-				"SELECT o.transfer_id, o.leaf_id, l.owner_key FROM transfer_output o JOIN leaf l USING (leaf_id)
-				 WHERE o.transfer_id = ANY($1::bytea[]) ORDER BY o.transfer_id, o.idx",
-				&[&transfers]).await?
-			{
-				out.outputs.entry(array32(r.get(0), "transfer id")?).or_default()
-					.push((array32(r.get(1), "leaf id")?, array32(r.get(2), "owner key")?));
-			}
-		}
-		for r in leaves {
-			out.leaves.insert(id_at(&r, 0)?, r);
-		}
-		for r in delegations {
-			out.delegations.insert(id_at(&r, 2)?, r);
-		}
-		for r in releases {
-			out.releases.entry(id_at(&r, 3)?).or_default().push((array32(r.get(4), "node hash")?, r));
-		}
-		for r in paid {
-			out.paid_releases.entry(id_at(&r, 3)?).or_default().push((array32(r.get(4), "node hash")?, r));
-		}
-		for r in &open {
-			out.refresh_open.insert(id_at(r, 0)?);
-		}
-		for r in sends {
-			out.sends.insert(id_at(&r, 6)?, r);
-		}
-		Ok(out)
+		coin_reads_on(&**conn, ids).await
 	}
 
 	/// Records `leaf_id`'s delegation into transfer `transfer_id`; a
