@@ -154,7 +154,7 @@ pub struct LeafRow {
 	pub spent_by: Option<Vec<u8>>,
 }
 
-const LEAF_COLUMNS: &str = "leaf_id, kind::text, asset, value, owner_key, script_pubkey, hops, record, state::text, spent_by";
+pub(super) const LEAF_COLUMNS: &str = "leaf_id, kind::text, asset, value, owner_key, script_pubkey, hops, record, state::text, spent_by";
 
 pub(super) fn leaf_row(r: &tokio_postgres::Row) -> Result<LeafRow, StoreError> {
 	let value: i64 = r.get(3);

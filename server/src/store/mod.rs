@@ -80,7 +80,7 @@ pub use channels::{Begun, ChannelNoteRow, ChannelSeen, ChannelStateRow, NewChann
 pub use chain::{BlockRow, Scan, ScannedOutput};
 pub use connections::{ConnError, PoolSettings, CHECK_WITHIN};
 pub use coins::{LeafKind, LeafRow, LeafState, NewCoin, NewScript, ScriptKind};
-pub use delegations::{DelegationRow, HolderReleaseRow, SpentBy};
+pub use delegations::{CoinReads, DelegationRow, HolderReleaseRow, SpentBy};
 pub use distributions::{ClaimRow, DistributionRow, NewDistribution, ReturnRow};
 pub use lightning::{NewReceive, ReceiveRow, ReceiveState, SendRow, SendState};
 pub use mailbox::MailboxMessage;
