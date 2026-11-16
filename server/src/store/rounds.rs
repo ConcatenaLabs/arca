@@ -871,6 +871,44 @@ impl Store {
 		Ok(Some((batch, leaves)))
 	}
 
+	/// The rounds of `round_ids` there are, as [`Store::round`] reads each,
+	/// and the batches paid by the outputs `outputs` (a round's id and an
+	/// output) there are, each with its leaves in tree order, as
+	/// [`Store::batch`] reads each: three statements, sent together, however
+	/// many.
+	pub async fn rounds_and_batches(&self, round_ids: &[i64], outputs: &[(i64, u32)])
+		-> Result<(Vec<RoundRow>, Vec<(BatchRow, Vec<BatchLeafRow>)>), StoreError>
+	{
+		if round_ids.is_empty() && outputs.is_empty() {
+			return Ok((vec![], vec![]));
+		}
+		let conn = self.conn().await?;
+		let (rounds, vouts): (Vec<i64>, Vec<i32>) = outputs.iter().map(|(r, v)| (*r, *v as i32)).unzip();
+		let round_sql = format!("SELECT {} FROM round r JOIN connector_output c ON c.round_id = r.round_id WHERE r.round_id = ANY($1::bigint[])",
+			ROUND_COLUMNS);
+		let batch_sql = format!("SELECT {} FROM batch WHERE (round_id, vout) IN (SELECT * FROM unnest($1::bigint[], $2::int[]))", BATCH_COLUMNS);
+		let leaf_sql = format!("SELECT {} FROM batch_leaf WHERE (round_id, vout) IN (SELECT * FROM unnest($1::bigint[], $2::int[]))
+			ORDER BY round_id, vout, idx", LEAF_COLUMNS);
+		let by_round: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&round_ids];
+		let by_output: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&rounds, &vouts];
+		let (round_rows, batch_rows, leaf_rows) = tokio::try_join!(
+			conn.query(round_sql.as_str(), &by_round),
+			conn.query(batch_sql.as_str(), &by_output),
+			conn.query(leaf_sql.as_str(), &by_output),
+		)?;
+		let found = round_rows.iter().map(round_row).collect::<Result<Vec<_>, _>>()?;
+		let mut batches: Vec<(BatchRow, Vec<BatchLeafRow>)> = batch_rows.iter().map(|r| Ok((batch_row(r)?, vec![])))
+			.collect::<Result<_, StoreError>>()?;
+		let at: std::collections::HashMap<(i64, u32), usize> = batches.iter().enumerate().map(|(i, (b, _))| ((b.round_id, b.vout), i)).collect();
+		for r in &leaf_rows {
+			let l = batch_leaf_row(r)?;
+			if let Some(i) = at.get(&(l.round_id, l.vout)) {
+				batches[*i].1.push(l);
+			}
+		}
+		Ok((found, batches))
+	}
+
 	/// The batches of the round `round_id`.
 	pub async fn batches(&self, round_id: i64) -> Result<Vec<BatchRow>, StoreError> {
 		let conn = self.conn().await?;
@@ -901,21 +939,64 @@ impl Store {
 	/// The batch leaves each coin of `ids` rests on: itself when it is one,
 	/// else each batch leaf up its lineage of reassignments (a payment out of
 	/// round, a swap), eight steps at most as in flight is counted. Each with
-	/// the coin of `ids` it was found for.
+	/// the coin of `ids` it was found for, once, ordered by batch leaf and
+	/// then by that coin.
+	///
+	/// A statement for each step up, over every coin reached at that step,
+	/// then one for the batch leaves among all the coins reached: each reads
+	/// by its indexes, for exactly the coins it names. (A recursive statement
+	/// over the same lineage is planned for some fifty times the rows it
+	/// finds, and a read of a few hundred coins then sorted every batch leaf
+	/// the server holds.)
 	pub async fn batch_leaves_under(&self, ids: &[[u8; 32]]) -> Result<Vec<([u8; 32], BatchLeafRow)>, StoreError> {
+		use std::collections::{BTreeMap, BTreeSet};
 		if ids.is_empty() {
 			return Ok(vec![]);
 		}
 		let conn = self.conn().await?;
-		let ids: Vec<&[u8]> = ids.iter().map(|i| &i[..]).collect();
-		let rows = conn.query(&format!(
-			"WITH RECURSIVE up (root, lid, depth) AS (
-			   SELECT x, x, 0 FROM unnest($1::bytea[]) AS x
-			   UNION
-			   SELECT u.root, ti.leaf_id, u.depth + 1 FROM up u JOIN transfer_output o ON o.leaf_id = u.lid
-			   JOIN transfer_input ti ON ti.transfer_id = o.transfer_id WHERE u.depth < 8)
-			 SELECT DISTINCT {}, up.root FROM up JOIN batch_leaf ON batch_leaf.leaf_id = up.lid", LEAF_COLUMNS), &[&ids]).await?;
-		rows.iter().map(|r| Ok((array32(r.get(16), "coin id")?, batch_leaf_row(r)?))).collect()
+		// Each coin reached, with the coins of `ids` it was reached for, at
+		// each step: every step from every coin, as the lineage branches and
+		// joins again.
+		let mut reached: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>> = BTreeMap::new();
+		let mut step: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>> = BTreeMap::new();
+		for id in ids {
+			step.entry(*id).or_default().insert(*id);
+		}
+		for depth in 0..=8 {
+			for (lid, roots) in &step {
+				reached.entry(*lid).or_default().extend(roots.iter().copied());
+			}
+			if depth == 8 {
+				break;
+			}
+			let at: Vec<&[u8]> = step.keys().map(|l| &l[..]).collect();
+			let rows = conn.query(
+				"SELECT o.leaf_id, ti.leaf_id FROM transfer_output o JOIN transfer_input ti ON ti.transfer_id = o.transfer_id
+				 WHERE o.leaf_id = ANY($1::bytea[])",
+				&[&at]).await?;
+			let mut up: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>> = BTreeMap::new();
+			for r in &rows {
+				let (from, to) = (array32(r.get(0), "coin id")?, array32(r.get(1), "coin id")?);
+				if let Some(roots) = step.get(&from) {
+					up.entry(to).or_default().extend(roots.iter().copied());
+				}
+			}
+			if up.is_empty() {
+				break;
+			}
+			step = up;
+		}
+		let all: Vec<&[u8]> = reached.keys().map(|l| &l[..]).collect();
+		let rows = conn.query(&format!("SELECT {} FROM batch_leaf WHERE leaf_id = ANY($1::bytea[]) ORDER BY leaf_id", LEAF_COLUMNS),
+			&[&all]).await?;
+		let mut out = vec![];
+		for r in &rows {
+			let leaf = batch_leaf_row(r)?;
+			for root in reached.get(&leaf.leaf_id).into_iter().flatten() {
+				out.push((*root, leaf.clone()));
+			}
+		}
+		Ok(out)
 	}
 
 	/// The leaves of batches of the round `round_id`.
