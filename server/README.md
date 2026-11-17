@@ -1596,7 +1596,7 @@ co-signed fill to the order's terms: the maker's credit at output 0, a `vtxo-1`
 leaf under the order's next credit key paying at least the price, and for a
 part fill the order resting again at output 1 under a new salt, holding the
 rest. An order fills at most four times along its lineage, one credit key a
-fill.
+fill; a refresh (below) starts a new lineage with four new credit keys.
 
 A maker asks a round for the leaf as for any leaf, its wanted leaf naming the
 template `order-3` and the order's terms (`order`: the asset it is paid in,
@@ -1631,7 +1631,13 @@ as in a transfer, for a leaf of what it takes and a leaf of its change
   resting, the taker's first leaf holds exactly what it takes and its second
   the change, a checkpoint and the fill each leave a margin that pays their
   fee as a transfer's does (the fill's in the asset paid), the depth limit
-  holds, and every signature verifies.
+  holds, and every signature verifies;
+- a fill that leaves part of the order resting leaves it at least one
+  reassignment short of the depth limit, so the maker can always cancel what
+  rests, which is one reassignment more: a part fill that would land the rest
+  at the limit is refused (`order_whole_only`, naming the whole remainder),
+  and the whole remainder is still taken. `order_state` shows how deep the
+  order's coin is (`hops`) and whether only the whole is taken (`whole_only`).
 
 The fill is recorded, the order's coin spent by it and the taker's request
 kept with it, before anything is signed. The signer co-signs the taker's checkpoints and their pair over the
@@ -1647,6 +1653,26 @@ taker signed its pairs over exactly these outputs, so completing it takes
 nothing from anyone, and the order's coin is not held until the taker returns.
 One the signer refuses (its record holds another spend of a coin) is dropped,
 its coins live again. While a fill is unsigned the order reads `filling`.
+
+A maker refreshes a resting order and keeps it by a participation that gives
+up the coin the order rests at (with any other coins that pay the round's fee)
+and wants an `order-3` leaf of the same order: the same landed terms (the
+asset it is paid in, the rate, the lot, the landed order's maker script hash,
+REFUND time and refund key) and the same value, under a new leaf key and four
+new credit keys. Once the round is final the maker publishes the new leaf as
+any order (`order_publish`); the server finds the participation that made it,
+and when that participation gave up exactly one coin an order rests at, of the
+same landed terms and value, and that coin is no longer live, the order goes
+on at the new leaf: the same id, the new leaf's record, credit keys, mailbox
+and record formats, its depth that of a round's leaf and four fills ahead of
+it. The participation's attestation by the old coin's key, over every leaf it
+wants, is the maker's consent; a coin a participation holds takes no fill, and
+a participation that never runs gives the coin back, the order resting where
+it was. While such a participation holds the order's coin, or has given it
+up and the new leaf is not yet published, the order reads `refreshing`. The
+server says it keeps an order through a refresh in its `info`
+(`fills.refresh_keeps_order`). A participation that gives up an order's coin
+for anything else (a plain refresh into a `vtxo` leaf) cancels the order.
 
 On a batch with RECLAIM-D a fill delegates like a transfer, into all of its
 outputs in order (the credit, the order resting again, the taker's leaves;
@@ -3096,11 +3122,11 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST plans` | Every plan whose leaves are bound to the authenticated key (a wallet's mailbox key), the newest first, each as `plan_status` answers it |
 | `POST cancel_plan` | Cancels the steps of a plan that have not started, on the plan's mailbox key's signature over `SHA256(T ‖ T ‖ genesis_hash ‖ S ‖ plan id)`, `T = SHA256("Arca/plan-cancel")`; a plan with a step in a round is cancelled once that round decides it |
 | `POST plan_leaf` | Takes the holder's unroll authorisations for a leaf a step of its plan made, signed by the leaf's key, and keeps the leaf's full record |
-| `POST order_publish` | Publishes a resting order its round made (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
+| `POST order_publish` | Publishes a resting order its round made, or the coin a refresh of one made, which the order then rests at under its id (see Resting orders), answered as `order_state` answers it; a publication sent again gets the order's state |
 | `POST order_fill` | Co-signs a fill of a resting order (each plain taker coin into a checkpoint with its owner's exit with `checkpoint_exit: true`, where `info.checkpoint_exit` offers it): the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`). A taker coin resting on a lowest node with RECLAIM-D carries its delegation into the fill's outputs (`delegation_sig`) |
 | `POST order_fill_delegation_terms` | For a signed fill, by its transfer id or the order coin it spent: the order coin it spent, the taker's leaves its maker's delegation names after the maker's own, and whether that delegation is recorded |
 | `POST order_fill_delegation` | Takes the maker's delegation of its order coin into a fill (`kept` false for a coin on no lowest node with RECLAIM-D, and for an order resting again, whose key delegated at an earlier fill) |
-| `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
+| `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more until its maker refreshes it), `refreshing` (a round gives it a fresh coin of the same order; it takes no fill meanwhile), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, how many reassignments the coin is from a round (`hops`) and whether only a fill of the whole is taken (`whole_only`), its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
 | `POST tree` | The published tree of a batch, by its round's txid and output: its kind (`kind`: `tree`, or `accumulator` for an accumulator batch, which has no nodes and a radix of 0), with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage; for a take in a round that fills orders and is not broadcast yet, takes them and returns no preimage (it goes out once the round is final) |
@@ -3750,6 +3776,14 @@ metrics are served (`metrics_listen`, a loopback address), and how takes of
 on-chain orders are bounded (`[fills]`: how long before its refund an order is
 no longer taken, and how long a round that fills orders waits for its takes'
 forfeits). The node must run with `-txindex` and `-validateanchor`.
+
+The depth limit (`depth_limit`, 1 to 5, 5 when absent) is the most
+reassignments from a round or a board a coin may be when the operator
+co-signs a spend of it out of round; `info` publishes it. It changes only
+with a restart, and a lower limit holds every coin to it at once, those made
+under a higher one included: such a coin is then spent only in a round, by
+its owner's refresh. A resting order whose coin is at the new limit is
+refreshed by its maker (`order refresh-resting`), which keeps the order.
 
 The exit-delay bounds (`exit_delay_units`) change only with a restart, and
 they govern the leaves the operator makes from then on: a board, a refresh's

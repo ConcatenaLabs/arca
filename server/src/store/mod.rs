@@ -25,7 +25,9 @@
 //! `schema/V41__strikes_on_dropped_coins.sql`, `schema/V42__slot_releases.sql`,
 //! `schema/V43__record_formats.sql`, `schema/V44__watched_for_index.sql`,
 //! `schema/V45__final_pass_indexes.sql`, `schema/V46__resting_order_reads.sql`,
-//! `schema/V47__participation_arriving.sql`),
+//! `schema/V47__participation_arriving.sql`,
+//! `schema/V48__offboard_by_participation.sql`, `schema/V49__leaf_made_xid.sql`,
+//! `schema/V50__swap_lock.sql`, `schema/V51__resting_order_refresh.sql`),
 //! built from
 //! nothing by [`Store::connect`] and
 //! applied in order, each once, under a lock. Every
@@ -156,6 +158,8 @@ const MIGRATIONS: &[(i32, &str)] = &[
 	(47, include_str!("../../schema/V47__participation_arriving.sql")),
 	(48, include_str!("../../schema/V48__offboard_by_participation.sql")),
 	(49, include_str!("../../schema/V49__leaf_made_xid.sql")),
+	(50, include_str!("../../schema/V50__swap_lock.sql")),
+	(51, include_str!("../../schema/V51__resting_order_refresh.sql")),
 ];
 
 /// A rebindable message the server asks the signer to sign, recorded before

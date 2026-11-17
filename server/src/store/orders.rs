@@ -9,6 +9,12 @@
 //! transaction, before anything of it is signed ([`Store::record_order_fill`]);
 //! the order coin is spent by one fill at most, which the database's unique
 //! key holds whatever the timing.
+//!
+//! A resting order refreshed in a round goes on at the coin the round made
+//! of it ([`Store::continue_resting_order`]): its row takes that coin's
+//! record, credit keys and mailbox, keeps its id, and counts the fills made
+//! before (`fills_before`), so the new coin's credit keys are counted from
+//! its own first fill.
 
 use super::transfers::{record_transfer_in, NewReassignment, NewTransferInput, NewTransferOutput};
 use super::{array32, Store, StoreError};
@@ -20,15 +26,33 @@ pub struct RestingOrderRow {
 	pub order_id: [u8; 32],
 	pub maker_key: [u8; 32],
 	pub mailbox_key: [u8; 32],
-	/// The record of the order's first coin, as the maker handed it over.
+	/// The record of the first coin of its current lineage (the coin a round
+	/// made of it, first or at its latest refresh), as the maker handed it
+	/// over.
 	pub record: Vec<u8>,
-	/// The nonces of the order's four credit keys, the first credit's first.
+	/// The nonces of that coin's four credit keys, the first credit's first.
 	pub credit_nonces: [[u8; 32]; 4],
-	/// The coin it rests at now: the first coin, or a fill's remainder.
+	/// The coin it rests at now: a coin a round made of it, or a fill's
+	/// remainder.
 	pub current_leaf: [u8; 32],
 	/// The coin record formats its maker's wallet reads, as it named them
 	/// when it published the order; none for an older build.
 	pub record_formats: Vec<String>,
+	/// How many fills the order made before its current lineage began (at
+	/// its latest refresh): the current lineage's fills are counted from
+	/// there.
+	pub fills_before: u32,
+}
+
+impl RestingOrderRow {
+	/// The leaf id of the first coin of the order's current lineage: the coin
+	/// whose record [`RestingOrderRow::record`] is.
+	pub fn record_leaf(&self) -> Option<[u8; 32]> {
+		match arca_covenant::CoinRecord::from_bytes(&self.record).ok()? {
+			arca_covenant::CoinRecord::Leaf { record, .. } => record.leaf_id().ok().map(|l| l.0),
+			_ => None,
+		}
+	}
 }
 
 /// A fill of a resting order made in the tree.
@@ -85,6 +109,7 @@ fn order_row(r: &tokio_postgres::Row) -> Result<RestingOrderRow, StoreError> {
 		credit_nonces: nonces(r.get(4))?,
 		current_leaf: array32(r.get(5), "current leaf")?,
 		record_formats: r.get(6),
+		fills_before: r.get::<_, i32>(7) as u32,
 	})
 }
 
@@ -103,7 +128,7 @@ fn fill_row(r: &tokio_postgres::Row) -> Result<OrderFillRow, StoreError> {
 	})
 }
 
-const ORDER_COLUMNS: &str = "order_id, maker_key, mailbox_key, record, credit_nonces, current_leaf, record_formats";
+const ORDER_COLUMNS: &str = "order_id, maker_key, mailbox_key, record, credit_nonces, current_leaf, record_formats, fills_before";
 const FILL_COLUMNS: &str = "transfer_id, order_id, order_leaf, seq, filled, credited, partial, m, signature";
 
 impl Store {
@@ -141,13 +166,64 @@ impl Store {
 	}
 
 	/// The resting order a coin is a coin of: its first coin, a coin a fill of
-	/// it spent, or the coin it rests at now.
+	/// it spent, a coin a refresh of it gave up or made, or the coin it rests
+	/// at now.
 	pub async fn resting_order_of_leaf(&self, leaf_id: &[u8; 32]) -> Result<Option<RestingOrderRow>, StoreError> {
 		let conn = self.conn().await?;
 		let r = conn.query_opt(&format!(
 			"SELECT {} FROM resting_order WHERE order_id = $1 OR current_leaf = $1
-			 OR order_id = (SELECT order_id FROM order_fill WHERE order_leaf = $1)", ORDER_COLUMNS), &[&&leaf_id[..]]).await?;
+			 OR order_id = (SELECT order_id FROM order_fill WHERE order_leaf = $1)
+			 OR order_id = (SELECT order_id FROM resting_order_refresh WHERE to_leaf = $1 OR from_leaf = $1 LIMIT 1)", ORDER_COLUMNS),
+			&[&&leaf_id[..]]).await?;
 		r.map(|r| order_row(&r)).transpose()
+	}
+
+	/// The participations that give up, or gave up, the coin `leaf_id` and
+	/// may still run or ran (none void or expired), the latest first.
+	pub async fn participations_giving_up(&self, leaf_id: &[u8; 32]) -> Result<Vec<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let rows = conn.query(
+			"SELECT i.participation_id FROM participation_input i JOIN participation p USING (participation_id)
+			 WHERE i.leaf_id = $1 AND i.active AND p.state NOT IN ('void', 'expired') ORDER BY p.created_at DESC",
+			&[&&leaf_id[..]]).await?;
+		rows.iter().map(|r| array32(r.get(0), "participation id")).collect()
+	}
+
+	/// The participation whose round made the leaf `leaf_id`, if a
+	/// participation's did.
+	pub async fn participation_making(&self, leaf_id: &[u8; 32]) -> Result<Option<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt("SELECT participation_id FROM participation_output WHERE leaf_id = $1", &[&&leaf_id[..]]).await?;
+		r.map(|r| array32(r.get(0), "participation id")).transpose()
+	}
+
+	/// The resting order `order_id`, resting at `from_leaf`, goes on at
+	/// `to_leaf`, a coin a refresh of it made: its row takes that coin's
+	/// record, credit nonces, maker key, mailbox and record formats, and the
+	/// fills made so far are counted as before its new lineage. All or
+	/// nothing; refused when the order rests elsewhere by now
+	/// ([`StoreError::LeafSpent`] of `from_leaf`). Returns the row.
+	#[allow(clippy::too_many_arguments)]
+	pub async fn continue_resting_order(&self, order_id: &[u8; 32], from_leaf: &[u8; 32], to_leaf: &[u8; 32], maker_key: &[u8; 32],
+		mailbox_key: &[u8; 32], record: &[u8], credit_nonces: &[[u8; 32]; 4], record_formats: &[String]) -> Result<RestingOrderRow, StoreError>
+	{
+		let mut conn = self.conn().await?;
+		let t = conn.transaction().await?;
+		let fills: i64 = t.query_one("SELECT count(*) FROM order_fill WHERE order_id = $1", &[&&order_id[..]]).await?.get(0);
+		let fills = fills as i32;
+		let n: Vec<u8> = credit_nonces.iter().flatten().copied().collect();
+		let moved = t.execute(
+			"UPDATE resting_order SET maker_key = $3, mailbox_key = $4, record = $5, credit_nonces = $6, current_leaf = $7,
+			 record_formats = $8, fills_before = $9, updated_at = now() WHERE order_id = $1 AND current_leaf = $2",
+			&[&&order_id[..], &&from_leaf[..], &&maker_key[..], &&mailbox_key[..], &record, &n, &&to_leaf[..], &record_formats, &fills],
+		).await?;
+		if moved != 1 {
+			return Err(StoreError::LeafSpent(super::hex(from_leaf)));
+		}
+		t.execute("INSERT INTO resting_order_refresh (to_leaf, order_id, from_leaf, fills_before) VALUES ($1, $2, $3, $4)",
+			&[&&to_leaf[..], &&order_id[..], &&from_leaf[..], &fills]).await?;
+		t.commit().await?;
+		self.resting_order(order_id).await?.ok_or_else(|| StoreError::Corrupt("a resting order just continued is gone".into()))
 	}
 
 	/// Every fill of the resting order `order_id`, in the order they were made.

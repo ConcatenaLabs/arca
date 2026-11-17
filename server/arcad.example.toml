@@ -61,6 +61,12 @@ checkpoint_exit = false
 # under its own delays (README, "exit-delay bounds").
 # exit_delay_units = [254, 338]
 
+# The most reassignments from a round or a board a coin may be when the
+# operator co-signs a spend of it out of round: 1 to 5, the specification's 5
+# when absent. Changed only by a restart; a lower limit holds every coin to it
+# at once (README, "depth limit").
+# depth_limit = 5
+
 # Where the operator's metrics are served (GET /metrics, the text format
 # Prometheus reads): the watcher's fee pool, what is outstanding against it,
 # and the board forfeits it holds back. For the operator alone: a loopback

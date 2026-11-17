@@ -32,7 +32,11 @@
 //!   taker's coin rests on is swept while the order's lineage needs it;
 //! - the coins it makes are within the depth limit (an order fills at most
 //!   four times along one lineage, which its credit keys hold in consensus
-//!   too);
+//!   too), and a fill that leaves part of the order resting leaves it at
+//!   least one reassignment short of the limit: the order's maker can always
+//!   cancel what rests, which is one reassignment more. A part fill that
+//!   would land the rest at the limit is refused (`order_whole_only`); the
+//!   whole remainder can still be taken;
 //! - the fill holds by the program's rules (`OrderPolicy::plan`, then
 //!   `judge` by the signer itself), the taker's leaves are within the
 //!   published bounds, and every owner signature verifies; the fill's margin
@@ -55,6 +59,22 @@
 //! collaborative path: a transfer into a leaf of its own (or a forfeit in a
 //! refresh). The signer's one spend per salt keeps a cancel and a fill of one
 //! coin apart.
+//!
+//! **Refresh.** A round can also give the order a fresh coin, as it gives
+//! any coin one: the maker's participation gives up the coin the order rests
+//! at and wants an `order-3` leaf of the same order (the same landed terms,
+//! so the same pair, rate, lot, expiry and landing, and the same value) under
+//! new keys. Once the round is final, the maker publishes the new leaf as it
+//! publishes any order ([`Orders::publish`]); the server finds the
+//! participation that made it, sees that the participation gave up exactly
+//! one coin an order rests at, of that order, and the order goes on at the
+//! new coin: the same id, the new coin's record, credit keys and mailbox, its
+//! depth back to that of a round's leaf and four fills ahead of it again. The
+//! participation's attestation by the old coin's key, over everything it
+//! wants, is the maker's consent; no fill of the old coin can be co-signed
+//! while a participation holds it, and a participation that never runs gives
+//! it back, the order resting where it was. While a refresh is under way the
+//! order reads `refreshing`.
 //!
 //! **The state view** ([`Orders::state`]) says, per order, where it rests,
 //! what it has filled and what is left, and the terms a taker builds a fill
@@ -299,17 +319,30 @@ pub struct OrderView {
 	/// Whether the coin it rests at, live, is on the chain: brought there to
 	/// land, by its maker or by the operator at its exit deadline.
 	pub landed: bool,
+	/// Whether a participation gives up the coin it rests at, or gave it up,
+	/// for a coin of the same order (a refresh that keeps it), and the
+	/// order has not gone on at that coin yet.
+	pub refreshing: bool,
+	/// How many reassignments the coin it rests at is from a round or a
+	/// board.
+	pub hops: u16,
+	/// Whether a fill of it is co-signed only for the whole of what rests:
+	/// a part fill would leave the rest at the operator's depth limit, where
+	/// it could no longer be cancelled.
+	pub whole_only: bool,
 }
 
 impl OrderView {
-	/// `resting`, `filling`, `filled`, `cancelled`, `exhausted`, `landed`,
-	/// `pending` or `unknown`. `filled` is said only of a fill the operator
-	/// signed.
+	/// `resting`, `filling`, `filled`, `cancelled`, `refreshing`,
+	/// `exhausted`, `landed`, `pending` or `unknown`. `filled` is said only
+	/// of a fill the operator signed.
 	pub fn state(&self) -> &'static str {
 		match self.coin_state {
 			LeafState::Live if self.landed => "landed",
+			LeafState::Live if self.refreshing => "refreshing",
 			LeafState::Live if self.policy.fills_left() == 0 => "exhausted",
 			LeafState::Live => "resting",
+			LeafState::Spent if self.given_up && self.refreshing => "refreshing",
 			LeafState::Spent if self.given_up => "cancelled",
 			LeafState::Spent if self.filling => "filling",
 			LeafState::Spent => "filled",
@@ -334,6 +367,9 @@ pub enum OrderError {
 	Moved(String),
 	#[error("{0}")]
 	Terms(String),
+	/// A part fill that would leave the rest at the depth limit.
+	#[error("{0}")]
+	WholeOnly(String),
 	#[error(transparent)]
 	Cosign(#[from] CosignError),
 	#[error("the server has not followed the chain yet")]
@@ -351,6 +387,7 @@ impl OrderError {
 			OrderError::NotAnOrder(_) => "not_an_order",
 			OrderError::Moved(_) => "order_moved",
 			OrderError::Terms(_) => "order",
+			OrderError::WholeOnly(_) => "order_whole_only",
 			OrderError::Cosign(e) => e.code(),
 			OrderError::NotSynced => "not_synced",
 			OrderError::Internal(_) => "internal",
@@ -429,8 +466,9 @@ impl Orders {
 		MedianTime::from_consensus(tip.median_time as u32).map_err(internal)
 	}
 
-	/// Publishes a resting order: see the [module documentation](self). The
-	/// same publication again gets the order's state.
+	/// Publishes a resting order, or the coin a refresh of one made: see the
+	/// [module documentation](self). The same publication again gets the
+	/// order's state.
 	pub async fn publish(&self, req: &PublishRequest) -> Result<OrderView, OrderError> {
 		let CoinRecord::Leaf { record, .. } = &req.record else {
 			return Err(OrderError::NotAnOrder("a resting order is published by the record of the coin a round made of it".into()));
@@ -439,8 +477,11 @@ impl Orders {
 			return Err(OrderError::NotAnOrder(format!("the coin's template is {}, not an order", record.template)));
 		}
 		let id = record.leaf_id().map_err(|e| OrderError::Malformed(e.to_string()))?;
-		if self.store.resting_order(&id.0).await?.is_some() {
-			return self.view(&id).await?.ok_or_else(|| internal("a published order is gone"));
+		if let Some(o) = self.store.resting_order_of_leaf(&id.0).await? {
+			let made_by_round = o.order_id == id.0 || o.record_leaf() == Some(id.0);
+			if made_by_round {
+				return self.view(&LeafId(o.order_id)).await?.ok_or_else(|| internal("a published order is gone"));
+			}
 		}
 		let p = &self.params;
 		let digest = publish_digest(&p.chain, &p.operator, &id, &req.credit_nonces, &req.mailbox);
@@ -458,10 +499,61 @@ impl Orders {
 			return Err(OrderError::NotAnOrder("the record published is not the record of the coin the server holds".into()));
 		}
 		let bytes = req.record.to_bytes().map_err(internal)?;
+		if let Some((order, from)) = self.refreshed_order(&id, &coin).await? {
+			let o = self.store.continue_resting_order(&order.order_id, &from, &id.0, &record.owner.serialize(), &req.mailbox.serialize(),
+				&bytes, &req.credit_nonces, &req.record_formats).await.map_err(|e| match e {
+					StoreError::LeafSpent(_) => OrderError::Moved(format!("order {} no longer rests at coin {}, which the refresh that made \
+						coin {} gave up", LeafId(order.order_id), LeafId(from), id)),
+					other => other.into(),
+				})?;
+			log::info!("resting order {} refreshed: it rests at coin {} (was {}), {} of {}, after {} fills", LeafId(o.order_id), id,
+				LeafId(from), coin.value, coin.asset, o.fills_before);
+			return self.view(&LeafId(o.order_id)).await?.ok_or_else(|| internal("a published order is gone"));
+		}
 		self.store.insert_resting_order(&id.0, &record.owner.serialize(), &req.mailbox.serialize(), &bytes, &req.credit_nonces,
 			&req.record_formats).await?;
 		log::info!("resting order {} published, {} of {} resting", id, coin.value, coin.asset);
 		self.view(&id).await?.ok_or_else(|| internal("a published order is gone"))
+	}
+
+	/// The published order a refresh made the coin `id` (holding `coin`)
+	/// for, and the coin the order rested at that the refresh gave up: when
+	/// the participation whose round made `id` gave up exactly one coin that
+	/// an order rests at, of the same order (the same landed terms) and the
+	/// same value, and that coin is no longer live. `None` otherwise: the
+	/// coin is then an order of its own.
+	async fn refreshed_order(&self, id: &LeafId, coin: &ValidCoin) -> Result<Option<(RestingOrderRow, [u8; 32])>, OrderError> {
+		let Some(new) = coin.leaf.order_policy() else { return Ok(None) };
+		let Some(pid) = self.store.participation_making(&id.0).await? else { return Ok(None) };
+		let Some(p) = self.store.participation(&pid).await? else { return Ok(None) };
+		let mut found = vec![];
+		for i in p.inputs.iter().filter(|i| !i.returned) {
+			let Some(o) = self.store.resting_order_of_leaf(&i.leaf_id).await? else { continue };
+			if o.current_leaf != i.leaf_id {
+				continue;
+			}
+			let Some(row) = self.store.leaf(&i.leaf_id).await? else { continue };
+			let Some(old) = CoinRecord::from_bytes(&row.record).ok().and_then(|r| r.order_policy()) else { continue };
+			if old.landed == new.landed && row.value == coin.value && !matches!(row.state, LeafState::Live | LeafState::Pending) {
+				found.push((o, i.leaf_id));
+			}
+		}
+		Ok(if found.len() == 1 { found.pop() } else { None })
+	}
+
+	/// Whether a participation that may still run, or ran, gives up `leaf`
+	/// (the coin an order of `policy` rests at, holding `value`) for an
+	/// order-3 leaf of the same order and value: a refresh that keeps it.
+	async fn refresh_under_way(&self, leaf: &[u8; 32], policy: &OrderPolicy, value: u64) -> Result<bool, OrderError> {
+		for pid in self.store.participations_giving_up(leaf).await? {
+			let Some(p) = self.store.participation(&pid).await? else { continue };
+			let keeps = p.outputs.iter().any(|o| o.value == value && matches!(&o.kind,
+				crate::store::WantedKind::Leaf { order: Some(t), .. } if t.landed == policy.landed));
+			if keeps {
+				return Ok(true);
+			}
+		}
+		Ok(false)
 	}
 
 	/// The order whose first coin is `id`, as the state view shows it.
@@ -474,9 +566,12 @@ impl Orders {
 		let whole = fills.iter().any(|f| f.order_leaf == order.current_leaf);
 		let filling = fills.iter().any(|f| f.order_leaf == order.current_leaf && f.signature.is_none());
 		let landed = row.state == LeafState::Live && !self.store.sightings_of(&row.script_pubkey).await?.is_empty();
+		let refreshing = !whole && matches!(row.state, LeafState::Live | LeafState::Spent)
+			&& self.refresh_under_way(&order.current_leaf, &policy, row.value).await?;
 		Ok(Some(OrderView {
 			value: row.value, coin_state: row.state, expiry: cosign::first_expiry(&record),
-			given_up: row.state == LeafState::Spent && !whole, filling, landed,
+			given_up: row.state == LeafState::Spent && !whole, filling, landed, refreshing,
+			hops: row.hops, whole_only: row.hops as usize + 1 >= self.params.depth_limit,
 			order, policy, fills,
 		}))
 	}
@@ -690,6 +785,21 @@ impl Orders {
 		if hops > p.depth_limit {
 			return Err(OrderError::Cosign(CosignError::DepthLimit { hops, limit: p.depth_limit }));
 		}
+		// What rests after a part fill is cancelled by one reassignment more:
+		// a part fill that left it at the limit would leave an order nobody
+		// could fill, cancel or refresh but its maker in a round. So it is
+		// refused, and only the whole of what rests is taken.
+		if plan.rest.is_some() && hops >= p.depth_limit {
+			let why = if oc.coin.hops + 1 >= p.depth_limit {
+				format!("order {} rests at coin {}, {} reassignments from a round", req.order, req.coin, oc.coin.hops)
+			} else {
+				format!("the coins it pays with bring it to {} reassignments from a round (pay with coins fewer than {} deep)", hops,
+					p.depth_limit - 1)
+			};
+			return Err(OrderError::WholeOnly(format!("{}: a fill of part of it would leave the rest {} reassignments deep, the operator's \
+				depth limit, where its maker could no longer cancel it; the operator co-signs only a fill of the whole remainder, {} atoms",
+				why, hops, oc.coin.value)));
+		}
 
 		// The values: the checkpoints keep at least what the outputs take in
 		// the asset paid, and what is left is the fill's margin.
@@ -787,16 +897,21 @@ impl Orders {
 		let new_ids: Vec<LeafId> = leaves.iter().enumerate().map(|(j, l)| LeafId::compute(&hash, &[j as u8], &l.program())).collect();
 		// The fill's place along the order's lineage: its own row's when it is
 		// recorded already, the next otherwise.
+		// `seq` counts every fill of the order; its current lineage (since
+		// the latest refresh) began after `fills_before` of them, and its
+		// coin's credit keys are counted from there.
 		let seq = match self.store.order_fill_by_transfer(&transfer).await? {
 			Some(f) => f.seq,
 			None => self.store.order_fills(&order.order_id).await?.len() as u32,
 		};
-		if seq >= 4 {
-			return Err(OrderError::Terms(format!("order {} has filled {} times; an order fills at most four times", req.order, seq)));
+		let k = seq.checked_sub(order.fills_before).ok_or_else(|| internal("a fill counted before the order's current lineage"))?;
+		if k >= 4 {
+			return Err(OrderError::Terms(format!("order {} has filled {} times since a round last made its coin; an order fills at most \
+				four times between refreshes: it rests until its maker refreshes or cancels it", req.order, k)));
 		}
 		let maker_nonce = match CoinRecord::from_bytes(&order.record).map_err(internal)? {
 			CoinRecord::Leaf { record, .. } => record.owner_nonce,
-			_ => return Err(internal("a resting order's first record is not a round's leaf")),
+			_ => return Err(internal("a resting order's lineage record is not a round's leaf")),
 		};
 
 		// A new fill is first asked of the signer, with nothing recorded or
@@ -823,7 +938,7 @@ impl Orders {
 			let mut outs = Vec::with_capacity(m);
 			for (j, (out, id)) in outputs.iter().zip(&new_ids).enumerate() {
 				let (owner, nonce, mailbox, salt, rest) = match j {
-					0 => (credit_leaf.owner, order.credit_nonces[seq as usize], order.mailbox_key, credit_leaf.salt, true),
+					0 => (credit_leaf.owner, order.credit_nonces[k as usize], order.mailbox_key, credit_leaf.salt, true),
 					1 if plan.rest.is_some() => (op.owner, maker_nonce, order.mailbox_key, rest_leaf.salt, true),
 					_ => {
 						let o = &req.outputs[j + req.outputs.len() - m];
@@ -979,9 +1094,10 @@ impl Orders {
 			outputs: outputs.clone(),
 		};
 		// The order coin's record as the maker published it carries its
-		// preimage and authorisations; a remainder's record is the server's own.
+		// preimage and authorisations (the first coin of its lineage, a
+		// round's); a remainder's record is the server's own.
 		let fill = match self.store.resting_order(&order.order_id).await? {
-			Some(o) if o.order_id == req.coin.0 => OrderFill { order: CoinRecord::from_bytes(&o.record).map_err(internal)?, ..fill },
+			Some(o) if o.record_leaf() == Some(req.coin.0) => OrderFill { order: CoinRecord::from_bytes(&o.record).map_err(internal)?, ..fill },
 			_ => fill,
 		};
 		let mut bases: Vec<Transaction> = std::iter::once(&oc).chain(&checked).flat_map(|c| c.bases.clone()).collect();
@@ -991,8 +1107,8 @@ impl Orders {
 		let mut records = Vec::with_capacity(m);
 		for (j, id) in new_ids.iter().enumerate() {
 			let (leaf, owner, nonce) = match j {
-				0 => (FillLeaf::Credit { owner_nonce: order.credit_nonces[seq as usize] }, credit_leaf.owner,
-					order.credit_nonces[seq as usize]),
+				0 => (FillLeaf::Credit { owner_nonce: order.credit_nonces[k as usize] }, credit_leaf.owner,
+					order.credit_nonces[k as usize]),
 				1 if plan.rest.is_some() => (FillLeaf::Rest { owner_nonce: maker_nonce }, op.owner, maker_nonce),
 				_ => {
 					let o = &req.outputs[j + req.outputs.len() - m];
