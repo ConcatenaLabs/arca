@@ -1151,6 +1151,13 @@ impl Wallet {
 		self.chain.calls()
 	}
 
+	/// The scans of the node's set of unspent outputs the wallet's chain
+	/// source made, and the scripts' answers it carried into a later view
+	/// instead ([`ChainSource::scans`]).
+	pub fn node_scans(&self) -> (u64, u64) {
+		self.chain.scans()
+	}
+
 	pub fn mnemonic_path(&self) -> PathBuf {
 		self.datadir.join(MNEMONIC_FILE)
 	}
@@ -4360,6 +4367,15 @@ impl Wallet {
 	/// view ([`ChainSource::coins_at`]). A window found used near its end
 	/// is scanned on past it, as before.
 	fn scan_onchain_windows(&self) -> Result<(), Error> {
+		let scripts = self.onchain_window_scripts()?;
+		// Only a hint: a scan refused or failed leaves each window to be
+		// scanned on its own, as without it.
+		let _ = self.chain.coins_at(&scripts);
+		Ok(())
+	}
+
+	/// Every script of the wallet's on-chain windows ([`Self::scan_onchain_windows`]).
+	fn onchain_window_scripts(&self) -> Result<Vec<Script>, Error> {
 		let mut scripts = vec![];
 		for chain in [RECEIVE, CHANGE] {
 			for i in 0..self.store.indices(chain)? + GAP {
@@ -4369,10 +4385,47 @@ impl Wallet {
 		for i in 0..self.store.indices(ORDERS)? + GAP {
 			scripts.push(self.keys.order_script(i)?);
 		}
-		// Only a hint: a scan refused or failed leaves each window to be
-		// scanned on its own, as without it.
-		let _ = self.chain.coins_at(&scripts);
-		Ok(())
+		Ok(scripts)
+	}
+
+	/// Tells the chain source what the wallet reads of the node's set of
+	/// unspent outputs in any view ([`ChainSource::scan_also`]): its on-chain
+	/// windows, and the path of every exit under way, which each exit step
+	/// locates on the chain. So one scan of the set answers all of them in a
+	/// view, where each exit made a scan of its own: a wallet with a dozen
+	/// exits under way made a dozen scans of the whole set at every block,
+	/// each read of the node's entire set of unspent outputs. A path is named
+	/// only from the base transactions the wallet stored (asking nothing of
+	/// the operator or the node); an exit whose bases it lacks scans for its
+	/// own path as before. Only a hint: nothing it names changes an answer.
+	pub(crate) fn scan_watched(&self) {
+		let mut scripts = self.onchain_window_scripts().unwrap_or_default();
+		if let (Ok(now), Ok(exiting)) = (self.now(), self.store.coins_in("exiting")) {
+			for c in exiting {
+				scripts.extend(self.exit_path_scripts(&c, now).unwrap_or_default());
+			}
+		}
+		self.chain.scan_also(scripts);
+	}
+
+	/// The scripts of the path coin `c` takes on-chain ([`Self::path_outputs`]),
+	/// from the base transactions the wallet stored for it; `None` when one is
+	/// not stored, or the coin does not resolve against them.
+	fn exit_path_scripts(&self, c: &CoinRow, now: MedianTime) -> Option<Vec<Script>> {
+		let record = Self::record_of(c).ok()?;
+		let mut outs = vec![];
+		base_outputs(&record, &mut outs).ok()?;
+		let mut txs: Vec<Transaction> = vec![];
+		for o in outs {
+			if txs.iter().any(|t| t.output.contains(&o)) {
+				continue;
+			}
+			txs.push(self.known_base(&o).ok()??);
+		}
+		let coin = self.resolve(&record, &txs, &self.followed_policy(c.expiry, now)).ok()?;
+		let mut path = vec![];
+		Self::path_outputs(&coin, &mut path);
+		Some(path.into_iter().map(|o| o.script_pubkey).collect())
 	}
 
 	/// The coins among `coins` (on-chain, single-owner) that a freeze binds

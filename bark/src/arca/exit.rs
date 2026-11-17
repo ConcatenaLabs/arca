@@ -1957,11 +1957,11 @@ impl Wallet {
 	/// they were last taken, taken at once, so an operator that answers
 	/// slowly holds back no claim. A step of `sync`, and of each page of its
 	/// mailbox read.
-	pub(crate) fn exits_meanwhile(&mut self) {
-		let Some(since) = *self.exit_watch.borrow() else { return };
-		let Ok(now) = self.now().map(|n| n.to_consensus_u32()) else { return };
+	pub(crate) fn exits_meanwhile(&mut self) -> bool {
+		let Some(since) = *self.exit_watch.borrow() else { return false };
+		let Ok(now) = self.now().map(|n| n.to_consensus_u32()) else { return false };
 		if !self.exit_date_between(since, now).unwrap_or(false) {
-			return;
+			return false;
 		}
 		// Outside the slice of the step under way: these steps are not its
 		// items.
@@ -1972,6 +1972,7 @@ impl Wallet {
 		let mut done = self.exits_done.borrow_mut();
 		done.0.extend(home);
 		done.1.extend(exits);
+		true
 	}
 
 	/// The exit steps whose date has come, and nothing else: no call to the
@@ -2083,6 +2084,13 @@ impl Wallet {
 		// [`super::wallet::WITNESS_FOR`]). A pass's witness is never taken
 		// as good on its record alone.
 		let mut kept = false;
+		// What each part of the slice cost, from here: the re-check and the
+		// exit steps before the pass's own steps are counted as steps too
+		// (`recheck`, `early exits`), so no work of a slice goes unnamed.
+		let mut steps = Steps::start(self);
+		// One scan of the node's set of unspent outputs a view answers every
+		// exit's path and the on-chain windows ([`Self::scan_watched`]).
+		self.scan_watched();
 		let mut r = match resumed {
 			Some(mut r) => {
 				r.slices += 1;
@@ -2098,6 +2106,7 @@ impl Wallet {
 					},
 					None => self.recheck()?,
 				};
+				steps.lap(self, "recheck");
 				if let (Some(all), Some(new)) = (r.out.get_mut("recheck").and_then(|v| v["changes"].as_array_mut()),
 					again["changes"].as_array())
 				{
@@ -2118,8 +2127,10 @@ impl Wallet {
 				// date has come, before the operator is asked anything, and the
 				// steps again whenever one comes while it is.
 				let recheck = self.recheck()?;
+				steps.lap(self, "recheck");
 				again = recheck.clone();
 				let (home, exits) = self.exit_steps();
+				steps.lap(self, "early exits");
 				let mut r = super::slice::Resume::new(args, now);
 				r.out.insert("recheck".into(), recheck);
 				r.out.insert("early home".into(), Value::Array(home));
@@ -2129,7 +2140,7 @@ impl Wallet {
 		};
 		*self.exit_watch.borrow_mut() = Some(r.watch);
 		*self.exits_done.borrow_mut() = (vec![], vec![]);
-		let out = self.sync_asking(&mut r, catch_up, deposits, history, budget, kept);
+		let out = self.sync_asking(&mut r, catch_up, deposits, history, budget, kept, steps);
 		r.watch = self.exit_watch.borrow_mut().take().unwrap_or(now);
 		*self.slice.borrow_mut() = None;
 		let (h, e) = std::mem::take(&mut *self.exits_done.borrow_mut());
@@ -2192,7 +2203,9 @@ impl Wallet {
 			}
 		}
 		steps.lap(self, name);
-		self.exits_meanwhile();
+		if self.exits_meanwhile() {
+			steps.lap(self, "exits meanwhile");
+		}
 		*ran += 1;
 		// A step stopped inside answers in parts, one a slice: arrays joined.
 		match (r.out.get_mut(name), v) {
@@ -2222,14 +2235,14 @@ impl Wallet {
 	/// and takes them as the pass found them. `Some(next step)` when it
 	/// stopped before the end.
 	fn sync_asking(&mut self, r: &mut super::slice::Resume, catch_up: bool, with_deposits: bool, with_history: bool,
-		budget: Option<std::time::Duration>, kept: bool) -> Result<Option<String>, Error>
+		budget: Option<std::time::Duration>, kept: bool, mut steps: Steps) -> Result<Option<String>, Error>
 	{
 		// The slice's budget counts from here: what came before it in this
 		// call (the command's start, the re-check) is not the pass's work.
 		let mut deadline = budget.map(|b| web_time::Instant::now() + b);
 		// What each step cost (milliseconds, and requests of the node and of
-		// the operator): `cost_by_step`, for a program that logs a slow sync.
-		let mut steps = Steps::start(self);
+		// the operator): `cost_by_step`, for a program that logs a slow sync;
+		// the slice's re-check and early exit steps are in it already.
 		let mut ran = 0usize;
 		let err = |e: Error| json!({"error": e.to_string()});
 		let arr = |v: Result<Vec<Value>, Error>| v.map(Value::Array).unwrap_or_else(|e| json!({"error": e.to_string()}));
@@ -2277,7 +2290,9 @@ impl Wallet {
 			}
 			reached
 		};
-		self.exits_meanwhile();
+		if self.exits_meanwhile() {
+			steps.lap(self, "exits meanwhile");
+		}
 		let witnessed = witness.is_ok();
 		let failed = witness.as_ref().err().map(|e| e.to_string());
 		// A slice whose witness or `info` failed has waited out the patience:
@@ -2589,6 +2604,27 @@ impl Steps {
 			let (waited, calls) = super::chain::operator_between(&self.op, &op);
 			step["operator_ms"] = json!(waited);
 			step["operator_calls"] = calls;
+		}
+		// A part that comes more than once in a slice (the exit steps taken
+		// after several steps) adds up under its one name.
+		if let Some(Value::Object(was)) = self.out.get(name) {
+			for (k, v) in was {
+				match (v, step.get(k)) {
+					(Value::Number(a), Some(Value::Number(b))) => step[k] = json!(a.as_u64().unwrap_or(0) + b.as_u64().unwrap_or(0)),
+					(Value::Number(_), None) => step[k] = v.clone(),
+					(Value::Object(a), _) => {
+						let mut sum = a.clone();
+						if let Some(Value::Object(b)) = step.get(k) {
+							for (m, n) in b {
+								let total = sum.get(m).and_then(Value::as_u64).unwrap_or(0) + n.as_u64().unwrap_or(0);
+								sum.insert(m.clone(), json!(total));
+							}
+						}
+						step[k] = Value::Object(sum);
+					},
+					_ => {},
+				}
+			}
 		}
 		self.out.insert(name.to_string(), step);
 		*self = Steps { at: web_time::Instant::now(), node, blocks, operator, by, op, out: std::mem::take(&mut self.out) };
