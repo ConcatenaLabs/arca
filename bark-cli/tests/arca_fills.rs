@@ -394,9 +394,12 @@ fn coin_states(w: &Arca) -> Vec<String> {
 /// is final the round is gone, the coin is live again, and E pays F with it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_coin_given_back_after_its_forfeit_waits_for_the_round_to_be_gone() {
+	// Blocks that bury nothing make nothing new final: a deeper anchor depth
+	// than the default, set here.
 	let mut r = Running::start_with(|c, x, _| {
 		c.assets[0] = AssetSection::new(x, 1_000);
 		c.assets[0].offboard_base = Some("1000".into());
+		c.finality.anchor_depth = common::running::DEEPER_ANCHOR_DEPTH;
 	}).await;
 	let x = r.x;
 	let tc = holder(&mut r, "GBC", 601_000).await;

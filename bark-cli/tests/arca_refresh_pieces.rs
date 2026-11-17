@@ -98,7 +98,9 @@ async fn refreshed_in_pieces(r: &mut Running, a: &Arca, leaf: &str, piece: u64, 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refresh_in_pieces_gives_leaves_of_the_size_asked_and_a_reserve() {
-	let mut r = Running::start().await;
+	// At depth 0 its second refresh stays waiting for a round
+	// (ConcatenaLabs/arca#958): run at a deeper depth until that is settled.
+	let mut r = Running::start_with(|c, _, _| c.finality.anchor_depth = common::running::DEEPER_ANCHOR_DEPTH).await;
 	let x = r.x;
 	let a = Arca::new("RP1A");
 	let board = boarded(&mut r, &a, x, 3_000_000).await;
