@@ -58,7 +58,14 @@
 //! of the wallet's own; [`gap`]), and at least once a second; any change to
 //! one of them drops every answer kept but those fixed by what they name (a
 //! transaction's bytes by its id, a header's or a block's by its hash, a
-//! script's address), which no view changes. What the node values at broadcast
+//! script's address), which no view changes, and what a scan of the set of
+//! unspent outputs found for a script, which a new block leaves as it was
+//! unless it pays the script or spends an output found for it: such an answer
+//! is carried into the next view while the chain only grew and the anchor
+//! status stands ([`ChainSource::carry_scanned`]), so a wallet watching
+//! scripts no block touches scans the node's whole set once, not at every
+//! block. Every scan carries the scripts the wallet watches
+//! ([`ChainSource::scan_also`]), so a view needs one at most. What the node values at broadcast
 //! (its fee whitelist, its rates, its relay floor) can change while the view
 //! stands, and is read again in every command. The wallet's checks run as
 //! often as before; they read the chain as it is when they run, at the price
@@ -346,13 +353,45 @@ struct Memo {
 	/// pays there (outpoint and height), whether found or not. A scan reads
 	/// the set at the tip, so its answer for a script stands until the tip
 	/// or the anchor status moves, when it is dropped with every answer of
-	/// the view: a later scan for scripts all scanned before is answered
-	/// from here, and one for some new ones scans only those.
+	/// the view, and carried into the next view where the blocks between
+	/// leave it standing ([`Memo::carried`]): a later scan for scripts all
+	/// scanned before is answered from here, and one for some new ones scans
+	/// only those.
 	scanned: HashMap<Script, Vec<(OutPoint, u64)>>,
+	/// The block at whose tip each answer of [`Memo::scanned`] was read (the
+	/// scan's `bestblock`, or the tip it was carried to): only an answer read
+	/// at the view's own tip is carried to the next view.
+	scanned_at: HashMap<Script, BlockHash>,
+	/// What the views before scanned, when the tip moved and the anchor
+	/// status did not: carried into the new view, script by script, where the
+	/// blocks between pay nothing to the script and spend none of what it
+	/// found ([`ChainSource::carry_scanned`]).
+	carried: Option<Carried>,
+	/// Scripts every scan carries beside the ones asked for
+	/// ([`ChainSource::scan_also`]).
+	also: Vec<Script>,
 	/// Counts each drop of the view's answers: what tells a scan answered in
 	/// one view from one answered in the next.
 	view_drops: u64,
+	/// How many scans of the set this source asked the node for, and how many
+	/// scripts' answers it carried into a later view ([`ChainSource::scans`]).
+	scans: u64,
+	carried_count: u64,
 }
+
+/// What a view scanned, kept past it ([`Memo::carried`]): its tip, that
+/// tip's height, the node's anchor status then, and each script's answer.
+#[derive(Debug)]
+struct Carried {
+	tip: BlockHash,
+	height: u64,
+	anchors: String,
+	scanned: HashMap<Script, Vec<(OutPoint, u64)>>,
+}
+
+/// The most blocks a scan's answers are carried across ([`ChainSource::carry_scanned`]):
+/// past them the set is scanned again.
+pub const CARRY_MOST: u64 = 120;
 
 /// What a block pays and spends, as a search of the chain needs it: a short
 /// digest ([`digest`]) of each output's script and of each input's outpoint;
@@ -850,8 +889,11 @@ impl ChainSource {
 			// transactions a command reads stay as they were.
 			Some(k) if k.tip == key.tip && k.anchors == key.anchors => if k.mempool != key.mempool { m.pool.clear(); m.gone.clear() },
 			_ => {
+				let carried = Self::carried_of(m, &key);
 				m.view.clear();
 				m.scanned.clear();
+				m.scanned_at.clear();
+				m.carried = carried;
 				m.view_drops += 1;
 				m.pool.clear();
 				m.gone.clear();
@@ -865,6 +907,86 @@ impl ChainSource {
 		m.looked_this_command = true;
 		m.gaps = gaps;
 		Ok(extra)
+	}
+
+	/// What the view `m` stands in keeps of its scans for the view `next`
+	/// (a new tip): each answer read at the old tip, with that tip and its
+	/// height. Nothing when the node's anchor status changed (a parent chain
+	/// it can no longer follow is not a chain that only grew), and the
+	/// answers an older view kept when this one scanned nothing.
+	fn carried_of(m: &mut Memo, next: &ViewKey) -> Option<Carried> {
+		let old = m.key.as_ref()?;
+		if old.anchors != next.anchors {
+			return None;
+		}
+		let kept = m.carried.take().filter(|c| c.anchors == next.anchors);
+		let (Ok(tip), Some(height)) = (BlockHash::from_str(&old.tip), m.view.get(&Self::read_key("getblockchaininfo", &[]))
+			.and_then(|a| a.as_ref().ok()).and_then(|v| v["blocks"].as_u64())) else { return kept };
+		let scanned: HashMap<Script, Vec<(OutPoint, u64)>> = m.scanned.iter()
+			.filter(|(s, _)| m.scanned_at.get(*s) == Some(&tip)).map(|(s, f)| (s.clone(), f.clone())).collect();
+		if scanned.is_empty() {
+			return kept;
+		}
+		Some(Carried { tip, height, anchors: old.anchors.clone(), scanned })
+	}
+
+	/// Carries what an earlier view scanned (`c`) into the view that stood
+	/// when `drops` was read: each script's answer, where no block between
+	/// that view's tip and this one's pays the script or spends an output it
+	/// found ([`BlockSeen`]: a digest that matches by chance drops an answer,
+	/// never keeps a wrong one). Such a block leaves the script's unspent
+	/// outputs as they were, so the answer stands. Only along a chain that
+	/// grew from that tip, by [`CARRY_MOST`] blocks at most, with the node's
+	/// anchor status as it was: after a reorganisation of any depth, an
+	/// anchor-driven one included, nothing is carried and the set is scanned
+	/// again. Carries nothing when the view moved meanwhile.
+	fn carry_scanned(&self, c: Carried, drops: u64) {
+		let Ok(tip) = self.tip() else { return };
+		if tip.height <= c.height || tip.height - c.height > CARRY_MOST {
+			return;
+		}
+		let Ok(range) = self.seen_range(c.height + 1, tip.height) else { return };
+		let grew = range.len() as u64 == tip.height - c.height && range.first().is_some_and(|(_, _, b)| b.prev == c.tip)
+			&& range.last().is_some_and(|(h, hash, _)| *h == tip.height && *hash == tip.hash);
+		if !grew {
+			return;
+		}
+		let kept: Vec<(Script, Vec<(OutPoint, u64)>)> = c.scanned.into_iter().filter(|(s, found)| {
+			let d = script_digest(s);
+			!range.iter().any(|(_, _, b)| b.may_pay(d) || found.iter().any(|(op, _)| b.may_spend(outpoint_digest(op))))
+		}).collect();
+		let mut m = self.memo.lock().expect("the chain memo");
+		if m.view_drops != drops || m.key.as_ref().is_none_or(|k| k.anchors != c.anchors || k.tip != tip.hash.to_string()) {
+			return;
+		}
+		m.carried_count += kept.len() as u64;
+		for (s, found) in kept {
+			if !m.scanned.contains_key(&s) {
+				m.scanned_at.insert(s.clone(), tip.hash);
+				m.scanned.insert(s, found);
+			}
+		}
+	}
+
+	/// Scripts every scan of the set of unspent outputs carries from now on,
+	/// beside the ones it is made for: what the wallet will ask of the set in
+	/// any view (each exit's path, its on-chain windows). The node reads its
+	/// whole set for a scan whatever it looks for, so the first scan of a
+	/// view answers them all, and the next reads of them in that view ask
+	/// the node nothing. Replaces the last call's scripts.
+	pub fn scan_also(&self, scripts: Vec<Script>) {
+		let mut scripts = scripts;
+		scripts.sort();
+		scripts.dedup();
+		self.memo.lock().expect("the chain memo").also = scripts;
+	}
+
+	/// How many scans of the set of unspent outputs this source made (a scan
+	/// in parts counts each part), and how many scripts' answers it carried
+	/// into a later view instead of scanning for them again.
+	pub fn scans(&self) -> (u64, u64) {
+		let m = self.memo.lock().expect("the chain memo");
+		(m.scans, m.carried_count)
 	}
 
 	fn read_key(method: &str, params: &[Value]) -> String {
@@ -1579,15 +1701,30 @@ impl ChainSource {
 		let found = loop {
 			// The view as it stands now: a look that is due is made first, and
 			// drops what an earlier view scanned.
-			let (drops, missing) = {
+			let (drops, missing, tip, carried) = {
 				let mut m = self.memo.lock().expect("the chain memo");
 				self.look(&mut m).map_err(node)?;
 				let mut missing: Vec<Script> = scripts.iter().filter(|s| !m.scanned.contains_key(*s)).cloned().collect();
+				// What an earlier view scanned is carried first, where the
+				// blocks since leave it standing ([`Self::carry_scanned`]).
+				let carried = if missing.is_empty() { None } else { m.carried.take() };
+				// A scan carries the scripts the wallet will ask for in this
+				// view as well ([`Self::scan_also`]).
+				if !missing.is_empty() && carried.is_none() {
+					missing.extend(m.also.iter().filter(|s| !m.scanned.contains_key(*s)).cloned());
+				}
 				missing.sort();
 				missing.dedup();
-				(m.view_drops, missing)
+				(m.view_drops, missing, m.key.as_ref().and_then(|k| BlockHash::from_str(&k.tip).ok()), carried)
 			};
+			if let Some(c) = carried {
+				self.carry_scanned(c, drops);
+				continue;
+			}
 			if !missing.is_empty() {
+				// The tip every part of the scan read the set at: an answer is
+				// carried to a later view only when it is the view's own.
+				let mut at: Option<Option<BlockHash>> = None;
 				let mut by: HashMap<Script, Vec<(OutPoint, u64)>> = missing.iter().map(|s| (s.clone(), vec![])).collect();
 				// In parts of at most `scan_most` scripts, each part a scan of
 				// its own: all in one where the node's route takes it, else
@@ -1597,6 +1734,7 @@ impl ChainSource {
 				let mut parts: std::collections::VecDeque<&[Script]> = missing.chunks(self.scan_most() as usize).collect();
 				while let Some(part) = parts.pop_front() {
 					let descs: Vec<Value> = part.iter().map(|s| json!(format!("raw({})", hex(s.as_bytes())))).collect();
+					self.memo.lock().expect("the chain memo").scans += 1;
 					let v: Value = match self.call("scantxoutset", &[json!("start"), Value::Array(descs)]) {
 						Ok(v) => v,
 						Err(e) if part.len() > SCAN_MOST && scan_too_large(&e) => {
@@ -1608,6 +1746,14 @@ impl ChainSource {
 						},
 						Err(e) => return Err(node(e)),
 					};
+					// A scan another client aborted answers part of the set
+					// (`success` false, arca #684): never carried to another view.
+					let best = v["bestblock"].as_str().and_then(|h| BlockHash::from_str(h).ok()).filter(|_| v["success"] == json!(true));
+					at = Some(match at {
+						None => best,
+						Some(a) if a == best => a,
+						Some(_) => None,
+					});
 					for u in v["unspents"].as_array().cloned().unwrap_or_default() {
 						let txid = Txid::from_str(u["txid"].as_str().unwrap_or("")).map_err(|e| Error::Node(e.to_string()))?;
 						let vout = u["vout"].as_u64().unwrap_or(0) as u32;
@@ -1622,6 +1768,11 @@ impl ChainSource {
 				// the next view, the rest of the last. Read again.
 				if m.view_drops != drops {
 					continue;
+				}
+				if let (Some(Some(best)), Some(tip)) = (at, tip) {
+					if best == tip {
+						m.scanned_at.extend(by.keys().map(|s| (s.clone(), tip)));
+					}
 				}
 				m.scanned.extend(by);
 			}
@@ -3412,6 +3563,271 @@ mod test {
 		// root's block: never below it.
 		assert_eq!(chain.spender(&root, 0).unwrap().map(|(t, _)| t.txid()), Some(unroll.txid()));
 		println!("AFTER (block {}): the lineage output is found, the root's spender {}", height, unroll.txid());
+	}
+
+	/// A scan's answers stand across blocks that pay none of its scripts and
+	/// spend none of what it found: they are carried into the next view, and
+	/// only the scripts a block touched are scanned for again, with what the
+	/// wallet watches ([`ChainSource::scan_also`]), in one scan. After a
+	/// reorganisation nothing is carried. Every answer is the one a source
+	/// opened afresh gives, which scans everything.
+	#[test]
+	fn a_scan_is_carried_across_blocks_that_touch_none_of_its_scripts() {
+		let _serial = serial();
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let op_true = Script::from(vec![0x51]);
+		let genesis = chain.genesis().unwrap();
+		let block = chain.raw_block(&genesis).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		let asset = coin.asset.explicit().unwrap();
+		let value = coin.value.explicit().unwrap();
+		// Bare scripts anyone spends: `<b> OP_DROP OP_TRUE`.
+		let (b, c, d) = (Script::from(vec![0x01, 0xbb, 0x75, 0x51]), Script::from(vec![0x01, 0xcc, 0x75, 0x51]),
+			Script::from(vec![0x01, 0xdd, 0x75, 0x51]));
+		let all = [op_true.clone(), b.clone(), c.clone()];
+		let answer = |src: &ChainSource, s: &[Script]| -> Vec<(OutPoint, u64)> {
+			let mut v: Vec<(OutPoint, u64)> = src.coins_at(s).unwrap().into_iter().map(|(op, _, h)| (op, h)).collect();
+			v.sort();
+			v
+		};
+		let fresh = |s: &[Script]| answer(&ChainSource::new(&url, Some("arca"), Some("arca"), None), s);
+		// A new view: blocks made outside the source.
+		let next_view = || {
+			gap();
+			chain.new_command();
+		};
+		let scans = || chain.scans();
+		let check = |what: &str, scans_made: u64, carried: u64, s: &[Script]| {
+			let (s0, c0) = scans();
+			let got = answer(&chain, s);
+			let (s1, c1) = scans();
+			println!("{}: {} scans, {} answers carried, {} outputs", what, s1 - s0, c1 - c0, got.len());
+			assert_eq!(got, fresh(s), "{}: the answer is the chain's", what);
+			assert_eq!(s1 - s0, scans_made, "{}: scans", what);
+			assert_eq!(c1 - c0, carried, "{}: answers carried", what);
+			got
+		};
+
+		// The node's anchor status is `not_validated` at genesis and `ok` from
+		// the first block on: a change of it carries nothing, so the views
+		// below start past it.
+		r.produce_block().unwrap();
+		next_view();
+		check("the first view", 1, 0, &all);
+		check("the same view", 0, 0, &all);
+
+		for k in 0..3 {
+			r.produce_block().unwrap();
+			next_view();
+			check(&format!("an empty block ({})", k), 0, 3, &all);
+		}
+		// A block spending the free coin (found at OP_TRUE) to b: both are
+		// scanned again, c is carried, in one scan. (A block's coinbase pays
+		// its fees to OP_TRUE here: every block with a transaction touches it.)
+		let to_b = spend_to(free, asset, value, b.clone());
+		r.node.client().send_raw_transaction(&to_b).unwrap();
+		r.produce_block().unwrap();
+		next_view();
+		let got = check("a block spending OP_TRUE's coin to b", 1, 1, &all);
+		assert!(got.iter().any(|(op, _)| op.txid == to_b.txid()), "b's new output found");
+		// Several blocks at once, one of them paying c from b's output.
+		let to_c = spend_to(OutPoint::new(to_b.txid(), 0), asset, value - 10_000, c.clone());
+		r.produce_block().unwrap();
+		r.node.client().send_raw_transaction(&to_c).unwrap();
+		r.produce_block().unwrap();
+		r.produce_block().unwrap();
+		next_view();
+		check("three blocks, one paying c from b", 1, 0, &all);
+		// What the wallet watches rides with the next scan; read alone after,
+		// it asks the node nothing.
+		chain.scan_also(vec![d.clone()]);
+		r.produce_block().unwrap();
+		let again_c = spend_to(OutPoint::new(to_c.txid(), 0), asset, value - 20_000, c.clone());
+		r.node.client().send_raw_transaction(&again_c).unwrap();
+		r.produce_block().unwrap();
+		next_view();
+		check("a block paying c, with d watched", 1, 1, &all);
+		check("d, watched", 0, 0, std::slice::from_ref(&d));
+		// A reorganisation: the tip replaced by another block at its height.
+		// Nothing is carried, whatever the blocks hold.
+		let tip = chain.tip().unwrap();
+		let _: Value = r.node.client().call("invalidateblock", &[json!(tip.hash.to_string())]).unwrap();
+		// Another block in its place: the one taken out held `again_c`, which
+		// is back in the mempool; this one holds a spend of it to d as well.
+		r.node.client().send_raw_transaction(&spend_to(OutPoint::new(again_c.txid(), 0), asset, value - 30_000, d.clone())).unwrap();
+		r.produce_block().unwrap();
+		next_view();
+		assert_ne!(chain.tip().unwrap().hash, tip.hash);
+		check("after a reorganisation", 1, 0, &all);
+		r.produce_block().unwrap();
+		next_view();
+		check("an empty block after it, d watched", 0, 4, &all);
+	}
+
+	// ---- What a carried scan answer must not outlive (against a regtest node) ----
+	fn regtest_node() -> Option<(tempfile::TempDir, sequentia_ext::regtest::Regtest, String)> {
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return None;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		Some((dir, r, url))
+	}
+	fn free_coin(chain: &ChainSource) -> (OutPoint, AssetId, u64) {
+		let op_true = Script::from(vec![0x51]);
+		let block = chain.raw_block(&chain.genesis().unwrap()).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		(free, coin.asset.explicit().unwrap(), coin.value.explicit().unwrap())
+	}
+	fn coins_of(src: &ChainSource, s: &[Script]) -> Vec<(OutPoint, u64)> {
+		let mut v: Vec<(OutPoint, u64)> = src.coins_at(s).unwrap().into_iter().map(|(op, _, h)| (op, h)).collect();
+		v.sort();
+		v
+	}
+
+	/// A reorganisation to a LONGER chain whose replaced block pays the script:
+	/// the carry's height guard does not apply, only the link to the scan's tip.
+	#[test]
+	fn a_reorg_to_a_longer_chain_carries_nothing() {
+		let _serial = serial();
+		let Some((_dir, r, url)) = regtest_node() else { return };
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let (free, asset, value) = free_coin(&chain);
+		let c = Script::from(vec![0x01, 0xcc, 0x75, 0x51]);
+		r.produce_block().unwrap();
+		gap(); chain.new_command();
+		assert!(coins_of(&chain, std::slice::from_ref(&c)).is_empty());
+		let t1 = chain.tip().unwrap();
+		let _: Value = r.node.client().call("invalidateblock", &[json!(t1.hash.to_string())]).unwrap();
+		let to_c = spend_to(free, asset, value, c.clone());
+		r.node.client().send_raw_transaction(&to_c).unwrap();
+		r.produce_block().unwrap();
+		r.produce_block().unwrap();
+		gap(); chain.new_command();
+		let tip = chain.tip().unwrap();
+		assert_eq!(tip.height, t1.height + 1);
+		let (s0, c0) = chain.scans();
+		let got = coins_of(&chain, std::slice::from_ref(&c));
+		let (s1, c1) = chain.scans();
+		let fresh = coins_of(&ChainSource::new(&url, Some("arca"), Some("arca"), None), std::slice::from_ref(&c));
+				assert!(fresh.iter().any(|(op, _)| op.txid == to_c.txid()), "the fresh answer has the coin");
+		assert_eq!(got, fresh, "a carried answer hid the coin paid in the replaced block");
+	}
+
+	/// The anchor status changes (not_validated at genesis, ok from the first
+	/// block): nothing is carried across it.
+	#[test]
+	fn an_anchor_status_change_carries_nothing() {
+		let _serial = serial();
+		let Some((_dir, r, url)) = regtest_node() else { return };
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let c = Script::from(vec![0x01, 0xcc, 0x75, 0x51]);
+		gap(); chain.new_command();
+		let a0: Value = r.node.client().call("getanchorstatus", &[]).unwrap();
+		coins_of(&chain, std::slice::from_ref(&c));
+		r.produce_block().unwrap();
+		gap(); chain.new_command();
+		let a1: Value = r.node.client().call("getanchorstatus", &[]).unwrap();
+		let (s0, c0) = chain.scans();
+		coins_of(&chain, std::slice::from_ref(&c));
+		let (s1, c1) = chain.scans();
+				assert_ne!(a0["anchorstatus"], a1["anchorstatus"], "the status changed");
+		assert_eq!((s1 - s0, c1 - c0), (1, 0), "nothing carried across an anchor status change");
+	}
+
+	/// A node's RPC behind a proxy that answers the first `n` scans of the
+	/// set of unspent outputs as a scan another client aborted: `success`
+	/// false and no unspents.
+	fn aborting_proxy(upstream: String, n: u64) -> String {
+		use std::io::{BufRead, BufReader, Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}/", listener.local_addr().unwrap());
+		let upstream = upstream.trim_start_matches("http://").trim_end_matches('/').to_string();
+		std::thread::spawn(move || {
+			let left = AtomicU64::new(n);
+			// One HTTP message off a stream: its head and its body.
+			let read_message = |r: &mut BufReader<std::net::TcpStream>| -> Option<(String, Vec<u8>)> {
+				let (mut head, mut length) = (String::new(), 0usize);
+				loop {
+					let mut line = String::new();
+					if r.read_line(&mut line).ok()? == 0 {
+						return None;
+					}
+					if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+						length = v.trim().parse().ok()?;
+					}
+					if line == "\r\n" {
+						break;
+					}
+					head.push_str(&line);
+				}
+				let mut body = vec![0u8; length];
+				r.read_exact(&mut body).ok()?;
+				Some((head, body))
+			};
+			let abort = |call: &Value, answer: &mut Value| {
+				if call["method"] == json!("scantxoutset") && answer["result"].is_object()
+					&& left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| l.checked_sub(1)).is_ok() {
+					answer["result"]["success"] = json!(false);
+					answer["result"]["unspents"] = json!([]);
+				}
+			};
+			for stream in listener.incoming() {
+				let Ok(mut stream) = stream else { continue };
+				let Some((head, body)) = read_message(&mut BufReader::new(stream.try_clone().unwrap())) else { continue };
+				let Ok(mut up) = std::net::TcpStream::connect(&upstream) else { continue };
+				let _ = write!(up, "{}Content-Length: {}\r\nConnection: close\r\n\r\n", head, body.len());
+				let _ = up.write_all(&body);
+				let Some((_, reply)) = read_message(&mut BufReader::new(up)) else { continue };
+				let mut out: Value = serde_json::from_slice(&reply).unwrap_or(Value::Null);
+				match (serde_json::from_slice::<Value>(&body), &mut out) {
+					(Ok(Value::Array(calls)), Value::Array(answers)) => calls.iter().zip(answers.iter_mut()).for_each(|(c, a)| abort(c, a)),
+					(Ok(call), answer) => abort(&call, answer),
+					_ => {},
+				}
+				let out = out.to_string();
+				let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", out.len(), out);
+			}
+		});
+		url
+	}
+
+	/// A scan answered `success: false` (another client aborted it, arca
+	/// #684) is kept for its own view and never carried to the next one.
+	#[test]
+	fn an_aborted_scan_is_never_carried() {
+		let _serial = serial();
+		let Some((_dir, r, url)) = regtest_node() else { return };
+		let direct = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let (free, asset, value) = free_coin(&direct);
+		let c = Script::from(vec![0x01, 0xcc, 0x75, 0x51]);
+		let to_c = spend_to(free, asset, value, c.clone());
+		r.produce_block().unwrap();
+		r.node.client().send_raw_transaction(&to_c).unwrap();
+		r.produce_block().unwrap();
+		let chain = ChainSource::new(&aborting_proxy(url.clone(), 1), Some("arca"), Some("arca"), None);
+		gap(); chain.new_command();
+		let first = coins_of(&chain, std::slice::from_ref(&c));
+		assert!(first.is_empty(), "the first scan was answered as aborted");
+		r.produce_block().unwrap();
+		gap(); chain.new_command();
+		let got = coins_of(&chain, std::slice::from_ref(&c));
+		let fresh = coins_of(&ChainSource::new(&url, Some("arca"), Some("arca"), None), std::slice::from_ref(&c));
+		assert!(fresh.iter().any(|(op, _)| op.txid == to_c.txid()), "the fresh answer has the coin");
+		assert_eq!(got, fresh, "an aborted scan's answer was carried into the next view");
 	}
 
 	// ---- The searches over the block index, against the searches they replaced ----
