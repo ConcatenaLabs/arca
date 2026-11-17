@@ -1575,5 +1575,6 @@ pub(super) async fn insert_participation_in(t: &tokio_postgres::Transaction<'_>,
 	if let Some(d) = &p.distribution {
 		super::distributions::insert_distribution(t, &p.id, d).await?;
 	}
+	super::orders::bind_refreshes(t, p).await?;
 	Ok(())
 }

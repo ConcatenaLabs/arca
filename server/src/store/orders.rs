@@ -10,11 +10,13 @@
 //! the order coin is spent by one fill at most, which the database's unique
 //! key holds whatever the timing.
 //!
-//! A resting order refreshed in a round goes on at the coin the round made
-//! of it ([`Store::continue_resting_order`]): its row takes that coin's
-//! record, credit keys and mailbox, keeps its id, and counts the fills made
-//! before (`fills_before`), so the new coin's credit keys are counted from
-//! its own first fill.
+//! A resting order refreshed in a round is bound, when the participation is
+//! taken in, to the exact leaf that participation wants for it
+//! ([`bind_refreshes`]); once that leaf is published the order goes on there
+//! ([`Store::continue_resting_order`]): its row takes that coin's record,
+//! credit keys and mailbox, keeps its id, and counts the fills made before
+//! (`fills_before`), so the new coin's credit keys are counted from its own
+//! first fill.
 
 use super::transfers::{record_transfer_in, NewReassignment, NewTransferInput, NewTransferOutput};
 use super::{array32, Store, StoreError};
@@ -178,42 +180,53 @@ impl Store {
 		r.map(|r| order_row(&r)).transpose()
 	}
 
-	/// The participations that give up, or gave up, the coin `leaf_id` and
-	/// may still run or ran (none void or expired), the latest first.
-	pub async fn participations_giving_up(&self, leaf_id: &[u8; 32]) -> Result<Vec<[u8; 32]>, StoreError> {
+	/// Whether a refresh of the order resting at `leaf_id` is under way: a
+	/// participation that may still run, or ran (none void or expired),
+	/// bound it when it was taken in, and the order has not gone on at the
+	/// bound leaf yet.
+	pub async fn refresh_under_way(&self, leaf_id: &[u8; 32]) -> Result<bool, StoreError> {
 		let conn = self.conn().await?;
-		let rows = conn.query(
-			"SELECT i.participation_id FROM participation_input i JOIN participation p USING (participation_id)
-			 WHERE i.leaf_id = $1 AND i.active AND p.state NOT IN ('void', 'expired') ORDER BY p.created_at DESC",
+		let r = conn.query_opt(
+			"SELECT 1 FROM resting_order_refresh b JOIN participation p USING (participation_id)
+			 WHERE b.from_leaf = $1 AND b.to_leaf IS NULL AND p.state NOT IN ('void', 'expired') LIMIT 1",
 			&[&&leaf_id[..]]).await?;
-		rows.iter().map(|r| array32(r.get(0), "participation id")).collect()
+		Ok(r.is_some())
 	}
 
 	/// The coin a refresh of a resting order gave up for the coin `to_leaf`,
-	/// when a refresh made `to_leaf` and the order went on there.
+	/// when the order went on at `to_leaf`.
 	pub async fn refresh_into(&self, to_leaf: &[u8; 32]) -> Result<Option<[u8; 32]>, StoreError> {
 		let conn = self.conn().await?;
 		let r = conn.query_opt("SELECT from_leaf FROM resting_order_refresh WHERE to_leaf = $1", &[&&to_leaf[..]]).await?;
 		r.map(|r| array32(r.get(0), "from leaf")).transpose()
 	}
 
-	/// The participation whose round made the leaf `leaf_id`, if a
-	/// participation's did.
-	pub async fn participation_making(&self, leaf_id: &[u8; 32]) -> Result<Option<[u8; 32]>, StoreError> {
+	/// The refresh bound to the leaf `leaf_id`: when a participation's round
+	/// made `leaf_id` of an output that participation bound to a resting
+	/// order when it was taken in ([`bind_refreshes`]), the participation,
+	/// the output's index, the order and the coin it gave up.
+	pub async fn refresh_bound_to(&self, leaf_id: &[u8; 32]) -> Result<Option<([u8; 32], i16, [u8; 32], [u8; 32])>, StoreError> {
 		let conn = self.conn().await?;
-		let r = conn.query_opt("SELECT participation_id FROM participation_output WHERE leaf_id = $1", &[&&leaf_id[..]]).await?;
-		r.map(|r| array32(r.get(0), "participation id")).transpose()
+		let r = conn.query_opt(
+			"SELECT b.participation_id, b.output_idx, b.order_id, b.from_leaf FROM participation_output o
+			 JOIN resting_order_refresh b ON b.participation_id = o.participation_id AND b.output_idx = o.idx
+			 WHERE o.leaf_id = $1", &[&&leaf_id[..]]).await?;
+		r.map(|r| Ok((array32(r.get(0), "participation id")?, r.get(1), array32(r.get(2), "order id")?, array32(r.get(3), "from leaf")?)))
+			.transpose()
 	}
 
 	/// The resting order `order_id`, resting at `from_leaf`, goes on at
-	/// `to_leaf`, a coin a refresh of it made: its row takes that coin's
-	/// record, credit nonces, maker key, mailbox and record formats, and the
-	/// fills made so far are counted as before its new lineage. All or
-	/// nothing; refused when the order rests elsewhere by now
+	/// `to_leaf`, the leaf a round made of output `output_idx` of the
+	/// participation `participation_id`, which that participation bound to
+	/// the order: its row takes that coin's record, credit nonces, maker key,
+	/// mailbox and record formats, the fills made so far are counted as
+	/// before its new lineage, and the binding records where the order went
+	/// on. All or nothing; refused when the order rests elsewhere by now
 	/// ([`StoreError::LeafSpent`] of `from_leaf`). Returns the row.
 	#[allow(clippy::too_many_arguments)]
-	pub async fn continue_resting_order(&self, order_id: &[u8; 32], from_leaf: &[u8; 32], to_leaf: &[u8; 32], maker_key: &[u8; 32],
-		mailbox_key: &[u8; 32], record: &[u8], credit_nonces: &[[u8; 32]; 4], record_formats: &[String]) -> Result<RestingOrderRow, StoreError>
+	pub async fn continue_resting_order(&self, (participation_id, output_idx): (&[u8; 32], i16), order_id: &[u8; 32], from_leaf: &[u8; 32],
+		to_leaf: &[u8; 32], maker_key: &[u8; 32], mailbox_key: &[u8; 32], record: &[u8], credit_nonces: &[[u8; 32]; 4],
+		record_formats: &[String]) -> Result<RestingOrderRow, StoreError>
 	{
 		let mut conn = self.conn().await?;
 		let t = conn.transaction().await?;
@@ -228,8 +241,13 @@ impl Store {
 		if moved != 1 {
 			return Err(StoreError::LeafSpent(super::hex(from_leaf)));
 		}
-		t.execute("INSERT INTO resting_order_refresh (to_leaf, order_id, from_leaf, fills_before) VALUES ($1, $2, $3, $4)",
-			&[&&to_leaf[..], &&order_id[..], &&from_leaf[..], &fills]).await?;
+		let bound = t.execute(
+			"UPDATE resting_order_refresh SET to_leaf = $3, fills_before = $4, continued_at = now()
+			 WHERE participation_id = $1 AND output_idx = $2 AND order_id = $5 AND from_leaf = $6 AND to_leaf IS NULL",
+			&[&&participation_id[..], &output_idx, &&to_leaf[..], &fills, &&order_id[..], &&from_leaf[..]]).await?;
+		if bound != 1 {
+			return Err(StoreError::Corrupt("a refresh continued without its binding".into()));
+		}
 		t.commit().await?;
 		self.resting_order(order_id).await?.ok_or_else(|| StoreError::Corrupt("a resting order just continued is gone".into()))
 	}
@@ -344,4 +362,41 @@ impl Store {
 		self.drop_transfer(transfer_id, reason).await?;
 		Ok(())
 	}
+}
+
+/// Binds each resting order the participation `p` refreshes to the exact
+/// leaf it wants for it, as the participation is taken in, inside its
+/// transaction `t`: the coins it gives up that are order coins (`order-3` or
+/// `order-2` leaves, published or not) are paired with the order leaves it
+/// wants by position among those of the same landed terms and value, the
+/// j-th such coin with the j-th such leaf; each pair whose coin a published
+/// order rests at is recorded. A coin with no leaf to pair with, or that no
+/// published order rests at, binds nothing. Publication of a leaf then
+/// continues the order bound to it, or none: nothing is worked out again
+/// later from what is published by then.
+pub(super) async fn bind_refreshes(t: &tokio_postgres::Transaction<'_>, p: &super::NewParticipation) -> Result<(), StoreError> {
+	use arca_covenant::CoinRecord;
+	let outs: Vec<(usize, arca_covenant::order::SeqdexOrder, u64)> = p.outputs.iter().enumerate().filter_map(|(k, o)| match &o.kind {
+		super::WantedKind::Leaf { order: Some(terms), .. } => Some((k, terms.landed, o.value)),
+		_ => None,
+	}).collect();
+	if outs.is_empty() {
+		return Ok(());
+	}
+	let mut taken = vec![false; outs.len()];
+	for i in &p.inputs {
+		let Some(r) = t.query_opt("SELECT record, value FROM leaf WHERE leaf_id = $1", &[&&i.leaf_id[..]]).await? else { continue };
+		let record: Vec<u8> = r.get(0);
+		let value = r.get::<_, i64>(1) as u64;
+		let Some(policy) = CoinRecord::from_bytes(&record).ok().and_then(|c| c.order_policy()) else { continue };
+		let Some(j) = outs.iter().enumerate().position(|(j, (_, landed, v))| !taken[j] && *landed == policy.landed && *v == value) else {
+			continue;
+		};
+		taken[j] = true;
+		let Some(o) = t.query_opt("SELECT order_id FROM resting_order WHERE current_leaf = $1", &[&&i.leaf_id[..]]).await? else { continue };
+		let order_id: Vec<u8> = o.get(0);
+		t.execute("INSERT INTO resting_order_refresh (participation_id, output_idx, order_id, from_leaf) VALUES ($1, $2, $3, $4)",
+			&[&&p.id[..], &(outs[j].0 as i16), &order_id, &&i.leaf_id[..]]).await?;
+	}
+	Ok(())
 }
