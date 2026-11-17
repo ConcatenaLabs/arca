@@ -1677,7 +1677,7 @@ as in a transfer, for a leaf of what it takes and a leaf of its change
 - a fill that leaves part of the order resting leaves it at least one
   reassignment short of the depth limit, so the maker can always cancel what
   rests, which is one reassignment more: a part fill that would land the rest
-  at the limit is refused (`order_whole_only`, naming the whole remainder),
+  at the limit is refused (`order`, naming the whole remainder),
   and the whole remainder is still taken. `order_state` shows how deep the
   order's coin is (`hops`) and whether only the whole is taken (`whole_only`).
 

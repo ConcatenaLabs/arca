@@ -35,8 +35,10 @@
 //!   too), and a fill that leaves part of the order resting leaves it at
 //!   least one reassignment short of the limit: the order's maker can always
 //!   cancel what rests, which is one reassignment more. A part fill that
-//!   would land the rest at the limit is refused (`order_whole_only`); the
-//!   whole remainder can still be taken;
+//!   would land the rest at the limit is refused under `order`, a code
+//!   every wallet library knows, so one that predates the rule gives the
+//!   taker's coins back; the message names the whole remainder, which can
+//!   still be taken, and the state view says so beforehand (`whole_only`);
 //! - the fill holds by the program's rules (`OrderPolicy::plan`, then
 //!   `judge` by the signer itself), the taker's leaves are within the
 //!   published bounds, and every owner signature verifies; the fill's margin
@@ -367,9 +369,6 @@ pub enum OrderError {
 	Moved(String),
 	#[error("{0}")]
 	Terms(String),
-	/// A part fill that would leave the rest at the depth limit.
-	#[error("{0}")]
-	WholeOnly(String),
 	#[error(transparent)]
 	Cosign(#[from] CosignError),
 	#[error("the server has not followed the chain yet")]
@@ -387,7 +386,6 @@ impl OrderError {
 			OrderError::NotAnOrder(_) => "not_an_order",
 			OrderError::Moved(_) => "order_moved",
 			OrderError::Terms(_) => "order",
-			OrderError::WholeOnly(_) => "order_whole_only",
 			OrderError::Cosign(e) => e.code(),
 			OrderError::NotSynced => "not_synced",
 			OrderError::Internal(_) => "internal",
@@ -796,7 +794,7 @@ impl Orders {
 				format!("the coins it pays with bring it to {} reassignments from a round (pay with coins fewer than {} deep)", hops,
 					p.depth_limit - 1)
 			};
-			return Err(OrderError::WholeOnly(format!("{}: a fill of part of it would leave the rest {} reassignments deep, the operator's \
+			return Err(OrderError::Terms(format!("{}: a fill of part of it would leave the rest {} reassignments deep, the operator's \
 				depth limit, where its maker could no longer cancel it; the operator co-signs only a fill of the whole remainder, {} atoms",
 				why, hops, oc.coin.value)));
 		}
