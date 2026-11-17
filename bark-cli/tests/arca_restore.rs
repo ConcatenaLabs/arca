@@ -167,7 +167,13 @@ async fn a_wallet_restored_from_its_mnemonic_ends_where_the_lost_one_was() {
 	// is final at once.
 	let pending = a.ok(&["board", &xs, "1500000"])["leaf_id"].as_str().unwrap().to_string();
 	r.produce().await;
+	// At depth 0 the wallet calls it live once the operator has credited it,
+	// at the operator's next look at the chain: waited for.
 	let board_state = if r.anchor_depth() > 0 { "pending" } else { "live" };
+	if board_state == "live" {
+		r.synced().await;
+		r.wait("the operator to credit the board", || coin_of(&a, &pending)["state"] == "live").await;
+	}
 	assert_eq!(coin_of(&a, &pending)["state"], board_state);
 	let still = left[2].clone();
 	println!("RS A before the loss: paid from {}, change {}, batch leaf {}, board {}, forfeited {}, pending {}", &paid_from[..16], &change[..16],
