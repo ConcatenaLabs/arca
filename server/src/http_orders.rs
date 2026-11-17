@@ -49,6 +49,7 @@ async fn order_json(app: &App, v: &OrderView) -> Result<api::OrderState, Refusal
 		fills_left: p.fills_left() as u8,
 		hops: v.hops,
 		whole_only: v.whole_only,
+		exit_coin: v.exit_coin.map(|c| hex(&c)),
 		expiry: v.expiry,
 		record,
 		fills: v.fills.iter().map(|f| api::OrderFillState {

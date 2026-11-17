@@ -1445,7 +1445,11 @@ amount), and wants an `order-3` leaf of the same order under new keys; once
 the round is final, `sync` publishes the new coin, and the operator, which
 sees that the round gave up the order's coin for it, has the order go on
 there (`arca order resting` reads `refreshing` meanwhile). A round that
-never runs gives the coin back, and the order rests where it was. `--quote`
+never runs gives the coin back, and the order rests where it was. A round
+that leaves the chain for good after the forfeit was handed over leaves the
+order `lost`: the operator co-signs nothing of it any more, and a refresh or
+cancel of it names the coin whose exit (`arca exit COIN`) brings its value
+home whole, as SeqDEX's order for the same terms. `--quote`
 and `--shown` work as for a cancel. The operator says it keeps an order
 through a refresh in its `info` (`fills.refresh_keeps_order`); a plain
 `arca refresh` of the order's coin cancels the order instead, into a leaf

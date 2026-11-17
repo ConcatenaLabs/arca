@@ -33,6 +33,10 @@
 //! part fill, is refused under `order`, a code it knows: its coins are its
 //! own again at once, and the refusal names the whole remainder.
 //!
+//! A second test loses a refresh's round for good, before and after the
+//! new coin is published: the order reads `lost`, a refresh or cancel of it
+//! names the coin whose exit brings it home, and that exit lands it whole.
+//!
 //! The operator's own refusal of a part fill at the limit, sent by hand past
 //! the wallet's check, is in the server's `tests/orders.rs`.
 //!
@@ -394,6 +398,156 @@ async fn a_resting_order_can_always_be_cancelled_and_its_refresh_keeps_it() {
 	assert!(live_hops(&m, x).iter().any(|(_, v, h)| v.to_string() == cq["gets"]["amount"].as_str().unwrap() && *h == 1),
 		"the maker holds what rested, one reassignment from the refresh's round: {:?}", live_hops(&m, x));
 	for w in [&m, &ta, &tb, &tc, &td].into_iter().chain(older.as_ref()) {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// A transaction spending the operator wallet's coin at `coin` (whose output
+/// is `txout`) whole to the test's own `OP_TRUE` less a fee, signed outside
+/// the server with the wallet's mnemonic: the operator's coin taken by
+/// another transaction, as when another tool uses the same wallet.
+fn spend_wallet_coin(coin: elements::OutPoint, txout: &elements::TxOut) -> elements::Transaction {
+	use elements::bitcoin::bip32::DerivationPath;
+	use elements::hashes::Hash as _;
+	use elements::pset::PartiallySignedTransaction;
+	use lwk_common::Signer as _;
+	use std::str::FromStr;
+	let signer = lwk_signer::SwSigner::new(common::running::MNEMONIC, false).unwrap();
+	let secp = elements::bitcoin::secp256k1::Secp256k1::new();
+	let (path, pk) = (0..2).flat_map(|c| (0..200).map(move |i| (c, i))).find_map(|(c, i)| {
+		let path = DerivationPath::from_str(&format!("m/84h/1h/0h/{}/{}", c, i)).unwrap();
+		let pk = elements::bitcoin::PublicKey::new(signer.derive_xprv(&path).unwrap().private_key.public_key(&secp));
+		(elements::Script::new_v0_wpkh(&elements::WPubkeyHash::hash(&pk.to_bytes())) == txout.script_pubkey).then_some((path, pk))
+	}).expect("a key of the operator wallet's");
+	let (asset, value) = (txout.asset.explicit().unwrap(), txout.value.explicit().unwrap());
+	let fee = 2_000;
+	let mut tx = elements::Transaction {
+		version: 2, lock_time: elements::LockTime::ZERO,
+		input: vec![elements::TxIn { previous_output: coin, sequence: elements::Sequence::MAX, ..Default::default() }],
+		output: vec![
+			sequentia_ext::explicit_txout(sequentia_ext::AssetAmount::new(asset, value - fee), common::node::op_true()),
+			sequentia_ext::fee_txout(sequentia_ext::AssetAmount::new(asset, fee)),
+		],
+	};
+	let mut pset = PartiallySignedTransaction::from_tx(tx.clone());
+	pset.inputs_mut()[0].witness_utxo = Some(txout.clone());
+	pset.inputs_mut()[0].bip32_derivation.insert(pk, (signer.fingerprint(), path));
+	assert_eq!(signer.sign(&mut pset).unwrap(), 1);
+	let sig = pset.inputs()[0].partial_sigs.get(&pk).unwrap().clone();
+	tx.input[0].witness.script_witness = vec![sig, pk.to_bytes()];
+	tx
+}
+
+/// The round `round` is lost for good: the server stopped, the round's block
+/// disconnected, the node restarted with an empty mempool, the operator's
+/// coin the round spent taken by another transaction, and that buried; the
+/// server started again and holding the round lost.
+async fn lose(r: &mut Running, round: &elements::Txid) {
+	r.server.stop();
+	let built = r.rt.client().raw_transaction(round).unwrap();
+	let v: Value = r.rt.client().call("getrawtransaction", &[json!(round.to_string()), json!(true)]).unwrap();
+	let block = v["blockhash"].as_str().expect("the round in a block").to_string();
+	let wi = built.input[0].previous_output;
+	let w_out = r.rt.client().raw_transaction(&wi.txid).unwrap().output[wi.vout as usize].clone();
+	let _: Value = r.rt.client().call("invalidateblock", &[json!(block)]).unwrap();
+	tokio::task::block_in_place(|| r.rt.node.restart(&["-persistmempool=0"])).unwrap();
+	let elsewhere = spend_wallet_coin(wi, &w_out);
+	r.rt.client().send_raw_transaction(&elsewhere).unwrap();
+	r.produce().await;
+	r.bury().await;
+	println!("DL round {}: its input {} spent elsewhere by {}, buried", round, wi, elsewhere.txid());
+	r.restart_server().await;
+	r.round_state(round, RoundState::Lost).await;
+}
+
+/// The value an exit of `coin` by `w` lands as SeqDEX's order: the exit run
+/// to its landing, block after block.
+async fn exit_lands(r: &mut Running, w: &Arca, coin: &str) -> u64 {
+	for _ in 0..24 {
+		let (ok, e) = w.run(&["exit", coin]);
+		assert!(ok, "the exit of {}: {}", coin, e);
+		if e["state"] == "claimed" {
+			r.produce().await;
+			let id: elements::Txid = e["claim"]["txid"].as_str().unwrap().parse().unwrap();
+			let landing = r.rt.client().raw_transaction(&id).unwrap();
+			return landing.output[0].value.explicit().unwrap();
+		}
+		r.produce().await;
+		r.synced().await;
+		tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, 600));
+		r.synced().await;
+	}
+	panic!("the exit of {} never landed", coin);
+}
+
+/// A refresh whose round leaves the chain for good after the forfeits were
+/// handed over (an anchor rollback, the round's input taken by another
+/// transaction): the participation is void, never run again, and the
+/// operator co-signs nothing more of the coin it gave up. Maker M1 had
+/// published its new coin before the round was lost, maker M2 had not. Each
+/// order then reads `lost`, naming the coin whose exit brings it home whole
+/// (the coin the refresh gave up); each wallet refuses a refresh or a cancel
+/// of it with those words; and that coin's exit lands the whole of it as
+/// SeqDEX's order. Nothing is lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_whose_round_is_lost_leaves_the_order_lost_and_whole() {
+	let mut r = Running::start_with(|c, x, _| testnet_like(c, x)).await;
+	let (x, y) = (r.x, r.y);
+	common::node::list_fee_asset(&r.rt, y, 100_000_000);
+	let m1 = holder(&mut r, "LR M1", x, 1_500_000).await;
+	let m2 = holder(&mut r, "LR M2", x, 1_500_000).await;
+	// A coin of X on the chain for each maker, for the fees of its exit.
+	for m in [&m1, &m2] {
+		let s = elements::Script::from(unhex(m.ok(&["address"])["script_pubkey"].as_str().unwrap()));
+		r.pay_to(s, x, 200_000);
+	}
+	r.produce().await;
+	let p1 = rest(&mut r, &m1, 1_000_000).await;
+	let p2 = rest(&mut r, &m2, 1_000_000).await;
+	let old1 = served(&m1, &p1)["coin"].as_str().unwrap().to_string();
+	let old2 = served(&m2, &p2)["coin"].as_str().unwrap().to_string();
+	refresh(&m1, &p1);
+	refresh(&m2, &p2);
+	// Both refreshes in one round: the forfeits handed over, the round
+	// broadcast and made final. M1 publishes its new coin; M2 does not sync.
+	let (built, failed) = r.server.rounds.run_rounds().await.unwrap();
+	assert!(failed.is_empty() && built.len() == 1, "{} built, {} failed", built.len(), failed.len());
+	m1.ok(&["sync"]);
+	m2.ok(&["sync"]);
+	r.server.rounds.pass().await.unwrap();
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let round = built[0].tx.txid();
+	r.round_state(&round, RoundState::Final).await;
+	m1.ok(&["sync"]);
+	let st1 = served(&m1, &p1);
+	println!("LR P1 published at its new coin before the loss: {} at {}", st1["state"], st1["coin"]);
+	assert_eq!(st1["state"], "resting");
+	assert_ne!(st1["coin"].as_str(), Some(old1.as_str()));
+	println!("LR P2 before the loss: {}", served(&m2, &p2)["state"]);
+	assert_eq!(served(&m2, &p2)["state"], "refreshing");
+
+	lose(&mut r, &round).await;
+	m1.ok(&["sync"]);
+	let s2 = m2.ok(&["sync"]);
+	println!("LR M2's sync after the loss: {}", s2["resting"]);
+	for (tag, m, p, old) in [("after its publication", &m1, &p1, &old1), ("before its publication", &m2, &p2, &old2)] {
+		let st = served(m, p);
+		println!("LR the order lost {}: {} exit_coin {}", tag, st["state"], st["exit_coin"]);
+		assert_eq!((st["state"].as_str(), st["exit_coin"].as_str()), (Some("lost"), Some(old.as_str())), "{}: {}", tag, st);
+		assert_eq!(view(m, Some(p), None)["state"], if m.name == "LR M2" { "lost" } else { "published" });
+		for cmd in ["refresh-resting", "cancel-resting"] {
+			let (ok, e) = m.run(&["order", cmd, p, "--quote"]);
+			println!("LR REFUSED, {} of the order lost {}: {}", cmd, tag, e);
+			assert!(!ok && e.to_string().contains("is lost") && e.to_string().contains(old.as_str()) && e.to_string().contains("arca exit"),
+				"{}", e);
+		}
+		let landed = exit_lands(&mut r, m, old).await;
+		println!("LR the exit of {} landed {} as SeqDEX's order ({})", old, landed, tag);
+		assert_eq!(landed, 1_000_000, "the whole of the order, nothing lost");
+	}
+	for w in [&m1, &m2] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

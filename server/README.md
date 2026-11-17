@@ -1672,7 +1672,19 @@ it was. While such a participation holds the order's coin, or has given it
 up and the new leaf is not yet published, the order reads `refreshing`. The
 server says it keeps an order through a refresh in its `info`
 (`fills.refresh_keeps_order`). A participation that gives up an order's coin
-for anything else (a plain refresh into a `vtxo` leaf) cancels the order.
+for anything else (a plain refresh into a `vtxo` leaf) cancels the order. One
+participation may refresh several orders of one landed terms and value: it
+pairs the order coins it gives up with the `order-3` leaves it wants of those
+terms and value by position (the j-th leaf goes on from the j-th coin), and
+each order goes on at its own leaf as that leaf is published.
+
+A round can leave the chain for good after the maker handed over its forfeit
+(an anchor rollback, and another transaction took the round's input). Its
+participation is then void, never run again, and the operator co-signs
+nothing more of the coin it gave up; a new coin already published is lost
+with the round. The order reads `lost`, and `order_state` names the coin
+whose exit brings its value home whole (`exit_coin`): the coin the refresh
+gave up, which lands as SeqDEX's order for the same terms.
 
 On a batch with RECLAIM-D a fill delegates like a transfer, into all of its
 outputs in order (the credit, the order resting again, the taker's leaves;
@@ -3126,7 +3138,7 @@ canonical binary form. Every object refuses a field it does not know.
 | `POST order_fill` | Co-signs a fill of a resting order (each plain taker coin into a checkpoint with its owner's exit with `checkpoint_exit: true`, where `info.checkpoint_exit` offers it): the transfer's id, the operator's fill signature, its signatures for each taker coin, and each coin the fill makes with its record (the credit, the order resting again, the taker's leaves), with the signed head of the signer's record (`signer_record`). A taker coin resting on a lowest node with RECLAIM-D carries its delegation into the fill's outputs (`delegation_sig`) |
 | `POST order_fill_delegation_terms` | For a signed fill, by its transfer id or the order coin it spent: the order coin it spent, the taker's leaves its maker's delegation names after the maker's own, and whether that delegation is recorded |
 | `POST order_fill_delegation` | Takes the maker's delegation of its order coin into a fill (`kept` false for a coin on no lowest node with RECLAIM-D, and for an order resting again, whose key delegated at an earlier fill) |
-| `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more until its maker refreshes it), `refreshing` (a round gives it a fresh coin of the same order; it takes no fill meanwhile), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, how many reassignments the coin is from a round (`hops`) and whether only a fill of the whole is taken (`whole_only`), its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
+| `POST order_state` | Up to 100 resting orders by their ids, each that is published: `resting`, `exhausted` (it fills no more until its maker refreshes it), `refreshing` (a round gives it a fresh coin of the same order; it takes no fill meanwhile), `lost` (the round of its refresh left the chain for good; `exit_coin` names the coin whose exit brings it home whole), `filling` (a fill of its coin is recorded and not yet signed; it is signed or dropped), `filled` (a fill of it whole is signed), `cancelled`, `landed` (its coin is on the chain, to land as SeqDEX's order; it takes no fill in the tree), `pending` or `unknown`, the coin it rests at, its asset and value, the coin's leaf key, salt, exit delay and terms, the fills left, how many reassignments the coin is from a round (`hops`) and whether only a fill of the whole is taken (`whole_only`), its first expiry, the coin's record while it rests, and each fill, with whether it is signed. Not authenticated: a relay polls it |
 | `POST tree` | The published tree of a batch, by its round's txid and output: its kind (`kind`: `tree`, or `accumulator` for an accumulator batch, which has no nodes and a radix of 0), with the signer's record's latest entry when its round was built, signed, every node as the server built it, each leaf's id and script and, for an `htlc-1` leaf, its terms (`htlc`), each leaf's preimage once its participation's went out, and the round's state |
 | `POST rounds` | The rounds after a cursor (`after`, a round's number; `limit`, at most 100), oldest first, each with its txid, its state and the outputs of its batches; `next` names the cursor to read on from |
 | `POST forfeit_leaves` | Takes a participation's forfeits and its new leaves' unroll authorisations, and returns its preimage; for a take in a round that fills orders and is not broadcast yet, takes them and returns no preimage (it goes out once the round is final) |

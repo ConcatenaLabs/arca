@@ -76,7 +76,17 @@
 //! wants, is the maker's consent; no fill of the old coin can be co-signed
 //! while a participation holds it, and a participation that never runs gives
 //! it back, the order resting where it was. While a refresh is under way the
-//! order reads `refreshing`.
+//! order reads `refreshing`. One participation may refresh several orders of
+//! one landed terms and value: it pairs the coins it gives up with the leaves
+//! it wants by position, and each order goes on at its own leaf.
+//!
+//! **Lost.** A round can leave the chain for good after the maker handed over
+//! its forfeit (an anchor rollback, and another transaction took the round's
+//! input). The participation is then void, never run again, and the operator
+//! co-signs nothing more of the coin it gave up, whose forfeit names a round
+//! that is gone; a new coin already published is lost with its round. The
+//! order reads `lost`, and names the coin whose exit brings its value home
+//! whole (`exit_coin`): the coin the refresh gave up.
 //!
 //! **The state view** ([`Orders::state`]) says, per order, where it rests,
 //! what it has filled and what is left, and the terms a taker builds a fill
@@ -332,13 +342,20 @@ pub struct OrderView {
 	/// a part fill would leave the rest at the operator's depth limit, where
 	/// it could no longer be cancelled.
 	pub whole_only: bool,
+	/// When the round that took the coin it rests at left the chain for
+	/// good, and the operator co-signs nothing of it any more: the coin
+	/// whose exit brings its value home whole ([`Orders::lost_exit`]).
+	pub exit_coin: Option<[u8; 32]>,
 }
 
 impl OrderView {
-	/// `resting`, `filling`, `filled`, `cancelled`, `refreshing`,
+	/// `resting`, `filling`, `filled`, `cancelled`, `refreshing`, `lost`,
 	/// `exhausted`, `landed`, `pending` or `unknown`. `filled` is said only
 	/// of a fill the operator signed.
 	pub fn state(&self) -> &'static str {
+		if self.exit_coin.is_some() {
+			return "lost";
+		}
 		match self.coin_state {
 			LeafState::Live if self.landed => "landed",
 			LeafState::Live if self.refreshing => "refreshing",
@@ -515,43 +532,89 @@ impl Orders {
 	}
 
 	/// The published order a refresh made the coin `id` (holding `coin`)
-	/// for, and the coin the order rested at that the refresh gave up: when
-	/// the participation whose round made `id` gave up exactly one coin that
-	/// an order rests at, of the same order (the same landed terms) and the
-	/// same value, and that coin is no longer live. `None` otherwise: the
-	/// coin is then an order of its own.
+	/// for, and the coin the order rested at that the refresh gave up. The
+	/// participation whose round made `id` pairs the coins of published
+	/// orders it gave up with the `order-3` leaves it wants, each of the same
+	/// landed terms and value, by position: the j-th such leaf goes on from
+	/// the j-th such coin ([`Orders::pairing`]). Every pairing keeps value
+	/// and terms, since both sides match in both, so a participation that
+	/// refreshes several orders of one terms and value continues each, one
+	/// per publication. `None` when `id` pairs with no coin an order still
+	/// rests at, given up: the coin is then an order of its own.
 	async fn refreshed_order(&self, id: &LeafId, coin: &ValidCoin) -> Result<Option<(RestingOrderRow, [u8; 32])>, OrderError> {
 		let Some(new) = coin.leaf.order_policy() else { return Ok(None) };
 		let Some(pid) = self.store.participation_making(&id.0).await? else { return Ok(None) };
 		let Some(p) = self.store.participation(&pid).await? else { return Ok(None) };
-		let mut found = vec![];
+		let (ins, outs) = self.pairing(&p, &new.landed, coin.value).await?;
+		let Some(j) = outs.iter().position(|o| *o == Some(id.0)) else { return Ok(None) };
+		let Some(from) = ins.get(j).copied() else { return Ok(None) };
+		let Some(o) = self.store.resting_order_of_leaf(&from).await? else { return Ok(None) };
+		let Some(row) = self.store.leaf(&from).await? else { return Ok(None) };
+		if o.current_leaf != from || matches!(row.state, LeafState::Live | LeafState::Pending) {
+			return Ok(None);
+		}
+		Ok(Some((o, from)))
+	}
+
+	/// How the participation `p` pairs coins of published orders of the
+	/// landed terms `landed`, holding `value`, with the `order-3` leaves it
+	/// wants of the same terms and value: those coins it gives up, in its
+	/// input order, and those leaves, in its output order (each by the leaf
+	/// its round made of it, once made). The j-th leaf continues the order
+	/// of the j-th coin.
+	async fn pairing(&self, p: &crate::store::ParticipationRow, landed: &arca_covenant::order::SeqdexOrder, value: u64)
+		-> Result<(Vec<[u8; 32]>, Vec<Option<[u8; 32]>>), OrderError>
+	{
+		let mut ins = vec![];
 		for i in p.inputs.iter().filter(|i| !i.returned) {
-			let Some(o) = self.store.resting_order_of_leaf(&i.leaf_id).await? else { continue };
-			if o.current_leaf != i.leaf_id {
+			if self.store.resting_order_of_leaf(&i.leaf_id).await?.is_none() {
 				continue;
 			}
 			let Some(row) = self.store.leaf(&i.leaf_id).await? else { continue };
 			let Some(old) = CoinRecord::from_bytes(&row.record).ok().and_then(|r| r.order_policy()) else { continue };
-			if old.landed == new.landed && row.value == coin.value && !matches!(row.state, LeafState::Live | LeafState::Pending) {
-				found.push((o, i.leaf_id));
+			if old.landed == *landed && row.value == value {
+				ins.push(i.leaf_id);
 			}
 		}
-		Ok(if found.len() == 1 { found.pop() } else { None })
+		let outs = p.outputs.iter().filter(|o| o.value == value && matches!(&o.kind,
+			crate::store::WantedKind::Leaf { order: Some(t), .. } if t.landed == *landed)).map(|o| o.leaf_id).collect();
+		Ok((ins, outs))
 	}
 
 	/// Whether a participation that may still run, or ran, gives up `leaf`
 	/// (the coin an order of `policy` rests at, holding `value`) for an
-	/// order-3 leaf of the same order and value: a refresh that keeps it.
+	/// order-3 leaf of the same order and value, paired with it
+	/// ([`Orders::pairing`]): a refresh that keeps it.
 	async fn refresh_under_way(&self, leaf: &[u8; 32], policy: &OrderPolicy, value: u64) -> Result<bool, OrderError> {
 		for pid in self.store.participations_giving_up(leaf).await? {
 			let Some(p) = self.store.participation(&pid).await? else { continue };
-			let keeps = p.outputs.iter().any(|o| o.value == value && matches!(&o.kind,
-				crate::store::WantedKind::Leaf { order: Some(t), .. } if t.landed == policy.landed));
-			if keeps {
+			let (ins, outs) = self.pairing(&p, &policy.landed, value).await?;
+			if ins.iter().position(|i| i == leaf).is_some_and(|k| k < outs.len()) {
 				return Ok(true);
 			}
 		}
 		Ok(false)
+	}
+
+	/// The coin whose exit brings an order's value home whole when the
+	/// operator can no longer co-sign anything of it: the round that took
+	/// the coin it rests at (`row`, `leaf`) left the chain for good. Before
+	/// the new coin was published, the coin itself, given up to a
+	/// participation that will never run (void or expired) and not given
+	/// back, its forfeit for a round that is gone; after it, the coin the
+	/// refresh gave up, the new coin being lost with its round. `None`
+	/// otherwise.
+	async fn lost_exit(&self, leaf: &[u8; 32], row: &crate::store::LeafRow) -> Result<Option<[u8; 32]>, OrderError> {
+		match row.state {
+			LeafState::Lost | LeafState::Expired => Ok(self.store.refresh_into(leaf).await?),
+			LeafState::Spent => {
+				let Some(by) = row.spent_by.as_ref().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) else { return Ok(None) };
+				let gone = self.store.participation(&by).await?
+					.is_some_and(|p| matches!(p.state, crate::store::ParticipationState::Void | crate::store::ParticipationState::Expired));
+				Ok(gone.then_some(*leaf))
+			},
+			_ => Ok(None),
+		}
 	}
 
 	/// The order whose first coin is `id`, as the state view shows it.
@@ -566,9 +629,10 @@ impl Orders {
 		let landed = row.state == LeafState::Live && !self.store.sightings_of(&row.script_pubkey).await?.is_empty();
 		let refreshing = !whole && matches!(row.state, LeafState::Live | LeafState::Spent)
 			&& self.refresh_under_way(&order.current_leaf, &policy, row.value).await?;
+		let exit_coin = if whole || refreshing { None } else { self.lost_exit(&order.current_leaf, &row).await? };
 		Ok(Some(OrderView {
 			value: row.value, coin_state: row.state, expiry: cosign::first_expiry(&record),
-			given_up: row.state == LeafState::Spent && !whole, filling, landed, refreshing,
+			given_up: row.state == LeafState::Spent && !whole, filling, landed, refreshing, exit_coin,
 			hops: row.hops, whole_only: row.hops as usize + 1 >= self.params.depth_limit,
 			order, policy, fills,
 		}))

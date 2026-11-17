@@ -57,7 +57,10 @@
 //! operator, which sees the participation gave up the order's coin, has the
 //! order go on there under the same id: a round's leaf again, four fills
 //! ahead of it. A round that never runs gives the coin back, and the order
-//! rests where it was. A maker's upkeep refreshes an order whose coin is
+//! rests where it was. A round that leaves the chain for good after the
+//! forfeit was handed over leaves the order `lost`: the operator co-signs
+//! nothing of it any more, and its value is whole in the coin the refresh
+//! gave up, which comes home by its exit; the wallet names that coin. A maker's upkeep refreshes an order whose coin is
 //! within two reassignments of the limit, or whose credit keys are used.
 //!
 //! **Cancel and home.** The maker cancels by spending the order's current
@@ -996,9 +999,20 @@ impl Wallet {
 	fn resting_to_cancel(&self, order: &str) -> Result<(RestingRow, CoinRow), Error> {
 		let r = self.store.restings()?.into_iter().find(|r| r.order_leaf.as_deref() == Some(order) || r.id == order)
 			.ok_or_else(|| Error::Refused(format!("the wallet rested no order {}", order)))?;
-		let leaf = self.store.nonce(&r.nonce)?.and_then(|n| n.leaf_id)
-			.ok_or_else(|| Error::Refused(format!("order {} has no coin yet: its round has not made it", order)))?;
-		let row = self.store.coin(&leaf)?.ok_or_else(|| Error::Store(format!("coin {} is gone", leaf)))?;
+		let leaf = self.store.nonce(&r.nonce)?.and_then(|n| n.leaf_id);
+		let row = match &leaf {
+			Some(l) => self.store.coin(l)?,
+			None => None,
+		};
+		// When the round of its refresh left the chain for good, the operator
+		// says which coin brings it home (whatever the wallet's own record of
+		// the refresh says yet); a read that fails leaves the operator to
+		// refuse what it cannot co-sign.
+		if let Ok(Some(exit)) = self.lost_exit(&r) {
+			return Err(self.lost_refusal(order, &exit));
+		}
+		let leaf = leaf.ok_or_else(|| Error::Refused(format!("order {} has no coin yet: its round has not made it", order)))?;
+		let row = row.ok_or_else(|| Error::Store(format!("coin {} is gone", leaf)))?;
 		if r.state == "refreshing" {
 			return Err(Error::Refused(format!("order {} is being refreshed in a round (its coin {} is given up for a fresh coin of the same \
 				order): once the round is final, sync publishes the new coin and the order rests there", order, leaf)));
@@ -1007,6 +1021,30 @@ impl Wallet {
 			return Err(Error::Refused(format!("order {} rests at coin {}, which is {}: nothing rests to cancel", order, leaf, row.state)));
 		}
 		Ok((r, row))
+	}
+
+	/// The coin whose exit brings the wallet's order `r` home whole, when the
+	/// operator says the order is `lost`: the round of its refresh left the
+	/// chain for good, and the operator co-signs nothing of it any more.
+	fn lost_exit(&self, r: &RestingRow) -> Result<Option<String>, Error> {
+		let Some(order) = &r.order_leaf else { return Ok(None) };
+		let st = self.server.post("order_state", &json!({"orders": [order]}))?;
+		let o = st["orders"].as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null);
+		Ok((o["state"] == "lost").then(|| o["exit_coin"].as_str().map(String::from)).flatten())
+	}
+
+	/// The refusal of anything but the exit for a lost order `order`, whose
+	/// value is whole in coin `exit`.
+	fn lost_refusal(&self, order: &str, exit: &str) -> Error {
+		Error::Refused(self.lost_words(order, exit))
+	}
+
+	/// What the wallet says of a lost order `order`, whose value is whole in
+	/// coin `exit`.
+	fn lost_words(&self, order: &str, exit: &str) -> String {
+		self.spelling.say(&format!("order {} is lost: the round of its refresh left the chain for good, so the operator \
+			co-signs nothing of it any more. Its value is whole in coin {}: take that coin home with {{exit}}, and it lands as SeqDEX's \
+			order for the same terms; nothing is lost", order, exit))
 	}
 
 	/// What refreshing the wallet's resting order `order` in the operator's
@@ -1192,11 +1230,20 @@ impl Wallet {
 			"released" => {},
 			"submitting" | "pending" | "issued" | "forfeiting" => return Ok(None),
 			other => {
+				// A round that never ran gives the coin back, and the order
+				// rests where it was; one that left the chain for good after
+				// the forfeit was handed over keeps it, and the order is lost,
+				// its value whole in that coin, which comes home by its exit.
+				let exit = self.lost_exit(r)?;
 				all.remove(&r.id);
 				self.store.atomically(|s| {
 					s.set_meta(REFRESHES, &Value::Object(all.clone()).to_string())?;
-					s.set_resting(&r.id, None, "published")
+					s.set_resting(&r.id, None, if exit.is_some() { "lost" } else { "published" })
 				})?;
+				if let Some(exit) = exit {
+					return Ok(Some(json!({"order": order, "state": "lost", "refreshed": false, "exit_coin": exit,
+						"note": self.lost_words(&order, &exit)})));
+				}
 				return Ok(Some(json!({"order": order, "state": "resting", "refreshed": false, "note": format!("its refresh's participation \
 					is {}: the order rests at its coin {} as before", other, x["from"].as_str().unwrap_or(""))})));
 			},

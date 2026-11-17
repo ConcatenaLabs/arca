@@ -217,7 +217,7 @@ pub struct RestingRow {
 	pub credit_nonces: Vec<String>,
 	/// The coin its round made, once the wallet holds it: the order's id.
 	pub order_leaf: Option<String>,
-	/// `participating`, `published`, `refreshing`, `cancelled` or
+	/// `participating`, `published`, `refreshing`, `lost`, `cancelled` or
 	/// `not_rested`.
 	pub state: String,
 }
