@@ -1045,7 +1045,7 @@ impl Wallet {
 		let schedule = schedule_of(info, a);
 		let order_fee = refresh_fee(&schedule, oc.value, self.service_expiry(&record, &held)?, now);
 		let min = Self::min_leaf(info, a)?;
-		let order_coin = In { lock: None, checkpoint_value: oc.value, row: row.clone(), coin: oc.clone() };
+		let order_coin = In { checkpoint_value: oc.value, row: row.clone(), coin: oc.clone() };
 		// The round's fee comes from other coins of the asset, so the order
 		// keeps its whole amount: the set of them that leaves the least
 		// change, as resting an order takes them.
