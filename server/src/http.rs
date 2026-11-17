@@ -1120,6 +1120,7 @@ async fn info(State(app): State<Arc<App>>) -> Json<api::Info> {
 			forfeit_window_seconds: app.params.fill_forfeit_window_seconds,
 			round_interval_seconds: app.params.round_interval_seconds,
 			shared: true,
+			refresh_keeps_order: true,
 		},
 		bond,
 		swept: api::SweptInfo { policy: "repaid".into(), late_fee: "refresh".into() },

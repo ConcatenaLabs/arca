@@ -388,6 +388,14 @@ pub struct FillsInfo {
 	/// together, and one round fills their sum and pays each its own leaf.
 	#[serde(default)]
 	pub shared: bool,
+	/// Whether a resting order's maker can give it a fresh coin in a round
+	/// and keep it (the same id, terms and amount): a participation that
+	/// gives up the coin it rests at for an `order-3` leaf of the same order,
+	/// published once the round is final. A part fill is co-signed only
+	/// while what rests stays short of the depth limit, so the order can
+	/// always be cancelled.
+	#[serde(default)]
+	pub refresh_keeps_order: bool,
 }
 
 /// An asset's Lightning leg: the operator's SeqLN node in that asset.
@@ -1587,7 +1595,12 @@ pub struct OrderStates {
 pub struct OrderState {
 	pub order: String,
 	/// `resting` (a taker can fill it), `exhausted` (it rests, and fills no
-	/// more: its credit keys are used), `filling` (a fill of the coin it
+	/// more: its credit keys are used, until its maker refreshes it),
+	/// `refreshing` (a round gives it a fresh coin of the same order, at its
+	/// maker's request: it takes no fill until it rests at that coin, under
+	/// the same id), `lost` (the round of its refresh left the chain for
+	/// good: the operator co-signs nothing of it, and `exit_coin` names the
+	/// coin whose exit brings its value home whole), `filling` (a fill of the coin it
 	/// rests at is recorded and not yet signed: it takes no other fill, and
 	/// the fill is either signed or dropped), `filled` (filled whole, the fill
 	/// signed), `cancelled` (its maker gave its coin up otherwise), `landed`
@@ -1608,6 +1621,18 @@ pub struct OrderState {
 	pub exit_delay_units: u16,
 	pub terms: serde_json::Value,
 	pub fills_left: u8,
+	/// How many reassignments the coin it rests at is from a round or a
+	/// board.
+	#[serde(default)]
+	pub hops: u16,
+	/// Whether the operator co-signs only a fill of the whole of what rests:
+	/// a part fill would leave the rest at its depth limit, where the order
+	/// could no longer be cancelled. Its maker's refresh lifts it.
+	#[serde(default)]
+	pub whole_only: bool,
+	/// For a `lost` order: the coin whose exit brings its value home whole.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub exit_coin: Option<String>,
 	/// The earliest first expiry of the batches the coin rests on.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub expiry: Option<u32>,

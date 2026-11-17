@@ -45,7 +45,8 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, owed, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?, no_open?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
 	rate_num, rate_den, min_lot?, expiry, max_fee_ppm?, shown?}, order_resting {orders?, brief?}, order_fill_resting_quote {order, amount?}, \
-	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, supply {asset}, \
+	order_fill_resting {order, amount?, shown?}, order_cancel_resting_quote {order}, order_cancel_resting {order, shown?}, \
+	order_refresh_resting_quote {order, max_fee_ppm?}, order_refresh_resting {order, max_fee_ppm?, shown?}, supply {asset}, \
 	bond, bond_evidence, watch_bond {evidence?: [line], fee_asset?}, instant_budget {share}, instant_limit {value}, coin_places, settle_first {coins? | asset?, max_fee_ppm?}, supervised_check {txid, vout}, channels, channel_open {leaves?, \
 	capacity, keep?, max_fee_ppm?}, channel_sync {leaf_id?}, channel_pay {leaf_id, to, amount}, channel_fold {leaf_id}, channel_exit {leaf_id, \
 	fee_asset?}, channel_code {address?}, leaf_template {template?}, require_checkpoint_exit {on?}, offboard_quote {asset, amount | coins | value + expiry, address | script, max_fee_ppm?}, \
@@ -270,7 +271,7 @@ fn reads_only(command: &str) -> bool {
 	matches!(command, "address" | "openamp_key" | "balance" | "coins" | "record" | "refusals" | "participations" | "exit_quote" | "schedule"
 		| "orders" | "swaps" | "plans" | "lightning_payments" | "lightning_receives" | "offboards"
 		| "info" | "supply" | "leaf_template" | "require_checkpoint_exit" | "board_quote" | "quote" | "settle_quote" | "take_quote" | "order_fill_quote" | "order_quote"
-		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "offboard_quote" | "lightning_pay_quote"
+		| "order_rest_quote" | "order_fill_resting_quote" | "order_cancel_resting_quote" | "order_refresh_resting_quote" | "offboard_quote" | "lightning_pay_quote"
 		| "lightning_receive_quote" | "distribute_quote" | "plan_quote" | "swap_read" | "btc_swap_read" | "boards" | "channels" | "send_quote" | "refresh_needed" | "coin_places"
 		| "locks" | "lock_status")
 }
@@ -544,6 +545,14 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"order_cancel_resting" => {
 			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
 			w.order_cancel_resting(req_str(&a["order"], "the order")?, shown)
+		},
+		// A refresh that keeps the order: a fresh coin in a round, the same
+		// id, terms and amount.
+		"order_refresh_resting_quote" => w.order_refresh_resting_quote(req_str(&a["order"], "the order")?,
+			opt_u64(&a["max_fee_ppm"], "the fee bound")?),
+		"order_refresh_resting" => {
+			let shown = Some(&a["shown"]).filter(|v| !v.is_null());
+			w.order_refresh_resting(req_str(&a["order"], "the order")?, opt_u64(&a["max_fee_ppm"], "the fee bound")?, shown)
 		},
 		// An in-tree swap of two assets with another wallet: the maker
 		// offers (its coins held, nothing signed), the taker reads the offer

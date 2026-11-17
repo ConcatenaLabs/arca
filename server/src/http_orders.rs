@@ -26,8 +26,9 @@ async fn order_json(app: &App, v: &OrderView) -> Result<api::OrderState, Refusal
 	let p = &v.policy;
 	let resting = matches!(v.state(), "resting" | "exhausted");
 	let record = if resting {
-		// The record a fill carries: the maker's for the order's first coin.
-		if v.order.current_leaf == v.order.order_id {
+		// The record a fill carries: the maker's for the first coin of the
+		// order's lineage (the coin a round made of it).
+		if v.order.record_leaf() == Some(v.order.current_leaf) {
 			Some(hex(&v.order.record))
 		} else {
 			app.store.leaf(&v.order.current_leaf).await?.map(|r| hex(&r.record))
@@ -46,6 +47,9 @@ async fn order_json(app: &App, v: &OrderView) -> Result<api::OrderState, Refusal
 		exit_delay_units: p.exit_delay.units(),
 		terms: arca_covenant::record_json::order_terms_json(&p.leaf_terms()),
 		fills_left: p.fills_left() as u8,
+		hops: v.hops,
+		whole_only: v.whole_only,
+		exit_coin: v.exit_coin.map(|c| hex(&c)),
 		expiry: v.expiry,
 		record,
 		fills: v.fills.iter().map(|f| api::OrderFillState {

@@ -46,11 +46,11 @@ use arca_covenant::script::sha256;
 use arca_covenant::sign::sign_digest;
 use arca_covenant::spend::FeeSource;
 use arca_covenant::{CoinRecord, ExplicitOutput, LeafId, NewLeaf, Rebindable, RelativeTime, Template, TransferPlan, ValidCoin, ValidOrigin};
-use common::client::{auths_json, exit_delay, forfeit_sig, hex, hold_key, new_leaf, participation_body, random32, transfer_body, unhex};
+use common::client::{auths_json, exit_delay, forfeit_sig, hex, hold_key, new_leaf, participation_body, random32, transfer_body, unhex, Held};
 use common::flow::{drive, final_of, forfeit_for, held_by, log, settle, txid, verdict, Coin};
 use common::keys::{keypair, xonly};
 use common::node;
-use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, status, validate_new_leaf, VALUE};
+use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, start_depth_limit, status, validate_new_leaf, VALUE};
 use common::running::Running;
 use server::participations::OutputRequest;
 
@@ -805,4 +805,257 @@ async fn an_exit_fill_goes_only_to_a_maker_that_reads_its_records() {
 	let (status, _, why) = refused(&r, "a fill of M's order giving a coin of format 2", &body);
 	assert_eq!(status, 422);
 	assert!(why.contains("past holds a checkpoint with its owner's exit"), "{}", why);
+}
+
+/// The operator co-signs a fill that leaves part of an order resting only
+/// while what rests stays short of its depth limit (here 2), so the order's
+/// maker can always cancel it, one reassignment more. A part fill that would
+/// land the rest at the limit, sent by hand past any wallet's check, is
+/// refused under `order` (a code every wallet library knows, so an older one
+/// gives the taker's coins back), naming the whole remainder; the whole
+/// remainder is co-signed, its coins at
+/// the limit and no deeper. The state view says how deep the order's coin is
+/// and whether only the whole is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_fill_that_would_leave_the_rest_at_the_depth_limit_is_refused() {
+	let mut r = start_depth_limit(2).await;
+	let (x, y) = (r.x, r.y);
+	let mut m = maker(&r, "WM");
+	// One Y an X, so one taker coin pays for the whole remainder.
+	m.terms.landed.terms.rate_num = 1;
+	let (t1, t2) = (keypair("WT1"), keypair("WT2"));
+	let mut boards = vec![];
+	for (label, asset) in [("WM, board", x), ("WT1, board", y), ("WT2, board", y)] {
+		let (held, tx) = credited_board(&mut r, &keypair(label), asset).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let (wm, nm) = want_order(&m, VALUE, x);
+	let (w1, n1) = want_leaf(&t1, y, VALUE);
+	let (w2, n2) = want_leaf(&t2, y, VALUE);
+	let got = one_round(&mut r, &[(&boards[0], &m.key, wm, nm), (&boards[1], &t1, w1, n1), (&boards[2], &t2, w2, n2)]).await;
+	let (om, c1, c2) = (&got[0], &got[1], &got[2]);
+	let bases = om.bases.clone();
+	assert_eq!(r.http.get("info").ok()["fills"]["refresh_keeps_order"], true);
+	let st = r.http.post("order_publish", &publish_body(&r, &m, om, &m.key)).ok();
+	println!("WM's order: hops {} whole_only {}", st["hops"], st["whole_only"]);
+	assert_eq!((st["hops"].as_u64(), st["whole_only"].as_bool()), (Some(0), Some(false)), "{}", st);
+
+	// T1 fills 300,000: what rests is one reassignment deep, short of the limit.
+	let p = policy_of(&r, &st, &bases);
+	let (l1, _) = new_leaf(&keypair("WT1, X"));
+	let (ch1, _) = new_leaf(&keypair("WT1, change"));
+	r.http.post("order_fill", &fill_body(&r, &st, &p, (c1, c1.valid(&r)), VALUE - 1, 300_000, (&l1, &ch1), 1, &t1, None)).ok();
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	println!("after a part fill: hops {} whole_only {} value {}", st["hops"], st["whole_only"], st["value"]);
+	assert_eq!((st["hops"].as_u64(), st["whole_only"].as_bool(), st["value"].as_str()), (Some(1), Some(true), Some("700000")), "{}", st);
+
+	// T2's part fill would leave the rest two deep, at the limit, where no
+	// cancel could follow: refused, nothing signed, T2's coin its own.
+	let p = policy_of(&r, &st, &bases);
+	let (l2, _) = new_leaf(&keypair("WT2, X"));
+	let (ch2, _) = new_leaf(&keypair("WT2, change"));
+	let part = fill_body(&r, &st, &p, (c2, c2.valid(&r)), VALUE - 1, 200_000, (&l2, &ch2), 1, &t2, None);
+	let (status, code, msg) = refused(&r, "a part fill that would leave the rest at the depth limit", &part);
+	assert_eq!((status, code.as_str()), (422, "order"), "{}", msg);
+	assert!(msg.contains("whole remainder, 700000 atoms"), "{}", msg);
+	assert_eq!(order_state(&r, &[om.held.id])[0]["state"], "resting", "the order rests where it was");
+
+	// The whole remainder is co-signed.
+	let whole = fill_body(&r, &st, &p, (c2, c2.valid(&r)), VALUE - 1, 700_000, (&l2, &ch2), 1, &t2, None);
+	let done = r.http.post("order_fill", &whole).ok();
+	assert_eq!(done["outputs"].as_array().unwrap().len(), 3, "the credit, the taker's leaf and its change: nothing rests");
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	println!("the whole remainder taken: {}", st["state"]);
+	assert_eq!(st["state"], "filled");
+}
+
+/// Orders of `makers`, each `VALUE` of X, made in one round; each whose
+/// `publish` is true published. The coins, in `makers`' order.
+async fn orders_of(r: &mut Running, makers: &[&Maker], publish: &[bool]) -> Vec<Coin> {
+	let x = r.x;
+	let mut boards = vec![];
+	for m in makers {
+		let (held, tx) = credited_board(r, &keypair(&format!("{:?}, board", xonly(&m.key))), x).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let wants: Vec<(OutputRequest, [u8; 32])> = makers.iter().map(|m| want_order(m, VALUE, x)).collect();
+	let entries: Vec<(&Coin, &Keypair, OutputRequest, [u8; 32])> = boards.iter().zip(makers).zip(wants)
+		.map(|((b, m), (w, n))| (b, &m.key, w, n)).collect();
+	let got = one_round(r, &entries).await;
+	for ((c, m), p) in got.iter().zip(makers).zip(publish) {
+		if *p {
+			let st = r.http.post("order_publish", &publish_body(r, m, c, &m.key)).ok();
+			assert_eq!(st["state"], "resting", "{}", st);
+		}
+	}
+	got
+}
+
+/// One participation gives up `olds` for an order leaf of each of `fresh`
+/// (in that order, each of `VALUE`), run in a round made final with every
+/// forfeit handed over: the participation and the new coins, in `fresh`'s
+/// order.
+async fn refresh_in_one(r: &mut Running, olds: &[&Coin], fresh: &[&Maker]) -> ([u8; 32], Vec<Coin>) {
+	let x = r.x;
+	let wants: Vec<(OutputRequest, [u8; 32])> = fresh.iter().map(|m| want_order(m, VALUE, x)).collect();
+	let held: Vec<&Held> = olds.iter().map(|c| &c.held).collect();
+	let (body, id) = participation_body(&held, &wants.iter().map(|w| w.0.clone()).collect::<Vec<_>>(), &[], None, xonly(&r.s), r.chain);
+	let a = r.http.post("submit_participation", &body).ok();
+	assert_eq!(a["state"], "pending", "{}", a);
+	let mut built = vec![];
+	while let Some(b) = r.server.rounds.run_round().await.unwrap() {
+		r.produce().await;
+		built.push(b.tx.txid());
+	}
+	r.bury().await;
+	for t in &built {
+		round_final(r, t).await;
+	}
+	let st = status(r, &id);
+	let mut news = vec![];
+	for (k, (m, (_, n))) in fresh.iter().zip(&wants).enumerate() {
+		news.push(validate_new_leaf(r, &id, k, &m.key, n));
+	}
+	let round = news[0].2.clone();
+	let forfeits: Vec<Value> = olds.iter().map(|c| {
+		let f = forfeit_for(&c.valid(r), &news[0].0, &round, &st);
+		json!({"leaf_id": c.held.id.to_string(), "signature": forfeit_sig(&f, &c.held.key)})
+	}).collect();
+	let leaves: Vec<Value> = fresh.iter().zip(&news).map(|(m, (v, rec, _))| auths_json(v, &m.key, created(rec))).collect();
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&id), "forfeits": forfeits, "leaves": leaves})).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+	let all: Vec<Transaction> = built.iter().map(|t| r.rt.client().raw_transaction(t).unwrap()).collect();
+	let coins = fresh.iter().zip(&wants).zip(&news)
+		.map(|((m, (_, n)), (v, _, _))| Coin { held: held_by(r, &m.key, *n, v.leaf_id), bases: all.clone() }).collect();
+	(id, coins)
+}
+
+/// A maker with new leaf and credit keys for the landed terms of `like`.
+fn refreshed(r: &Running, label: &str, like: &Maker) -> Maker {
+	let mut m = maker(r, label);
+	m.terms.landed = like.terms.landed;
+	m
+}
+
+/// Publishes `coin` as `m`: the order it answers, and the coin it rests at.
+fn publish_as(r: &Running, m: &Maker, coin: &Coin) -> (String, String) {
+	let st = r.http.post("order_publish", &publish_body(r, m, coin, &m.key)).ok();
+	(st["order"].as_str().unwrap().to_string(), st["coin"].as_str().unwrap().to_string())
+}
+
+/// Asserts the order `order` rests at `coin`, whole, a round's leaf with four
+/// fills ahead, under the key of `m`.
+fn assert_rests_at(r: &Running, tag: &str, order: LeafId, coin: &Coin, m: &Maker) {
+	let o = order_state(r, &[order])[0].clone();
+	println!("{}: order {} {} at {} hops {} fills_left {} owner {}", tag, order, o["state"], o["coin"], o["hops"], o["fills_left"], o["owner"]);
+	assert_eq!((o["state"].as_str(), o["coin"].as_str(), o["value"].as_str(), o["hops"].as_u64(), o["fills_left"].as_u64()),
+		(Some("resting"), Some(coin.held.id.to_string().as_str()), Some(VALUE.to_string().as_str()), Some(0), Some(4)), "{}: {}", tag, o);
+	assert_eq!(o["owner"].as_str(), Some(hex(&xonly(&m.key).serialize()).as_str()), "{}: the new leaf's key", tag);
+}
+
+/// One participation refreshes two orders of one landed terms and value (a
+/// maker that rests one level twice). Which leaf continues which order is
+/// bound when the participation is taken in: each order goes on at its own
+/// leaf under its own id as that leaf is published. While the round runs
+/// both read `refreshing`; after, neither does, and nothing is published
+/// under a new id.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_orders_of_one_terms_refreshed_in_one_participation_each_go_on() {
+	let mut r = start().await;
+	let m1 = maker(&r, "PM1");
+	let mut m2 = maker(&r, "PM2");
+	m2.terms.landed = m1.terms.landed;
+	let got = orders_of(&mut r, &[&m1, &m2], &[true, true]).await;
+	let ids = [got[0].held.id, got[1].held.id];
+	let (f1, f2) = (refreshed(&r, "PM1, refreshed", &m1), refreshed(&r, "PM2, refreshed", &m1));
+	let (_, news) = refresh_in_one(&mut r, &[&got[0], &got[1]], &[&f1, &f2]).await;
+	let during: Vec<String> = order_state(&r, &ids).iter().map(|o| o["state"].as_str().unwrap().to_string()).collect();
+	println!("PM before either new leaf is published: {:?}", during);
+	assert_eq!(during, vec!["refreshing", "refreshing"]);
+	assert_eq!(publish_as(&r, &f1, &news[0]).0, ids[0].to_string());
+	assert_eq!(order_state(&r, &[ids[1]])[0]["state"], "refreshing", "the second waits for its own leaf");
+	assert_eq!(publish_as(&r, &f2, &news[1]).0, ids[1].to_string());
+	assert_rests_at(&r, "PM order 1", ids[0], &news[0], &f1);
+	assert_rests_at(&r, "PM order 2", ids[1], &news[1], &f2);
+	assert!(order_state(&r, &[news[0].held.id, news[1].held.id]).is_empty(), "no order is published under a new leaf's id");
+	assert_eq!(publish_as(&r, &f1, &news[0]).0, ids[0].to_string(), "the same publication again gets the order's state");
+}
+
+/// Two orders of one landed terms and value given up in one participation,
+/// the first never published (KR67): the binding counts the unpublished
+/// coin's place, so its leaf continues nothing and publishes as an order of
+/// its own, and the second's leaf continues the second order, under the
+/// second's new key. Published in either order, the answer is the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpublished_order_in_a_refresh_keeps_its_place() {
+	let mut r = start().await;
+	let m1 = maker(&r, "UM1");
+	let mut m2 = maker(&r, "UM2");
+	m2.terms.landed = m1.terms.landed;
+	let got = orders_of(&mut r, &[&m1, &m2], &[false, true]).await;
+	let second = got[1].held.id;
+	assert!(order_state(&r, &[got[0].held.id]).is_empty(), "the first order is not published");
+	let (f1, f2) = (refreshed(&r, "UM1, refreshed", &m1), refreshed(&r, "UM2, refreshed", &m1));
+	let (_, news) = refresh_in_one(&mut r, &[&got[0], &got[1]], &[&f1, &f2]).await;
+	assert_eq!(order_state(&r, &[second])[0]["state"], "refreshing");
+	let (o1, c1) = publish_as(&r, &f1, &news[0]);
+	println!("UM the first new leaf published: order {} at {}", o1, c1);
+	assert_eq!((o1.as_str(), c1.as_str()), (news[0].held.id.to_string().as_str(), news[0].held.id.to_string().as_str()),
+		"the unpublished order's leaf is an order of its own");
+	assert_eq!(order_state(&r, &[second])[0]["state"], "refreshing", "the second order is not taken by the first leaf");
+	let (o2, _) = publish_as(&r, &f2, &news[1]);
+	println!("UM the second new leaf published: order {}", o2);
+	assert_eq!(o2, second.to_string(), "the second order goes on at its own leaf");
+	assert_rests_at(&r, "UM the second order", second, &news[1], &f2);
+	let own = order_state(&r, &[news[0].held.id])[0].clone();
+	assert_eq!((own["state"].as_str(), own["owner"].as_str()), (Some("resting"), Some(hex(&xonly(&f1.key).serialize()).as_str())));
+}
+
+/// Three orders of one landed terms and value refreshed in one participation,
+/// their leaves published out of order (the third, the first, the second):
+/// each goes on at its own leaf; until its own is published each reads
+/// `refreshing`.
+#[tokio::test(flavor = "multi_thread")]
+async fn three_orders_refreshed_together_go_on_whatever_order_they_publish_in() {
+	let mut r = start().await;
+	let m1 = maker(&r, "TM1");
+	let mut m2 = maker(&r, "TM2");
+	let mut m3 = maker(&r, "TM3");
+	m2.terms.landed = m1.terms.landed;
+	m3.terms.landed = m1.terms.landed;
+	let got = orders_of(&mut r, &[&m1, &m2, &m3], &[true, true, true]).await;
+	let ids: Vec<LeafId> = got.iter().map(|c| c.held.id).collect();
+	let fresh = [refreshed(&r, "TM1, refreshed", &m1), refreshed(&r, "TM2, refreshed", &m1), refreshed(&r, "TM3, refreshed", &m1)];
+	let (_, news) = refresh_in_one(&mut r, &[&got[0], &got[1], &got[2]], &[&fresh[0], &fresh[1], &fresh[2]]).await;
+	for (k, j) in [2usize, 0, 1].iter().enumerate() {
+		let (o, _) = publish_as(&r, &fresh[*j], &news[*j]);
+		println!("TM leaf {} published {}: order {}", j + 1, k + 1, o);
+		assert_eq!(o, ids[*j].to_string());
+		let states: Vec<String> = order_state(&r, &ids).iter().map(|o| o["state"].as_str().unwrap().to_string()).collect();
+		println!("TM states after it: {:?}", states);
+	}
+	for j in 0..3 {
+		assert_rests_at(&r, &format!("TM order {}", j + 1), ids[j], &news[j], &fresh[j]);
+	}
+}
+
+/// Two makers' orders of different terms refreshed in one participation,
+/// the leaves wanted in the other order (B's first): each order goes on at
+/// the leaf of its own terms.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_makers_refreshed_in_one_participation_each_get_their_own_leaf() {
+	let mut r = start().await;
+	let a = maker(&r, "MA");
+	let mut b = maker(&r, "MB");
+	b.terms.landed.terms.rate_num = 3;
+	let got = orders_of(&mut r, &[&a, &b], &[true, true]).await;
+	let (fa, fb) = (refreshed(&r, "MA, refreshed", &a), refreshed(&r, "MB, refreshed", &b));
+	let (_, news) = refresh_in_one(&mut r, &[&got[0], &got[1]], &[&fb, &fa]).await;
+	let (ob, _) = publish_as(&r, &fb, &news[0]);
+	let (oa, _) = publish_as(&r, &fa, &news[1]);
+	println!("MB's leaf answered order {}, MA's leaf order {}", ob, oa);
+	assert_eq!((oa, ob), (got[0].held.id.to_string(), got[1].held.id.to_string()));
+	assert_rests_at(&r, "MA", got[0].held.id, &news[1], &fa);
+	assert_rests_at(&r, "MB", got[1].held.id, &news[0], &fb);
+	assert_eq!(order_state(&r, &[got[1].held.id])[0]["terms"]["rate_num"], json!("3"), "B's terms, unchanged");
 }

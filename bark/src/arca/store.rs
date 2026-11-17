@@ -224,11 +224,14 @@ pub struct RestingRow {
 	/// Its terms, as the leaf record's JSON gives them.
 	pub terms: String,
 	pub amount: u64,
-	/// The nonces of its four credit keys, hex, the first credit's first.
+	/// The nonces of its credit keys, hex, the first credit's first: four
+	/// for each coin a round made of it (at resting, and at each refresh),
+	/// the current coin's four last.
 	pub credit_nonces: Vec<String>,
 	/// The coin its round made, once the wallet holds it: the order's id.
 	pub order_leaf: Option<String>,
-	/// `participating`, `published`, `cancelled` or `not_rested`.
+	/// `participating`, `published`, `refreshing`, `lost`, `cancelled` or
+	/// `not_rested`.
 	pub state: String,
 }
 
@@ -1162,6 +1165,14 @@ impl Store {
 	pub fn set_resting(&self, id: &str, order_leaf: Option<&str>, state: &str) -> Result<(), Error> {
 		self.conn.execute("UPDATE resting_order SET order_leaf = COALESCE(?2, order_leaf), state = ?3 WHERE id = ?1",
 			params![id, order_leaf, state]).map_err(db)?;
+		Ok(())
+	}
+
+	/// Resting order `id` goes on at a coin a refresh made: the owner nonce
+	/// of that coin's key, and its credit nonces after the earlier ones.
+	pub fn set_resting_keys(&self, id: &str, nonce: &[u8; 32], credit_nonces: &[String]) -> Result<(), Error> {
+		self.conn.execute("UPDATE resting_order SET nonce = ?2, credit_nonces = ?3 WHERE id = ?1",
+			params![id, &nonce[..], serde_json::to_string(credit_nonces).expect("strings")]).map_err(db)?;
 		Ok(())
 	}
 

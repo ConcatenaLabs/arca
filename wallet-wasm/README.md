@@ -173,7 +173,8 @@ leaves (`take_quote`, `take`, `order_quote`, `order_place`, `orders`,
 `order_refund`); an order resting in the tree (`order_rest_quote`,
 `order_rest`, `order_resting {orders?, brief?}`, `order_fill_resting_quote {order,
 amount?}`, `order_fill_resting {order, amount?, shown?}`,
-`order_cancel_resting_quote {order}`, `order_cancel_resting {order, shown?}`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
+`order_cancel_resting_quote {order}`, `order_cancel_resting {order, shown?}`,
+`order_refresh_resting_quote {order, max_fee_ppm?}`, `order_refresh_resting {order, max_fee_ppm?, shown?}`); the in-tree swap (`swap_offer {give_asset, give, want_asset,
 want, leaves?}`, `swap_read {offer}`, `swap_accept {offer, shown?}`, `swap_complete
 {accept}`, `swap_cancel {swap}`, `swaps {swaps?}`); the swap of BTC in a Bitcoin
 ark (`btc_swap_*`); payments over Lightning in and out of the tree

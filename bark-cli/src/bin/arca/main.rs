@@ -966,6 +966,23 @@ enum OrderCmd {
 		#[arg(long)]
 		shown: Option<String>,
 	},
+	/// Gives an order the wallet rests in the tree a fresh coin in the
+	/// operator's next round, and keeps it: the same id, terms and amount,
+	/// its depth back to that of a round's leaf and four fills ahead of it.
+	/// The round's fee is paid from another coin of the asset the order
+	/// sells; `sync` publishes the new coin once the round is final.
+	RefreshResting {
+		order: String,
+		/// The most the refresh's fee may be, in millionths of what it gives up.
+		#[arg(long)]
+		max_fee_ppm: Option<u64>,
+		/// Only says what the refresh would give up and cost, signing nothing.
+		#[arg(long, conflicts_with = "shown")]
+		quote: bool,
+		/// The quote shown to the user, as `--quote` answered it.
+		#[arg(long)]
+		shown: Option<String>,
+	},
 	/// Takes back what an order holds where it rests, by its REFUND, once
 	/// the chain's median time has passed its expiry: to an address of the
 	/// wallet's.
@@ -1802,6 +1819,14 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
 				.map_err(|e| bark::arca::Error::Parse(format!("the cancel shown: {}", e)))).transpose()?;
 			w.order_cancel_resting(&order, shown.as_ref())
+		},
+		Cmd::Order(OrderCmd::RefreshResting { order, max_fee_ppm, quote, shown }) => {
+			if quote {
+				return w.order_refresh_resting_quote(&order, max_fee_ppm);
+			}
+			let shown = shown.map(|s| serde_json::from_str::<Value>(&s)
+				.map_err(|e| bark::arca::Error::Parse(format!("the refresh shown: {}", e)))).transpose()?;
+			w.order_refresh_resting(&order, max_fee_ppm, shown.as_ref())
 		},
 		Cmd::Orders => w.orders(),
 		Cmd::Offboard { asset: a, amount, coins, value, expiry, address, script, fee_asset, max_fee_ppm, quote, shown } => {

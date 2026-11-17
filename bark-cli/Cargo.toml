@@ -83,6 +83,8 @@ elements.workspace = true
 tokio-postgres = "0.7"
 rusqlite = "0.31.0"
 tokio = { workspace = true, features = [ "time" ] }
+lwk_signer.workspace = true
+lwk_common.workspace = true
 
 [[test]]
 name = "arca_shaped"
