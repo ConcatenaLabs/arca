@@ -286,3 +286,40 @@ async fn the_most_a_lightning_payment_can_be_is_paid() {
 		}
 	}
 }
+
+/// A small coin the wallet takes first (it expires later), beside a large one:
+/// every amount below `most` pays, those the small coin alone covers included,
+/// although the small coin's margins alone are above the wallet's bound (#869).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_coin_taken_first_does_not_refuse_what_the_coins_pay() {
+	let tag = "SF10 small coin first";
+	let mut r = start().await;
+	let x = r.x;
+	let a = wallet(&r, &format!("{} A", tag));
+	let c = wallet(&r, &format!("{} C", tag));
+	// The 30,000 boarded once the 2,000,000 is in: it expires later, so it is
+	// the first taken.
+	boards(&mut r, &a, x, &[2_000_000]).await;
+	r.produce().await;
+	boards(&mut r, &a, x, &[30_000]).await;
+	for k in a.ok(&["coins"]).as_array().unwrap().iter().filter(|k| k["asset"] == x.to_string().as_str()) {
+		println!("{}: coin {} expiry {} {}", tag, k["value"], k["expiry"], k["state"]);
+	}
+	let (held, k) = live_of(&a, &x.to_string());
+	assert_eq!((held, k), (2_030_000, 2), "{}", tag);
+	let to = request(&c);
+	let quote = |v: u64| library(&a, "send_quote", json!({"request": to, "amount": v.to_string(), "asset": x.to_string(), "route": "leaf"}));
+	let (most, _) = check(tag, &quote, held);
+	for v in [5_000u64, 10_000, 20_000, 25_000, 28_000, 29_000, 40_000, 100_000] {
+		assert!(v < most, "{}: {} is below most {}", tag, v, most);
+		if let Err(e) = quote(v) {
+			panic!("{}: {} (most {}) is refused: {}", tag, v, most, e);
+		}
+	}
+	// And it is paid, for real.
+	let sent = a.ok(&["send", &request(&c), "--amount", "10000", "--asset", &x.to_string()]);
+	println!("{}: sent 10000: {} inputs", tag, sent["inputs"].as_array().map(|v| v.len()).unwrap_or(0));
+	for w in [&a, &c] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
