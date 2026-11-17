@@ -3673,6 +3673,163 @@ mod test {
 		check("an empty block after it, d watched", 0, 4, &all);
 	}
 
+	// ---- What a carried scan answer must not outlive (against a regtest node) ----
+	fn regtest_node() -> Option<(tempfile::TempDir, sequentia_ext::regtest::Regtest, String)> {
+		use sequentia_ext::regtest::Regtest;
+		if std::env::var_os("SEQUENTIAD_EXEC").is_none() {
+			eprintln!("SEQUENTIAD_EXEC is not set: skipped");
+			return None;
+		}
+		let dir = tempfile::tempdir().unwrap();
+		let r = Regtest::from_env(dir.path(), &["-acceptnonstdtxn=1"]);
+		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
+		Some((dir, r, url))
+	}
+	fn free_coin(chain: &ChainSource) -> (OutPoint, AssetId, u64) {
+		let op_true = Script::from(vec![0x51]);
+		let block = chain.raw_block(&chain.genesis().unwrap()).unwrap();
+		let (free, coin) = block.txdata.iter().flat_map(|t| t.output.iter().enumerate().map(move |(i, o)| (OutPoint::new(t.txid(), i as u32), o.clone())))
+			.find(|(_, o)| o.script_pubkey == op_true && o.value.explicit().is_some_and(|v| v > 1_000_000)).expect("free coins");
+		(free, coin.asset.explicit().unwrap(), coin.value.explicit().unwrap())
+	}
+	fn coins_of(src: &ChainSource, s: &[Script]) -> Vec<(OutPoint, u64)> {
+		let mut v: Vec<(OutPoint, u64)> = src.coins_at(s).unwrap().into_iter().map(|(op, _, h)| (op, h)).collect();
+		v.sort();
+		v
+	}
+
+	/// A reorganisation to a LONGER chain whose replaced block pays the script:
+	/// the carry's height guard does not apply, only the link to the scan's tip.
+	#[test]
+	fn a_reorg_to_a_longer_chain_carries_nothing() {
+		let _serial = serial();
+		let Some((_dir, r, url)) = regtest_node() else { return };
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let (free, asset, value) = free_coin(&chain);
+		let c = Script::from(vec![0x01, 0xcc, 0x75, 0x51]);
+		r.produce_block().unwrap();
+		gap(); chain.new_command();
+		assert!(coins_of(&chain, std::slice::from_ref(&c)).is_empty());
+		let t1 = chain.tip().unwrap();
+		let _: Value = r.node.client().call("invalidateblock", &[json!(t1.hash.to_string())]).unwrap();
+		let to_c = spend_to(free, asset, value, c.clone());
+		r.node.client().send_raw_transaction(&to_c).unwrap();
+		r.produce_block().unwrap();
+		r.produce_block().unwrap();
+		gap(); chain.new_command();
+		let tip = chain.tip().unwrap();
+		assert_eq!(tip.height, t1.height + 1);
+		let (s0, c0) = chain.scans();
+		let got = coins_of(&chain, std::slice::from_ref(&c));
+		let (s1, c1) = chain.scans();
+		let fresh = coins_of(&ChainSource::new(&url, Some("arca"), Some("arca"), None), std::slice::from_ref(&c));
+				assert!(fresh.iter().any(|(op, _)| op.txid == to_c.txid()), "the fresh answer has the coin");
+		assert_eq!(got, fresh, "a carried answer hid the coin paid in the replaced block");
+	}
+
+	/// The anchor status changes (not_validated at genesis, ok from the first
+	/// block): nothing is carried across it.
+	#[test]
+	fn an_anchor_status_change_carries_nothing() {
+		let _serial = serial();
+		let Some((_dir, r, url)) = regtest_node() else { return };
+		let chain = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let c = Script::from(vec![0x01, 0xcc, 0x75, 0x51]);
+		gap(); chain.new_command();
+		let a0: Value = r.node.client().call("getanchorstatus", &[]).unwrap();
+		coins_of(&chain, std::slice::from_ref(&c));
+		r.produce_block().unwrap();
+		gap(); chain.new_command();
+		let a1: Value = r.node.client().call("getanchorstatus", &[]).unwrap();
+		let (s0, c0) = chain.scans();
+		coins_of(&chain, std::slice::from_ref(&c));
+		let (s1, c1) = chain.scans();
+				assert_ne!(a0["anchorstatus"], a1["anchorstatus"], "the status changed");
+		assert_eq!((s1 - s0, c1 - c0), (1, 0), "nothing carried across an anchor status change");
+	}
+
+	/// A node's RPC behind a proxy that answers the first `n` scans of the
+	/// set of unspent outputs as a scan another client aborted: `success`
+	/// false and no unspents.
+	fn aborting_proxy(upstream: String, n: u64) -> String {
+		use std::io::{BufRead, BufReader, Read, Write};
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let url = format!("http://{}/", listener.local_addr().unwrap());
+		let upstream = upstream.trim_start_matches("http://").trim_end_matches('/').to_string();
+		std::thread::spawn(move || {
+			let left = AtomicU64::new(n);
+			// One HTTP message off a stream: its head and its body.
+			let read_message = |r: &mut BufReader<std::net::TcpStream>| -> Option<(String, Vec<u8>)> {
+				let (mut head, mut length) = (String::new(), 0usize);
+				loop {
+					let mut line = String::new();
+					if r.read_line(&mut line).ok()? == 0 {
+						return None;
+					}
+					if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+						length = v.trim().parse().ok()?;
+					}
+					if line == "\r\n" {
+						break;
+					}
+					head.push_str(&line);
+				}
+				let mut body = vec![0u8; length];
+				r.read_exact(&mut body).ok()?;
+				Some((head, body))
+			};
+			let abort = |call: &Value, answer: &mut Value| {
+				if call["method"] == json!("scantxoutset") && answer["result"].is_object()
+					&& left.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| l.checked_sub(1)).is_ok() {
+					answer["result"]["success"] = json!(false);
+					answer["result"]["unspents"] = json!([]);
+				}
+			};
+			for stream in listener.incoming() {
+				let Ok(mut stream) = stream else { continue };
+				let Some((head, body)) = read_message(&mut BufReader::new(stream.try_clone().unwrap())) else { continue };
+				let Ok(mut up) = std::net::TcpStream::connect(&upstream) else { continue };
+				let _ = write!(up, "{}Content-Length: {}\r\nConnection: close\r\n\r\n", head, body.len());
+				let _ = up.write_all(&body);
+				let Some((_, reply)) = read_message(&mut BufReader::new(up)) else { continue };
+				let mut out: Value = serde_json::from_slice(&reply).unwrap_or(Value::Null);
+				match (serde_json::from_slice::<Value>(&body), &mut out) {
+					(Ok(Value::Array(calls)), Value::Array(answers)) => calls.iter().zip(answers.iter_mut()).for_each(|(c, a)| abort(c, a)),
+					(Ok(call), answer) => abort(&call, answer),
+					_ => {},
+				}
+				let out = out.to_string();
+				let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", out.len(), out);
+			}
+		});
+		url
+	}
+
+	/// A scan answered `success: false` (another client aborted it, arca
+	/// #684) is kept for its own view and never carried to the next one.
+	#[test]
+	fn an_aborted_scan_is_never_carried() {
+		let _serial = serial();
+		let Some((_dir, r, url)) = regtest_node() else { return };
+		let direct = ChainSource::new(&url, Some("arca"), Some("arca"), None);
+		let (free, asset, value) = free_coin(&direct);
+		let c = Script::from(vec![0x01, 0xcc, 0x75, 0x51]);
+		let to_c = spend_to(free, asset, value, c.clone());
+		r.produce_block().unwrap();
+		r.node.client().send_raw_transaction(&to_c).unwrap();
+		r.produce_block().unwrap();
+		let chain = ChainSource::new(&aborting_proxy(url.clone(), 1), Some("arca"), Some("arca"), None);
+		gap(); chain.new_command();
+		let first = coins_of(&chain, std::slice::from_ref(&c));
+		assert!(first.is_empty(), "the first scan was answered as aborted");
+		r.produce_block().unwrap();
+		gap(); chain.new_command();
+		let got = coins_of(&chain, std::slice::from_ref(&c));
+		let fresh = coins_of(&ChainSource::new(&url, Some("arca"), Some("arca"), None), std::slice::from_ref(&c));
+		assert!(fresh.iter().any(|(op, _)| op.txid == to_c.txid()), "the fresh answer has the coin");
+		assert_eq!(got, fresh, "an aborted scan's answer was carried into the next view");
+	}
+
 	// ---- The searches over the block index, against the searches they replaced ----
 	//
 	// `find_payment`, `find_payments`, `spender` and `scripts_seen` read a
