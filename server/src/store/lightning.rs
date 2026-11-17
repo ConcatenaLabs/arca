@@ -47,9 +47,9 @@ pub struct SendRow {
 	pub reason: Option<String>,
 }
 
-const COLUMNS: &str = "payment_hash, asset, invoice, amount, fee, transfer_id, htlc_leaf_id, state, preimage, reason";
+pub(super) const COLUMNS: &str = "payment_hash, asset, invoice, amount, fee, transfer_id, htlc_leaf_id, state, preimage, reason";
 
-fn row_of(r: &tokio_postgres::Row) -> Result<SendRow, StoreError> {
+pub(super) fn row_of(r: &tokio_postgres::Row) -> Result<SendRow, StoreError> {
 	Ok(SendRow {
 		payment_hash: array32(r.get(0), "payment hash")?,
 		asset: array32(r.get(1), "asset")?,

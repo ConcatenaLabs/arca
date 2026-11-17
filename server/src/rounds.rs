@@ -269,7 +269,7 @@
 //! a wallet, or a mirror, rebuilds every script of the tree and checks it
 //! against the round transaction from that alone.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -386,9 +386,31 @@ fn lowest_nodes(record: &CoinRecord) -> Option<Vec<[u8; 32]>> {
 
 /// The children hash of the lowest node above a batch leaf, from its leaf
 /// record; `None` for an accumulator batch's leaf.
+///
+/// Working it out rebuilds the leaf's branch, its scripts and their keys,
+/// about a sixth of a millisecond, and `holding_back` and the in-flight cap
+/// ask it of every slot they read, again on every call. The answer depends
+/// on the record's bytes alone, so it is kept by their hash
+/// ([`LOWEST_KEPT`] records at most, forgotten all at once when full).
 fn lowest_of(record: &[u8]) -> Option<[u8; 32]> {
-	arca_covenant::LeafRecord::from_bytes(record).ok().and_then(|r| r.branch().ok()).and_then(|b| b.nodes.last().map(|n| n.children_hash()))
+	use std::sync::{LazyLock, Mutex};
+	static KEPT: LazyLock<Mutex<HashMap<[u8; 32], Option<[u8; 32]>>>> = LazyLock::new(Default::default);
+	let key = arca_covenant::script::sha256(record);
+	if let Some(h) = KEPT.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+		return *h;
+	}
+	let h = arca_covenant::LeafRecord::from_bytes(record).ok().and_then(|r| r.branch().ok()).and_then(|b| b.nodes.last().map(|n| n.children_hash()));
+	let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+	if kept.len() >= LOWEST_KEPT {
+		kept.clear();
+	}
+	kept.insert(key, h);
+	h
 }
+
+/// The most records whose lowest node [`lowest_of`] keeps: some 10 MB,
+/// more than twice the batch leaves of the testnet's operator.
+const LOWEST_KEPT: usize = 1 << 17;
 
 /// Of the coins `leaf_ids`, the ones that keep a lowest node's fronted value
 /// from coming back, and nothing else does: each coin rests on the node,
@@ -408,13 +430,30 @@ fn lowest_of(record: &[u8]) -> Option<[u8; 32]> {
 /// those coins is at hand, and to none while a holder is away.
 pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]], active: &ActiveCoins) -> Result<Vec<([u8; 32], u64)>, StoreError> {
 	let asked: HashSet<[u8; 32]> = leaf_ids.iter().copied().collect();
+	// Everything the walks below read, read ahead in a few statements from
+	// one snapshot of the store: the batch leaves under the coins asked
+	// after, the rounds and batches of their nodes, then the coins those
+	// nodes' slots became, a step of reassignments at a time, as far as
+	// each node's walk can follow ([`HoldingReads`]).
+	let mut reader = store.reader().await?;
+	let snapshot = reader.snapshot().await?;
+	let under = snapshot.batch_leaves_under(leaf_ids).await?;
+	let mut lowest: HashMap<[u8; 32], Option<[u8; 32]>> = HashMap::new();
+	for (_, bl) in &under {
+		lowest.entry(bl.leaf_id).or_insert_with(|| lowest_of(&bl.record));
+	}
+	let ahead = HoldingReads::read(&snapshot, &under, &mut lowest).await?;
+	snapshot.end().await?;
+	drop(reader);
+	let reads = crate::delegations::Reads::ahead(store, &ahead.coins);
+	let mut served: HashMap<Vec<[u8; 32]>, bool> = HashMap::new();
 	let mut nodes: BTreeMap<[u8; 32], Option<(Vec<[u8; 32]>, u64)>> = BTreeMap::new();
 	let mut seen: HashSet<([u8; 32], [u8; 32])> = HashSet::new();
 	let mut back: BTreeMap<[u8; 32], u64> = BTreeMap::new();
-	for (id, bl) in store.batch_leaves_under(leaf_ids).await? {
-		let Some(h) = lowest_of(&bl.record) else { continue };
+	for (id, bl) in under {
+		let Some(h) = lowest[&bl.leaf_id] else { continue };
 		if !nodes.contains_key(&h) {
-			let held = held_back_by(store, &bl, h, leaf_ids, &asked, active).await?;
+			let held = held_back_by(store, reads, &ahead, &lowest, &bl, h, leaf_ids, &asked, active, &mut served).await?;
 			nodes.insert(h, held);
 		}
 		if let Some(Some((waits, b))) = nodes.get(&h) {
@@ -426,31 +465,124 @@ pub async fn holding_back(store: &Store, leaf_ids: &[[u8; 32]], active: &ActiveC
 	Ok(leaf_ids.iter().filter_map(|id| back.get(id).map(|b| (*id, *b))).collect())
 }
 
+/// What [`holding_back`] reads, read ahead of its walks from one snapshot
+/// of the store: the rounds and the batches (with their leaves) of the batch
+/// leaves under the coins asked after, and the rows of the coins the slots
+/// of those batches' lowest nodes became ([`crate::store::CoinReads`]), each
+/// step's statements sent together.
+///
+/// A step follows only what a node's walk can follow
+/// ([`crate::delegations::steps_from`]): a coin no order resting again,
+/// spent by the reassignment its delegation names; and no more coins for a
+/// node, its slots included, than its walk can read
+/// ([`crate::delegations::WALK_READS`], the steps of
+/// [`arca_covenant::node::RECLAIM_STEPS`] being shared by the node's slots).
+/// So a read ahead never costs more rows than the walks would read
+/// themselves, however large a lineage below a node grows. A read of 64
+/// coins costs some ten statements on one connection, where a statement for
+/// each step of each walk, each on a connection of its own, cost several
+/// hundred. A row a walk needs and that is not here is read by the walk
+/// itself, so the answer never depends on what was read ahead; and every
+/// row read ahead is of the one snapshot, so a write committed while it
+/// reads (a round ending, a delegation signed) is seen whole or not at all.
+struct HoldingReads {
+	rounds: HashMap<i64, crate::store::RoundRow>,
+	batches: HashMap<(i64, u32), (crate::store::BatchRow, Vec<crate::store::BatchLeafRow>)>,
+	coins: crate::store::CoinReads,
+}
+
+impl HoldingReads {
+	async fn read(snapshot: &crate::store::Snapshot<'_>, under: &[([u8; 32], crate::store::BatchLeafRow)],
+		lowest: &mut HashMap<[u8; 32], Option<[u8; 32]>>)
+		-> Result<HoldingReads, StoreError>
+	{
+		use crate::delegations::{steps_from, WALK_READS};
+		let round_ids: Vec<i64> = under.iter().map(|(_, bl)| bl.round_id).collect::<BTreeSet<_>>().into_iter().collect();
+		// The batches of every node, whatever its round's state: a walk
+		// starts only from a round broadcast or final, and reads only those.
+		let outputs: Vec<(i64, u32)> = under.iter()
+			.filter(|(_, bl)| lowest.get(&bl.leaf_id).is_some_and(Option::is_some))
+			.map(|(_, bl)| (bl.round_id, bl.vout)).collect::<BTreeSet<_>>().into_iter().collect();
+		let (rounds, batches) = snapshot.rounds_and_batches(&round_ids, &outputs).await?;
+		let rounds: HashMap<i64, crate::store::RoundRow> = rounds.into_iter().map(|r| (r.round_id, r)).collect();
+		let batches: HashMap<(i64, u32), _> = batches.into_iter().map(|(b, l)| ((b.round_id, b.vout), (b, l))).collect();
+		// Every slot of every node a walk may start from: the leaves of the
+		// batches read whose lowest node is one under a coin asked after.
+		// `next` holds each coin to read at the next step with the nodes
+		// whose walks may reach it, `given` the coins each node's walks have
+		// been given so far, slots included.
+		let starting: HashSet<[u8; 32]> = under.iter().filter_map(|(_, bl)| lowest[&bl.leaf_id]).collect();
+		let mut next: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>> = BTreeMap::new();
+		let mut given: HashMap<[u8; 32], usize> = HashMap::new();
+		for ((round_id, _), (_, leaves)) in &batches {
+			if !rounds.get(round_id).is_some_and(|r| matches!(r.state, RoundState::Broadcast | RoundState::Final)) {
+				continue;
+			}
+			for l in leaves {
+				let h = *lowest.entry(l.leaf_id).or_insert_with(|| lowest_of(&l.record));
+				if let Some(h) = h.filter(|h| starting.contains(h)) {
+					next.entry(l.leaf_id).or_default().insert(h);
+					*given.entry(h).or_default() += 1;
+				}
+			}
+		}
+		let mut coins = crate::store::CoinReads::default();
+		while !next.is_empty() {
+			let unread: Vec<[u8; 32]> = next.keys().filter(|c| !coins.has(c)).copied().collect();
+			if !unread.is_empty() {
+				coins.extend(snapshot.coin_reads(&unread).await?);
+			}
+			let mut after: BTreeMap<[u8; 32], BTreeSet<[u8; 32]>> = BTreeMap::new();
+			for (c, nodes) in &next {
+				let Some(steps) = steps_from(&coins, c) else { continue };
+				for h in nodes {
+					// Past what the node's walk can read, its walk reads
+					// the rest itself, and stops there.
+					let n = given.entry(*h).or_default();
+					if *n + steps.len() > WALK_READS {
+						continue;
+					}
+					*n += steps.len();
+					for s in &steps {
+						after.entry(*s).or_default().insert(*h);
+					}
+				}
+			}
+			next = after;
+		}
+		Ok(HoldingReads { rounds, batches, coins })
+	}
+}
+
 /// Of node `h` of `bl`'s batch, the coins it still waits on and what it holds
 /// beyond them, when those are all among `asked` and it holds something
-/// more ([`holding_back`]).
-async fn held_back_by(store: &Store, bl: &crate::store::BatchLeafRow, h: [u8; 32], leaf_ids: &[[u8; 32]], asked: &HashSet<[u8; 32]>,
-	active: &ActiveCoins)
+/// more ([`holding_back`]). Reads by `reads` and from `ahead`, each round,
+/// batch and coin as the store holds it.
+#[allow(clippy::too_many_arguments)]
+async fn held_back_by(store: &Store, reads: crate::delegations::Reads<'_>, ahead: &HoldingReads,
+	lowest: &HashMap<[u8; 32], Option<[u8; 32]>>, bl: &crate::store::BatchLeafRow, h: [u8; 32], leaf_ids: &[[u8; 32]],
+	asked: &HashSet<[u8; 32]>, active: &ActiveCoins, served: &mut HashMap<Vec<[u8; 32]>, bool>)
 	-> Result<Option<(Vec<[u8; 32]>, u64)>, StoreError>
 {
-	let Some(round) = store.round(bl.round_id).await? else { return Ok(None) };
+	let Some(round) = ahead.rounds.get(&bl.round_id) else { return Ok(None) };
 	if !matches!(round.state, RoundState::Broadcast | RoundState::Final) {
 		return Ok(None);
 	}
-	let Some((batch, leaves)) = store.batch(&round.txid, bl.vout).await? else { return Ok(None) };
-	let slots: Vec<&crate::store::BatchLeafRow> = leaves.iter().filter(|l| lowest_of(&l.record) == Some(h)).collect();
+	let Some((batch, leaves)) = ahead.batches.get(&(bl.round_id, bl.vout)) else { return Ok(None) };
+	let slots: Vec<&crate::store::BatchLeafRow> = leaves.iter()
+		.filter(|l| lowest.get(&l.leaf_id).copied().unwrap_or_else(|| lowest_of(&l.record)) == Some(h)).collect();
 	let ids: Vec<[u8; 32]> = slots.iter().map(|l| l.leaf_id).collect();
-	if !crate::delegations::can_complete(store, &ids, h).await? {
+	if !crate::delegations::can_complete_with(reads, &ids, h).await? {
 		return Ok(None);
 	}
 	let (mut value, mut waits) = (0u64, vec![]);
 	for l in slots {
 		value = value.saturating_add(l.value);
-		let Some(w) = crate::delegations::waiting_on(store, l.leaf_id, h, batch.delegated_reclaim, arca_covenant::node::RECLAIM_STEPS).await? else {
+		let Some(w) = crate::delegations::waiting_on_with(reads, l.leaf_id, h, batch.delegated_reclaim, arca_covenant::node::RECLAIM_STEPS).await? else {
 			return Ok(None);
 		};
 		for c in w {
-			if !asked.contains(&c) && !at_hand(store, active, &c, leaf_ids).await? {
+			if !asked.contains(&c) && !at_hand(store, active, &c, leaf_ids, served).await? {
 				return Ok(None);
 			}
 			if !waits.contains(&c) {
@@ -460,7 +592,11 @@ async fn held_back_by(store: &Store, bl: &crate::store::BatchLeafRow, h: [u8; 32
 	}
 	let mut waited = 0u64;
 	for c in &waits {
-		waited = waited.saturating_add(store.leaf(c).await?.map_or(0, |l| l.value));
+		let leaf = match ahead.coins.leaf(c) {
+			Some(l) => l?,
+			None => store.leaf(c).await?,
+		};
+		waited = waited.saturating_add(leaf.map_or(0, |l| l.value));
 	}
 	let back = value.saturating_sub(waited);
 	Ok((!waits.is_empty() && back > 0).then_some((waits, back)))
@@ -516,9 +652,20 @@ impl ActiveCoins {
 /// coins `asked` is served to. A coin marked by the asker's own keys does not
 /// count: one holder's coins of a node are named, and refreshed for no fee,
 /// together, never one without the other.
-async fn at_hand(store: &Store, active: &ActiveCoins, c: &[u8; 32], asked: &[[u8; 32]]) -> Result<bool, StoreError> {
+/// `served` keeps the answer for each set of keys, `asked` being the same
+/// throughout one read.
+async fn at_hand(store: &Store, active: &ActiveCoins, c: &[u8; 32], asked: &[[u8; 32]], served: &mut HashMap<Vec<[u8; 32]>, bool>)
+	-> Result<bool, StoreError>
+{
 	match active.keys_of(c) {
-		Some(keys) => Ok(store.served_among(&keys, asked).await?.is_empty()),
+		Some(keys) => {
+			if let Some(none) = served.get(&keys) {
+				return Ok(*none);
+			}
+			let none = store.served_among(&keys, asked).await?.is_empty();
+			served.insert(keys, none);
+			Ok(none)
+		},
 		None => Ok(false),
 	}
 }

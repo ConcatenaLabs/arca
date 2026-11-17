@@ -36,13 +36,84 @@ use arca_covenant::message::Chain;
 use arca_covenant::node::{connector_index, ReleaseTree, RECLAIM_STEPS};
 use arca_covenant::{Delegation, ExplicitOutput, LeafPolicy, ValidCoin};
 
-use crate::store::{HolderReleaseRow, SendState, SpentBy, Store, StoreError};
+use crate::store::{CoinReads, DelegationRow, HolderReleaseRow, LeafRow, SendRow, SendState, SpentBy, Store, StoreError};
 
 /// Checks `sig`, `coin`'s key's delegation into a reassignment of `outputs`,
 /// each the leaf `leaves` names at its index.
 pub fn check(coin: &ValidCoin, chain: Chain, outputs: &[ExplicitOutput], leaves: &[LeafPolicy], sig: &Signature) -> Result<(), String> {
 	let d = Delegation::for_outputs(coin.leaf.owner, chain, outputs, leaves).map_err(|e| e.to_string())?;
 	d.verify(sig).map_err(|e| e.to_string())
+}
+
+/// Where a reclaim's walk reads the store: a statement for each coin
+/// ([`Reads::of`]), or the rows read ahead for many coins together
+/// ([`Reads::ahead`], [`CoinReads`]), the store answering whatever those do
+/// not hold. Either way the walk finds the same rows.
+#[derive(Clone, Copy)]
+pub struct Reads<'a> {
+	store: &'a Store,
+	ahead: Option<&'a CoinReads>,
+}
+
+impl<'a> Reads<'a> {
+	/// Reads of `store`, a coin at a time.
+	pub fn of(store: &'a Store) -> Reads<'a> {
+		Reads { store, ahead: None }
+	}
+
+	/// Reads from `ahead`, and of `store` for what it does not hold.
+	pub fn ahead(store: &'a Store, ahead: &'a CoinReads) -> Reads<'a> {
+		Reads { store, ahead: Some(ahead) }
+	}
+
+	async fn spent_by(&self, leaf: &[u8; 32]) -> Result<SpentBy, StoreError> {
+		match self.ahead.and_then(|a| a.spent_by(leaf)) {
+			Some(r) => r,
+			None => self.store.spent_by(leaf).await,
+		}
+	}
+
+	async fn delegation(&self, leaf: &[u8; 32]) -> Result<Option<DelegationRow>, StoreError> {
+		match self.ahead.and_then(|a| a.delegation(leaf)) {
+			Some(r) => r,
+			None => self.store.delegation(leaf).await,
+		}
+	}
+
+	async fn leaf(&self, leaf: &[u8; 32]) -> Result<Option<LeafRow>, StoreError> {
+		match self.ahead.and_then(|a| a.leaf(leaf)) {
+			Some(r) => r,
+			None => self.store.leaf(leaf).await,
+		}
+	}
+
+	async fn holder_releases(&self, leaf: &[u8; 32], node_hash: &[u8; 32]) -> Result<Vec<HolderReleaseRow>, StoreError> {
+		match self.ahead.and_then(|a| a.holder_releases(leaf, node_hash)) {
+			Some(r) => r,
+			None => self.store.holder_releases(leaf, node_hash).await,
+		}
+	}
+
+	async fn paid_send_releases(&self, leaf: &[u8; 32], node_hash: &[u8; 32]) -> Result<Vec<HolderReleaseRow>, StoreError> {
+		match self.ahead.and_then(|a| a.paid_send_releases(leaf, node_hash)) {
+			Some(r) => r,
+			None => self.store.paid_send_releases(leaf, node_hash).await,
+		}
+	}
+
+	async fn refresh_open(&self, leaf: &[u8; 32]) -> Result<bool, StoreError> {
+		match self.ahead.and_then(|a| a.refresh_open(leaf)) {
+			Some(r) => Ok(r),
+			None => self.store.refresh_open(leaf).await,
+		}
+	}
+
+	async fn send_of_leaf(&self, leaf: &[u8; 32]) -> Result<Option<SendRow>, StoreError> {
+		match self.ahead.and_then(|a| a.send_of_leaf(leaf)) {
+			Some(r) => r,
+			None => self.store.send_of_leaf(leaf).await,
+		}
+	}
 }
 
 /// One slot's consent to a reclaim by RECLAIM-D, before the reclaim's inputs
@@ -114,7 +185,7 @@ pub fn consent<'a>(store: &'a Store, leaf_id: [u8; 32], key: XOnlyPublicKey, nod
 		}
 		match store.spent_by(&leaf_id).await? {
 			SpentBy::Reassignment { transfer_id, outputs } => {
-				if is_rest(store, &leaf_id).await? != Some(false) {
+				if is_rest(Reads::of(store), &leaf_id).await? != Some(false) {
 					return Ok(None);
 				}
 				let Some(d) = store.delegation(&leaf_id).await? else { return Ok(None) };
@@ -136,7 +207,7 @@ pub fn consent<'a>(store: &'a Store, leaf_id: [u8; 32], key: XOnlyPublicKey, nod
 				}
 				Ok(Some(Consent::Delegation { key, sig, to }))
 			},
-			SpentBy::Other => match is_rest(store, &leaf_id).await? {
+			SpentBy::Other => match is_rest(Reads::of(store), &leaf_id).await? {
 				Some(false) => release_of(key, store.holder_releases(&leaf_id, &node_hash).await?),
 				_ => Ok(None),
 			},
@@ -158,10 +229,39 @@ pub fn consent<'a>(store: &'a Store, leaf_id: [u8; 32], key: XOnlyPublicKey, nod
 /// ([`arca_covenant::ValidCoin::is_rest`]). A delegation a wallet signed for
 /// one before wallets stopped signing them may be in the store; it is never
 /// followed.
-async fn is_rest(store: &Store, leaf: &[u8; 32]) -> Result<Option<bool>, StoreError> {
-	Ok(store.leaf(leaf).await?.map(|row| matches!(arca_covenant::CoinRecord::from_bytes(&row.record),
-		Ok(arca_covenant::CoinRecord::Fill(f)) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. }))))
+async fn is_rest(reads: Reads<'_>, leaf: &[u8; 32]) -> Result<Option<bool>, StoreError> {
+	Ok(reads.leaf(leaf).await?.map(|row| rests(&row.record)))
 }
+
+/// Whether the coin of leaf record `record` is an order resting again
+/// ([`is_rest`]).
+fn rests(record: &[u8]) -> bool {
+	matches!(arca_covenant::CoinRecord::from_bytes(record),
+		Ok(arca_covenant::CoinRecord::Fill(f)) if matches!(f.leaf, arca_covenant::transfer::FillLeaf::Rest { .. }))
+}
+
+/// The coins a reclaim's walk ([`can_complete`]) steps on to from `leaf`,
+/// found in `ahead` alone: the outputs of the one signed reassignment that
+/// spent it, when it is no order resting again and its delegation names
+/// that reassignment. `None` wherever the walk stops there, and wherever
+/// `ahead` lacks a row it would need or holds one the walk would find
+/// corrupt (the walk then reads the store itself, and stops or fails as it
+/// does). A read ahead of the walk follows only these, so it never reads
+/// more than the walk could.
+pub fn steps_from(ahead: &CoinReads, leaf: &[u8; 32]) -> Option<Vec<[u8; 32]>> {
+	let Ok(SpentBy::Reassignment { transfer_id, outputs }) = ahead.spent_by(leaf)? else { return None };
+	let row = ahead.leaf(leaf)?.ok()??;
+	if rests(&row.record) {
+		return None;
+	}
+	let d = ahead.delegation(leaf)?.ok()??;
+	(d.transfer_id == transfer_id && !outputs.is_empty()).then(|| outputs.into_iter().map(|(o, _)| o).collect())
+}
+
+/// The most coins a reclaim's walk of one node reads ([`can_complete`]):
+/// every coin it reads costs at least a step of [`RECLAIM_STEPS`], shared by
+/// the node's slots, but the one at which it stops.
+pub const WALK_READS: usize = RECLAIM_STEPS + 1;
 
 /// `key`'s consent by the latest of its releases `rows`, if any.
 fn release_of(key: XOnlyPublicKey, rows: Vec<HolderReleaseRow>) -> Result<Option<Consent>, StoreError> {
@@ -203,9 +303,14 @@ pub async fn node_consents(store: &Store, slots: &[([u8; 32], XOnlyPublicKey)], 
 /// of a payment into the tree, or a tree past [`RECLAIM_STEPS`] steps, keeps
 /// the node until its batch expires.
 pub async fn can_complete(store: &Store, slots: &[[u8; 32]], node_hash: [u8; 32]) -> Result<bool, StoreError> {
+	can_complete_with(Reads::of(store), slots, node_hash).await
+}
+
+/// [`can_complete`], reading by `reads`.
+pub async fn can_complete_with(reads: Reads<'_>, slots: &[[u8; 32]], node_hash: [u8; 32]) -> Result<bool, StoreError> {
 	let mut left = RECLAIM_STEPS;
 	for leaf in slots {
-		match reach(store, *leaf, node_hash, left).await? {
+		match reach(reads, *leaf, node_hash, left).await? {
 			Some(n) if n <= left => left -= n,
 			_ => return Ok(false),
 		}
@@ -215,25 +320,25 @@ pub async fn can_complete(store: &Store, slots: &[[u8; 32]], node_hash: [u8; 32]
 
 /// The steps `leaf`'s consent would take once every holder under it
 /// releases ([`can_complete`]), or `None` when it never can within `budget`.
-fn reach<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], budget: usize)
+fn reach<'a>(reads: Reads<'a>, leaf: [u8; 32], node_hash: [u8; 32], budget: usize)
 	-> Pin<Box<dyn Future<Output = Result<Option<usize>, StoreError>> + Send + 'a>>
 {
 	Box::pin(async move {
 		if budget == 0 {
 			return Ok(None);
 		}
-		match store.spent_by(&leaf).await? {
+		match reads.spent_by(&leaf).await? {
 			SpentBy::Reassignment { transfer_id, outputs } => {
-				if is_rest(store, &leaf).await? != Some(false) {
+				if is_rest(reads, &leaf).await? != Some(false) {
 					return Ok(None);
 				}
-				match store.delegation(&leaf).await? {
+				match reads.delegation(&leaf).await? {
 					Some(d) if d.transfer_id == transfer_id && !outputs.is_empty() => {},
 					_ => return Ok(None),
 				}
 				let mut used = 1;
 				for (out, _) in outputs {
-					match reach(store, out, node_hash, budget.saturating_sub(used)).await? {
+					match reach(reads, out, node_hash, budget.saturating_sub(used)).await? {
 						Some(n) => used += n,
 						None => return Ok(None),
 					}
@@ -243,17 +348,17 @@ fn reach<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], budget: usiz
 			SpentBy::Other => {
 				// An order resting again releases nothing: its key delegated
 				// at the fill. Given up in a refresh, it never consents.
-				let Some(rest) = is_rest(store, &leaf).await? else { return Ok(None) };
-				let comes = !rest && (!store.holder_releases(&leaf, &node_hash).await?.is_empty() || store.refresh_open(&leaf).await?);
+				let Some(rest) = is_rest(reads, &leaf).await? else { return Ok(None) };
+				let comes = !rest && (!reads.holder_releases(&leaf, &node_hash).await?.is_empty() || reads.refresh_open(&leaf).await?);
 				Ok(comes.then_some(1))
 			},
 			SpentBy::Nothing => {
-				let Some(row) = store.leaf(&leaf).await? else { return Ok(None) };
+				let Some(row) = reads.leaf(&leaf).await? else { return Ok(None) };
 				let held = match arca_covenant::CoinRecord::from_bytes(&row.record) {
 					Ok(arca_covenant::CoinRecord::Transfer(t)) => match t.leaf.htlc {
 						None => true,
-						Some(h) if h.direction == arca_covenant::HtlcDirection::Send => match store.send_of_leaf(&leaf).await? {
-							Some(s) if s.state == SendState::Paid => !store.paid_send_releases(&leaf, &node_hash).await?.is_empty(),
+						Some(h) if h.direction == arca_covenant::HtlcDirection::Send => match reads.send_of_leaf(&leaf).await? {
+							Some(s) if s.state == SendState::Paid => !reads.paid_send_releases(&leaf, &node_hash).await?.is_empty(),
 							_ => true,
 						},
 						Some(_) => false,
@@ -279,18 +384,25 @@ fn reach<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], budget: usiz
 pub fn waiting_on<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], delegated: bool, budget: usize)
 	-> Pin<Box<dyn Future<Output = Result<Option<Vec<[u8; 32]>>, StoreError>> + Send + 'a>>
 {
+	waiting_on_with(Reads::of(store), leaf, node_hash, delegated, budget)
+}
+
+/// [`waiting_on`], reading by `reads`.
+pub fn waiting_on_with<'a>(reads: Reads<'a>, leaf: [u8; 32], node_hash: [u8; 32], delegated: bool, budget: usize)
+	-> Pin<Box<dyn Future<Output = Result<Option<Vec<[u8; 32]>>, StoreError>> + Send + 'a>>
+{
 	Box::pin(async move {
 		if budget == 0 {
 			return Ok(None);
 		}
-		match store.spent_by(&leaf).await? {
+		match reads.spent_by(&leaf).await? {
 			SpentBy::Reassignment { outputs, .. } => {
 				if !delegated {
 					return Ok(None);
 				}
 				let mut out = vec![];
 				for (o, _) in outputs {
-					match waiting_on(store, o, node_hash, delegated, budget - 1).await? {
+					match waiting_on_with(reads, o, node_hash, delegated, budget - 1).await? {
 						Some(w) => for l in w {
 							if !out.contains(&l) {
 								out.push(l);
@@ -302,8 +414,8 @@ pub fn waiting_on<'a>(store: &'a Store, leaf: [u8; 32], node_hash: [u8; 32], del
 				Ok(Some(out))
 			},
 			SpentBy::Other => Ok(Some(vec![])),
-			SpentBy::Nothing => match store.send_of_leaf(&leaf).await? {
-				Some(s) if s.state == SendState::Paid && !store.paid_send_releases(&leaf, &node_hash).await?.is_empty() => Ok(Some(vec![])),
+			SpentBy::Nothing => match reads.send_of_leaf(&leaf).await? {
+				Some(s) if s.state == SendState::Paid && !reads.paid_send_releases(&leaf, &node_hash).await?.is_empty() => Ok(Some(vec![])),
 				_ => Ok(Some(vec![leaf])),
 			},
 		}
