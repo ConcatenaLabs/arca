@@ -1598,7 +1598,9 @@ pub struct OrderState {
 	/// more: its credit keys are used, until its maker refreshes it),
 	/// `refreshing` (a round gives it a fresh coin of the same order, at its
 	/// maker's request: it takes no fill until it rests at that coin, under
-	/// the same id), `filling` (a fill of the coin it
+	/// the same id), `lost` (the round of its refresh left the chain for
+	/// good: the operator co-signs nothing of it, and `exit_coin` names the
+	/// coin whose exit brings its value home whole), `filling` (a fill of the coin it
 	/// rests at is recorded and not yet signed: it takes no other fill, and
 	/// the fill is either signed or dropped), `filled` (filled whole, the fill
 	/// signed), `cancelled` (its maker gave its coin up otherwise), `landed`
@@ -1628,6 +1630,9 @@ pub struct OrderState {
 	/// could no longer be cancelled. Its maker's refresh lifts it.
 	#[serde(default)]
 	pub whole_only: bool,
+	/// For a `lost` order: the coin whose exit brings its value home whole.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub exit_coin: Option<String>,
 	/// The earliest first expiry of the batches the coin rests on.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub expiry: Option<u32>,

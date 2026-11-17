@@ -868,3 +868,86 @@ async fn a_part_fill_that_would_leave_the_rest_at_the_depth_limit_is_refused() {
 	println!("the whole remainder taken: {}", st["state"]);
 	assert_eq!(st["state"], "filled");
 }
+
+/// One participation refreshes two orders of one landed terms and value (a
+/// maker that rests one level twice): it pairs the coins it gives up with
+/// the leaves it wants by position, and each order goes on at its own leaf
+/// under its own id as that leaf is published. While the round runs both
+/// read `refreshing`; after, neither does, and nothing is published under a
+/// new id.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_orders_of_one_terms_refreshed_in_one_participation_each_go_on() {
+	let mut r = start().await;
+	let x = r.x;
+	let m1 = maker(&r, "PM1");
+	let mut m2 = maker(&r, "PM2");
+	m2.terms.landed = m1.terms.landed;
+	let mut boards = vec![];
+	for label in ["PM1, board", "PM2, board"] {
+		let (held, tx) = credited_board(&mut r, &keypair(label), x).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let (w1, n1) = want_order(&m1, VALUE, x);
+	let (w2, n2) = want_order(&m2, VALUE, x);
+	let got = one_round(&mut r, &[(&boards[0], &m1.key, w1, n1), (&boards[1], &m2.key, w2, n2)]).await;
+	let o1 = r.http.post("order_publish", &publish_body(&r, &m1, &got[0], &m1.key)).ok();
+	let o2 = r.http.post("order_publish", &publish_body(&r, &m2, &got[1], &m2.key)).ok();
+	let ids = [got[0].held.id, got[1].held.id];
+	assert_eq!((o1["state"].as_str(), o2["state"].as_str()), (Some("resting"), Some("resting")));
+	assert_eq!(o1["terms"]["expiry"], o2["terms"]["expiry"], "one landed terms");
+
+	// The refresh: new leaf keys and credit keys, the same landed terms and
+	// value, both coins in one participation.
+	let mut f1 = maker(&r, "PM1, refreshed");
+	let mut f2 = maker(&r, "PM2, refreshed");
+	f1.terms.landed = m1.terms.landed;
+	f2.terms.landed = m1.terms.landed;
+	let (v1, k1) = want_order(&f1, VALUE, x);
+	let (v2, k2) = want_order(&f2, VALUE, x);
+	let (body, id) = participation_body(&[&got[0].held, &got[1].held], &[v1, v2], &[], None, xonly(&r.s), r.chain);
+	let a = r.http.post("submit_participation", &body).ok();
+	assert_eq!(a["state"], "pending", "{}", a);
+	let during: Vec<String> = order_state(&r, &ids).iter().map(|o| o["state"].as_str().unwrap().to_string()).collect();
+	println!("PM while the refresh waits for its round: {:?}", during);
+	assert_eq!(during, vec!["refreshing", "refreshing"]);
+	let mut built = vec![];
+	while let Some(b) = r.server.rounds.run_round().await.unwrap() {
+		r.produce().await;
+		built.push(b.tx.txid());
+	}
+	r.bury().await;
+	for t in &built {
+		round_final(&r, t).await;
+	}
+	let st = status(&r, &id);
+	let (new1, rec1, round) = validate_new_leaf(&r, &id, 0, &f1.key, &k1);
+	let (new2, rec2, _) = validate_new_leaf(&r, &id, 1, &f2.key, &k2);
+	let ff1 = forfeit_for(&got[0].valid(&r), &new1, &round, &st);
+	let ff2 = forfeit_for(&got[1].valid(&r), &new2, &round, &st);
+	let done = r.http.post("forfeit_leaves", &json!({"participation_id": hex(&id),
+		"forfeits": [{"leaf_id": got[0].held.id.to_string(), "signature": forfeit_sig(&ff1, &got[0].held.key)},
+			{"leaf_id": got[1].held.id.to_string(), "signature": forfeit_sig(&ff2, &got[1].held.key)}],
+		"leaves": [auths_json(&new1, &f1.key, created(&rec1)), auths_json(&new2, &f2.key, created(&rec2))]})).ok();
+	assert_eq!(done["state"], "released", "{}", done);
+	let all: Vec<Transaction> = built.iter().map(|t| r.rt.client().raw_transaction(t).unwrap()).collect();
+	let c1 = Coin { held: held_by(&r, &f1.key, k1, new1.leaf_id), bases: all.clone() };
+	let c2 = Coin { held: held_by(&r, &f2.key, k2, new2.leaf_id), bases: all };
+
+	// Each new leaf, published, continues the order of the coin in its place.
+	let p1 = r.http.post("order_publish", &publish_body(&r, &f1, &c1, &f1.key)).ok();
+	println!("PM the first new leaf published: order {} at {}", p1["order"], p1["coin"]);
+	assert_eq!((p1["order"].as_str(), p1["coin"].as_str()), (Some(ids[0].to_string().as_str()), Some(c1.held.id.to_string().as_str())));
+	assert_eq!(order_state(&r, &[ids[1]])[0]["state"], "refreshing", "the second waits for its own leaf");
+	let p2 = r.http.post("order_publish", &publish_body(&r, &f2, &c2, &f2.key)).ok();
+	println!("PM the second new leaf published: order {} at {}", p2["order"], p2["coin"]);
+	assert_eq!((p2["order"].as_str(), p2["coin"].as_str()), (Some(ids[1].to_string().as_str()), Some(c2.held.id.to_string().as_str())));
+	for (k, o) in order_state(&r, &ids).iter().enumerate() {
+		println!("PM order {}: {} value {} hops {} fills_left {}", k + 1, o["state"], o["value"], o["hops"], o["fills_left"]);
+		assert_eq!((o["state"].as_str(), o["value"].as_str(), o["hops"].as_u64(), o["fills_left"].as_u64()),
+			(Some("resting"), Some(VALUE.to_string().as_str()), Some(0), Some(4)));
+	}
+	assert!(order_state(&r, &[c1.held.id, c2.held.id]).is_empty(), "no order is published under a new leaf's id");
+	// The same publication again gets the order's state.
+	let again = r.http.post("order_publish", &publish_body(&r, &f1, &c1, &f1.key)).ok();
+	assert_eq!(again["order"], p1["order"]);
+}

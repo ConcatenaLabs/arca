@@ -189,6 +189,14 @@ impl Store {
 		rows.iter().map(|r| array32(r.get(0), "participation id")).collect()
 	}
 
+	/// The coin a refresh of a resting order gave up for the coin `to_leaf`,
+	/// when a refresh made `to_leaf` and the order went on there.
+	pub async fn refresh_into(&self, to_leaf: &[u8; 32]) -> Result<Option<[u8; 32]>, StoreError> {
+		let conn = self.conn().await?;
+		let r = conn.query_opt("SELECT from_leaf FROM resting_order_refresh WHERE to_leaf = $1", &[&&to_leaf[..]]).await?;
+		r.map(|r| array32(r.get(0), "from leaf")).transpose()
+	}
+
 	/// The participation whose round made the leaf `leaf_id`, if a
 	/// participation's did.
 	pub async fn participation_making(&self, leaf_id: &[u8; 32]) -> Result<Option<[u8; 32]>, StoreError> {

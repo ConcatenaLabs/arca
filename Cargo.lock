@@ -189,6 +189,8 @@ dependencies = [
  "lightning-invoice",
  "lnurl-rs",
  "log",
+ "lwk_common",
+ "lwk_signer",
  "minreq 2.14.1",
  "rusqlite",
  "serde",
