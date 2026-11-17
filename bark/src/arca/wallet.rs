@@ -261,6 +261,10 @@ pub struct Wallet {
 	/// The tip the last complete re-check ran at ([`Wallet::recheck`]): a
 	/// command that starts on the same tip needs none ([`Wallet::tip_rechecked`]).
 	pub(crate) rechecked_at: std::cell::RefCell<Option<String>>,
+	/// Every coin given up in a participation the operator refused, voided
+	/// or let expire, with the last such participation (`pid state`), as read
+	/// at the store's count of such writes ([`Wallet::refused_refreshes`]).
+	pub(crate) refused_cache: std::cell::RefCell<Option<(i64, std::collections::HashMap<String, String>)>>,
 }
 
 /// How many reassignments a coin's record has made since a round, board or
@@ -382,7 +386,7 @@ pub const REFUSED_AGAIN: u32 = (REFRESH_FROM - HOME_FROM) / 4;
 
 /// Where the wallet keeps when `sync` last asked for each live coin's
 /// refresh: `{leaf id: median time}`.
-const REFRESH_ASKED: &str = "refresh_asked";
+pub(crate) const REFRESH_ASKED: &str = "refresh_asked";
 
 /// Where the wallet keeps when it handed out each receive request still
 /// unpaid: `{owner nonce: median time}`.
@@ -996,7 +1000,7 @@ impl Wallet {
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, pass: Default::default(), change_in_flight: Default::default(),
 			spelling: Spelling::default(), adopting: std::cell::Cell::new(false), locking: std::cell::Cell::new(false), quoting: Default::default(), quote_frees: Default::default(), pay_from: Default::default(), lock_until: Default::default(), exit_watch: Default::default(),
-			exits_done: Default::default(), slice: Default::default(), statuses_read: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
+			exits_done: Default::default(), slice: Default::default(), statuses_read: Default::default(), resolved: Default::default(), rechecked_at: Default::default(), refused_cache: Default::default(), base_index: Default::default(), roots_cache: Default::default(),
 			unlock_cache: Default::default(), expiry_cache: Default::default(), towers_one_at_a_time: Default::default() })
 	}
 
@@ -2612,19 +2616,31 @@ impl Wallet {
 	/// and not refreshed since (a coin refreshed since is spent, or given
 	/// again). By leaf id, with the participation's state.
 	pub(crate) fn refused_refreshes(&self) -> Result<BTreeMap<String, String>, Error> {
-		let mut out = BTreeMap::new();
-		for (pid, _, given, _, state, _, _) in self.store.participations_in(&["refused", "void", "expired"])? {
-			if !matches!(state.as_str(), "refused" | "void" | "expired") {
-				continue;
-			}
-			let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
-			for l in given {
-				if self.store.coin(&l)?.is_some_and(|c| c.state == "live") {
-					out.insert(l, format!("{} {}", &pid[..16.min(pid.len())], state));
+		// Every coin those participations gave up, the last of them for
+		// each, read again only when the store's triggers counted a write to
+		// them since ([`super::store::Store::refused_writes`]): a wallet that
+		// keeps thousands of them (a maker's) would otherwise read them all,
+		// and look up every coin they name, at each call (in every slice of
+		// a sync's refresh step, its home step and its schedule). The coins
+		// live now are read each call, so the answer is the one reading
+		// everything again gives.
+		let n = self.store.refused_writes()?;
+		let fresh = self.refused_cache.borrow().as_ref().is_some_and(|(k, _)| *k == n);
+		if !fresh {
+			let mut last = std::collections::HashMap::new();
+			for (pid, given, state) in self.store.refused_givens()? {
+				let given: Vec<String> = serde_json::from_str(&given).map_err(|e| Error::Store(e.to_string()))?;
+				let label = format!("{} {}", &pid[..16.min(pid.len())], state);
+				for l in given {
+					last.insert(l, label.clone());
 				}
 			}
+			*self.refused_cache.borrow_mut() = Some((n, last));
 		}
-		Ok(out)
+		let live = self.store.coin_ids_in("live")?;
+		let cache = self.refused_cache.borrow();
+		let last = &cache.as_ref().expect("set above").1;
+		Ok(live.into_iter().filter_map(|l| last.get(&l).map(|v| (l, v.clone()))).collect())
 	}
 
 	/// Why the operator could not refresh the wallet's coins, as `sync` last
@@ -5195,5 +5211,174 @@ mod tests {
 		// The operator's own rule where the node does not take the asset.
 		let not_accepted = WalletPolicy { min_reserve: reserve_floor(None), ..policy };
 		assert!(not_accepted.check(&record).is_ok());
+	}
+
+	/// The coins whose refresh was refused, as reading every refused, void
+	/// and expired participation again and looking up each coin it names
+	/// answers them: what `refused_refreshes` answered before it kept them.
+	fn refused_read_again(store: &Store) -> BTreeMap<String, String> {
+		let mut out = BTreeMap::new();
+		for (pid, _, given, _, state, _, _) in store.participations_in(&["refused", "void", "expired"]).unwrap() {
+			for l in serde_json::from_str::<Vec<String>>(&given).unwrap() {
+				if store.coin(&l).unwrap().is_some_and(|c| c.state == "live") {
+					out.insert(l, format!("{} {}", &pid[..16.min(pid.len())], state));
+				}
+			}
+		}
+		out
+	}
+
+	/// `refused_refreshes` keeps what it read of the refused, void and
+	/// expired participations while the store's count of writes to them
+	/// stands, and answers what reading them all again answers whatever
+	/// changes: coins going live or spent and back (a spent coin given back
+	/// by a round lost), participations entering those states, leaving one
+	/// (a void one released) or changing their coins, and writes the count
+	/// does not follow (a released participation's own), which change
+	/// nothing it reads.
+	#[test]
+	fn refused_refreshes_kept_answer_as_read_again() {
+		let dir = bare_wallet("refused-kept");
+		let store = Store::open(&dir.join(DB_FILE)).unwrap();
+		let row = |id: &str, state: &str, n: u8| CoinRow {
+			leaf_id: id.into(), owner_nonce: [n; 32], kind: "batch".into(), asset: AssetId::from_slice(&[7; 32]).unwrap().to_string(),
+			value: 1_000, record: vec![], salt: [n; 32], state: state.into(), note: String::new(), expiry: 2_000_000_000, bases: vec![],
+			spent_by: None,
+		};
+		for (k, id) in ["a", "b", "c", "d"].iter().enumerate() {
+			let n = k as u8 + 1;
+			store.put_nonce(&[n; 32], &key(n + 1).x_only_public_key().0.serialize(), "receive").unwrap();
+			store.put_coin(&row(id, "live", n)).unwrap();
+		}
+		drop(store);
+		let w = Wallet::open(&dir).unwrap();
+		let check = |w: &Wallet, why: &str| {
+			let kept = w.refused_refreshes().unwrap();
+			assert_eq!(kept, refused_read_again(&w.store), "{}", why);
+			kept
+		};
+		assert!(check(&w, "none refused").is_empty());
+		let n0 = w.store.refused_writes().unwrap();
+		w.store.put_participation("p1", "{}", "[\"a\", \"b\"]", "[]").unwrap();
+		assert_eq!(w.store.refused_writes().unwrap(), n0, "a participation submitted is not counted");
+		w.store.set_participation("p1", "refused", None, None).unwrap();
+		assert!(w.store.refused_writes().unwrap() > n0, "one refused is counted");
+		assert_eq!(check(&w, "p1 refused").len(), 2);
+		// Kept: read again only when the count moves.
+		let n1 = w.store.refused_writes().unwrap();
+		w.store.set_coin_state("a", "spent", "").unwrap();
+		assert_eq!(w.store.refused_writes().unwrap(), n1, "a coin's state is not counted");
+		assert_eq!(check(&w, "a spent").len(), 1);
+		w.store.set_coin_state("a", "given", "given up to a round run again").unwrap();
+		w.store.set_coin_state("a", "live", "").unwrap();
+		assert_eq!(check(&w, "a back").len(), 2, "a spent coin back is named again");
+		// A later participation of the same coin, void: the last one named.
+		w.store.put_participation("p2", "{}", "[\"b\", \"c\"]", "[]").unwrap();
+		w.store.set_participation("p2", "void", None, None).unwrap();
+		let k = check(&w, "p2 void");
+		assert!(k["b"].ends_with("void") && k["c"].ends_with("void") && k["a"].ends_with("refused"), "{:?}", k);
+		// A released participation's writes are not counted, and change nothing read.
+		let n2 = w.store.refused_writes().unwrap();
+		w.store.put_participation("p3", "{}", "[\"d\"]", "[]").unwrap();
+		w.store.set_participation("p3", "pending", None, None).unwrap();
+		w.store.set_participation("p3", "released", None, Some("r")).unwrap();
+		assert_eq!(w.store.refused_writes().unwrap(), n2);
+		check(&w, "p3 released");
+		// A void participation released after all leaves the set.
+		w.store.set_participation("p2", "released", None, Some("r")).unwrap();
+		assert!(w.store.refused_writes().unwrap() > n2);
+		let k = check(&w, "p2 released");
+		assert!(k["b"].ends_with("refused") && !k.contains_key("c"), "{:?}", k);
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// A slice whose first item comes past its deadline (its step's reads
+	/// before the items took the budget) gives its items the budget again,
+	/// then stops at the first item past it, as any slice does.
+	#[test]
+	fn a_slice_past_its_budget_before_its_first_item_gives_the_items_the_budget_again() {
+		let dir = bare_wallet("budget-again");
+		let w = Wallet::open(&dir).unwrap();
+		let budget = std::time::Duration::from_millis(200);
+		*w.slice.borrow_mut() = Some(crate::arca::slice::Slice { deadline: web_time::Instant::now() - budget, budget, again: false,
+			done: Default::default(), ran: 0, cut: false, memo: Default::default() });
+		assert!(matches!(w.slice_item("one"), crate::arca::slice::Item::Go));
+		assert!(matches!(w.slice_item("two"), crate::arca::slice::Item::Go), "the items have the budget again");
+		assert!(w.slice.borrow().as_ref().unwrap().again);
+		std::thread::sleep(budget + std::time::Duration::from_millis(20));
+		assert!(matches!(w.slice_item("three"), crate::arca::slice::Item::Stop), "and stop past it");
+		// A slice with its budget left runs as before: no budget again.
+		*w.slice.borrow_mut() = Some(crate::arca::slice::Slice { deadline: web_time::Instant::now() + budget, budget, again: false,
+			done: Default::default(), ran: 0, cut: false, memo: Default::default() });
+		assert!(matches!(w.slice_item("one"), crate::arca::slice::Item::Go));
+		assert!(!w.slice.borrow().as_ref().unwrap().again);
+		*w.slice.borrow_mut() = None;
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// A sliced pass keeps its place while its slices keep coming, however
+	/// long ago it started, and loses it [`crate::arca::slice::RESUME_FOR`]
+	/// after its last slice.
+	#[test]
+	fn a_pass_keeps_its_place_while_its_slices_keep_coming() {
+		use crate::arca::slice::{Resume, RESUME_FOR};
+		let dir = bare_wallet("resume-progress");
+		let w = Wallet::open(&dir).unwrap();
+		let args = json!([false, false, false]);
+		let start = 1_000_000u32;
+		let mut r = Resume::new(args.clone(), start);
+		// Slices every five minutes for an hour: never dropped.
+		for k in 1..=12u32 {
+			let now = start + k * 300;
+			let kept = w.sync_resume(now, &args).unwrap();
+			assert!(kept.is_some() || k == 1, "slice {} found its pass", k);
+			r.progressed = now;
+			w.keep_resume(&r).unwrap();
+		}
+		let last = start + 12 * 300;
+		assert!(w.sync_resume(last + RESUME_FOR, &args).unwrap().is_some(), "within the lifetime of its last slice");
+		assert!(w.sync_resume(last + RESUME_FOR + 1, &args).unwrap().is_none(), "dropped past it");
+		// A resume point kept before `progressed` was written counts from its start.
+		let mut old = Resume::new(args.clone(), start);
+		old.progressed = start;
+		w.keep_resume(&old).unwrap();
+		let mut m: serde_json::Map<String, Value> = serde_json::from_str(&w.store.meta(crate::arca::slice::SYNC_RESUME).unwrap().unwrap()).unwrap();
+		for v in m.values_mut() {
+			v.as_object_mut().unwrap().remove("progressed");
+		}
+		w.store.set_meta(crate::arca::slice::SYNC_RESUME, &Value::Object(m).to_string()).unwrap();
+		assert!(w.sync_resume(start + RESUME_FOR, &args).unwrap().is_some());
+		assert!(w.sync_resume(start + RESUME_FOR + 1, &args).unwrap().is_none());
+		let _ = std::fs::remove_dir_all(&dir);
+	}
+
+	/// `sync_size` reads a store opened read-only, writes nothing to it, and
+	/// counts the refused participations and the coins they name.
+	#[test]
+	fn sync_size_reads_a_store_and_writes_nothing() {
+		let dir = bare_wallet("sync-size");
+		let store = Store::open(&dir.join(DB_FILE)).unwrap();
+		for (k, id) in ["a", "b"].iter().enumerate() {
+			let n = k as u8 + 1;
+			store.put_nonce(&[n; 32], &key(n + 1).x_only_public_key().0.serialize(), "receive").unwrap();
+			store.put_coin(&CoinRow { leaf_id: id.to_string(), owner_nonce: [n; 32], kind: "batch".into(),
+				asset: AssetId::from_slice(&[7; 32]).unwrap().to_string(), value: 1_000, record: vec![], salt: [n; 32], state: "live".into(),
+				note: String::new(), expiry: 2_000_000_000, bases: vec![], spent_by: None }).unwrap();
+		}
+		store.put_participation("p1", "{}", "[\"a\", \"b\", \"gone\"]", "[]").unwrap();
+		store.set_participation("p1", "refused", None, None).unwrap();
+		drop(store);
+		let path = dir.join(DB_FILE);
+		let before = std::fs::read(&path).unwrap();
+		let v = crate::arca::size::sync_size(&Store::open_read_only(&path).unwrap()).unwrap();
+		assert_eq!(std::fs::read(&path).unwrap(), before, "the store's file is unchanged");
+		let r = &v["steps"]["refresh"];
+		assert_eq!(r["items"], 2);
+		assert_eq!(r["refused_participations"]["refused"], 1);
+		assert_eq!(r["refused_participations"]["coins_named"], 3);
+		assert_eq!(r["refused_participations"]["live_coins_named"], 2);
+		assert_eq!(r["before_items_ms"]["coin_lookups_by_an_older_library"], 3);
+		assert_eq!(v["store"]["live_coins"], 2);
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

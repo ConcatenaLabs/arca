@@ -154,6 +154,19 @@ pub struct ArcaWallet {
 	w: Wallet,
 }
 
+/// What a pass of `sync` in slices would cost on the store named `name`
+/// (the name its storage file carries), read from the store alone and
+/// opened read-only: nothing is written, and no operator or node is asked
+/// ([`bark::arca::size`]). For a copy of a wallet's storage, never the
+/// storage a running wallet uses.
+#[wasm_bindgen(js_name = arcaSyncSize)]
+pub fn sync_size(name: &str) -> Result<String, JsValue> {
+	let conn = rusqlite::Connection::open_with_flags(name, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+		.map_err(|e| refusal(Error::Store(e.to_string())))?;
+	let v = bark::arca::size::sync_size(&Store::read_only_connection(conn)).map_err(refusal)?;
+	Ok(v.to_string())
+}
+
 /// Whether this browser's storage holds the wallet of `mnemonic`.
 #[wasm_bindgen(js_name = arcaWalletExists)]
 pub fn wallet_exists(mnemonic: &str) -> Result<bool, JsValue> {
