@@ -995,7 +995,7 @@ impl Wallet {
 		chain.see_kept(&store.chain_seen()?);
 		// The operator's anchor depth as last read, until its `info` is read
 		// again ([`Self::server_info`]).
-		chain.follow_anchor_depth(opt(ANCHOR_DEPTH_META)?.and_then(|d| d.parse().ok()), &get("chain_name")?);
+		chain.follow_anchor_depth(opt(ANCHOR_DEPTH_META)?.and_then(|d| d.parse().ok()));
 		let server = ServerClient::new(&cfg.server)?;
 		Ok(Wallet { datadir, store, keys, chain, server, genesis, operator, cfg, secp: Secp256k1::new(),
 			witnessed: std::cell::RefCell::new(None), witness_patience: WITNESS_PATIENCE, pass: Default::default(), change_in_flight: Default::default(),
@@ -1321,8 +1321,7 @@ impl Wallet {
 	/// it for the next time the wallet opens.
 	fn follow_anchor_depth(&self, info: &Value) -> Result<(), Error> {
 		let published = info["finality"]["anchor_depth"].as_u64();
-		let chain_name = self.store.meta("chain_name")?.unwrap_or_default();
-		self.chain.follow_anchor_depth(published, &chain_name);
+		self.chain.follow_anchor_depth(published);
 		let kept = published.map(|d| d.to_string()).unwrap_or_default();
 		if self.store.meta(ANCHOR_DEPTH_META)?.unwrap_or_default() != kept {
 			self.store.set_meta(ANCHOR_DEPTH_META, &kept)?;

@@ -586,9 +586,11 @@ and a board whose registration never reached the server, are not recovered.
   inside the delay.
 - **Finality** is the node's: a round or board is final when its block is
   certified by the committee and its Bitcoin anchor buried as many blocks as
-  the operator's `info` publishes (`finality.anchor_depth`; 2 for an operator
-  that publishes none, and never fewer on the main chain; 0 on the public
-  testnet, where a coin is final once its block is certified). A coin
+  the operator's `info` publishes (`finality.anchor_depth`), on every chain;
+  0 for an operator that publishes none, where a coin is final once its block
+  is certified, and more only when the operator asks for more. Final is
+  never irreversible against Bitcoin: at any depth a Bitcoin reorganisation of
+  the anchored block takes the round or board out again. A coin
   is spendable only while everything it rests on is final. The wallet asks again
   every time, never remembers: on every start it re-checks every coin against
   the chain, so a rollback un-credits the coins it took out, and credits them
@@ -3289,11 +3291,15 @@ protobuf-compiler`).
     SEQUENTIAD_EXEC=/path/to/sequentiad cargo test -p arca-cli --test arca_scenarios --test arca_adversity -- --nocapture
     cargo test -p arca-wallet --features arca --lib arca::
 
-The test operator runs at the server's defaults. Two settings follow the
-environment, so a proof of anything that waits runs at an operator's
-published settings too (`/v1/info`): `ARCA_TEST_ANCHOR_DEPTH` is the anchor
-depth it calls a block final at, and `ARCA_TEST_CHECKPOINT_EXIT=0` runs it
-without checkpoints that carry their owners' exit. The testnet's operator
-publishes anchor depth 0 and no checkpoint exit:
+The test operator runs at the server's defaults, anchor depth 0 among them:
+a block is final once it is certified. The cases that exercise a deeper
+depth (a block certified but its anchor not yet buried, a rollback past
+finality) set one themselves (`DEEPER_ANCHOR_DEPTH` in
+`tests/common/running.rs`), so both are proven in every run. Two settings
+follow the environment, so a proof of anything that waits runs at an
+operator's published settings too (`/v1/info`): `ARCA_TEST_ANCHOR_DEPTH` is
+the anchor depth it calls a block final at, and `ARCA_TEST_CHECKPOINT_EXIT=0`
+runs it without checkpoints that carry their owners' exit. The testnet's
+operator publishes anchor depth 0 and no checkpoint exit:
 
     ARCA_TEST_ANCHOR_DEPTH=0 ARCA_TEST_CHECKPOINT_EXIT=0 cargo test -p arca-cli --test arca_swap_commands

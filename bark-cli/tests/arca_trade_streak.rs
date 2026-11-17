@@ -159,7 +159,8 @@ fn trade(m: &Arca, a: &Arca, x: AssetId, y: AssetId, give: u64, get: u64) -> Res
 /// server's own.
 ///
 /// With `ARCA_TEST_HARNESS_DEFAULTS` set, the harness's own defaults instead
-/// (anchor depth 2, batches swept, the checkpoint exit offered), the round
+/// (anchor depth 0 or `ARCA_TEST_ANCHOR_DEPTH`, batches swept, the checkpoint
+/// exit offered), the round
 /// loop and the block clock as ever.
 fn defaults() -> bool {
 	std::env::var_os("ARCA_TEST_HARNESS_DEFAULTS").is_some()

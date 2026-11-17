@@ -18,13 +18,14 @@
 //! operator it uses does, from the `finality.anchor_depth` its `info`
 //! publishes ([`ChainSource::follow_anchor_depth`]), so that a coin the
 //! operator takes into a round is one the wallet calls final, and the other
-//! way round. An operator that publishes none is held to [`ANCHOR_DEPTH`].
-//! On the main chain (`sequentia`) the wallet never goes below
-//! [`ANCHOR_DEPTH`], whatever the operator publishes. At depth 0 a coin is
-//! final once its block is certified while the node's anchor status is `ok`:
-//! a Bitcoin reorganisation of the anchored block still takes the block, and
-//! everything built on it, out of the chain, and the wallet follows that as
-//! it follows any other.
+//! way round, on every chain. An operator that publishes none is held to
+//! [`ANCHOR_DEPTH`], which is 0: a coin is final once its block is certified
+//! while the node's anchor status is `ok`. An operator may publish a deeper
+//! depth for its own protection, and the wallet then waits for that many
+//! Bitcoin blocks too. Final is never irreversible against Bitcoin: at any
+//! depth a Bitcoin reorganisation of the anchored block still takes the
+//! block, and everything built on it, out of the chain, and the wallet
+//! follows that as it follows any other.
 //!
 //! The node must run with `-txindex`, so the wallet can fetch any transaction
 //! by its id, and with `-validateanchor`, without which it has no notion of
@@ -102,10 +103,10 @@ use sequentia_ext::{Block, BlockHeader, BlockHeaderExt};
 
 use super::Error;
 
-/// The Bitcoin blocks that bury a final block's anchor, when the operator
-/// publishes no depth of its own, and the least the wallet accepts on the
-/// main chain ([`ChainSource::follow_anchor_depth`]).
-pub const ANCHOR_DEPTH: u64 = 2;
+/// The Bitcoin blocks that bury a final block's anchor when the operator
+/// publishes no depth of its own: none, so a block is final once it is
+/// certified ([`ChainSource::follow_anchor_depth`]).
+pub const ANCHOR_DEPTH: u64 = 0;
 
 /// The most transactions [`ChainSource::gone`] reads walking back through
 /// parents that are off the chain.
@@ -656,13 +657,10 @@ fn not_found(e: &RpcError) -> bool {
 }
 
 /// The anchor depth the wallet counts for an operator that publishes
-/// `published` on the chain named `chain_name` ([`ChainSource::follow_anchor_depth`]).
-pub fn anchor_depth_of(published: Option<u64>, chain_name: &str) -> u64 {
-	match published {
-		None => ANCHOR_DEPTH,
-		Some(d) if chain_name == "sequentia" => d.max(ANCHOR_DEPTH),
-		Some(d) => d,
-	}
+/// `published`, on any chain: the operator's own, or [`ANCHOR_DEPTH`] when it
+/// publishes none ([`ChainSource::follow_anchor_depth`]).
+pub fn anchor_depth_of(published: Option<u64>) -> u64 {
+	published.unwrap_or(ANCHOR_DEPTH)
 }
 
 impl ChainSource {
@@ -691,13 +689,12 @@ impl ChainSource {
 	}
 
 	/// Follows the anchor depth an operator publishes (`published`, its
-	/// `info`'s `finality.anchor_depth`) on the chain named `chain_name`, and
-	/// returns the depth finality counts from now on: the operator's;
-	/// [`ANCHOR_DEPTH`] when it publishes none; and never less than
-	/// [`ANCHOR_DEPTH`] on the main chain. Every clone of the source follows
-	/// it.
-	pub fn follow_anchor_depth(&self, published: Option<u64>, chain_name: &str) -> u64 {
-		let d = anchor_depth_of(published, chain_name);
+	/// `info`'s `finality.anchor_depth`), and returns the depth finality
+	/// counts from now on: the operator's, on every chain, or
+	/// [`ANCHOR_DEPTH`] when it publishes none. Every clone of the source
+	/// follows it.
+	pub fn follow_anchor_depth(&self, published: Option<u64>) -> u64 {
+		let d = anchor_depth_of(published);
 		self.anchor_depth.store(d, Ordering::SeqCst);
 		d
 	}
@@ -2223,24 +2220,24 @@ mod test {
 		GAPS_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 	}
 
+	#[test]
+	fn the_anchor_depth_is_the_operators_on_every_chain_and_zero_when_it_publishes_none() {
+		assert_eq!(ANCHOR_DEPTH, 0, "a block is final once certified unless the operator asks for more");
+		assert_eq!(anchor_depth_of(None), 0, "an operator that publishes none is held to 0");
+		assert_eq!(anchor_depth_of(Some(0)), 0, "an operator's 0 is followed, the main chain's included");
+		assert_eq!(anchor_depth_of(Some(5)), 5, "a deeper depth is followed");
+		let chain = ChainSource::new("http://127.0.0.1:1/", None, None, None);
+		let other = chain.clone();
+		assert_eq!(chain.anchor_depth(), 0, "0 until the operator's is read");
+		assert_eq!(chain.follow_anchor_depth(Some(3)), 3);
+		assert_eq!(other.anchor_depth(), 3, "every clone follows it");
+		assert_eq!(chain.follow_anchor_depth(Some(0)), 0, "no floor: an operator's 0 is followed after a deeper one");
+		assert_eq!(chain.follow_anchor_depth(None), 0);
+	}
+
 	/// A command that shares the view answers from another's look made within
 	/// BURST_VIEW_FOR; one that does not looks when it starts; one started
 	/// later looks again, and a gap calls for a look at once.
-	#[test]
-	fn the_anchor_depth_is_the_operators_and_never_below_two_on_the_main_chain() {
-		assert_eq!(anchor_depth_of(None, "test"), ANCHOR_DEPTH, "an operator that publishes none is held to the constant");
-		assert_eq!(anchor_depth_of(Some(0), "test"), 0, "the testnet operator's 0 is followed");
-		assert_eq!(anchor_depth_of(Some(5), "elementsregtest"), 5);
-		assert_eq!(anchor_depth_of(Some(0), "sequentia"), ANCHOR_DEPTH, "the main chain keeps its depth");
-		assert_eq!(anchor_depth_of(Some(3), "sequentia"), 3);
-		let chain = ChainSource::new("http://127.0.0.1:1/", None, None, None);
-		let other = chain.clone();
-		assert_eq!(chain.anchor_depth(), ANCHOR_DEPTH, "the constant until the operator's is read");
-		assert_eq!(chain.follow_anchor_depth(Some(0), "test"), 0);
-		assert_eq!(other.anchor_depth(), 0, "every clone follows it");
-		assert_eq!(chain.follow_anchor_depth(None, "test"), ANCHOR_DEPTH);
-	}
-
 	#[test]
 	fn a_burst_of_commands_shares_one_look() {
 		let _serial = serial();
@@ -3251,7 +3248,7 @@ mod test {
 		let dir = tempfile::tempdir().unwrap();
 		let mut r = Regtest::pos_from_env(dir.path(), &["-acceptnonstdtxn=1"]);
 		let url = format!("http://127.0.0.1:{}/", r.node.rpc_port());
-		let open = |_: ()| { let c = ChainSource::new(&url, Some("arca"), Some("arca"), None); c.follow_anchor_depth(Some(DEPTH), "elementsregtest"); c };
+		let open = |_: ()| { let c = ChainSource::new(&url, Some("arca"), Some("arca"), None); c.follow_anchor_depth(Some(DEPTH)); c };
 		let a = open(());
 		let op_true = Script::from(vec![0x51]);
 		let genesis = a.genesis().unwrap();

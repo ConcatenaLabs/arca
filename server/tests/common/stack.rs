@@ -50,7 +50,7 @@ impl Stack {
 		let params = Arc::new(Params::new(chain, s.x_only_public_key().0,
 			BTreeMap::from([(x, AssetParams { min_leaf: MIN_LEAF, ..Default::default() })])));
 		let source = Arc::new(NodeSource::new(rt.client().clone()));
-		let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
+		let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::buried_two()).await.unwrap();
 		let rx = finality.subscribe();
 		let nursery = Nursery::new(db.store.clone(), finality.clone(), None, Duration::ZERO);
 		let boards = Boards::new(db.store.clone(), finality.clone(), nursery.clone(), params.clone(), Duration::from_secs(6 * 3600));

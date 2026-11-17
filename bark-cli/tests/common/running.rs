@@ -160,9 +160,9 @@ impl Running {
 				rpc_url: format!("http://127.0.0.1:{}/", rt.node.rpc_port()),
 				cookie_file: None, rpc_user: Some("arca".into()), rpc_password: Some("arca".into()),
 			},
-			// ARCA_TEST_ANCHOR_DEPTH runs the operator at another anchor depth than the default (the
-			// testnet's operator publishes its own), so a proof of anything that waits for finality
-			// runs at the settings it meets there too.
+			// The server's default anchor depth (0: final once certified), or ARCA_TEST_ANCHOR_DEPTH,
+			// so a whole suite can run at a deeper depth an operator may publish. A case that
+			// exercises a deeper depth itself sets it in its own tuning ([`DEEPER_ANCHOR_DEPTH`]).
 			finality: FinalitySection { poll_interval_ms: 200, anchor_depth: test_anchor_depth(), ..Default::default() },
 			exit_delay_units: Some((1, 338)),
 			assets: vec![
@@ -332,7 +332,12 @@ fn test_checkpoint_exit() -> bool {
 	}
 }
 
-/// The anchor depth the test operator runs at: ARCA_TEST_ANCHOR_DEPTH, else the server's default.
+/// The anchor depth a case sets for itself when it exercises a block certified
+/// but its anchor not yet buried, or a rollback past finality: a deeper depth
+/// than the server's default 0, which an operator may publish.
+pub const DEEPER_ANCHOR_DEPTH: u32 = 2;
+
+/// The anchor depth the test operator runs at: ARCA_TEST_ANCHOR_DEPTH, else the server's default (0).
 fn test_anchor_depth() -> u32 {
 	std::env::var("ARCA_TEST_ANCHOR_DEPTH").ok().and_then(|v| v.trim().parse().ok())
 		.unwrap_or_else(|| FinalitySection::default().anchor_depth)

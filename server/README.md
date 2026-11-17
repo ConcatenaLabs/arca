@@ -274,11 +274,15 @@ something in the server relies on:
 | settled | in a certified block, its anchor buried fewer Bitcoin blocks than the rule |
 | final | certified, and its anchor buried `anchor_depth` Bitcoin blocks |
 
-`anchor_depth` is the `[finality]` setting, 2 by default; the public testnet's
-operator runs at 0, where a block is final once it is certified while the node
-reports its tip's anchor as `ok`. `info` publishes it (`finality`), and the
-wallet judges finality by the depth its operator publishes, never below 2 on
-the main chain. At any depth a Bitcoin reorganisation of the anchored block
+`anchor_depth` is the `[finality]` setting, 0 by default: a block is final
+once it is certified while the node reports its tip's anchor as `ok`. An
+operator may set a deeper depth for its own protection: it then credits a
+board only once that many Bitcoin blocks bury the board's anchor, so a Bitcoin
+reorganisation cannot take a board away after its coin was spent off the
+chain; the people who use it wait about ten minutes more per Bitcoin block
+before a coin they boarded or received in a round can be spent. `info`
+publishes it (`finality`), and the wallet judges finality by the depth its
+operator publishes, on every chain. At any depth a Bitcoin reorganisation of the anchored block
 takes the block, and every round built on it, out of the chain: the service
 disconnects it as below, and the rounds return or are run again.
 

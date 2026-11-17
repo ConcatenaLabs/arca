@@ -30,7 +30,7 @@ async fn finality_on_regtest() {
 	let db = TestDb::new().await;
 	let rt = tokio::task::block_in_place(node::start);
 	let source = Arc::new(NodeSource::new(rt.client().clone()));
-	let f = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
+	let f = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::buried_two()).await.unwrap();
 	f.sync().await.unwrap();
 	let mut rx = f.subscribe();
 

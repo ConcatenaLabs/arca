@@ -133,7 +133,11 @@ async fn paid_inside(r: &Running, q: &Arca, p: &Arca, hash: &str, amount: u64, t
 #[tokio::test(flavor = "multi_thread")]
 async fn a_receive_under_a_given_hash_waits_for_its_preimage_and_is_claimed_with_it() {
 	let Some(lnd) = lightningd("a_receive_under_a_given_hash_waits_for_its_preimage_and_is_claimed_with_it") else { return };
+	// The exit is asked once a block until the claim is seen; at depth 0 the
+	// claim is final before the next ask, which then finds nothing to exit:
+	// a deeper anchor depth than the default, set here.
 	let mut r = Running::start_seqln(|c, _, _| {
+		c.finality.anchor_depth = common::running::DEEPER_ANCHOR_DEPTH;
 		c.fees.lightning_ppm = 1_000;
 		c.lightning.operator_delay_units = 1;
 		c.lightning.owner_delay_units = 2;

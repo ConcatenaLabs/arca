@@ -32,7 +32,7 @@ async fn wallet_without_the_policy_asset() {
 	println!("policy asset {}, X {} (listed 1:1), Y {} (not listed)", purse.policy, x, y);
 
 	let source = Arc::new(NodeSource::new(rt.client().clone()));
-	let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
+	let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::buried_two()).await.unwrap();
 	finality.sync().await.unwrap();
 	let s = keypair("operator");
 	let wallet = Wallet::new(db.store.clone(), finality.clone(), xonly(&s),

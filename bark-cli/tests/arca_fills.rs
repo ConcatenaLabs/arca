@@ -123,9 +123,12 @@ fn print_round(tx: &Transaction) {
 #[tokio::test(flavor = "multi_thread")]
 async fn two_wallets_take_two_orders_and_hold_leaves() {
 	// X carries an offboard fee of 1,000 atoms: a take pays it on the price.
+	// Its orders are refused while their round is in a block not yet final:
+	// a deeper anchor depth than the default, set here.
 	let mut r = Running::start_with(|c, x, _| {
 		c.assets[0] = AssetSection::new(x, 1_000);
 		c.assets[0].offboard_base = Some("1000".into());
+		c.finality.anchor_depth = common::running::DEEPER_ANCHOR_DEPTH;
 	}).await;
 	let (x, y) = (r.x, r.y);
 	// Taker 1 holds 2,000,000 X, more than its take; taker 2 exactly its

@@ -147,13 +147,17 @@ async fn until_held(r: &Running, hash: &str) {
 /// end 88 hours after it starts (Bark's HTLC-send expiry delta of 258 blocks
 /// at half Bitcoin's pace), and short delays otherwise.
 async fn operator(lnd: &PathBuf, tag: &str) -> (Running, sequentia_ext::lightning::LightningNode) {
-	operator_with(lnd, tag, 3600).await
+	operator_with(lnd, tag, 3600, None).await
 }
 
 /// [`operator`], its invoices for payments into the tree good for
-/// `invoice_expiry` seconds (a term the operator takes at its start).
-async fn operator_with(lnd: &PathBuf, tag: &str, invoice_expiry: u32) -> (Running, sequentia_ext::lightning::LightningNode) {
+/// `invoice_expiry` seconds (a term the operator takes at its start), at
+/// anchor depth `depth` when named and the harness's otherwise.
+async fn operator_with(lnd: &PathBuf, tag: &str, invoice_expiry: u32, depth: Option<u32>) -> (Running, sequentia_ext::lightning::LightningNode) {
 	let mut r = Running::start_seqln(|c, _, _| {
+		if let Some(d) = depth {
+			c.finality.anchor_depth = d;
+		}
 		c.lightning.invoice_expiry_seconds = invoice_expiry;
 		c.fees.lightning_ppm = 1_000;
 		c.lightning.operator_delay_units = 1;
@@ -528,7 +532,7 @@ async fn each_abandoned_swap_leaves_every_leg_with_one_party() {
 	let Some(lnd) = lightningd("each_abandoned_swap_leaves_every_leg_with_one_party") else { return };
 	// Invoices for payments into the tree good for two minutes, so a receive
 	// nobody pays lapses within the test.
-	let (mut r, ox) = operator_with(&lnd, "sw2", 120).await;
+	let (mut r, ox) = operator_with(&lnd, "sw2", 120, None).await;
 	let xs = r.x.to_string();
 	let p = dual_wallet(&r, "SAP", 0, None);
 	let q = dual_wallet(&r, "SAQ", 800_000, None);
@@ -721,7 +725,9 @@ async fn the_sequentia_leg_follows_an_anchor_driven_rollback_before_and_after_th
 		return;
 	}
 	let Some(lnd) = lightningd("the_sequentia_leg_follows_an_anchor_driven_rollback_before_and_after_the_swap") else { return };
-	let (mut r, ox) = operator(&lnd, "sw3").await;
+	// The round in a block, not yet final: a deeper anchor depth than the
+	// default, set here.
+	let (mut r, ox) = operator_with(&lnd, "sw3", 3600, Some(common::running::DEEPER_ANCHOR_DEPTH)).await;
 	let p = dual_wallet(&r, "SRP", 0, None);
 	let q = dual_wallet(&r, "SRQ", 400_000, None);
 	// The rows of the older path (htlc-1), which a buyer asking no lock takes.

@@ -540,7 +540,7 @@ fn window_answers(w: &Arca, coins: &[String], asset: AssetId, req: &str, address
 /// depth the coin it makes cannot be spent: `settle-first` is not ready yet
 /// and says when it will be, and every spend of the asset answers
 /// `settle_first`, never a plain shortfall. Run at depth 0 (the testnet's)
-/// and depth 2 (the harness's default and the main chain's least).
+/// and depth 2 (a deeper depth an operator may publish).
 async fn window_case(depth: u32) {
 	let tag = format!("SF6 d{}", depth);
 	let mut r = Running::start_with(move |cfg, _, _| {

@@ -71,11 +71,10 @@ fi
 : "${SEQ_CHAIN_CONF:=}" "${SEQ_ADDNODE:=}" "${BTC_ADDNODE:=}" "${SEQ_ANCHOR_RPC:=}" "${SEQ_ANCHOR_AUTH:=}"
 : "${SEQLN_NETWORK:=}" "${BTC_FEE_FLOOR:=30}"
 # The Bitcoin blocks that must bury a certified block's anchor before the
-# operator, and the wallets that use it, call a coin in it final: 0 on the
-# public testnet, where a coin is tradeable once its block is certified, and 2
-# on any other chain.
-[ "$SEQ_CHAIN" = test ] && : "${ARCA_ANCHOR_DEPTH:=0}"
-: "${ARCA_ANCHOR_DEPTH:=2}"
+# operator, and the wallets that use it, call a coin in it final: 0, where a
+# coin is tradeable once its block is certified, unless the operator asks for
+# more for its own protection (server/arcad.example.toml, [finality]).
+: "${ARCA_ANCHOR_DEPTH:=0}"
 # Limits on everything the bundle runs together (a systemd slice): empty for none.
 # Where the operator, the ark and the nodes' RPC listen: 127.0.0.1 on a machine;
 # all addresses in a container, whose ports the compose file publishes to the

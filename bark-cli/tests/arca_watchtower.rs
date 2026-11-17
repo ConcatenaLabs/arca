@@ -463,9 +463,13 @@ fn copy_wallet(from: &Arca, to: &Arca) {
 /// coin on the chain under its own key and takes it home.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watchtower_answers_a_sender_who_takes_an_earlier_coin_home() {
+	// R's exit is asked once a block until it reads `claimed`; at depth 0
+	// the claim is final before the next ask, which then finds nothing to
+	// exit: a deeper anchor depth than the default, set here.
 	let mut r = Running::start_with(|c, _, _| {
 		c.watcher.unroll_at_release = false;
 		c.watcher.enabled = false;
+		c.finality.anchor_depth = common::running::DEEPER_ANCHOR_DEPTH;
 	}).await;
 	let (url, node) = (r.url(), r.node_url());
 	let x = r.x.to_string();
