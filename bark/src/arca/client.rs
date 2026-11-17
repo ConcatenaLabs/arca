@@ -397,7 +397,7 @@ pub const REFUSALS: &[&str] = &[
 	"declined", "delegated", "depth_limit", "double_spend", "fee", "forfeit_set", "frozen", "hash_reused", "htlc", "in_round", "in_use", "invalid_coin", "invalid_leaf", "invalid_record", "invalid_transaction", "invoice",
 	"key_reused", "lapsed", "leaf_set", "malformed", "margin", "merge", "no_lightning", "no_lowest_node", "nonce_unknown", "nonce_used", "not_accepted",
 	"not_an_order", "not_declined", "not_in_round", "not_live", "not_on_node", "not_participating", "not_withdrawable", "on_chain", "open_reassignment", "operator_key", "order", "order_expiring",
-	"order_moved", "order_not_final", "order_spent", "order_taken", "out_of_bounds", "owed_claimed", "owed_withdrawn", "planned",
+	"order_moved", "order_not_final", "order_spent", "order_taken", "order_whole_only", "out_of_bounds", "owed_claimed", "owed_withdrawn", "planned",
 	"receive_cap", "release_early", "request_lapsed", "request_too_large", "round_not_final", "salt", "script_reused", "template",
 	"unauthenticated", "unbalanced",
 	"unknown_batch", "unknown_board", "unknown_fill", "unknown_leaf", "unknown_order", "unknown_participation", "unknown_payment", "unknown_plan", "value", "vesting", "wrong_chain", "wrong_operator",

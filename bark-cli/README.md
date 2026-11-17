@@ -1398,8 +1398,9 @@ takers fill it while the wallet is away. Each fill is co-signed by the
 operator alone, and the leaf's program holds every fill to the order's terms:
 the maker's credit, a leaf of the asset the order is paid in under the next of
 four credit keys of the wallet's, at least the price; and for a part fill the
-order resting again under a new salt. An order fills at most four times; what
-rests after the fourth is the maker's to cancel.
+order resting again under a new salt. An order fills at most four times on one
+coin a round made of it; what rests after the fourth is the maker's to
+refresh or cancel.
 
 `arca order rest` gives up leaves of the asset the order sells for one leaf of
 exactly the amount, paying their refresh fees (`--quote` shows them, and
@@ -1427,6 +1428,27 @@ refreshed by default or planned: `arca order cancel-resting` cancels it, a
 transfer of what rests into a leaf of the wallet's own. With `--quote` it
 only says what the cancel gives back and its fee (the transfer's margin);
 with `--shown '<the quote>'` it goes ahead only for the coin and fee shown.
+
+Each fill puts what rests one reassignment deeper, and the operator
+co-signs nothing past its depth limit (`depth_limit` in its `info`). A
+cancel is one reassignment more, so the operator co-signs a fill of part of
+an order only while what rests stays short of the limit: once it would land
+there, a taker is offered the whole remainder and nothing less (the
+operator refuses a part fill with `order_whole_only`), and the order can
+always be cancelled. `arca order refresh-resting ORDER` lifts it: the
+operator's next round gives the order a fresh coin and keeps it, the same
+id, terms and amount, a round's leaf again with four fills ahead of it. The
+wallet gives up the coin the order rests at and, for the round's fee,
+another coin of the asset the order sells (so the order keeps its whole
+amount), and wants an `order-3` leaf of the same order under new keys; once
+the round is final, `sync` publishes the new coin, and the operator, which
+sees that the round gave up the order's coin for it, has the order go on
+there (`arca order resting` reads `refreshing` meanwhile). A round that
+never runs gives the coin back, and the order rests where it was. `--quote`
+and `--shown` work as for a cancel. The operator says it keeps an order
+through a refresh in its `info` (`fills.refresh_keeps_order`); a plain
+`arca refresh` of the order's coin cancels the order instead, into a leaf
+of the wallet's own.
 
 `arca order fill-resting ORDER` fills another maker's order by its id. The
 wallet reads the order, rebuilds the coin's script from its terms and checks
@@ -1458,6 +1480,8 @@ within the delay.
     arca order fill-resting ORDER --amount 300000 --quote     # what it takes and costs
     arca order fill-resting ORDER --amount 300000 --shown '<the quote>'   # a taker, in the tree
     arca sync                                                 # the maker: credits, what rests
+    arca order refresh-resting ORDER --quote                  # a fresh coin, the same order
+    arca order refresh-resting ORDER --shown '<the quote>'    # its round runs; sync publishes it
     arca order cancel-resting ORDER
 
 ### Taking an on-chain order
@@ -2254,6 +2278,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `order resting [ORDER…]` | The wallet's resting orders as the operator shows them (state, coin, what is left, each fill) with the credits the wallet holds of each, and any other resting orders named |
 | `order fill-resting ORDER [--amount N] [--quote \| --shown Q]` | Fills another maker's resting order in the tree: what is filled, the price paid, the fill's fee and the change, and the coins it makes the wallet's; `--quote` only says so and the coin it rests at, `--shown` fills only as quoted. A coin given up that rests on a lowest node with RECLAIM-D carries the delegation of its release to every output of the fill |
 | `order cancel-resting ORDER [--quote \| --shown Q]` | Cancels a resting order of the wallet's: what rests comes back to a leaf of its own; `--quote` only says what comes back and the fee, `--shown` cancels only as quoted |
+| `order refresh-resting ORDER [--max-fee-ppm N] [--quote \| --shown Q]` | Gives a resting order of the wallet's a fresh coin in the operator's next round and keeps it (the same id, terms and amount), its depth back to a round leaf's; `--quote` only says what it gives up and the fee, `--shown` refreshes only as quoted |
 | `order refund ORDER [--fee-asset A]` | Takes what order `ORDER` holds where it rests home by its REFUND, once the chain's median time has passed its expiry, to an address of the wallet's; the fee from the order's own value where the node takes its asset for fees, else from an on-chain coin in `A` |
 | `distribute LIST --asset A [--return ADDRESS] [--quote \| --shown FEE]` | Pays the holders of `LIST` (a file or `-`, a line `KEY AMOUNT` each) in one round (see Paying many holders in one round): with `--quote`, only says what it would cost (the operator's fee, the coins it gives up, whether the wallet first pays itself a coin of exactly the claims and the fee), signing and asking nothing; with `--shown`, goes ahead only on that very fee. Refused before anything is signed, with `--quote` too: a key named twice, a claim below the operator's smallest leaf, a key the text does not name (a P2WPKH address), claims and a fee beyond what the wallet's live coins of the asset hold; without `--quote`, a fee that changed since it was shown |
 | `distributions` | Every distribution the wallet made, as the operator shows it: its state, round, deadline and expiry, each claim's key, claim key, value, leaf and state (`pending`, `open`, `claimed`, `returned`), and each payment of what no holder took up back to the return script, with its state |
