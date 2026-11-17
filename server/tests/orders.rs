@@ -811,7 +811,9 @@ async fn an_exit_fill_goes_only_to_a_maker_that_reads_its_records() {
 /// while what rests stays short of its depth limit (here 2), so the order's
 /// maker can always cancel it, one reassignment more. A part fill that would
 /// land the rest at the limit, sent by hand past any wallet's check, is
-/// refused `order_whole_only`; the whole remainder is co-signed, its coins at
+/// refused under `order` (a code every wallet library knows, so an older one
+/// gives the taker's coins back), naming the whole remainder; the whole
+/// remainder is co-signed, its coins at
 /// the limit and no deeper. The state view says how deep the order's coin is
 /// and whether only the whole is taken.
 #[tokio::test(flavor = "multi_thread")]
@@ -854,7 +856,7 @@ async fn a_part_fill_that_would_leave_the_rest_at_the_depth_limit_is_refused() {
 	let (ch2, _) = new_leaf(&keypair("WT2, change"));
 	let part = fill_body(&r, &st, &p, (c2, c2.valid(&r)), VALUE - 1, 200_000, (&l2, &ch2), 1, &t2, None);
 	let (status, code, msg) = refused(&r, "a part fill that would leave the rest at the depth limit", &part);
-	assert_eq!((status, code.as_str()), (422, "order_whole_only"), "{}", msg);
+	assert_eq!((status, code.as_str()), (422, "order"), "{}", msg);
 	assert!(msg.contains("whole remainder, 700000 atoms"), "{}", msg);
 	assert_eq!(order_state(&r, &[om.held.id])[0]["state"], "resting", "the order rests where it was");
 

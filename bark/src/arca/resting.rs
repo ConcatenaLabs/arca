@@ -739,7 +739,9 @@ impl Wallet {
 			return Err(Error::Refused(format!("order {} rests at a coin {} reassignments from a round, at the operator's depth limit of {}: \
 				the operator co-signs no fill of it until its maker refreshes it", order, oc.hops, limit.unwrap_or(0))));
 		}
-		if partial && !part_fill_allowed(oc.hops, 0, limit) {
+		// The operator says so of the order too (`whole_only` in its state
+		// view), whatever the library counts: its word is the one it co-signs by.
+		if partial && (o["whole_only"].as_bool() == Some(true) || !part_fill_allowed(oc.hops, 0, limit)) {
 			return Err(Error::Refused(format!("order {} rests at a coin {} reassignments from a round: a fill of part of it would leave the \
 				rest at the operator's depth limit of {}, where its maker could no longer cancel it, so the operator takes only a fill of the \
 				whole remainder, {} (fill it without an amount), until its maker refreshes it", order, oc.hops, limit.unwrap_or(0), oc.value)));

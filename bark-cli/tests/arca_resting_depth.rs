@@ -28,6 +28,11 @@
 //!    testnet). Its refresh brings it back to a round's leaf under the same
 //!    id, and it is cancelled into the maker's own leaf.
 //!
+//! In step 2, a taker running an older wallet library (the `arca` at
+//! `ARCA_CLI_OLDER`, when set), which knows nothing of the rule and sends the
+//! part fill, is refused under `order`, a code it knows: its coins are its
+//! own again at once, and the refusal names the whole remainder.
+//!
 //! The operator's own refusal of a part fill at the limit, sent by hand past
 //! the wallet's check, is in the server's `tests/orders.rs`.
 //!
@@ -58,8 +63,12 @@ fn testnet_like(c: &mut server::server::Config, x: AssetId) {
 
 /// A wallet holding one coin of `asset`, boarded.
 async fn holder(r: &mut Running, name: &str, asset: AssetId, value: u64) -> Arca {
+	holder_of(r, Arca::new(name), asset, value).await
+}
+
+/// [`holder`] for the wallet `w`, whatever build runs it.
+async fn holder_of(r: &mut Running, w: Arca, asset: AssetId, value: u64) -> Arca {
 	let (url, node) = (r.url(), r.node_url());
-	let w = Arca::new(name);
 	w.ok(&["create", "--server", &url, "--node-url", &node, "--node-user", "arca", "--exit-delay-units", "1", "--min-exit-delay-units", "1"]);
 	let s = elements::Script::from(unhex(w.ok(&["address"])["script_pubkey"].as_str().unwrap()));
 	r.pay_to(s, asset, value + 100_000);
@@ -217,6 +226,13 @@ async fn a_resting_order_can_always_be_cancelled_and_its_refresh_keeps_it() {
 	let tb = holder(&mut r, "DL TB", y, 4_000_000).await;
 	let tc = holder(&mut r, "DL TC", y, 2_000_000).await;
 	let td = holder(&mut r, "DL TD", y, 2_000_000).await;
+	let older = match std::env::var("ARCA_CLI_OLDER") {
+		Ok(p) => Some(holder_of(&mut r, Arca::built_from("DL TO", std::path::Path::new(&p)), y, 2_000_000).await),
+		Err(_) => {
+			println!("ARCA_CLI_OLDER is not set: the older taker's part of step 2 is not run");
+			None
+		},
+	};
 
 	// 1. Three part fills, then a refresh at three reassignments deep.
 	for k in 1..=3 {
@@ -255,7 +271,12 @@ async fn a_resting_order_can_always_be_cancelled_and_its_refresh_keeps_it() {
 	// coins: they refresh theirs to fill it.
 	ta.ok(&["participate"]);
 	tb.ok(&["participate"]);
-	rounds(&mut r, &[&ta, &tb]).await;
+	let mut refreshing = vec![&ta, &tb];
+	if let Some(to) = &older {
+		to.ok(&["participate"]);
+		refreshing.push(to);
+	}
+	rounds(&mut r, &refreshing).await;
 
 	// 2. Two more part fills, the second from a coin three deep: the order at
 	//    four. A sixth part fill is refused; the cancel goes.
@@ -269,6 +290,23 @@ async fn a_resting_order_can_always_be_cancelled_and_its_refresh_keeps_it() {
 	assert_eq!((hops_of(&st), st["whole_only"].as_bool(), st["value"].as_str()), (4, Some(true), Some("500000")));
 	let e = fill_refused(&tb, &o, Some(100_000), "only a fill of the whole remainder");
 	println!("DL REFUSED, a sixth part fill: {}", e);
+	let whole = tb.ok(&["order", "fill-resting", &o, "--quote"]);
+	println!("DL OFFERED, the whole remainder: filled {} for {}", whole["filled"], whole["paid"]);
+	assert_eq!(whole["filled"], "500000", "the new library offers the whole remainder: {}", whole);
+	// An older library sends the part fill: refused under a code it knows,
+	// its coins its own again at once, the whole remainder named.
+	if let Some(to) = &older {
+		let held_before = live_hops(to, y);
+		let (ok, e) = to.run(&["order", "fill-resting", &o, "--amount", "100000"]);
+		let e = e.to_string();
+		println!("DL REFUSED, the older library's part fill: {}", e);
+		assert!(!ok && e.contains("(422 order)") && e.contains("whole remainder, 500000 atoms"), "{}", e);
+		assert!(!e.contains("cannot reach the server"), "a refusal, not an unreachable operator: {}", e);
+		let sending: Vec<Value> = to.ok(&["coins"]).as_array().unwrap().iter().filter(|c| c["state"] == "sending").cloned().collect();
+		assert!(sending.is_empty(), "no coin held in sending: {:?}", sending);
+		assert_eq!(live_hops(to, y), held_before, "the older taker's coins are its own again, unchanged");
+		assert_eq!(served(&ta, &o)["value"], "500000", "the order rests where it was");
+	}
 	m.ok(&["sync"]);
 	let cq = m.ok(&["order", "cancel-resting", &o, "--quote"]);
 	let c = m.ok(&["order", "cancel-resting", &o, "--shown", &cq.to_string()]);
@@ -355,7 +393,7 @@ async fn a_resting_order_can_always_be_cancelled_and_its_refresh_keeps_it() {
 	println!("DL O4 HOME: cancelled into the maker's own leaf, {} of X ({})", cq["gets"]["amount"], home.chars().take(200).collect::<String>());
 	assert!(live_hops(&m, x).iter().any(|(_, v, h)| v.to_string() == cq["gets"]["amount"].as_str().unwrap() && *h == 1),
 		"the maker holds what rested, one reassignment from the refresh's round: {:?}", live_hops(&m, x));
-	for w in [&m, &ta, &tb, &tc, &td] {
+	for w in [&m, &ta, &tb, &tc, &td].into_iter().chain(older.as_ref()) {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
 }

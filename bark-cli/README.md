@@ -1434,8 +1434,9 @@ co-signs nothing past its depth limit (`depth_limit` in its `info`). A
 cancel is one reassignment more, so the operator co-signs a fill of part of
 an order only while what rests stays short of the limit: once it would land
 there, a taker is offered the whole remainder and nothing less (the
-operator refuses a part fill with `order_whole_only`), and the order can
-always be cancelled. `arca order refresh-resting ORDER` lifts it: the
+operator refuses a part fill under `order`, naming the whole remainder,
+and its `order_state` says `whole_only`), and the order can always be
+cancelled. `arca order refresh-resting ORDER` lifts it: the
 operator's next round gives the order a fresh coin and keeps it, the same
 id, terms and amount, a round's leaf again with four fills ahead of it. The
 wallet gives up the coin the order rests at and, for the round's fee,
