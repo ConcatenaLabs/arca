@@ -165,6 +165,7 @@ impl Running {
 			// runs at the settings it meets there too.
 			finality: FinalitySection { poll_interval_ms: 200, anchor_depth: test_anchor_depth(), ..Default::default() },
 			exit_delay_units: Some((1, 338)),
+			depth_limit: None,
 			assets: vec![
 				AssetSection::new(x, MIN_LEAF),
 				AssetSection::new(y, MIN_LEAF),

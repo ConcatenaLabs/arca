@@ -50,7 +50,7 @@ use common::client::{auths_json, exit_delay, forfeit_sig, hex, hold_key, new_lea
 use common::flow::{drive, final_of, forfeit_for, held_by, log, settle, txid, verdict, Coin};
 use common::keys::{keypair, xonly};
 use common::node;
-use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, status, validate_new_leaf, VALUE};
+use common::rounds::{advance_mtp, created, credited_board, mtp, round_final, start, start_depth_limit, status, validate_new_leaf, VALUE};
 use common::running::Running;
 use server::participations::OutputRequest;
 
@@ -805,4 +805,64 @@ async fn an_exit_fill_goes_only_to_a_maker_that_reads_its_records() {
 	let (status, _, why) = refused(&r, "a fill of M's order giving a coin of format 2", &body);
 	assert_eq!(status, 422);
 	assert!(why.contains("past holds a checkpoint with its owner's exit"), "{}", why);
+}
+
+/// The operator co-signs a fill that leaves part of an order resting only
+/// while what rests stays short of its depth limit (here 2), so the order's
+/// maker can always cancel it, one reassignment more. A part fill that would
+/// land the rest at the limit, sent by hand past any wallet's check, is
+/// refused `order_whole_only`; the whole remainder is co-signed, its coins at
+/// the limit and no deeper. The state view says how deep the order's coin is
+/// and whether only the whole is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_fill_that_would_leave_the_rest_at_the_depth_limit_is_refused() {
+	let mut r = start_depth_limit(2).await;
+	let (x, y) = (r.x, r.y);
+	let mut m = maker(&r, "WM");
+	// One Y an X, so one taker coin pays for the whole remainder.
+	m.terms.landed.terms.rate_num = 1;
+	let (t1, t2) = (keypair("WT1"), keypair("WT2"));
+	let mut boards = vec![];
+	for (label, asset) in [("WM, board", x), ("WT1, board", y), ("WT2, board", y)] {
+		let (held, tx) = credited_board(&mut r, &keypair(label), asset).await;
+		boards.push(Coin { held, bases: vec![tx] });
+	}
+	let (wm, nm) = want_order(&m, VALUE, x);
+	let (w1, n1) = want_leaf(&t1, y, VALUE);
+	let (w2, n2) = want_leaf(&t2, y, VALUE);
+	let got = one_round(&mut r, &[(&boards[0], &m.key, wm, nm), (&boards[1], &t1, w1, n1), (&boards[2], &t2, w2, n2)]).await;
+	let (om, c1, c2) = (&got[0], &got[1], &got[2]);
+	let bases = om.bases.clone();
+	assert_eq!(r.http.get("info").ok()["fills"]["refresh_keeps_order"], true);
+	let st = r.http.post("order_publish", &publish_body(&r, &m, om, &m.key)).ok();
+	println!("WM's order: hops {} whole_only {}", st["hops"], st["whole_only"]);
+	assert_eq!((st["hops"].as_u64(), st["whole_only"].as_bool()), (Some(0), Some(false)), "{}", st);
+
+	// T1 fills 300,000: what rests is one reassignment deep, short of the limit.
+	let p = policy_of(&r, &st, &bases);
+	let (l1, _) = new_leaf(&keypair("WT1, X"));
+	let (ch1, _) = new_leaf(&keypair("WT1, change"));
+	r.http.post("order_fill", &fill_body(&r, &st, &p, (c1, c1.valid(&r)), VALUE - 1, 300_000, (&l1, &ch1), 1, &t1, None)).ok();
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	println!("after a part fill: hops {} whole_only {} value {}", st["hops"], st["whole_only"], st["value"]);
+	assert_eq!((st["hops"].as_u64(), st["whole_only"].as_bool(), st["value"].as_str()), (Some(1), Some(true), Some("700000")), "{}", st);
+
+	// T2's part fill would leave the rest two deep, at the limit, where no
+	// cancel could follow: refused, nothing signed, T2's coin its own.
+	let p = policy_of(&r, &st, &bases);
+	let (l2, _) = new_leaf(&keypair("WT2, X"));
+	let (ch2, _) = new_leaf(&keypair("WT2, change"));
+	let part = fill_body(&r, &st, &p, (c2, c2.valid(&r)), VALUE - 1, 200_000, (&l2, &ch2), 1, &t2, None);
+	let (status, code, msg) = refused(&r, "a part fill that would leave the rest at the depth limit", &part);
+	assert_eq!((status, code.as_str()), (422, "order_whole_only"), "{}", msg);
+	assert!(msg.contains("whole remainder, 700000 atoms"), "{}", msg);
+	assert_eq!(order_state(&r, &[om.held.id])[0]["state"], "resting", "the order rests where it was");
+
+	// The whole remainder is co-signed.
+	let whole = fill_body(&r, &st, &p, (c2, c2.valid(&r)), VALUE - 1, 700_000, (&l2, &ch2), 1, &t2, None);
+	let done = r.http.post("order_fill", &whole).ok();
+	assert_eq!(done["outputs"].as_array().unwrap().len(), 3, "the credit, the taker's leaf and its change: nothing rests");
+	let st = order_state(&r, &[om.held.id])[0].clone();
+	println!("the whole remainder taken: {}", st["state"]);
+	assert_eq!(st["state"], "filled");
 }

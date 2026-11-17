@@ -80,6 +80,14 @@ pub struct Config {
 	/// 48 hours when absent.
 	#[serde(default)]
 	pub exit_delay_units: Option<(u16, u16)>,
+	/// The most reassignments a coin may be from a round or a board when the
+	/// operator co-signs a spend of it out of round: the specification's 5
+	/// (`arca_covenant::transfer::DEPTH_LIMIT`) when absent, and never more.
+	/// A lower limit holds every coin to it from the start, those made under
+	/// a higher one included: they are spent only in a round, which a
+	/// resting order's maker reaches by refreshing it.
+	#[serde(default)]
+	pub depth_limit: Option<usize>,
 	/// The assets served, in the order `info` lists them; taken anew,
 	/// without a restart, by [`Server::reload`].
 	pub assets: Vec<AssetSection>,
@@ -1606,6 +1614,7 @@ fn restart_only(a: &Config, b: &Config) -> Vec<String> {
 	differ("node", a.node == b.node);
 	differ("finality", a.finality == b.finality);
 	differ("exit_delay_units", a.exit_delay_units == b.exit_delay_units);
+	differ("depth_limit", a.depth_limit == b.depth_limit);
 	differ("fees.max_margin_multiple", a.fees.max_margin_multiple == b.fees.max_margin_multiple);
 	differ("watcher", a.watcher == b.watcher);
 	differ("limits", a.limits == b.limits);
@@ -1899,6 +1908,12 @@ impl Server {
 		}
 		if config.fills.block_seconds == 0 {
 			return Err(StartError("fills.block_seconds is at least 1".into()));
+		}
+		if let Some(l) = config.depth_limit {
+			if !(1..=arca_covenant::transfer::DEPTH_LIMIT).contains(&l) {
+				return Err(StartError(format!("depth_limit is 1 to {}", arca_covenant::transfer::DEPTH_LIMIT)));
+			}
+			params.depth_limit = l;
 		}
 		params.order_margin_seconds = config.fills.order_margin_seconds;
 		params.order_block_seconds = config.fills.block_seconds;

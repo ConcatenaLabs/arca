@@ -108,6 +108,7 @@ impl Running {
 			},
 			finality: FinalitySection { poll_interval_ms: 200, ..Default::default() },
 			exit_delay_units: None,
+			depth_limit: None,
 			assets: vec![AssetSection::new(x, MIN_LEAF)],
 			fee_assets: None,
 			fees: Default::default(),

@@ -42,13 +42,24 @@ async fn start_tuned(unroll_at_release: bool) -> Running {
 	start_config(unroll_at_release, false).await
 }
 
+/// [`start`] with the operator's depth limit at `limit`.
+#[allow(dead_code)]
+pub async fn start_depth_limit(limit: usize) -> Running {
+	start_full(true, false, Some(limit)).await
+}
+
 async fn start_config(unroll_at_release: bool, no_sweep: bool) -> Running {
+	start_full(unroll_at_release, no_sweep, None).await
+}
+
+async fn start_full(unroll_at_release: bool, no_sweep: bool, depth_limit: Option<usize>) -> Running {
 	let mut r = Running::start_with(|c, y| {
 		c.assets.push(AssetSection::new(y, MIN_LEAF));
 		c.watcher.unroll_at_release = unroll_at_release;
 		if no_sweep {
 			c.batches.no_sweep = true;
 		}
+		c.depth_limit = depth_limit;
 	}).await;
 	let (x, y) = (r.x, r.y);
 	r.fund_wallet_in(x, 50_000_000).await;
