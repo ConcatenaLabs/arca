@@ -40,12 +40,34 @@
 //! operator refuses others), through checkpoints into the credit, the
 //! remainder, a leaf of what it takes and its change.
 //!
+//! **Depth.** Each fill puts what rests one reassignment deeper, and the
+//! operator co-signs nothing past its depth limit (`info.depth_limit`). A
+//! cancel is one reassignment more, so a part fill is offered and co-signed
+//! only while what rests stays short of the limit: once it would land there,
+//! a taker is offered the whole remainder, never a part, and the order can
+//! always be cancelled.
+//!
+//! **Refresh.** [`Wallet::order_refresh_resting`] gives the order a fresh
+//! coin in the operator's next round and keeps it: a participation gives up
+//! the coin it rests at (and, for the round's fee, another coin of the asset
+//! it sells, so the order keeps its whole amount) for an `order-3` leaf of
+//! the same order (the same landed terms, so the same pair, rate, lot,
+//! expiry and landing, and the same amount) under a new leaf key and four new
+//! credit keys. Once the round is final `sync` publishes the new coin, and the
+//! operator, which sees the participation gave up the order's coin, has the
+//! order go on there under the same id: a round's leaf again, four fills
+//! ahead of it. A round that never runs gives the coin back, and the order
+//! rests where it was. A maker's upkeep refreshes an order whose coin is
+//! within two reassignments of the limit, or whose credit keys are used.
+//!
 //! **Cancel and home.** The maker cancels by spending the order's current
 //! coin into a leaf of its own ([`Wallet::order_cancel_resting`]). An order's
-//! coin is never paid on, refreshed by default or planned otherwise. Brought
-//! on the chain (`exit`), it comes home by its landing: after its exit delay
-//! the whole of it becomes SeqDEX's own order for the same terms, which any
-//! taker fills on the chain.
+//! coin is never paid on, nor refreshed but by naming it: a named refresh
+//! ([`Wallet::order_refresh_resting`]) keeps the order, a plain refresh of
+//! the coin (`refresh <coin>`) cancels it into a leaf of the wallet's own.
+//! Brought on the chain (`exit`), it comes home by its landing: after its
+//! exit delay the whole of it becomes SeqDEX's own order for the same terms,
+//! which any taker fills on the chain.
 
 use std::collections::BTreeSet;
 use std::str::FromStr;
@@ -95,6 +117,41 @@ const PENDING_FILLS: &str = "resting_fills_pending";
 /// The meta key of the wallet's order coins whose delegation into the fill
 /// that spent them is done.
 const FILLS_DELEGATED: &str = "resting_fills_delegated";
+
+/// The meta key of the refreshes of resting orders under way: for each
+/// order (its row's id), the participation that refreshes it, the coin it
+/// gives up, and the new coin's leaf nonce and credit nonces.
+const REFRESHES: &str = "resting_refreshes";
+
+/// How close to the operator's depth limit an order's coin may come before a
+/// maker's upkeep refreshes it: two reassignments, as for its other coins.
+pub const REFRESH_WITHIN_HOPS: usize = 2;
+
+/// Whether a resting order at a coin `hops` reassignments from a round,
+/// with `fills_left` fills before its credit keys are used, is due for a
+/// refresh: within [`REFRESH_WITHIN_HOPS`] of the operator's `depth_limit`,
+/// or with no fill left.
+pub fn order_refresh_due(hops: usize, fills_left: usize, depth_limit: Option<usize>) -> bool {
+	fills_left == 0 || depth_limit.is_some_and(|l| hops + REFRESH_WITHIN_HOPS >= l)
+}
+
+/// Whether a fill that leaves part of an order resting, made from the order
+/// coin `order_hops` deep with taker coins at most `taker_hops` deep, keeps
+/// what rests short of the operator's `depth_limit`, so it can still be
+/// cancelled: the operator co-signs a part fill only then.
+pub fn part_fill_allowed(order_hops: usize, taker_hops: usize, depth_limit: Option<usize>) -> bool {
+	depth_limit.is_none_or(|l| 1 + order_hops.max(taker_hops) < l)
+}
+
+/// A refresh of a resting order the wallet would make.
+struct OrderRefresh {
+	row: RestingRow,
+	order_coin: In,
+	policy: OrderPolicy,
+	others: Vec<In>,
+	fee: u64,
+	change: u64,
+}
 
 /// What a maker asks: rest `amount` of `sell` for `want`, `rate_num` atoms of
 /// `want` for every `rate_den` atoms of `sell` (each fill's price rounded
@@ -409,6 +466,12 @@ impl Wallet {
 				super::slice::Item::Skip => continue,
 				super::slice::Item::Stop => break,
 			}
+			if r.state == "refreshing" {
+				if let Some(v) = self.progress_refresh(&r)? {
+					out.push(v);
+				}
+				continue;
+			}
 			if r.state != "participating" {
 				continue;
 			}
@@ -527,15 +590,17 @@ impl Wallet {
 	fn publish_resting(&self, r: &RestingRow, leaf: &str) -> Result<Value, Error> {
 		let row = self.store.coin(leaf)?.ok_or_else(|| Error::Store(format!("coin {} is gone", leaf)))?;
 		let id = LeafId::from_str(leaf).map_err(|e| Error::Store(e.to_string()))?;
+		// The current coin's credit nonces: the last four.
 		let mut nonces = [[0u8; 32]; CREDIT_KEYS];
-		for (i, n) in r.credit_nonces.iter().enumerate().take(CREDIT_KEYS) {
+		let from = r.credit_nonces.len().saturating_sub(CREDIT_KEYS);
+		for (i, n) in r.credit_nonces.iter().skip(from).enumerate().take(CREDIT_KEYS) {
 			nonces[i] = unhex32(n)?;
 		}
 		let mailbox = self.keys.mailbox()?.x_only_public_key().0;
 		let key = self.keys.leaf(&r.nonce)?;
 		let digest = publish_digest(&self.genesis, &self.operator, &id, &nonces, &mailbox);
 		let mut body = json!({
-			"record": hex(&row.record), "credit_nonces": r.credit_nonces, "mailbox": hex(&mailbox.serialize()),
+			"record": hex(&row.record), "credit_nonces": r.credit_nonces[from..], "mailbox": hex(&mailbox.serialize()),
 			"signature": hex(sign(&key, &digest).as_ref()),
 		});
 		// The record formats this wallet reads: a taker gives a coin of the
@@ -576,7 +641,7 @@ impl Wallet {
 			if let Some(leaf) = &r.order_leaf {
 				if let Some(s) = served.as_array().into_iter().flatten().find(|s| s["order"].as_str() == Some(leaf)) {
 					v["operator"] = json!({"state": s["state"], "coin": s["coin"], "value": s["value"], "fills_left": s["fills_left"],
-						"fills": s["fills"]});
+						"fills": s["fills"], "hops": s["hops"], "whole_only": s["whole_only"], "terms": s["terms"]});
 				}
 			}
 			let mut credits = vec![];
@@ -670,6 +735,21 @@ impl Wallet {
 		}
 		let filled = amount.unwrap_or(oc.value);
 		let plan = policy.plan(oc.value, filled).map_err(|e| Error::Refused(e.to_string()))?;
+		// A fill that leaves part of the order resting must leave it short of
+		// the operator's depth limit, where its maker can still cancel it:
+		// once the order's coin is that deep, only the whole remainder is
+		// offered.
+		let limit = super::pay::depth_limit(info);
+		let partial = plan.rest.is_some();
+		if limit.is_some_and(|l| oc.hops + 1 > l) {
+			return Err(Error::Refused(format!("order {} rests at a coin {} reassignments from a round, at the operator's depth limit of {}: \
+				the operator co-signs no fill of it until its maker refreshes it", order, oc.hops, limit.unwrap_or(0))));
+		}
+		if partial && !part_fill_allowed(oc.hops, 0, limit) {
+			return Err(Error::Refused(format!("order {} rests at a coin {} reassignments from a round: a fill of part of it would leave the \
+				rest at the operator's depth limit of {}, where its maker could no longer cancel it, so the operator takes only a fill of the \
+				whole remainder, {} (fill it without an amount), until its maker refreshes it", order, oc.hops, limit.unwrap_or(0), oc.value)));
+		}
 		let asset_b = policy.terms().asset_b;
 		let price = plan.credit.value;
 		let m = Margins::of(info, asset_b)?;
@@ -690,8 +770,16 @@ impl Wallet {
 		// maker reads no coin record of the newer format.
 		let maker_reads = Self::reads_exit_format(&json!({"reads": o["maker_reads"]}));
 		let mut unread = 0u64;
+		let mut too_deep = 0u64;
 		for mut c in self.coins_to_give(asset_b, super::places::Spend::Trade)? {
 			if c.row.expiry < order_expiry {
+				continue;
+			}
+			// A coin that would put the fill's coins past the depth limit (or,
+			// for a part fill, what rests at it) is left out.
+			let fits = if partial { part_fill_allowed(oc.hops, c.coin.hops, limit) } else { limit.is_none_or(|l| 1 + c.coin.hops <= l) };
+			if !fits {
+				too_deep = too_deep.saturating_add(c.coin.value);
 				continue;
 			}
 			if !maker_reads && c.row.record.first() == Some(&arca_covenant::transfer::COIN_RECORD_VERSION_EXIT) {
@@ -706,6 +794,11 @@ impl Wallet {
 			c.checkpoint_value = v;
 			kept = kept.saturating_add(v);
 			chosen.push(c);
+			// Priced only once the coins hold the price: a fill of fewer does
+			// not balance, and the next coin is taken first.
+			if kept <= price {
+				continue;
+			}
 			let outs = fill_outputs(&plan, &policy, (got, filled), Some((change_leaf, asset_b, 1)), self);
 			let fee = fill_margin(&oc, &plan, &chosen, &outs, &m)?;
 			let need = price.saturating_add(fee);
@@ -715,6 +808,12 @@ impl Wallet {
 			}
 		}
 		let Some((fee, change)) = done else {
+			if too_deep > 0 && partial && kept.saturating_add(too_deep) > price {
+				return Err(Error::Refused(format!("the wallet's coins of asset {} that would pay this part fill are so many reassignments \
+					from a round that the rest of order {} would land at the operator's depth limit of {}, where its maker could no longer \
+					cancel it: fill the whole remainder, {}, or refresh those coins in a round first", asset_b, order, limit.unwrap_or(0),
+					oc.value)));
+			}
 			// Coins enough, but of a format the order's maker cannot read:
 			// say so, as a payment or a swap with an older build does.
 			if unread > 0 && kept.saturating_add(unread) > price {
@@ -912,10 +1011,230 @@ impl Wallet {
 		let leaf = self.store.nonce(&r.nonce)?.and_then(|n| n.leaf_id)
 			.ok_or_else(|| Error::Refused(format!("order {} has no coin yet: its round has not made it", order)))?;
 		let row = self.store.coin(&leaf)?.ok_or_else(|| Error::Store(format!("coin {} is gone", leaf)))?;
+		if r.state == "refreshing" {
+			return Err(Error::Refused(format!("order {} is being refreshed in a round (its coin {} is given up for a fresh coin of the same \
+				order): once the round is final, sync publishes the new coin and the order rests there", order, leaf)));
+		}
 		if row.state != "live" || !is_order_coin(&row) {
 			return Err(Error::Refused(format!("order {} rests at coin {}, which is {}: nothing rests to cancel", order, leaf, row.state)));
 		}
 		Ok((r, row))
+	}
+
+	/// What refreshing the wallet's resting order `order` in the operator's
+	/// next round would cost, before anything is signed: the coin it rests
+	/// at and what it holds (which the order keeps whole), the coins given up
+	/// with it for the round's fee, the fee and the change. Refuses what
+	/// [`Self::order_refresh_resting`] refuses for the same reason.
+	pub fn order_refresh_resting_quote(&mut self, order: &str, max_fee_ppm: Option<u64>) -> Result<Value, Error> {
+		let _quote = self.quoting();
+		let info = self.server_info()?;
+		let q = self.order_refresh_plan(&info, order, max_fee_ppm).map(|(q, _)| q);
+		self.quoted(q)
+	}
+
+	fn order_refresh_plan(&mut self, info: &Value, order: &str, max_fee_ppm: Option<u64>) -> Result<(Value, OrderRefresh), Error> {
+		if info["fills"]["refresh_keeps_order"].as_bool() != Some(true) {
+			return Err(Error::Refused(format!("the operator does not keep a resting order through a refresh (an older operator): cancel \
+				order {} instead, and rest it again", order)));
+		}
+		let (r, row) = self.resting_to_cancel(order)?;
+		let (record, held) = self.held(&row)?;
+		if !held.all_final() {
+			return Err(Error::Refused(format!("order {}'s coin {} is not final: {}", order, row.leaf_id, held.waiting())));
+		}
+		let oc = held.valid.clone();
+		let policy = oc.leaf.order_policy().ok_or_else(|| Error::Refused(format!("coin {} is no order's", row.leaf_id)))?;
+		if policy.landed.version != arca_covenant::order::SeqdexVersion::V2 {
+			return Err(Error::Refused(format!("order {} rests as order-2, which no round makes any more: cancel it and rest it again", order)));
+		}
+		let a = policy.terms().asset_a;
+		let now = self.now()?.to_consensus_u32();
+		if let Some(b) = self.board_expiry(&record, &held.bases)? {
+			if now as u64 + arca_covenant::WalletPolicy::EXIT_DEADLINE as u64 >= b as u64 {
+				return Err(Error::Refused(format!("order {}'s coin rests on a board whose service ends at median time {}: the operator takes \
+					it into a refresh only until its exit deadline, three days before; cancel the order or bring it home", order, b)));
+			}
+		}
+		let schedule = schedule_of(info, a);
+		let order_fee = refresh_fee(&schedule, oc.value, self.service_expiry(&record, &held)?, now);
+		let min = Self::min_leaf(info, a)?;
+		let order_coin = In { lock: None, checkpoint_value: oc.value, row: row.clone(), coin: oc.clone() };
+		// The round's fee comes from other coins of the asset, so the order
+		// keeps its whole amount: the set of them that leaves the least
+		// change, as resting an order takes them.
+		let (mut others, mut fee, mut change) = (vec![], order_fee, 0u64);
+		if order_fee > 0 {
+			self.free_when_short(a, order_fee)?;
+			let coins = self.coins_to_give(a, super::places::Spend::Trade)?;
+			let mut priced: Vec<(u64, u64)> = Vec::with_capacity(coins.len());
+			for c in &coins {
+				let (rc, h) = self.held(&c.row)?;
+				priced.push((c.coin.value, refresh_fee(&schedule, c.coin.value, self.service_expiry(&rc, &h)?, now)));
+			}
+			let pick = least_change(&priced, order_fee, min, super::round::MAX_GIVEN - 1, 0).ok_or_else(|| Error::Refused(format!("refreshing \
+				order {} costs a round's fee of {} of asset {}, which the wallet pays from another coin of the asset so the order keeps its \
+				whole amount, and its live coins of the asset hold none that pays it with change of none or at least {}: receive some, or \
+				cancel the order (cancel-resting)", order, order_fee, a, min)))?;
+			fee = order_fee + pick.iter().map(|&i| priced[i].1).sum::<u64>();
+			change = pick.iter().map(|&i| priced[i].0).sum::<u64>() - fee;
+			let mut coins: Vec<Option<In>> = coins.into_iter().map(Some).collect();
+			others = pick.iter().map(|&i| coins[i].take().expect("each coin picked once")).collect();
+		}
+		let given_value = oc.value + others.iter().map(|c| c.coin.value).sum::<u64>();
+		let bound = max_fee_ppm.unwrap_or(DEFAULT_MAX_FEE_PPM);
+		if !fee_within(fee, given_value, bound) {
+			return Err(Error::Refused(format!("refreshing order {} costs {} of asset {}, above the wallet's bound of {} ppm of the {} it gives \
+				up (raise it with max_fee_ppm)", order, fee, a, bound, given_value)));
+		}
+		let mut gives = vec![row.leaf_id.clone()];
+		gives.extend(others.iter().map(|c| c.row.leaf_id.clone()));
+		let q = json!({
+			"order": order, "coin": row.leaf_id, "holds": oc.value.to_string(), "keeps": oc.value.to_string(),
+			"depth": oc.hops, "depth_limit": super::pay::depth_limit(info), "fills_left": policy.fills_left(),
+			"fee": {"asset": a.to_string(), "amount": fee.to_string()}, "gives": gives, "change": change.to_string(),
+		});
+		Ok((q, OrderRefresh { row: r, order_coin, policy, others, fee, change }))
+	}
+
+	/// Refreshes the wallet's resting order `order` in the operator's next
+	/// round and keeps it (see the [module documentation](self)): the same
+	/// id, terms and amount at a fresh coin, a round's leaf, four fills
+	/// ahead of it. With `shown` (an [`Self::order_refresh_resting_quote`]'s
+	/// answer), only for the coins and the fee it showed. `sync` completes
+	/// the participation and publishes the new coin.
+	pub fn order_refresh_resting(&mut self, order: &str, max_fee_ppm: Option<u64>, shown: Option<&Value>) -> Result<Value, Error> {
+		self.witnessed_now()?;
+		let info = self.server_info()?;
+		let (quote, plan) = self.order_refresh_plan(&info, order, max_fee_ppm)?;
+		if let Some(s) = shown {
+			for k in ["coin", "fee", "gives"] {
+				if s[k] != quote[k] {
+					return Err(Error::Refused(format!("the refresh's {} changed since it was shown: it is now {}", k, quote[k])));
+				}
+			}
+		}
+		let OrderRefresh { row: r, order_coin, policy, others, fee, change } = plan;
+		let a = policy.terms().asset_a;
+		// The new coin's leaf key and credit keys; its landed order is the
+		// order's own, unchanged.
+		let nonce = random32();
+		let owner = self.keys.leaf_xonly(&nonce)?;
+		let mut credit_nonces = [[0u8; 32]; CREDIT_KEYS];
+		let mut credits = [[0u8; 32]; CREDIT_KEYS];
+		for i in 0..CREDIT_KEYS {
+			credit_nonces[i] = random32();
+			credits[i] = self.keys.leaf_xonly(&credit_nonces[i])?.serialize();
+		}
+		let terms = OrderLeafTerms { landed: policy.landed, credits };
+		terms.check(a, &owner, &self.operator).map_err(|e| Error::Refused(e.to_string()))?;
+		self.store.put_nonce(&nonce, &owner.serialize(), "resting order")?;
+		for (i, n) in credit_nonces.iter().enumerate() {
+			self.store.put_nonce(n, &credits[i], "order credit")?;
+		}
+		let terms_json = order_terms_json(&terms);
+		let value = order_coin.coin.value;
+		let mut wanted = vec![Wanted::Leaf { asset: a, value, template: Template::Order3, owner, owner_nonce: nonce,
+			exit_delay: self.exit_delay(), order: Some(terms), landing: None, channel: None }];
+		let mut wanted_json = vec![json!({"nonce": hex(&nonce), "asset": a.to_string(), "value": value.to_string(), "order": terms_json})];
+		if change > 0 {
+			let (w, entry) = self.change_wanted(&info, a, change, "order refresh change")?;
+			wanted.push(w);
+			wanted_json.push(entry);
+		}
+		let fees = vec![(a, fee)];
+		let coins: Vec<&In> = std::iter::once(&order_coin).chain(others.iter()).collect();
+		let ids: Vec<LeafId> = coins.iter().map(|c| c.coin.id).collect();
+		let id = participation_id(&self.genesis, &self.operator, &ids, &wanted, &fees, None);
+		let mut inputs = vec![];
+		for c in &coins {
+			let k = self.coin_key(&c.row.owner_nonce)?;
+			inputs.push(json!({"leaf_id": c.row.leaf_id, "attestation": hex(sign(&k, &id).as_ref())}));
+		}
+		let mut outputs = vec![];
+		for w in &wanted {
+			let mut j = w.json();
+			if let Wanted::Leaf { owner_nonce, .. } = w {
+				let k = self.keys.leaf(owner_nonce)?;
+				j["leaf"]["key_proof"] = json!(hex(sign(&k, &key_proof_digest(&id)).as_ref()));
+				let (mailbox, proof) = self.binding(&k)?;
+				j["leaf"]["mailbox"] = json!(mailbox);
+				j["leaf"]["mailbox_proof"] = json!(proof);
+			}
+			outputs.push(j);
+		}
+		let body = json!({"inputs": inputs, "outputs": outputs,
+			"fees": fees.iter().map(|(a, v)| json!({"asset": a.to_string(), "amount": v.to_string()})).collect::<Vec<_>>()});
+		let pid = hex(&id);
+		let given: Vec<String> = coins.iter().map(|c| c.row.leaf_id.clone()).collect();
+		let pending = json!({"participation": pid, "from": order_coin.row.leaf_id, "nonce": hex(&nonce),
+			"credit_nonces": credit_nonces.iter().map(|n| hex(n)).collect::<Vec<_>>()});
+		self.store.atomically(|s| {
+			s.put_participation(&pid, &body.to_string(), &serde_json::to_string(&given).expect("strings"),
+				&Value::Array(wanted_json.clone()).to_string())?;
+			for l in &given {
+				s.set_coin_state(l, "given", &format!("refresh of resting order {}", order))?;
+			}
+			let mut all: serde_json::Map<String, Value> = s.meta(REFRESHES)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+			all.insert(r.id.clone(), pending.clone());
+			s.set_meta(REFRESHES, &Value::Object(all).to_string())?;
+			s.set_resting(&r.id, None, "refreshing")
+		})?;
+		let answer = self.submit_participation_body(&pid, &body, &given)?;
+		Ok(json!({"order": order, "state": "refreshing", "participation": pid, "answer_state": answer["state"], "coin": quote["coin"],
+			"keeps": value.to_string(), "fee": quote["fee"], "gives": given, "change": change.to_string(),
+			"note": self.spelling.say("refreshing: once the operator's round makes the order's new coin and is final, {sync} hands over the \
+				forfeits and publishes it; the order then rests there under the same id")}))
+	}
+
+	/// Moves the refresh of resting order `r` on as far as `sync` takes it:
+	/// once its participation is released and the wallet holds the new coin,
+	/// publishes it, and the order goes on there; a participation that ended
+	/// without its round leaves the order resting where it was.
+	fn progress_refresh(&mut self, r: &RestingRow) -> Result<Option<Value>, Error> {
+		let mut all: serde_json::Map<String, Value> = self.store.meta(REFRESHES)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
+		let Some(x) = all.get(&r.id).cloned() else {
+			self.store.set_resting(&r.id, None, "published")?;
+			return Ok(None);
+		};
+		let pid = x["participation"].as_str().unwrap_or("").to_string();
+		let order = r.order_leaf.clone().unwrap_or_else(|| r.id.clone());
+		let state = self.store.participation(&pid)?.map(|p| p.4).unwrap_or_else(|| "gone".into());
+		match state.as_str() {
+			"released" => {},
+			"submitting" | "pending" | "issued" | "forfeiting" => return Ok(None),
+			other => {
+				all.remove(&r.id);
+				self.store.atomically(|s| {
+					s.set_meta(REFRESHES, &Value::Object(all.clone()).to_string())?;
+					s.set_resting(&r.id, None, "published")
+				})?;
+				return Ok(Some(json!({"order": order, "state": "resting", "refreshed": false, "note": format!("its refresh's participation \
+					is {}: the order rests at its coin {} as before", other, x["from"].as_str().unwrap_or(""))})));
+			},
+		}
+		let nonce = unhex32(x["nonce"].as_str().unwrap_or(""))?;
+		let Some(leaf) = self.store.nonce(&nonce)?.and_then(|n| n.leaf_id) else { return Ok(None) };
+		let fresh: Vec<String> = x["credit_nonces"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect();
+		let mut credit_nonces = r.credit_nonces.clone();
+		credit_nonces.extend(fresh);
+		let next = RestingRow { nonce, credit_nonces: credit_nonces.clone(), ..r.clone() };
+		match self.publish_resting(&next, &leaf) {
+			Ok(v) => {
+				// An operator that keeps the order answers it by its id; one
+				// that published the new coin as an order of its own names that.
+				let served = v["order"].as_str().unwrap_or(&leaf).to_string();
+				all.remove(&r.id);
+				self.store.atomically(|s| {
+					s.set_resting_keys(&r.id, &nonce, &credit_nonces)?;
+					s.set_resting(&r.id, (served != order).then_some(served.as_str()), "published")?;
+					s.set_meta(REFRESHES, &Value::Object(all.clone()).to_string())
+				})?;
+				Ok(Some(json!({"order": served, "state": v["state"], "refreshed": true, "coin": leaf, "value": v["value"],
+					"kept_id": served == order})))
+			},
+			Err(e) => Ok(Some(json!({"order": order, "state": "refreshing", "coin": leaf, "unpublished": e.to_string()}))),
+		}
 	}
 
 	/// What cancelling the wallet's resting order `order` would give back,
