@@ -1672,11 +1672,15 @@ it was. While such a participation holds the order's coin, or has given it
 up and the new leaf is not yet published, the order reads `refreshing`. The
 server says it keeps an order through a refresh in its `info`
 (`fills.refresh_keeps_order`). A participation that gives up an order's coin
-for anything else (a plain refresh into a `vtxo` leaf) cancels the order. One
-participation may refresh several orders of one landed terms and value: it
-pairs the order coins it gives up with the `order-3` leaves it wants of those
-terms and value by position (the j-th leaf goes on from the j-th coin), and
-each order goes on at its own leaf as that leaf is published.
+for anything else (a plain refresh into a `vtxo` leaf) cancels the order. Which
+leaf continues which order is fixed when the participation is taken in,
+never at publication: the order coins it gives up (published orders or not)
+are paired with the `order-3` leaves it wants by position among those of the
+same landed terms and value, the j-th such coin with the j-th such leaf, and
+each pair whose coin a published order rests at is recorded. Publishing a
+leaf continues the order bound to it, or none; a leaf bound to no order is an
+order of its own, and an order whose leaf is never published stays as it is
+(`refreshing`, or `lost` should the round be lost).
 
 A round can leave the chain for good after the maker handed over its forfeit
 (an anchor rollback, and another transaction took the round's input). Its

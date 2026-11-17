@@ -76,9 +76,13 @@
 //! wants, is the maker's consent; no fill of the old coin can be co-signed
 //! while a participation holds it, and a participation that never runs gives
 //! it back, the order resting where it was. While a refresh is under way the
-//! order reads `refreshing`. One participation may refresh several orders of
-//! one landed terms and value: it pairs the coins it gives up with the leaves
-//! it wants by position, and each order goes on at its own leaf.
+//! order reads `refreshing`. Which leaf continues which order is fixed when
+//! the participation is taken in, never at publication: its order coins are
+//! paired with the order leaves it wants by position among those of the same
+//! landed terms and value, published orders or not, and each pair whose coin
+//! a published order rests at is recorded. Publishing a leaf continues the
+//! order bound to it, or none; a pair whose leaf is never published leaves
+//! its order as it is (`refreshing`, or `lost` should the round be lost).
 //!
 //! **Lost.** A round can leave the chain for good after the maker handed over
 //! its forfeit (an anchor rollback, and another transaction took the round's
@@ -514,9 +518,9 @@ impl Orders {
 			return Err(OrderError::NotAnOrder("the record published is not the record of the coin the server holds".into()));
 		}
 		let bytes = req.record.to_bytes().map_err(internal)?;
-		if let Some((order, from)) = self.refreshed_order(&id, &coin).await? {
-			let o = self.store.continue_resting_order(&order.order_id, &from, &id.0, &record.owner.serialize(), &req.mailbox.serialize(),
-				&bytes, &req.credit_nonces, &req.record_formats).await.map_err(|e| match e {
+		if let Some((order, from, (pid, idx))) = self.refreshed_order(&id, &coin).await? {
+			let o = self.store.continue_resting_order((&pid, idx), &order.order_id, &from, &id.0, &record.owner.serialize(),
+				&req.mailbox.serialize(), &bytes, &req.credit_nonces, &req.record_formats).await.map_err(|e| match e {
 					StoreError::LeafSpent(_) => OrderError::Moved(format!("order {} no longer rests at coin {}, which the refresh that made \
 						coin {} gave up", LeafId(order.order_id), LeafId(from), id)),
 					other => other.into(),
@@ -531,69 +535,32 @@ impl Orders {
 		self.view(&id).await?.ok_or_else(|| internal("a published order is gone"))
 	}
 
-	/// The published order a refresh made the coin `id` (holding `coin`)
-	/// for, and the coin the order rested at that the refresh gave up. The
-	/// participation whose round made `id` pairs the coins of published
-	/// orders it gave up with the `order-3` leaves it wants, each of the same
-	/// landed terms and value, by position: the j-th such leaf goes on from
-	/// the j-th such coin ([`Orders::pairing`]). Every pairing keeps value
-	/// and terms, since both sides match in both, so a participation that
-	/// refreshes several orders of one terms and value continues each, one
-	/// per publication. `None` when `id` pairs with no coin an order still
-	/// rests at, given up: the coin is then an order of its own.
-	async fn refreshed_order(&self, id: &LeafId, coin: &ValidCoin) -> Result<Option<(RestingOrderRow, [u8; 32])>, OrderError> {
+	/// The published order the coin `id` (holding `coin`) continues, and
+	/// the coin that order rested at: the order bound to the output of which
+	/// a round made `id`, when the participation that wants that output was
+	/// taken in ([`crate::store::orders::bind_refreshes`]). The order goes on
+	/// at `id` only if it still rests at that coin, given up, and `id` is of
+	/// its landed terms and value. `None` when no order is bound to it: the
+	/// coin is then an order of its own. Nothing is worked out from what
+	/// other leaves are published by now.
+	async fn refreshed_order(&self, id: &LeafId, coin: &ValidCoin) -> Result<Option<(RestingOrderRow, [u8; 32], ([u8; 32], i16))>, OrderError> {
 		let Some(new) = coin.leaf.order_policy() else { return Ok(None) };
-		let Some(pid) = self.store.participation_making(&id.0).await? else { return Ok(None) };
-		let Some(p) = self.store.participation(&pid).await? else { return Ok(None) };
-		let (ins, outs) = self.pairing(&p, &new.landed, coin.value).await?;
-		let Some(j) = outs.iter().position(|o| *o == Some(id.0)) else { return Ok(None) };
-		let Some(from) = ins.get(j).copied() else { return Ok(None) };
-		let Some(o) = self.store.resting_order_of_leaf(&from).await? else { return Ok(None) };
+		let Some((pid, idx, order_id, from)) = self.store.refresh_bound_to(&id.0).await? else { return Ok(None) };
+		let Some(o) = self.store.resting_order(&order_id).await? else { return Ok(None) };
 		let Some(row) = self.store.leaf(&from).await? else { return Ok(None) };
-		if o.current_leaf != from || matches!(row.state, LeafState::Live | LeafState::Pending) {
+		let Some(old) = CoinRecord::from_bytes(&row.record).ok().and_then(|r| r.order_policy()) else { return Ok(None) };
+		if o.current_leaf != from || matches!(row.state, LeafState::Live | LeafState::Pending) || old.landed != new.landed
+			|| row.value != coin.value
+		{
 			return Ok(None);
 		}
-		Ok(Some((o, from)))
+		Ok(Some((o, from, (pid, idx))))
 	}
 
-	/// How the participation `p` pairs coins of published orders of the
-	/// landed terms `landed`, holding `value`, with the `order-3` leaves it
-	/// wants of the same terms and value: those coins it gives up, in its
-	/// input order, and those leaves, in its output order (each by the leaf
-	/// its round made of it, once made). The j-th leaf continues the order
-	/// of the j-th coin.
-	async fn pairing(&self, p: &crate::store::ParticipationRow, landed: &arca_covenant::order::SeqdexOrder, value: u64)
-		-> Result<(Vec<[u8; 32]>, Vec<Option<[u8; 32]>>), OrderError>
-	{
-		let mut ins = vec![];
-		for i in p.inputs.iter().filter(|i| !i.returned) {
-			if self.store.resting_order_of_leaf(&i.leaf_id).await?.is_none() {
-				continue;
-			}
-			let Some(row) = self.store.leaf(&i.leaf_id).await? else { continue };
-			let Some(old) = CoinRecord::from_bytes(&row.record).ok().and_then(|r| r.order_policy()) else { continue };
-			if old.landed == *landed && row.value == value {
-				ins.push(i.leaf_id);
-			}
-		}
-		let outs = p.outputs.iter().filter(|o| o.value == value && matches!(&o.kind,
-			crate::store::WantedKind::Leaf { order: Some(t), .. } if t.landed == *landed)).map(|o| o.leaf_id).collect();
-		Ok((ins, outs))
-	}
-
-	/// Whether a participation that may still run, or ran, gives up `leaf`
-	/// (the coin an order of `policy` rests at, holding `value`) for an
-	/// order-3 leaf of the same order and value, paired with it
-	/// ([`Orders::pairing`]): a refresh that keeps it.
-	async fn refresh_under_way(&self, leaf: &[u8; 32], policy: &OrderPolicy, value: u64) -> Result<bool, OrderError> {
-		for pid in self.store.participations_giving_up(leaf).await? {
-			let Some(p) = self.store.participation(&pid).await? else { continue };
-			let (ins, outs) = self.pairing(&p, &policy.landed, value).await?;
-			if ins.iter().position(|i| i == leaf).is_some_and(|k| k < outs.len()) {
-				return Ok(true);
-			}
-		}
-		Ok(false)
+	/// Whether a refresh of the order resting at `leaf` is under way: bound
+	/// by a participation that may still run, or ran, and not gone on yet.
+	async fn refresh_under_way(&self, leaf: &[u8; 32]) -> Result<bool, OrderError> {
+		Ok(self.store.refresh_under_way(leaf).await?)
 	}
 
 	/// The coin whose exit brings an order's value home whole when the
@@ -628,7 +595,7 @@ impl Orders {
 		let filling = fills.iter().any(|f| f.order_leaf == order.current_leaf && f.signature.is_none());
 		let landed = row.state == LeafState::Live && !self.store.sightings_of(&row.script_pubkey).await?.is_empty();
 		let refreshing = !whole && matches!(row.state, LeafState::Live | LeafState::Spent)
-			&& self.refresh_under_way(&order.current_leaf, &policy, row.value).await?;
+			&& self.refresh_under_way(&order.current_leaf).await?;
 		let exit_coin = if whole || refreshing { None } else { self.lost_exit(&order.current_leaf, &row).await? };
 		Ok(Some(OrderView {
 			value: row.value, coin_state: row.state, expiry: cosign::first_expiry(&record),
