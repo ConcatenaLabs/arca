@@ -725,29 +725,30 @@ async fn a_lock_whose_payments_fail_back_ends_unmarked_and_comes_back_out_of_rou
 	std::fs::write(&busy, format!("#!/bin/sh\ncase \"$*\" in *\"lightning pay status\"*) echo 'Error: database is locked' >&2; exit 1;; esac\nexec '{}' \"$@\"\n", real)).unwrap();
 	std::fs::set_permissions(&busy, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 	let q_btc0 = spendable_sat(&q);
-	let mut read_busy = false;
+	// Q's first follow pays (its first try), and Bark cannot be read on how the
+	// payment stands: followed as in flight, no further try used, the mark kept.
+	assert_eq!(swap_of(&q, &id)["state"], "taken");
+	let out = tokio::task::block_in_place(|| Command::new(env!("CARGO_BIN_EXE_arca")).env("ARCA_BARK_EXEC", &busy).arg("--datadir").arg(&q.dir)
+		.args(["btc-swap", "follow", &id, "--claim-slice", "5"]).output().unwrap());
+	let s = swap_of(&q, &id);
+	println!("ROW G Bark not read: {} | {} | tries {} | lock paid {} | {}", s["state"], s["note"], s["pay_tries"], lock(&q)["paid"],
+		String::from_utf8_lossy(&out.stderr).trim());
+	assert_eq!((s["state"].as_str(), s["pay_tries"].as_u64()), (Some("paying"), Some(1)), "followed as in flight: {}", s);
+	assert_eq!(lock(&q)["paid"], true, "the mark stays while the payment is not read");
+	let s = follow_one(&q, &id);
+	println!("ROW G read again: {} | {} | tries {}", s["state"], s["note"], s["pay_tries"]);
+	assert_eq!(s["pay_tries"], 1, "the reading used no try: {}", s);
 	let t0 = Instant::now();
 	let end = loop {
-		let s = swap_of(&q, &id);
-		if s["state"] == "paying" && !read_busy {
-			let tries = s["pay_tries"].clone();
-			let out = tokio::task::block_in_place(|| Command::new(env!("CARGO_BIN_EXE_arca")).env("ARCA_BARK_EXEC", &busy).arg("--datadir").arg(&q.dir)
-				.args(["btc-swap", "follow", &id, "--claim-slice", "5"]).output().unwrap());
-			let after = swap_of(&q, &id);
-			println!("ROW G Bark not read: {} | {} | tries {} | {}", after["state"], after["note"], after["pay_tries"], String::from_utf8_lossy(&out.stderr).trim());
-			assert_eq!((after["state"].as_str(), after["pay_tries"].clone()), (Some("paying"), tries), "followed as in flight, no try used");
-			assert_eq!(lock(&q)["paid"], true, "the mark stays while the payment is not read");
-			read_busy = true;
-		}
 		let s = follow_one(&q, &id);
 		println!("ROW G Q's swap: {} | {} | tries {} | lock paid {}", s["state"], s["note"], s["pay_tries"], lock(&q)["paid"]);
 		if s["state"] == "btc_failed" {
 			break s;
 		}
+		assert_eq!(lock(&q)["paid"], true, "marked until the swap ends");
 		assert!(t0.elapsed() < Duration::from_secs(400), "Q's payment never ended: {}", s);
 		std::thread::sleep(Duration::from_secs(3));
 	};
-	assert!(read_busy, "a payment was followed while Bark could not be read");
 	assert_eq!(end["pay_tries"], 3, "three tries: {}", end);
 	assert_eq!(lock(&q)["paid"], false, "the lock is no longer marked paid: {}", lock(&q));
 	until_btc(&[&q], 120, "Q's BTC back", || spendable_sat(&q) >= q_btc0);
