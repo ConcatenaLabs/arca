@@ -1183,6 +1183,9 @@ async fn d64_the_pool_counts_coins_not_yet_final() {
 		c.lightning.retry_seconds = 10;
 		c.lightning.receive_window_seconds = 600;
 		c.lightning.receive_cap_ppm = 100_000;
+		// A coin in a block and not yet final: a deeper anchor depth than
+		// the default.
+		c.finality.anchor_depth = common::running::DEEPER_ANCHOR_DEPTH;
 	}).await;
 	let x = r.x;
 	let xs = x.to_string();

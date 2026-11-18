@@ -65,8 +65,8 @@ pub enum Certification {
 
 #[derive(Debug, Clone)]
 pub struct FinalityConfig {
-	/// The Bitcoin blocks that must bury a block's anchor for it to be final.
-	/// The specification's value is 2.
+	/// The Bitcoin blocks that must bury a block's anchor for it to be final:
+	/// the operator's `[finality] anchor_depth`, 0 unless it asks for more.
 	pub anchor_depth: u32,
 	pub certification: Certification,
 	/// The height to start following from on an empty database; the node's
@@ -79,9 +79,10 @@ pub struct FinalityConfig {
 }
 
 impl FinalityConfig {
-	/// The specification's rule: certified, and the anchor buried two Bitcoin
-	/// blocks.
-	pub fn spec() -> FinalityConfig {
+	/// Certified, and the anchor buried two Bitcoin blocks: a deeper depth
+	/// than the default, which an operator may ask for. The service's tests
+	/// run at it so that the burial is proven.
+	pub fn buried_two() -> FinalityConfig {
 		FinalityConfig {
 			anchor_depth: 2,
 			certification: Certification::Required,

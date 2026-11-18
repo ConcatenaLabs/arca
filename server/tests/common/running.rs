@@ -106,7 +106,11 @@ impl Running {
 				rpc_url: format!("http://127.0.0.1:{}/", rt.node.rpc_port()),
 				cookie_file: None, rpc_user: Some("arca".into()), rpc_password: Some("arca".into()),
 			},
-			finality: FinalitySection { poll_interval_ms: 200, ..Default::default() },
+			// Anchor depth 2, deeper than the server's default 0: these tests
+			// drive each block's burial by hand and prove what waits for it.
+			// The cases at depth 0 set it themselves (unlock_lane,
+			// minting_round, round_latency).
+			finality: FinalitySection { poll_interval_ms: 200, anchor_depth: 2, ..Default::default() },
 			exit_delay_units: None,
 			depth_limit: None,
 			assets: vec![AssetSection::new(x, MIN_LEAF)],

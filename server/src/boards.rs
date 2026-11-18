@@ -16,9 +16,10 @@
 //! which it never accepts twice, and take the transaction into the nursery.
 //!
 //! The board is credited, and its leaf becomes live, only once the finality
-//! service calls its transaction final: certified, and its anchor buried two
-//! Bitcoin blocks. The operator carries the risk of a board that is rolled
-//! back, which is why it waits. A rollback that takes a credited board out
+//! service calls its transaction final: certified, and its anchor buried
+//! `[finality] anchor_depth` Bitcoin blocks (none by default). The operator
+//! carries the risk of a board that is rolled back after its coin was spent,
+//! which a deeper anchor depth narrows. A rollback that takes a credited board out
 //! uncredits it at once; the nursery broadcasts it again, unchanged, and it is
 //! credited again when final again. A board whose transaction can no longer
 //! confirm is lost, and so is one never credited whose transaction is in no

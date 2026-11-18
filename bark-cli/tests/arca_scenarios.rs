@@ -51,7 +51,9 @@ fn encode(prefix: &str, v: &Value) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_board_pay_refresh_swap_rollback_and_exit() {
-	let mut r = Running::start().await;
+	// A board and a round in a block, their anchor not yet buried, then a
+	// rollback: a deeper anchor depth than the default, set here.
+	let mut r = Running::start_with(|c, _, _| c.finality.anchor_depth = common::running::DEEPER_ANCHOR_DEPTH).await;
 	let (x, y) = (r.x.to_string(), r.y.to_string());
 	let (url, node) = (r.url(), r.node_url());
 	println!("server {}, node {}, asset X {} (listed for fees), asset Y {} (not listed)", url, node, x, y);

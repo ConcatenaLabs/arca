@@ -102,11 +102,16 @@ cookie_file = "/var/lib/sequentia/.cookie"
 # or: rpc_user = "...", rpc_password = "..."
 
 [finality]
-# Certified, and the anchor buried this many Bitcoin blocks. 0 makes a coin
-# final once its block is certified (the public testnet's setting); a Bitcoin
-# reorganisation of the anchored block still takes it out of the chain.
-# Published in `info`, and the wallets that use the operator follow it.
-anchor_depth = 2
+# Certified, and the anchor buried this many Bitcoin blocks. 0, the default,
+# makes a coin final once its block is certified. A deeper depth protects the
+# operator: it credits a board only once that many Bitcoin blocks bury the
+# board's anchor, so a Bitcoin reorganisation cannot take a board away after
+# its coin has been spent off the chain. It costs the
+# people who use the operator about ten minutes a block before a coin they
+# receive on the chain or from a round can be spent. At any depth a Bitcoin
+# reorganisation of the anchored block still takes the block out of the
+# chain. Published in `info`, and the wallets that use the operator follow it.
+anchor_depth = 0
 # "required" on every chain with a committee.
 certification = "required"
 poll_interval_ms = 1000

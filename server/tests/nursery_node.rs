@@ -53,7 +53,7 @@ async fn nursery_on_regtest() {
 	node::list_fee_asset(&rt, x, 100_000_000);
 
 	let source = Arc::new(NodeSource::new(rt.client().clone()));
-	let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
+	let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::buried_two()).await.unwrap();
 	let mut rx = finality.subscribe();
 	let wallet = Arc::new(Wallet::new(db.store.clone(), finality.clone(), xonly(&keypair("operator")),
 		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 2, spend_from: SpendFrom::Final, pool_coins: server::wallet::POOL_COINS }).unwrap());
@@ -161,7 +161,7 @@ async fn a_pass_reads_only_what_is_no_longer_final() {
 	let x = tokio::task::block_in_place(|| purse.issue(&rt, "asset X", 100_000_000_000));
 	node::list_fee_asset(&rt, x, 100_000_000);
 	let source = Arc::new(NodeSource::new(rt.client().clone()));
-	let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::spec()).await.unwrap();
+	let finality = FinalityService::new(db.store.clone(), source as Arc<dyn ChainSource>, FinalityConfig::buried_two()).await.unwrap();
 	let mut rx = finality.subscribe();
 	let wallet = Arc::new(Wallet::new(db.store.clone(), finality.clone(), xonly(&keypair("operator")),
 		WalletConfig { mnemonic: MNEMONIC.into(), fee_multiple: 2, spend_from: SpendFrom::Final, pool_coins: server::wallet::POOL_COINS }).unwrap());

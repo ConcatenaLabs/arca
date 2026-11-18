@@ -199,7 +199,9 @@ Arca runs on Sequentia, and the chain's design rules apply to every line here:
 
 - **Bitcoin anchoring is supreme.** Sequentia reorgs whenever its Bitcoin anchor
   does, with no depth limit. Nothing here may resist that. A transaction is final
-  only when its block is certified and that block's anchor is buried.
+  when its block is certified and that block's anchor is buried as deep as the
+  operator publishes: 0 Bitcoin blocks by default, with no floor on any chain. It
+  is never final beyond Bitcoin: a Bitcoin reorganisation still undoes it.
 - **Time-based locks.** Expiry and exit delays are median-time locks, not block
   counts: a height-based expiry slips after an anchor rollback.
 - **No privileged asset.** Every asset can have batches. Fees are paid in an

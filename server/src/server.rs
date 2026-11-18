@@ -763,8 +763,11 @@ impl Default for FinalitySection {
 	}
 }
 
+/// No Bitcoin block need bury a certified block's anchor: a coin is final
+/// once its block is certified. An operator that wants more for its own
+/// protection sets `[finality] anchor_depth`.
 fn default_anchor_depth() -> u32 {
-	2
+	0
 }
 
 fn default_certification() -> String {
@@ -2362,6 +2365,22 @@ mod tests {
 		let d = super::LimitsSection::default();
 		assert_eq!((c.limits.witness_per_second, c.limits.witness_burst, c.limits.witness_source_per_second, c.limits.witness_source_burst),
 			(d.witness_per_second, d.witness_burst, d.witness_source_per_second, d.witness_source_burst), "the example names the defaults");
+	}
+
+	/// An operator that names no anchor depth calls a block final once it is
+	/// certified, and the example names that default; a deeper depth is the
+	/// operator's to set.
+	#[test]
+	fn the_anchor_depth_is_zero_unless_the_operator_asks_for_more() {
+		assert_eq!(super::FinalitySection::default().anchor_depth, 0);
+		let c: Config = toml::from_str(include_str!("../arcad.example.toml")).expect("the example parses");
+		assert_eq!(c.finality.anchor_depth, 0, "the example names the default");
+		let deeper = include_str!("../arcad.example.toml").replace("anchor_depth = 0", "anchor_depth = 3");
+		let c: Config = toml::from_str(&deeper).expect("a deeper depth parses");
+		assert_eq!(c.finality.anchor_depth, 3);
+		let none = include_str!("../arcad.example.toml").replace("anchor_depth = 0\n", "");
+		let c: Config = toml::from_str(&none).expect("a [finality] without a depth parses");
+		assert_eq!(c.finality.anchor_depth, 0);
 	}
 
 	/// An asset entry with a `restricted` section, whatever it holds, stops
