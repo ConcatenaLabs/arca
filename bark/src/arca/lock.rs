@@ -107,6 +107,27 @@ pub fn lock_home_date(timeout: u64, exit_delay: u64, steps: u64, block: u64, unr
 	timeout.saturating_sub(path + exit_delay + 600)
 }
 
+/// Whether the wallet's lock record `rec` as payer still stands: made or
+/// being made, claimed, or ended by its refund after a claim could have been
+/// made. Only a lock refused before anything was locked does not.
+pub(crate) fn lock_stands(rec: &Value) -> bool {
+	rec["state"] != "refused"
+}
+
+/// Whether a lock whose transfer failed with `e` is to be recorded as
+/// refused, nothing locked: the operator's own refusal, or a refusal of the
+/// wallet's while every input is live still (`inputs_back`: nothing was
+/// posted, or the operator's refusal put them back). A refusal of the
+/// wallet's once the request was posted (an answer it does not accept, after
+/// the operator may have co-signed the lock) leaves the request standing.
+pub(crate) fn lock_refused(e: &Error, inputs_back: bool) -> bool {
+	match e {
+		Error::Server { .. } => true,
+		Error::Refused(_) => inputs_back,
+		_ => false,
+	}
+}
+
 /// The nonce of the payer's key for the lock whose leaf's creator nonce is
 /// `creator_nonce`: `SHA256("Arca/lock refund" ‖ creator_nonce)`. Drawn from
 /// the leaf, which the payer makes, so a restore from the phrase finds the
@@ -282,6 +303,14 @@ impl Wallet {
 				return Err(Error::Refused(format!("the wallet has locked under hash {} already ({})", h, r["state"])));
 			}
 		}
+		// A payment of the wallet's over Lightning under the same hash gives
+		// the same thing through the operator ([`super::lightning`]): locked
+		// straight as well, the payee could claim both with the one preimage.
+		// Only a payment whose coin came back no longer stands.
+		if let Some(s) = self.sends()?.get(&h).filter(|s| s["state"] != "returned") {
+			return Err(Error::Refused(format!("the wallet is paying under hash {} through the operator already ({}): locking it \
+				straight as well would give it twice; nothing is signed", h, s["state"])));
+		}
 		let owner = XOnlyPublicKey::from_str(request["owner"].as_str().unwrap_or("")).map_err(|e| Error::Parse(format!("the request's key: {}", e)))?;
 		let owner_nonce = unhex32(request["owner_nonce"].as_str().unwrap_or(""))?;
 		let mailbox = XOnlyPublicKey::from_str(request["mailbox"].as_str().unwrap_or("")).map_err(|e| Error::Parse(format!("the request's mailbox: {}", e)))?;
@@ -373,9 +402,12 @@ impl Wallet {
 					"change": if change > 0 { json!(change.to_string()) } else { Value::Null }, "transfer": answer}))
 			},
 			Err(e) => {
-				// A refusal leaves nothing locked; anything else leaves the
+				// A refusal before anything was posted, or the operator's own,
+				// leaves nothing locked; anything else (no answer, or a refusal
+				// of the wallet's after the operator co-signed) leaves the
 				// request standing, posted again by `sync`.
-				if matches!(e, Error::Server { .. } | Error::Refused(_)) {
+				let back = inputs.iter().all(|i| self.store.coin(&i.row.leaf_id).ok().flatten().is_some_and(|c| c.state == "live"));
+				if lock_refused(&e, back) {
 					rec["state"] = json!("refused");
 					rec["why"] = json!(e.to_string());
 					self.set_lock("payer", &h, rec)?;
@@ -797,15 +829,17 @@ impl Wallet {
 		Ok(out)
 	}
 
-	/// Notes that the payee's wallet has paid for the preimage of `hash`
-	/// (its BTC payment is out): from the lock's home date it is taken on the
-	/// chain unless claimed, and its claim there waits for the preimage.
-	pub fn lock_paid(&mut self, hash: &str) -> Result<(), Error> {
-		if let Some(mut r) = self.lock_rec("payee", hash)? {
-			r["paid"] = json!(true);
-			self.set_lock("payee", hash, r)?;
-		}
-		Ok(())
+	/// Notes that the payee's wallet pays for the preimage of `hash` (its
+	/// BTC payment is going out): from the lock's home date it is taken on
+	/// the chain unless claimed, and its claim there waits for the preimage.
+	/// A program that pays the other leg itself marks it so before it pays,
+	/// as the swap does ([`super::btc_swap`]); kept before it answers.
+	/// Refused for a hash the wallet asked no lock under.
+	pub fn lock_paid(&mut self, hash: &str) -> Result<Value, Error> {
+		let mut r = self.lock_rec("payee", hash)?.ok_or_else(|| Error::Refused(format!("the wallet asked no lock under hash {}", hash)))?;
+		r["paid"] = json!(true);
+		self.set_lock("payee", hash, r)?;
+		Ok(json!({"payment_hash": hash, "paid": true}))
 	}
 
 	/// Hands the payee's wallet the preimage of `hash`, learnt elsewhere (a
@@ -1009,5 +1043,24 @@ mod test {
 		assert_ne!(a, refund_nonce(&[2; 32]));
 		assert_eq!(a, refund_nonce(&[1; 32]));
 		assert_ne!(a, [1; 32]);
+	}
+
+	#[test]
+	fn a_lock_is_recorded_refused_only_while_nothing_was_posted_or_the_operator_refused() {
+		let server = Error::Server { call: "cosign_transfer".into(), status: 400, code: "refused".into(), message: "no".into() };
+		assert!(lock_refused(&server, false), "the operator's refusal: nothing locked");
+		assert!(lock_refused(&server, true));
+		let mine = Error::Refused("the server's record of output L: bad".into());
+		assert!(lock_refused(&mine, true), "the wallet's refusal before the post: every input live, nothing locked");
+		assert!(!lock_refused(&mine, false), "the wallet's refusal after the post: the lock may stand, the request stands");
+		assert!(!lock_refused(&Error::Unreachable("timeout".into()), true), "no answer: the request stands");
+	}
+
+	#[test]
+	fn a_payers_lock_stands_unless_it_was_refused() {
+		assert!(!lock_stands(&json!({"state": "refused"})));
+		for s in ["locking", "locked", "claimed", "refunded"] {
+			assert!(lock_stands(&json!({"state": s})), "{}", s);
+		}
 	}
 }

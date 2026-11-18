@@ -342,3 +342,82 @@ async fn a_coin_spent_into_a_lock_outlives_the_lock() {
 	println!("SO the same coin named for a lock of the usual timeout: paid from {}", paid["inputs"]);
 	assert_eq!(paid["inputs"], json!([working[0]]));
 }
+
+/// One hash pays once (arca #966). A maker that paid a buyer's receive under
+/// a hash through the operator cannot also lock the same asset straight to
+/// the buyer under that hash, nor pay through the operator a hash it locked
+/// under: either would give the buyer the asset twice for one preimage. Both
+/// are refused before anything is signed, and nothing moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_hash_pays_once_through_the_operator_or_straight() {
+	let Some(lnd) = lightningd("one_hash_pays_once_through_the_operator_or_straight") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
+	}).await;
+	let x = r.x;
+	let xs = x.to_string();
+	// The operator's Lightning leg in X, as the scenarios above set it up.
+	let ox = tokio::task::block_in_place(|| {
+		let ox = node(&r.rt, &mut r.purse, &lnd, "s1o", true, x, 2_000_000_000);
+		let px = node(&r.rt, &mut r.purse, &lnd, "s1p", true, x, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
+		drop(px);
+		ox
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if a.asset == xs {
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("X's leg up", || g.leg(&x, true).is_ok()).await;
+	let p = wallet_at("once P", &r);
+	let q = wallet_at("once Q", &r);
+	let s = script(&p.ok(&["address"]));
+	r.pay_to(s, x, 3_000_000);
+	r.produce().await;
+	p.ok(&["board", &xs, "2000000"]);
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	r.wait("the board to be credited", || p.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+	p.ok(&["sync"]);
+
+	// Locked straight first: the receive under the same hash is not paid too.
+	let h1 = a_hash("straight-first");
+	let req1 = q.ok(&["lock", "request", "--asset", &xs, "--amount", "50000", "--hash", &h1]);
+	let inv1 = q.ok(&["lightning", "receive", &xs, "50000", "--hash", &h1])["invoice"].as_str().unwrap().to_string();
+	let l1 = p.ok(&["lock", "to", &req1.to_string(), "--timeout-in", "7200"]);
+	println!("locked straight under {}: {}", &h1[..12], l1["leaf_id"]);
+	let before = values(&p, &xs);
+	let e = p.refused(&["lightning", "pay", &inv1, "--wait", "5"], "would give it twice");
+	println!("lightning pay under a standing lock: {}", e);
+	assert_eq!(values(&p, &xs), before, "nothing moved");
+	assert!(p.ok(&["lightning", "payments"]).get(&h1).is_none(), "no payment recorded under the hash");
+
+	// Paid through the operator first: the same hash is not locked straight too.
+	let h2 = a_hash("operator-first");
+	let req2 = q.ok(&["lock", "request", "--asset", &xs, "--amount", "40000", "--hash", &h2]);
+	let inv2 = q.ok(&["lightning", "receive", &xs, "40000", "--hash", &h2])["invoice"].as_str().unwrap().to_string();
+	let paid = p.ok(&["lightning", "pay", &inv2, "--wait", "5"]);
+	println!("paid through the operator under {}: {}", &h2[..12], paid["paying"]);
+	let before = values(&p, &xs);
+	let e = p.refused(&["lock", "to", &req2.to_string(), "--timeout-in", "7200"], "would give it twice");
+	println!("lock to under a standing payment: {}", e);
+	assert_eq!(values(&p, &xs), before, "nothing moved");
+	let locks = p.ok(&["lock", "list"]);
+	assert!(!locks.as_array().unwrap().iter().any(|l| l["hash"] == h2.as_str()), "no lock recorded under the hash: {}", locks);
+}

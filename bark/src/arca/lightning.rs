@@ -461,6 +461,13 @@ impl Wallet {
 		if let Some(p) = self.sends()?.get(&hash) {
 			return Err(Error::Refused(format!("the wallet is paying this invoice already, or paid it: {}", p)));
 		}
+		// A lock of the wallet's under the same hash gives the same thing to
+		// the same payee straight ([`super::lock`]): paid through the operator
+		// as well, the payee could claim both with the one preimage.
+		if let Some(l) = self.lock_rec("payer", &hash)?.filter(|l| super::lock::lock_stands(l)) {
+			return Err(Error::Refused(format!("the wallet has locked under hash {} already ({}): paying it through the operator as \
+				well would give it twice; nothing is signed", hash, l["state"])));
+		}
 		let info = self.server_info()?;
 		let leg = info["assets"].as_array().into_iter().flatten().find(|a| a["asset"].as_str() == Some(&asset.to_string()))
 			.map(|a| a["lightning"].clone())
