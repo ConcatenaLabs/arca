@@ -1034,9 +1034,13 @@ async fn a_lock_marked_paid_goes_home_at_its_home_date_without_its_preimage() {
 	let mut r = Running::start().await;
 	let x = r.x.to_string();
 	let p = Arca::new("paid P");
+	// The second lock's payer is another wallet, so the two locks share no lineage: the first one
+	// brought on the chain brings nothing of the second's path with it.
+	let p2 = Arca::new("paid P2");
 	let q = Arca::new("paid Q");
 	let xa = r.x;
 	boarded(&mut r, &p, xa, 3_000_000).await;
+	boarded(&mut r, &p2, xa, 3_000_000).await;
 	q.ok(&create_args(&r.url(), &r.node_url()));
 	let (pre1, pre2) = ([0x6au8; 32], [0x6bu8; 32]);
 	let h1 = hex(&sha256::Hash::hash(&pre1).to_byte_array());
@@ -1044,7 +1048,7 @@ async fn a_lock_marked_paid_goes_home_at_its_home_date_without_its_preimage() {
 	let req1 = q.ok(&["lock", "request", "--asset", &x, "--amount", "100000", "--hash", &h1]);
 	let req2 = q.ok(&["lock", "request", "--asset", &x, "--amount", "90000", "--hash", &h2]);
 	let l1 = p.ok(&["lock", "to", &req1.to_string(), "--timeout-in", "30000"]);
-	let l2 = p.ok(&["lock", "to", &req2.to_string(), "--timeout-in", "30000"]);
+	let l2 = p2.ok(&["lock", "to", &req2.to_string(), "--timeout-in", "30000"]);
 	let t = num(&l1["timeout"]).min(num(&l2["timeout"])) as u32;
 	let (leaf1, leaf2) = (l1["leaf_id"].as_str().unwrap().to_string(), l2["leaf_id"].as_str().unwrap().to_string());
 	q.ok(&["sync"]);
