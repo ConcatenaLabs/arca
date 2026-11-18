@@ -1280,7 +1280,11 @@ running `follow`, which moves its swaps on and runs Bark as each needs.
   its home date at least an hour past the Bitcoin leg's latest moment, and the
   invoice ten minutes from its expiry at least. It pays once; a payment that
   did not go through is tried again at most twice, which Bark refuses at once
-  once it has failed the first back.
+  once it has failed the first back. Only a definite reading of Bark's
+  counts as not gone through: the payment failed back (`revocable-htlcs`,
+  `revocation-stuck`) or Bark knowing none (`unknown`). Bark not run, its
+  database busy, or a state not listed is followed as a payment in flight,
+  and uses no try.
 - P's claim of the BTC reveals the preimage. `follow` claims it in slices
   (`--claim-slice`, 20 seconds) while the payer may pay, since Bark's server
   fails a payment back unless the receiver claims within its forward timeout,
@@ -1325,6 +1329,7 @@ alone:
     arca lock to REQUEST --timeout-in 7200                 # the payer
     arca lock ready H --need 3600                          # the payee: held?
     arca lock paid H                                       # the payee, before paying the other leg
+    arca lock unpaid H                                     # the payee, once that payment failed for good
     arca lock claim H PREIMAGE                             # the payee
     arca lock refund H                                     # the payer, from the timeout
     arca lock list
@@ -1367,6 +1372,28 @@ alone:
   claimed, even when the wallet has not learnt the preimage yet and the
   operator neither co-signs the claim nor serves it. `btc-swap` does this by
   itself.
+- A payee whose payment of the other leg then failed for good runs
+  `lock unpaid H` (the command `lock_unpaid {hash}`): the mark is cleared,
+  so the lock is not taken on the chain at its home date (an exit the
+  payee, holding no preimage, could not finish) and goes back to its payer
+  out of round from its timeout. It is for a definite failure only: it is
+  refused once the lock is claimed (by the wallet's record or the
+  operator's) or its preimage is known (to the lock, the wallet's receive
+  or payment under the hash, or served by the operator), when a receive or
+  payment under the hash is recorded paid, while a payment of the wallet's
+  own under the hash is not definitely failed back (a `lightning pay` not
+  `failed` or `returned`; a `btc-swap` in any state but `offered`, `taken`,
+  `lapsed`, `abandoned`, `btc_failed` or `cancelled`), and once the lock's
+  exit has started, and for a lock record in a state the wallet does not
+  know. An operator that does not answer, or whose answer is not a lock
+  status the wallet can read (another hash, a lock of a state it does not
+  know, a preimage that is not one of the hash), leaves the mark, with its
+  error rather than a refusal, to be asked again. A payment in flight
+  or of unknown state keeps the mark. A lock never marked paid is answered
+  as it stands. `btc-swap` clears the mark itself before it ends unpaid
+  (`btc_failed` once its payments failed back every time, `abandoned`,
+  `lapsed`), and does not end while the operator cannot be asked;
+  `btc-swap cancel` clears it first too, or does not cancel.
 - One hash pays once: `lock to` refuses while the wallet pays under the same
   hash through the operator (`lightning pay`, not yet returned), and
   `lightning pay` refuses while a lock of the wallet's under it stands.
@@ -2480,7 +2507,7 @@ the leaf claimed with the preimage once held), takes on the chain every coin who
 | `btc-swap read OFFER`, `btc-swap take OFFER`, `btc-swap complete TAKE` | What taking an offer gives and gets, with every fee; the take (asking the operator to receive under the offer's hash, or making the Bitcoin invoice), its text for the maker; the maker's completion |
 | `btc-swap follow [SWAP] [--wait S] [--claim-slice C]` | Moves the wallet's swaps on, running Bark as each needs (lock, claim, payment, claim of the leaf), for `S` seconds; one pass when 0 |
 | `lock request --asset A --amount N --hash H [--min-timeout T]`, `lock to REQUEST --timeout T \| --timeout-in S` | A lock between two holders (see Locks between two holders): the payee's request; the payer's lock of it, out of round |
-| `lock ready H [--need S]`, `lock paid H`, `lock claim H PREIMAGE`, `lock preimage H PREIMAGE`, `lock refund H`, `lock status H`, `lock list` | Whether the payee's lock is held; the payee's mark that it pays for the preimage, so the lock goes home from its home date; its claim; a preimage learnt elsewhere, kept and claimed with; the payer's refund from the timeout; the operator's word on the hash; every lock |
+| `lock ready H [--need S]`, `lock paid H`, `lock unpaid H`, `lock claim H PREIMAGE`, `lock preimage H PREIMAGE`, `lock refund H`, `lock status H`, `lock list` | Whether the payee's lock is held; the payee's mark that it pays for the preimage, so the lock goes home from its home date, and its clearing once that payment failed for good; its claim; a preimage learnt elsewhere, kept and claimed with; the payer's refund from the timeout; the operator's word on the hash; every lock |
 | `btc-swap list`, `btc-swap cancel SWAP` | Every swap with its state and log, and the legs a restore found; cancels a swap the wallet has locked nothing of |
 | `refusals` | Every refusal the wallet made, with its reason |
 | `bitcoin create (--testnet4 \| --mainnet \| --signet \| --mutinynet \| --regtest) --ark URL (--bitcoind URL (--bitcoind-cookie F \| --bitcoind-user U) \| --esplora URL) [--birthday-height H]` | Makes the wallet's Bitcoin ark wallet from its own mnemonic, through Bark's daemon (see The Bitcoin side): the network, the ark, the chain source (no password), the height it scans from and what the ark's server says of itself |

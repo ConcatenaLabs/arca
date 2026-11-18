@@ -1091,6 +1091,140 @@ async fn a_lock_marked_paid_goes_home_at_its_home_date_without_its_preimage() {
 	assert!(got < 100_000 && got > 90_000, "the claim pays what the lock held less its fee: {}", got);
 }
 
+/// A payee whose payment of the other leg failed for good clears the
+/// lock's paid mark (`lock unpaid`, the command `lock_unpaid`), as the BTC
+/// purchase of a page does when its payment is refused. Past its home date
+/// the cleared lock is not taken on the chain, where the payee, holding no
+/// preimage, could never finish its exit; from its timeout it goes back to
+/// its payer out of round. A second lock, marked paid and never cleared, is
+/// taken on the chain from its home date, as a paid lock is. The mark is
+/// not cleared once the payment went through: a lock whose preimage the
+/// payee holds, and a claimed lock, are refused. Before the command, a mark
+/// once set stayed, and the first lock went on the chain like the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_cleared_of_its_paid_mark_goes_back_to_its_payer_out_of_round() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("unpaid P");
+	// The second lock's payer is another wallet, so the two locks share no lineage: the second one
+	// brought on the chain brings nothing of the first's path with it.
+	let p2 = Arca::new("unpaid P2");
+	let q = Arca::new("unpaid Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 3_000_000).await;
+	boarded(&mut r, &p2, xa, 3_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+	let (pre1, pre2, pre3, pre4) = ([0x7au8; 32], [0x7bu8; 32], [0x7cu8; 32], [0x7du8; 32]);
+	let hash = |p: &[u8; 32]| hex(&sha256::Hash::hash(p).to_byte_array());
+	let (h1, h2, h3, h4) = (hash(&pre1), hash(&pre2), hash(&pre3), hash(&pre4));
+	let req1 = q.ok(&["lock", "request", "--asset", &x, "--amount", "100000", "--hash", &h1]);
+	let req2 = q.ok(&["lock", "request", "--asset", &x, "--amount", "90000", "--hash", &h2]);
+	let p_before = held(&p, &x, "live");
+	let l1 = p.ok(&["lock", "to", &req1.to_string(), "--timeout-in", "30000"]);
+	let l2 = p2.ok(&["lock", "to", &req2.to_string(), "--timeout-in", "30000"]);
+	let fee1 = margins(&l1);
+	let (t1, t2) = (num(&l1["timeout"]) as u32, num(&l2["timeout"]) as u32);
+	let (leaf1, leaf2) = (l1["leaf_id"].as_str().unwrap().to_string(), l2["leaf_id"].as_str().unwrap().to_string());
+	q.ok(&["sync"]);
+	assert_eq!(q.ok(&["lock", "ready", &h1])["ready"], true);
+	assert_eq!(q.ok(&["lock", "ready", &h2])["ready"], true);
+	// The payee pays the other leg of both: each marked before it pays.
+	assert_eq!(q.ok(&["lock", "paid", &h1])["paid"], true);
+	assert_eq!(q.ok(&["lock", "paid", &h2])["paid"], true);
+	// The first payment fails for good: the mark is cleared.
+	let u = q.ok(&["lock", "unpaid", &h1]);
+	println!("lock unpaid: {}", u);
+	assert_eq!((u["paid"].clone(), u["was_paid"].clone()), (json!(false), json!(true)), "{}", u);
+	assert_eq!(lock(&q, &h1)["paid"], false, "kept with the lock: {}", lock(&q, &h1));
+	assert_eq!(lock(&q, &h2)["paid"], true, "the second lock stays marked: {}", lock(&q, &h2));
+	// Asked again, answered as it stands.
+	let u2 = q.ok(&["lock", "unpaid", &h1]);
+	assert_eq!((u2["paid"].clone(), u2["was_paid"].clone()), (json!(false), json!(false)), "{}", u2);
+	let unknown = hash(&[0x7eu8; 32]);
+	println!("lock unpaid of a hash asked under no lock: {}", q.refused(&["lock", "unpaid", &unknown], "asked no lock"));
+
+	// Past both home dates, short of the timeouts, the operator up: the
+	// paid lock goes on the chain, the cleared one stays where it is.
+	let t = t1.min(t2);
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, t - 900 - common::node::median_time(&r.rt)));
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let state = |leaf: &str| q.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+	for _ in 0..3 {
+		let (_, s) = q.run(&["sync"]);
+		println!("the payee's sync past its home dates (median {} T {}): locks {}", common::node::median_time(&r.rt), t, s["locks"]);
+		r.produce().await;
+		if state(&leaf2) == "exiting" {
+			break;
+		}
+	}
+	assert_eq!(state(&leaf2), "exiting", "the lock still marked paid is taken on the chain from its home date");
+	assert_eq!(state(&leaf1), "lock_in", "the cleared lock stays where it is");
+	// Its exit started, the second lock's mark is no longer cleared.
+	let why = q.refused(&["lock", "unpaid", &h2], "exit has started");
+	println!("lock unpaid once the exit started: {}", why);
+
+	// From the first lock's timeout, its payer refunds it out of round.
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, t1 - common::node::median_time(&r.rt) + 1));
+	r.bury().await;
+	r.synced().await;
+	let s = p.ok(&["sync"]);
+	println!("P's sync past T: {}", s["locks"]);
+	assert_eq!(lock(&p, &h1)["state"], "refunded", "the payer has its lock back out of round: {}", lock(&p, &h1));
+	let p_lock = p.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf1.as_str()).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+	assert_ne!(p_lock, "exiting", "nothing of the lock went on the chain");
+	let back = held(&p, &x, "live") + held(&p, &x, "pending");
+	let refund_fee = p_before - fee1 - back;
+	assert!(refund_fee > 0 && refund_fee < 100_000, "P has its lock back less the refund's margins: {} back, {} fee", back, refund_fee);
+	println!("P refunded out of round: {} of 100000 back (lock margins {}, refund margins {})", 100_000 - refund_fee, fee1, refund_fee);
+	q.ok(&["sync"]);
+	assert_eq!(lock(&q, &h1)["state"], "refunded", "the payee learns the lock is gone: {}", lock(&q, &h1));
+
+	// The payment went through: the mark stays. A preimage the payee holds,
+	// its lock asked and not yet come ...
+	q.ok(&["lock", "request", "--asset", &x, "--amount", "50000", "--hash", &h3]);
+	q.ok(&["lock", "paid", &h3]);
+	let kept = q.ok(&["lock", "preimage", &h3, &hex(&pre3)]);
+	println!("the preimage of a lock not come yet: {}", kept);
+	let why = q.refused(&["lock", "unpaid", &h3], "is known");
+	println!("lock unpaid with the preimage known: {}", why);
+	assert_eq!(lock(&q, &h3)["paid"], true, "still marked: {}", lock(&q, &h3));
+	// ... and a claimed lock.
+	let req4 = q.ok(&["lock", "request", "--asset", &x, "--amount", "50000", "--hash", &h4]);
+	p.ok(&["lock", "to", &req4.to_string(), "--timeout-in", "7200"]);
+	q.ok(&["sync"]);
+	q.ok(&["lock", "paid", &h4]);
+	assert_eq!(q.ok(&["lock", "claim", &h4, &hex(&pre4)])["state"], "claimed");
+	let why = q.refused(&["lock", "unpaid", &h4], "is claimed");
+	println!("lock unpaid of a claimed lock: {}", why);
+
+	// The operator serves the preimage (its payer posted it): the payment went
+	// through whatever the payee saw, and the mark stays.
+	let (pre5, pre6) = ([0x7f; 32], [0x80; 32]);
+	let (h5, h6) = (hash(&pre5), hash(&pre6));
+	for (h, amount) in [(&h5, "40000"), (&h6, "30000")] {
+		let req = q.ok(&["lock", "request", "--asset", &x, "--amount", amount, "--hash", h]);
+		p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "7200"]);
+	}
+	q.ok(&["sync"]);
+	q.ok(&["lock", "paid", &h5]);
+	q.ok(&["lock", "paid", &h6]);
+	let n = lock_sql(&r, &format!("UPDATE swap_lock SET preimage = '\\x{}' WHERE payment_hash = '\\x{}'", hex(&pre5), h5)).await;
+	assert_eq!(n, 1);
+	let why = q.refused(&["lock", "unpaid", &h5], "is known");
+	println!("lock unpaid with the preimage served by the operator: {}", why);
+	assert_eq!(lock(&q, &h5)["paid"], true);
+	// The operator away: the mark stays, and the answer is not a refusal but
+	// the operator's silence, to be asked again.
+	r.server.stop();
+	let (ok, v) = q.run(&["lock", "unpaid", &h6]);
+	println!("lock unpaid with the operator away: ok={} {}", ok, v["error"]);
+	assert!(!ok, "not cleared with the operator away: {}", v);
+	assert_ne!(v["error"]["kind"], "refused", "not a refusal: {}", v);
+	assert_eq!(lock(&q, &h6)["paid"], true, "still marked: {}", lock(&q, &h6));
+}
+
 /// The operator's database is rolled back after a claim was
 /// co-signed (the lock reads open again). At T the payer asks the refund:
 /// the signer, whose record is never rolled back, must refuse it.

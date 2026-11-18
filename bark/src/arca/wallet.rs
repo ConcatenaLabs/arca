@@ -4917,6 +4917,70 @@ fn refresh_entry(leaf_id: &str, asked: Result<Value, String>) -> Value {
 	}
 }
 
+/// A wallet in memory, for unit tests: its operator at `server`, its node
+/// unreachable. Opening it contacts neither.
+#[cfg(test)]
+pub(crate) fn wallet_for_tests(server: &str) -> Wallet {
+	const A: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+	let s = Store::open_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+	let cfg = Config::spec_delays(server, "http://127.0.0.1:1/");
+	let op = Keypair::from_seckey_slice(&Secp256k1::new(), &[7; 32]).unwrap();
+	let pins = Pins { genesis: "00".repeat(32), chain_name: "elementsregtest".into(), operator: op.x_only_public_key().0.to_string(),
+		keepers: json!({"keys": [], "required": 0}).to_string(), tip_height: 1, tip_hash: "00".repeat(32), anchor_depth: String::new() };
+	Wallet::write_pins(&s, &cfg, pins).unwrap();
+	s.set_meta("mailbox_key", &Keys::new(A, 0, 1).unwrap().mailbox().unwrap().x_only_public_key().0.to_string()).unwrap();
+	Wallet::open_in(s, A, None).unwrap()
+}
+
+/// A `lock_status` answer as the server gives it, for unit tests: hash
+/// `hash`, one lock in each of `states`, and `preimage` when named.
+#[cfg(test)]
+pub(crate) fn lock_status_for_tests(hash: &str, states: &[&str], preimage: Option<String>) -> Value {
+	let locks: Vec<Value> = states.iter().enumerate().map(|(i, st)| json!({"leaf_id": format!("{:02x}", i + 1).repeat(32),
+		"payee": "bb".repeat(32), "payer": "cc".repeat(32), "timeout": 1_800_000_000u32, "state": st})).collect();
+	let mut v = json!({"payment_hash": hash, "locks": locks});
+	if let Some(p) = preimage {
+		v["preimage"] = json!(p);
+	}
+	v
+}
+
+/// An operator for unit tests that answers every request with `body`: its
+/// address. Its thread ends with the test process.
+#[cfg(test)]
+pub(crate) fn operator_answering(body: Value) -> String {
+	use std::io::{Read, Write};
+	let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+	let addr = l.local_addr().unwrap();
+	std::thread::spawn(move || {
+		for c in l.incoming() {
+			let Ok(mut c) = c else { continue };
+			// The request whole (its headers and the body they announce),
+			// then the one answer.
+			let mut got = vec![];
+			let mut buf = [0u8; 4096];
+			loop {
+				let Ok(n) = c.read(&mut buf) else { break };
+				if n == 0 {
+					break;
+				}
+				got.extend_from_slice(&buf[..n]);
+				let text = String::from_utf8_lossy(&got).to_string();
+				if let Some(end) = text.find("\r\n\r\n") {
+					let len = text[..end].lines().find_map(|h| h.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+						.unwrap_or(0);
+					if got.len() >= end + 4 + len {
+						break;
+					}
+				}
+			}
+			let b = body.to_string();
+			let _ = write!(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", b.len(), b);
+		}
+	});
+	format!("http://{}", addr)
+}
+
 #[cfg(test)]
 mod tests {
 
