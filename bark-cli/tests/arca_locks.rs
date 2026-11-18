@@ -1020,6 +1020,73 @@ async fn a_restored_payee_takes_its_lock_home_without_the_preimage_yet() {
 	assert_eq!(state, "exiting", "the restored payee takes its lock on the chain from its home date");
 }
 
+/// A payee that pays the other leg itself marks the lock paid before it
+/// pays (`lock paid`, the command `lock_paid`), as the BTC purchase of a
+/// page does. Then the operator answers nothing, neither co-signing the claim
+/// nor serving the preimage, and the payee has not learnt the preimage yet.
+/// Past its home date the paid lock is taken on the chain; a second lock the
+/// payee never marked stays where it is. Once the preimage comes, the payee
+/// claims the paid lock on the chain, by CLAIM. Before the command existed, a
+/// program paying the other leg itself could not mark a lock paid, and both
+/// locks stayed where the payer's refund takes them at the timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_marked_paid_goes_home_at_its_home_date_without_its_preimage() {
+	let mut r = Running::start().await;
+	let x = r.x.to_string();
+	let p = Arca::new("paid P");
+	let q = Arca::new("paid Q");
+	let xa = r.x;
+	boarded(&mut r, &p, xa, 3_000_000).await;
+	q.ok(&create_args(&r.url(), &r.node_url()));
+	let (pre1, pre2) = ([0x6au8; 32], [0x6bu8; 32]);
+	let h1 = hex(&sha256::Hash::hash(&pre1).to_byte_array());
+	let h2 = hex(&sha256::Hash::hash(&pre2).to_byte_array());
+	let req1 = q.ok(&["lock", "request", "--asset", &x, "--amount", "100000", "--hash", &h1]);
+	let req2 = q.ok(&["lock", "request", "--asset", &x, "--amount", "90000", "--hash", &h2]);
+	let l1 = p.ok(&["lock", "to", &req1.to_string(), "--timeout-in", "30000"]);
+	let l2 = p.ok(&["lock", "to", &req2.to_string(), "--timeout-in", "30000"]);
+	let t = num(&l1["timeout"]).min(num(&l2["timeout"])) as u32;
+	let (leaf1, leaf2) = (l1["leaf_id"].as_str().unwrap().to_string(), l2["leaf_id"].as_str().unwrap().to_string());
+	q.ok(&["sync"]);
+	assert_eq!(q.ok(&["lock", "ready", &h1])["ready"], true);
+	assert_eq!(q.ok(&["lock", "ready", &h2])["ready"], true);
+	// The payee pays the other leg of the first lock: marked before it pays.
+	let paid = q.ok(&["lock", "paid", &h1]);
+	println!("lock paid: {}", paid);
+	assert_eq!(paid["paid"], true, "{}", paid);
+	assert_eq!(lock(&q, &h1)["paid"], true, "kept with the lock: {}", lock(&q, &h1));
+	assert!(lock(&q, &h2)["paid"].is_null(), "the second lock is not marked: {}", lock(&q, &h2));
+	let unknown = hex(&sha256::Hash::hash(&[0x6cu8; 32]).to_byte_array());
+	let why = q.refused(&["lock", "paid", &unknown], "asked no lock");
+	println!("lock paid of a hash asked under no lock: {}", why);
+	// The operator answers nothing more; the payee has no preimage yet.
+	r.server.stop();
+	tokio::task::block_in_place(|| common::node::advance_mtp(&r.rt, t - 900 - common::node::median_time(&r.rt)));
+	r.produce().await;
+	r.bury().await;
+	let state = |leaf: &str| q.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+	for _ in 0..3 {
+		let (_, s) = q.run(&["sync"]);
+		println!("the payee's sync past its home date (median {} T {}): locks {}", common::node::median_time(&r.rt), t, s["locks"]);
+		r.produce().await;
+		if state(&leaf1) == "exiting" {
+			break;
+		}
+	}
+	assert_eq!(state(&leaf1), "exiting", "the paid lock is taken on the chain from its home date");
+	assert_eq!(state(&leaf2), "lock_in", "the lock never marked paid stays where it is");
+	// The preimage comes (the other leg settled): kept, and claimed on the chain.
+	let (ok, v) = q.run(&["lock", "preimage", &h1, &hex(&pre1)]);
+	println!("the preimage, with the operator down: ok={} {}", ok, v);
+	assert_eq!(lock(&q, &h1)["preimage"], hex(&pre1), "the preimage is kept: {}", lock(&q, &h1));
+	let e = exit_until(&r, &q, &leaf1, "claimed", false).await;
+	let claim = tx(&r, e["claim"]["txid"].as_str().unwrap());
+	assert!(claim.input[0].witness.script_witness.iter().any(|i| i[..] == pre1[..]), "CLAIM carries the preimage in its witness");
+	let got = claim.output[0].value.explicit().unwrap();
+	println!("the paid lock's CLAIM {}: {} vB, pays {} of 100000", claim.txid(), claim.vsize(), got);
+	assert!(got < 100_000 && got > 90_000, "the claim pays what the lock held less its fee: {}", got);
+}
+
 /// The operator's database is rolled back after a claim was
 /// co-signed (the lock reads open again). At T the payer asks the refund:
 /// the signer, whose record is never rolled back, must refuse it.

@@ -1076,6 +1076,10 @@ enum LockCmd {
 	Claim { hash: String, preimage: String },
 	/// As the payer: refunds the lock under `hash`, from its timeout.
 	Refund { hash: String },
+	/// As the payee: notes that the other leg is being paid for the
+	/// preimage of `hash`, before paying it: from the lock's home date it is
+	/// taken on the chain unless claimed.
+	Paid { hash: String },
 	/// As the payee: the preimage of `hash`, learnt elsewhere: kept, posted
 	/// to the operator, and the lock claimed when it is held.
 	Preimage { hash: String, preimage: String },
@@ -1869,6 +1873,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Lock(LockCmd::Ready { hash, need }) => w.lock_ready(&hash.to_lowercase(), need),
 		Cmd::Lock(LockCmd::Claim { hash, preimage }) => w.lock_claim(&hash.to_lowercase(), unhex32(&preimage)?),
 		Cmd::Lock(LockCmd::Refund { hash }) => w.lock_refund(&hash.to_lowercase()),
+		Cmd::Lock(LockCmd::Paid { hash }) => w.lock_paid(&hash.to_lowercase()),
 		Cmd::Lock(LockCmd::Preimage { hash, preimage }) => w.lock_preimage_known(&hash.to_lowercase(), unhex32(&preimage)?),
 		Cmd::Lock(LockCmd::Status { hash }) => w.lock_status(&hash.to_lowercase()),
 		Cmd::Lock(LockCmd::List) => w.locks(),

@@ -40,7 +40,7 @@ pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, b
 	asset?, max_fee_ppm?, timeout?, shown?, leaves?}, lightning_payments, lightning_receive_quote {asset, amount, max_fee_ppm?}, lightning_receive \
 	{asset, amount, description?, max_fee_ppm?, hash?}, lightning_receive_preimage {hash, preimage}, lightning_receive_ready {hash, \
 	need_seconds}, lightning_receives, lightning_lookup {hash}, lightning_post_preimage {hash, preimage}, lock_request {asset, amount, hash, min_timeout?}, lock_to {request, timeout}, lock_ready {hash, \
-	need_seconds}, lock_claim {hash, preimage}, lock_refund {hash}, lock_preimage {hash, preimage}, lock_status {hash}, locks, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
+	need_seconds}, lock_claim {hash, preimage}, lock_refund {hash}, lock_paid {hash}, lock_preimage {hash, preimage}, lock_status {hash}, locks, distribute_quote {asset, claims: [{key, amount}]}, distribute {asset, claims, \
 	return_address?, shown?, deadline?, vest?}, distributions, claims {scan?}, claim {claims?, scan?}, plan_quote {leaves?, expiries?, max_fee_ppm?}, \
 	plan {leaves?, expiries?, max_fee_ppm?}, plans, owed, plan_cancel {plan}, plan_release {leaves, max_fee_ppm?}, care {scan?, expiries?, max_fee_ppm?, plan_within?, channels?, no_open?}, \
 	order_rest_quote {sell, amount, want, rate_num, rate_den, min_lot?, expiry, max_fee_ppm?}, order_rest {sell, amount, want, \
@@ -654,6 +654,7 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		"lock_claim" => w.lock_claim(&req_str(&a["hash"], "the hash")?.to_lowercase(),
 			super::chain::unhex32(req_str(&a["preimage"], "the preimage")?)?),
 		"lock_refund" => w.lock_refund(&req_str(&a["hash"], "the hash")?.to_lowercase()),
+		"lock_paid" => w.lock_paid(&req_str(&a["hash"], "the hash")?.to_lowercase()),
 		"lock_preimage" => w.lock_preimage_known(&req_str(&a["hash"], "the hash")?.to_lowercase(),
 			super::chain::unhex32(req_str(&a["preimage"], "the preimage")?)?),
 		"lock_status" => w.lock_status(&req_str(&a["hash"], "the hash")?.to_lowercase()),
