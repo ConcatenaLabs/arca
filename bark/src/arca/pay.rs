@@ -2368,6 +2368,10 @@ impl Wallet {
 		// Coins read again that the wallet holds already (the messages after
 		// one that waits are read again with it): never reported as taken.
 		let mut held = vec![];
+		// Coins under a nonce another store of the mnemonic drew, with the
+		// reason this store's own checks gave: asked of the operator by id
+		// and taken as a catch-up takes them ([`Self::take_elsewhere`]).
+		let mut elsewhere: Vec<(String, String)> = vec![];
 		for (leaf, bytes, head) in self.store.kept_for_retry()? {
 			let head_v: Value = head.as_deref().and_then(|h| serde_json::from_str(h).ok()).unwrap_or(Value::Null);
 			if let (Err(why), None) = (self.held_outside(&head_v), &home) {
@@ -2389,6 +2393,11 @@ impl Wallet {
 					self.store.keep_for_retry(&leaf, &bytes, &e.to_string(), None)?;
 					waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
 				},
+				Err(e) if self.another_stores_coin(&bytes) => {
+					self.store.drop_retry(&leaf)?;
+					self.pending_ended(&leaf)?;
+					elsewhere.push((leaf, e.to_string()));
+				},
 				Err(e) => {
 					self.store.drop_retry(&leaf)?;
 					self.pending_ended(&leaf)?;
@@ -2402,11 +2411,15 @@ impl Wallet {
 		let mut notes: Vec<String> = vec![];
 		{
 			let mut taken = Taken { accepted: &mut accepted, refused: &mut refused, waiting: &mut waiting, held: &mut held,
-				withdrawn: &mut withdrawn };
+				withdrawn: &mut withdrawn, elsewhere: &mut elsewhere };
 			self.read_mailboxes(&keys, now, home.is_some(), &mut taken, &mut notes)?;
 		}
 		self.reread_mailbox(home.is_some(), &mut accepted, &mut waiting, &mut notes)?;
+		let from_other_stores = self.take_elsewhere(elsewhere, &mut accepted, &mut refused, &mut notes)?;
 		let mut out = json!({"accepted": accepted, "refused": refused, "waiting": waiting});
+		if let Some(v) = from_other_stores {
+			out["from_other_stores"] = v;
+		}
 		// A coin paid out of round while the operator's bond does not stand,
 		// or does not cover it, is the wallet's still: sync refreshes it at
 		// once.
@@ -2602,6 +2615,10 @@ impl Wallet {
 				self.store.keep_for_retry(&leaf, &bytes, &e.to_string(), head.as_deref())?;
 				t.waiting.push(json!({"leaf_id": leaf, "reason": e.to_string()}));
 			},
+			Err(e) if self.another_stores_coin(&bytes) => {
+				self.pending_ended(&leaf)?;
+				t.elsewhere.push((leaf, e.to_string()));
+			},
 			Err(e) => {
 				self.pending_ended(&leaf)?;
 				self.store.refused(&format!("mailbox coin {}", leaf), &e.to_string())?;
@@ -2612,6 +2629,61 @@ impl Wallet {
 			self.store.set_cursor(k, cursor)?;
 		}
 		Ok(true)
+	}
+
+	/// Whether `bytes` is the record of a coin under an owner nonce this
+	/// store never drew whose owner key the mnemonic derives from it: a
+	/// payment to a receive request another store of the mnemonic handed
+	/// out. A coin of another key altogether is no such coin.
+	fn another_stores_coin(&self, bytes: &[u8]) -> bool {
+		let Ok(record) = CoinRecord::from_bytes(bytes) else { return false };
+		let (owner, nonce) = owner_of(&record);
+		matches!(self.store.nonce(&nonce), Ok(None)) && self.keys.leaf_xonly(&nonce).is_ok_and(|k| k == owner)
+	}
+
+	/// The coins of a mailbox read made under a nonce another store of the
+	/// mnemonic drew (`elsewhere`, each with the reason this store's own
+	/// checks gave): taken at once, as a catch-up takes them
+	/// ([`Self::take_from_other_stores`]), each one held now and counted
+	/// reported with the coins accepted (`from`: `another store`); each one
+	/// not taken refused with its reason, and asked for again by the next
+	/// catch-ups. What the take did, for the read's answer.
+	fn take_elsewhere(&mut self, elsewhere: Vec<(String, String)>, accepted: &mut Vec<Value>, refused: &mut Vec<Value>,
+		notes: &mut Vec<String>) -> Result<Option<Value>, Error>
+	{
+		if elsewhere.is_empty() {
+			return Ok(None);
+		}
+		let ids: Vec<String> = elsewhere.iter().map(|(l, _)| l.clone()).collect();
+		let (taken, why) = match self.take_from_other_stores(&ids) {
+			Ok(Some(v)) => (v, None),
+			Ok(None) => (Value::Null, Some("the operator reads no leaves by id: the next sync catches up at once".to_string())),
+			Err(e) => (json!({"error": e.to_string()}), Some(format!("asking the operator for it failed ({}): the next catch-up asks again", e))),
+		};
+		for (leaf, reason) in elsewhere {
+			match self.store.coin(&leaf)? {
+				Some(c) if matches!(c.state.as_str(), "live" | "pending") || c.state == super::lock::LOCK_IN => {
+					accepted.push(json!({"leaf_id": leaf, "kind": c.kind, "asset": c.asset, "value": c.value.to_string(), "state": c.state,
+						"note": c.note, "from": "another store"}));
+				},
+				// Taken and given up at once: another store of the mnemonic
+				// spent it already. Counted nowhere.
+				Some(_) => {},
+				None => {
+					let reason = match &why {
+						Some(w) => format!("{}; {}", reason, w),
+						None => format!("{}; another store of the mnemonic drew it, and the operator serves no coin of it this store can take \
+							yet: the next catch-up asks again", reason),
+					};
+					self.store.refused(&format!("mailbox coin {}", leaf), &reason)?;
+					refused.push(json!({"leaf_id": leaf, "reason": reason}));
+				},
+			}
+		}
+		if let Some(w) = why {
+			notes.push(format!("coins paid to receive requests another store of the mnemonic handed out: {}", w));
+		}
+		Ok((!taken.is_null()).then_some(taken))
 	}
 
 	/// Reads every mailbox of the wallet again from its start, once for each
@@ -4119,6 +4191,7 @@ struct Taken<'a> {
 	waiting: &'a mut Vec<Value>,
 	held: &'a mut Vec<Value>,
 	withdrawn: &'a mut Vec<Value>,
+	elsewhere: &'a mut Vec<(String, String)>,
 }
 
 fn passing(e: &Error) -> bool {

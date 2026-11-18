@@ -236,7 +236,12 @@ between stores of one mnemonic: a program that is the only store of its mnemonic
 (a service wallet on one machine) has no other store to catch up with, and the
 catch-up reads every coin it holds and every leaf made since the last one to
 find that out (every leaf ever served to its mailbox key, from an operator
-without reads past a settled cursor). With
+without reads past a settled cursor). A coin paid to a receive request
+another store of the mnemonic handed out (the payment name hands out the
+requests of every store) does not wait for a catch-up: `mailbox`, and the
+mailbox step of `sync`, takes it in the same read, asked of the operator by its
+id and checked as the catch-up checks it, answered in `accepted` with `from`
+`"another store"`. With
 `"deposits": false` it leaves out the watchtowers' step too, which the program
 runs next as the command `deposits`: a program that answers others from the
 wallet then finds it free between the two.

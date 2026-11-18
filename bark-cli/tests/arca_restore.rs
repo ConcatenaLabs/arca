@@ -1049,10 +1049,25 @@ async fn catch_up_due(r: &Running) {
 	r.synced().await;
 }
 
+/// What a sync of one store followed of another store of its mnemonic: the
+/// coins it gave up and the coins it took, by its mailbox read (a coin under
+/// a nonce the other store drew, such as its change, taken at once) and by
+/// its catch-up together.
+fn followed(s: &Value) -> (BTreeSet<String>, BTreeSet<String>) {
+	let ids = |v: &Value| -> Vec<String> { v.as_array().into_iter().flatten().filter_map(|g| g["leaf_id"].as_str().map(String::from)).collect() };
+	let (mut gone, mut taken) = (BTreeSet::new(), BTreeSet::new());
+	for part in [&s["mailbox"]["from_other_stores"], &s["caught_up"]] {
+		gone.extend(ids(&part["given_elsewhere"]));
+		taken.extend(ids(&part["restored"]));
+	}
+	(gone, taken)
+}
+
 /// Two stores of one mnemonic, both kept, spending in turn: A pays B out of
 /// round; A2, restored from A's mnemonic before that, still shows what it
-/// held until its next sync catches up, then drops the coin A spent and
-/// takes A's change. A2 then offboards part of a coin to an address; A's next
+/// held until its next sync, whose mailbox read takes A's change at once
+/// (posted to the mailbox key both share) and drops the coin A spent, which
+/// the change's record spends, with no catch-up due. A2 then offboards part of a coin to an address; A's next
 /// sync drops that coin and takes A2's change. A pays again, and A2 follows.
 /// Each time both show the same coins and the same balance, and a third
 /// store restored from the mnemonic alone shows them too.
@@ -1073,20 +1088,18 @@ async fn two_stores_of_one_mnemonic_spending_in_turn_show_the_same_coins() {
 	let start = tree_balance(&a);
 	assert_eq!(tree_balance(&a2), start, "A2 restored holds what A holds");
 
-	// A spends. Until its next catch-up, A2 shows what it held: nothing is
-	// hidden while it has not looked.
+	// A spends. Until its next sync, A2 shows what it held: nothing is
+	// hidden while it has not looked. Its next sync's mailbox read takes A's
+	// change at once, and gives up the coin A spent, with no catch-up due.
 	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
 	let sent = a.ok(&["send", &req_b, "--amount", "600000", "--asset", &xs]);
 	let paid_from = sent["inputs"][0].as_str().unwrap().to_string();
 	b.ok(&["sync"]);
-	a2.ok(&["sync"]);
-	assert_eq!(tree_balance(&a2), start, "A2 has not caught up yet, and shows what it held");
-	catch_up_due(&r).await;
+	assert_eq!(tree_balance(&a2), start, "A2 has not looked yet, and shows what it held");
 	let s = a2.ok(&["sync"]);
-	println!("TS A2's catch-up after A's payment: {}", s["caught_up"]);
-	assert!(s["caught_up"]["error"].is_null(), "{}", s["caught_up"]);
-	let gone: Vec<&str> = s["caught_up"]["given_elsewhere"].as_array().unwrap().iter().filter_map(|g| g["leaf_id"].as_str()).collect();
-	assert_eq!(gone, vec![paid_from.as_str()], "A2 gives up the coin A spent: {}", s["caught_up"]);
+	println!("TS A2's sync after A's payment: mailbox {} | caught up {}", s["mailbox"]["from_other_stores"], s["caught_up"]);
+	assert!(s["caught_up"].is_null(), "no catch-up was due: {}", s["caught_up"]);
+	assert_eq!(followed(&s).0, BTreeSet::from([paid_from.clone()]), "A2 gives up the coin A spent: {}", s["mailbox"]);
 	a.ok(&["sync"]);
 	assert_eq!(live(&a2), live(&a), "the same coins after A's payment");
 	assert_eq!(tree_balance(&a2), tree_balance(&a), "the same balance after A's payment");
@@ -1122,9 +1135,9 @@ async fn two_stores_of_one_mnemonic_spending_in_turn_show_the_same_coins() {
 	assert!(s["caught_up"]["error"].is_null(), "{}", s["caught_up"]);
 	// The offboard's round spends the board A2 gave up (its forfeit, published from the board): A's
 	// re-check at the start of the sync finds the board spent and catches up at once, or the sync's
-	// own catch-up does.
+	// own mailbox read or catch-up does.
 	let early = s["recheck"]["changes"].as_array().is_some_and(|c| c.iter().any(|x| x["caught_up"] == true));
-	assert!(early || s["caught_up"]["given_elsewhere"].as_array().is_some_and(|g| !g.is_empty()),
+	assert!(early || !followed(&s).0.is_empty(),
 		"A gives up the coin A2 offboarded: {} {}", s["recheck"], s["caught_up"]);
 	a2.ok(&["sync"]);
 	assert_eq!(live(&a), live(&a2), "the same coins after A2's offboard");
@@ -1149,6 +1162,143 @@ async fn two_stores_of_one_mnemonic_spending_in_turn_show_the_same_coins() {
 	assert_eq!(live(&a3), live(&a), "a store restored now holds what both hold");
 	assert_eq!(tree_balance(&a3), tree_balance(&a), "and shows the same balance");
 	println!("TS the end: A {} | A2 {} | A3 {}", tree_balance(&a), tree_balance(&a2), tree_balance(&a3));
+	for w in [&a, &a2, &a3, &b] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
+/// The mailbox read's coins, by id, that came from another store's request.
+fn from_another_store(mb: &Value) -> BTreeMap<String, Value> {
+	mb["accepted"].as_array().unwrap().iter().filter(|c| c["from"] == "another store")
+		.map(|c| (c["leaf_id"].as_str().unwrap().to_string(), c.clone())).collect()
+}
+
+/// The coin a payment made for its payee: its output the payer did not keep.
+fn paid_leaf(sent: &Value) -> String {
+	sent["transfer"]["outputs"].as_array().unwrap().iter().map(|o| o.as_str().unwrap().to_string())
+		.find(|o| !sent["transfer"]["kept"].as_array().unwrap().iter().any(|k| k["leaf_id"] == o.as_str())).expect("the payee's coin")
+}
+
+/// A JSON object encoded as the wallet encodes requests.
+fn encode(prefix: &str, v: &Value) -> String {
+	format!("{}{}", prefix, v.to_string().as_bytes().iter().map(|b| format!("{:02x}", b)).collect::<String>())
+}
+
+/// Two stores of one mnemonic each hand out a receive request and both are
+/// paid (arca #972): each store's mailbox read takes the coin paid to the
+/// other's request at once, as a coin from another store, with no catch-up
+/// (A2 was restored a moment before, so its next one is ten minutes away),
+/// and both show the same coins. The request is single use: the operator
+/// refuses a second payment to it, and after the ten minutes the catch-ups
+/// take nothing more, so no coin is counted twice. A coin paid to A's
+/// request that A took and spent before A2 read its mailbox is taken by A2
+/// and given up at once, counted nowhere. A coin of another mnemonic posted
+/// to A2's mailbox is still refused as a key it never drew. From an
+/// operator that reads no leaves by id, the coin is refused as before, and
+/// the next sync catches up at once, past the ten minutes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payment_to_a_code_another_store_drew_is_taken_at_once() {
+	let mut r = Running::start_kept(1, None).await;
+	let (url, node) = (r.url(), r.node_url());
+	let x = r.x;
+	let xs = x.to_string();
+	let (a, a2, a3, b) = (Arca::new("PSA"), Arca::new("PSA2"), Arca::new("PSA3"), Arca::new("PSB"));
+	boarded(&mut r, &a, &url, &[]).await;
+	boarded(&mut r, &b, &url, &[(x, 3_000_000)]).await;
+	let mnemonic = std::fs::read_to_string(a.dir.join("mnemonic")).unwrap().trim().to_string();
+	let mut args = create_args(&url, &node);
+	args.extend(["--mnemonic", &mnemonic]);
+	let made = a2.ok(&args);
+	assert!(made["restore"]["error"].is_null(), "{}", made["restore"]);
+	let caught_up = |w: &Arca| w.ok(&["sync"])["caught_up"].clone();
+
+	// A coin A takes and spends before A2 reads its mailbox: A2 takes it and
+	// gives it up at once, as A spent it.
+	let req_a = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let spent = paid_leaf(&b.ok(&["send", &req_a, "--amount", "300000", "--asset", &xs]));
+	assert_eq!(a.ok(&["mailbox"])["accepted"][0]["leaf_id"], spent.as_str());
+	let req_b = b.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let back = pay_whole(&a, &req_b, &xs, 300_000);
+	assert_eq!(back["inputs"][0], spent.as_str(), "A pays the coin it took whole: {}", back);
+	let mb = a2.ok(&["mailbox"]);
+	println!("PS A2's mailbox, the coin A spent: {}", mb);
+	assert!(mb["refused"].as_array().unwrap().is_empty(), "nothing refused: {}", mb);
+	assert!(!mb["accepted"].as_array().unwrap().iter().any(|c| c["leaf_id"] == spent.as_str()), "the coin A spent is not counted: {}", mb);
+	assert_eq!(mb["from_other_stores"]["restored"][0]["leaf_id"], spent.as_str(), "{}", mb);
+	assert_eq!(coin_of(&a2, &spent)["state"], "spent", "A2 holds it spent, as A does: {}", coin_of(&a2, &spent));
+	assert!(live(&a2).is_empty() && live(&a).is_empty(), "neither store counts it: A2 {:?}, A {:?}", live(&a2), live(&a));
+
+	// Each store hands out a request, and B pays both.
+	let req_a = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let req_a2 = a2.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let to_a = paid_leaf(&b.ok(&["send", &req_a, "--amount", "200000", "--asset", &xs]));
+	let to_a2 = paid_leaf(&b.ok(&["send", &req_a2, "--amount", "100000", "--asset", &xs]));
+	// The request is single use: the operator refuses a second leaf under its key.
+	b.refused(&["send", &req_a, "--amount", "200000", "--asset", &xs], "key_reused");
+	let mb = a2.ok(&["mailbox"]);
+	println!("PS A2's mailbox: {}", mb);
+	assert!(mb["refused"].as_array().unwrap().is_empty(), "nothing refused: {}", mb);
+	let taken = from_another_store(&mb);
+	assert_eq!(taken.keys().collect::<Vec<_>>(), vec![&to_a], "A2 takes the coin paid to A's request at once: {}", mb);
+	assert_eq!((taken[&to_a]["asset"].as_str().unwrap(), taken[&to_a]["value"].as_str().unwrap(), taken[&to_a]["state"].as_str().unwrap()),
+		(xs.as_str(), "200000", "live"), "{}", mb);
+	assert!(mb["accepted"].as_array().unwrap().iter().any(|c| c["leaf_id"] == to_a2.as_str() && c["from"] == "mailbox"),
+		"and its own as ever: {}", mb);
+	let mb = a.ok(&["mailbox"]);
+	println!("PS A's mailbox: {}", mb);
+	assert!(mb["refused"].as_array().unwrap().is_empty(), "nothing refused: {}", mb);
+	assert_eq!(from_another_store(&mb).keys().collect::<Vec<_>>(), vec![&to_a2], "A takes the coin paid to A2's request at once: {}", mb);
+	assert_eq!(live(&a), live(&a2), "both stores hold the same coins, with no catch-up");
+	assert_eq!(live(&a).len(), 2, "the two coins paid: {:?}", live(&a));
+	assert_eq!(tree_balance(&a), tree_balance(&a2), "and show the same balance");
+	assert!(caught_up(&a2).is_null(), "A2's catch-up is not due yet: the coins came from the mailbox read alone");
+
+	// Read again, and caught up after ten minutes: nothing more, nothing twice.
+	assert_eq!(a2.ok(&["mailbox"])["accepted"], json!([]), "a mailbox read again holds nothing new");
+	let before = (live(&a), tree_balance(&a));
+	catch_up_due(&r).await;
+	for w in [&a, &a2] {
+		let c = caught_up(w);
+		println!("PS {}'s catch-up: {}", w.name, c);
+		assert!(c["error"].is_null() && !c.is_null(), "{}", c);
+		assert_eq!(c["restored"], json!([]), "the catch-up takes nothing the mailbox took: {}", c);
+	}
+	assert_eq!((live(&a), tree_balance(&a)), before, "A unchanged by its catch-up");
+	assert_eq!((live(&a2), tree_balance(&a2)), before, "A2 the same");
+
+	// A coin of another mnemonic, posted to A2's mailbox: still refused.
+	let a2_mailbox = a2.ok(&["info"])["mailbox_key"].as_str().unwrap().to_string();
+	let mut forged = b.ok(&["receive"])["details"].clone();
+	forged["mailbox"] = json!(a2_mailbox);
+	b.ok(&["send", &encode("arca:", &forged), "--amount", "150000", "--asset", &xs]);
+	let mb = a2.ok(&["mailbox"]);
+	println!("PS A2's mailbox, another mnemonic's coin: {}", mb);
+	assert!(mb["refused"][0]["reason"].as_str().unwrap().contains("which this wallet never drew"), "{}", mb);
+	assert!(mb["from_other_stores"].is_null() && mb["accepted"] == json!([]), "nothing taken, nothing asked: {}", mb);
+	assert_eq!(live(&a2), before.0, "nothing counted");
+
+	// An operator that reads no leaves by id: refused as before, and the
+	// next sync catches up at once.
+	let p = Proxy::start(&url);
+	p.rewrite(Some(Arc::new(|path: &str, _: &Value, status: u16, v: &mut Value| {
+		if status == 200 && path == "/v1/info" {
+			v["leaf_data"] = json!({"page": 0, "held": 0, "leaf_ids": 0, "epoch": ""});
+		}
+		None
+	})));
+	let mut args3 = create_args(&p.url, &node);
+	args3.extend(["--mnemonic", &mnemonic]);
+	let made = a3.ok(&args3);
+	assert!(made["restore"]["error"].is_null(), "{}", made["restore"]);
+	assert!(caught_up(&a3).is_null(), "A3's catch-up is not due after its restore");
+	let req_a = a.ok(&["receive"])["request"].as_str().unwrap().to_string();
+	let to_a = paid_leaf(&b.ok(&["send", &req_a, "--amount", "120000", "--asset", &xs]));
+	let mb = a3.ok(&["mailbox"]);
+	println!("PS A3's mailbox, no leaves by id: {}", mb);
+	assert!(mb["refused"][0]["reason"].as_str().unwrap().contains("the next sync catches up at once"), "{}", mb);
+	let c = caught_up(&a3);
+	println!("PS A3's sync: {}", c);
+	assert!(c["restored"].as_array().unwrap().iter().any(|v| v["leaf_id"] == to_a.as_str()), "taken by the catch-up at once: {}", c);
 	for w in [&a, &a2, &a3, &b] {
 		let _ = std::fs::remove_dir_all(&w.dir);
 	}
@@ -1310,10 +1460,9 @@ async fn a_long_history_is_restored_after_the_balance() {
 	b.ok(&["sync"]);
 	catch_up_due(&r).await;
 	let s = a2.ok(&["sync"]);
-	println!("LH A2's sync: caught up {} | history {}", s["caught_up"], s["history"]);
+	println!("LH A2's sync: mailbox {} | caught up {} | history {}", s["mailbox"]["from_other_stores"], s["caught_up"], s["history"]);
 	assert!(s["caught_up"]["error"].is_null(), "{}", s["caught_up"]);
-	let gone: Vec<&str> = s["caught_up"]["given_elsewhere"].as_array().unwrap().iter().filter_map(|g| g["leaf_id"].as_str()).collect();
-	assert_eq!(gone, vec![held[0].as_str()], "A2 gives up the coin A spent: {}", s["caught_up"]);
+	assert_eq!(followed(&s).0, BTreeSet::from([held[0].clone()]), "A2 gives up the coin A spent: {} {}", s["mailbox"], s["caught_up"]);
 	assert!(s["history"]["checked"].as_u64().unwrap() >= 1, "{}", s["history"]);
 	let mut left = s["history"]["left"].as_u64().unwrap();
 	a.ok(&["sync"]);
@@ -2007,11 +2156,14 @@ fn catch_up_reads(p: &Proxy, w: &Arca) -> Value {
 	let s = w.ok(&["sync"]);
 	let calls = p.calls();
 	let new = &calls[from..];
-	let data: Vec<&(String, Value, u16, Value)> = new.iter().filter(|c| c.0 == "/v1/leaf_data").collect();
+	// The catch-up's reads; not the mailbox read's ask for the leaves it was
+	// paid under another store's nonces (one leaf past the cursor, by id).
+	let by_id = |q: &Value| q["limit"] == 1 && q["leaf_ids"].as_array().is_some_and(|a| !a.is_empty());
+	let data: Vec<&(String, Value, u16, Value)> = new.iter().filter(|c| c.0 == "/v1/leaf_data" && !by_id(&c.1)).collect();
 	let leaves: usize = data.iter().map(|c| c.3["leaves"].as_array().map_or(0, |a| a.len())).sum();
 	let count = |f: &str| -> usize { data.iter().map(|c| c.1[f].as_array().map_or(0, |a| a.len())).sum() };
 	json!({"leaf_data": data.len(), "leaves": leaves, "held": count("held"), "leaf_ids": count("leaf_ids"),
-		"step": s["cost_by_step"]["catch up"], "caught_up": s["caught_up"]})
+		"step": s["cost_by_step"]["catch up"], "caught_up": s["caught_up"], "sync": s})
 }
 
 /// Has each wallet of `ws` give up each of its live coins in a
@@ -2230,9 +2382,12 @@ async fn a_store_learns_what_the_other_did_between_two_catch_ups() {
 	let c = &second["caught_up"];
 	assert!(c["error"].is_null(), "{}", c);
 	assert_eq!(c["read"], "past the settled cursor", "{}", c);
-	let gone: BTreeSet<&str> = c["given_elsewhere"].as_array().unwrap().iter().filter_map(|g| g["leaf_id"].as_str()).collect();
-	assert_eq!(gone, BTreeSet::from([paid_from.as_str(), refreshed.as_str()]), "A2 gives up the coins A gave up: {}", c);
-	assert_eq!(c["restored"].as_array().unwrap().len(), 3, "A2 takes A's change, refreshed leaf and B's payment: {}", c);
+	// A's change and B's payment to A come through A2's mailbox read at
+	// once; the catch-up takes the rest.
+	let (gone, taken) = followed(&second["sync"]);
+	assert_eq!(gone, BTreeSet::from([paid_from.clone(), refreshed.clone()]), "A2 gives up the coins A gave up: {} {}",
+		second["sync"]["mailbox"], c);
+	assert_eq!(taken.len(), 3, "A2 takes A's change, refreshed leaf and B's payment: {} {}", second["sync"]["mailbox"], c);
 	assert!(second["leaves"].as_u64().unwrap() < first["leaves"].as_u64().unwrap() + 4,
 		"A2 reads what changed, not the history again: {} then {}", first, second);
 	assert_eq!(live(&a2), live(&a), "the same coins after A acted");

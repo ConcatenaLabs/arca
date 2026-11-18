@@ -46,9 +46,12 @@
 //! such a request could last ([`super::wallet::REQUEST_HOLDS`] from the
 //! restore), since a payment to one is read only by `sync`.
 //!
-//! Two live stores of one mnemonic draw their own owner nonces, and each
-//! one's mailbox read refuses a coin made under a nonce it never drew; each
-//! follows the other by catching up ([`Wallet::catch_up`], from `sync`),
+//! Two live stores of one mnemonic draw their own owner nonces. A coin paid
+//! to a receive request the other store handed out reaches each one's
+//! mailbox under a nonce it never drew: the mailbox read asks the operator
+//! for it by id and takes it at once, as the catch-up would
+//! ([`Wallet::take_from_other_stores`]). Each follows the other by catching
+//! up ([`Wallet::catch_up`], from `sync`),
 //! which reads what the server serves as a restore does: it takes what the
 //! store does not hold, and gives up what the other store gave up on the
 //! owner's own signatures, so both show the same coins. The leaf of a
@@ -1343,6 +1346,81 @@ impl Wallet {
 			out["note"] = json!(n);
 		}
 		Ok((out, served))
+	}
+
+	/// The coins `ids`, each one that the mailbox read refused as made under
+	/// an owner nonce this store never drew whose key the mnemonic derives
+	/// from it: a payment to a receive request another store of the
+	/// mnemonic handed out (the payment name hands out the codes of every
+	/// store). Each is asked of the operator by its id, with the read past
+	/// the catch-up's settled cursor, and taken as the catch-up takes it
+	/// ([`Self::take_served`]): every check a restore makes, and how it was
+	/// given up, on its owner's own signatures, so a coin the other store
+	/// spent already is taken and given up at once, never counted. Nothing
+	/// waits for [`CATCH_UP_EVERY`]: the read names only these leaves, so it
+	/// costs the operator one `leaf_data` request a mailbox read that
+	/// refused such a coin, and the wallet the checks of those coins alone.
+	/// One key, one coin, as ever: the leaves come in the order the
+	/// operator made them, a second coin under one key is refused as a
+	/// restore refuses it, and the operator refuses a second leaf under a
+	/// receive request's key in the first place. A leaf it could not take
+	/// is asked for by id again at the next catch-ups, as a catch-up's own
+	/// untaken leaves are. `None` from an operator that reads no leaves by
+	/// id (`info.leaf_data` zero): its next `sync` catches up at once
+	/// instead, past the ten minutes.
+	pub(crate) fn take_from_other_stores(&mut self, ids: &[String]) -> Result<Option<Value>, Error> {
+		let info = self.server_info()?;
+		let most = info["leaf_data"]["leaf_ids"].as_u64().unwrap_or(0) as usize;
+		if info["leaf_data"]["page"].as_u64().unwrap_or(0) == 0 || most == 0 {
+			self.store.set_meta(CAUGHT_UP, "0")?;
+			return Ok(None);
+		}
+		let epoch = info["leaf_data"]["epoch"].as_str().unwrap_or("").to_string();
+		// The catch-up's own settled cursor, so that the one leaf the read
+		// serves past it besides is one the next catch-up reads anyway; a
+		// cursor of another epoch, or none, reads from the first.
+		let since = self.catch_up_read()?.since
+			.filter(|c| c == "0" || c.split(':').next() == Some(epoch.as_str()))
+			.unwrap_or_else(|| "0".into());
+		let listed = self.history_ids()?;
+		let mailbox = self.keys.mailbox()?;
+		let wanted: Vec<[u8; 32]> = ids.iter().filter(|i| !listed.contains(*i)).filter_map(|i| unhex32(i).ok()).collect();
+		let mut entries: Vec<Value> = vec![];
+		for chunk in wanted.chunks(most) {
+			let v = self.server.leaf_data_since(&mailbox, &self.genesis, &since, 1, &[], chunk)?;
+			for e in v["asked"].as_array().into_iter().flatten() {
+				let id = e["leaf_id"].as_str().unwrap_or("");
+				if ids.iter().any(|i| i == id) && !entries.iter().any(|x| x["leaf_id"] == id) {
+					entries.push(e.clone());
+				}
+			}
+		}
+		let t = self.take_served(&info, &entries, &[], true, None)?;
+		let mut restored = t.restored;
+		for v in restored.iter_mut() {
+			if let Some(c) = self.store.coin(v["leaf_id"].as_str().unwrap_or(""))? {
+				v["state"] = json!(c.state);
+			}
+		}
+		// What it could not take, the next catch-ups ask for by id.
+		let now = unix_now();
+		let mut read = self.catch_up_read()?;
+		let mut untaken = vec![];
+		for id in ids {
+			if self.store.coin(id)?.is_none() {
+				read.untaken.entry(id.clone()).or_insert(now);
+				untaken.push(id.clone());
+			}
+		}
+		if !untaken.is_empty() {
+			self.keep_catch_up_read(&read)?;
+		}
+		let mut out = json!({"asked": ids.len(), "served": entries.len(), "restored": restored, "given_elsewhere": t.given_elsewhere,
+			"not_taken": t.not_recovered, "notes": t.notes});
+		if !untaken.is_empty() {
+			out["untaken"] = json!(untaken);
+		}
+		Ok(Some(out))
 	}
 
 	/// Whether the server serves coin `e` as given up for good: in a
