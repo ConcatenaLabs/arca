@@ -4932,6 +4932,19 @@ pub(crate) fn wallet_for_tests(server: &str) -> Wallet {
 	Wallet::open_in(s, A, None).unwrap()
 }
 
+/// A `lock_status` answer as the server gives it, for unit tests: hash
+/// `hash`, one lock in each of `states`, and `preimage` when named.
+#[cfg(test)]
+pub(crate) fn lock_status_for_tests(hash: &str, states: &[&str], preimage: Option<String>) -> Value {
+	let locks: Vec<Value> = states.iter().enumerate().map(|(i, st)| json!({"leaf_id": format!("{:02x}", i + 1).repeat(32),
+		"payee": "bb".repeat(32), "payer": "cc".repeat(32), "timeout": 1_800_000_000u32, "state": st})).collect();
+	let mut v = json!({"payment_hash": hash, "locks": locks});
+	if let Some(p) = preimage {
+		v["preimage"] = json!(p);
+	}
+	v
+}
+
 /// An operator for unit tests that answers every request with `body`: its
 /// address. Its thread ends with the test process.
 #[cfg(test)]

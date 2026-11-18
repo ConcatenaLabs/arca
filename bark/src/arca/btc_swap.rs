@@ -1224,7 +1224,7 @@ mod test {
 		assert!(decode(OFFER_KIND, "nothing", "the offer").is_err());
 	}
 
-	use super::super::wallet::{operator_answering, wallet_for_tests};
+	use super::super::wallet::{lock_status_for_tests as status, operator_answering, wallet_for_tests};
 
 	const PRE: [u8; 32] = [0x43; 32];
 
@@ -1279,7 +1279,7 @@ mod test {
 		assert_eq!(rec["state"], "taken");
 		assert_eq!(rec["pay_tries"], PAY_TRIES);
 		assert_eq!(marked(&w), true);
-		let mut w = q_swap(&operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}]})), "taken", PAY_TRIES);
+		let mut w = q_swap(&operator_answering(status(&h(), &["open"], None)), "taken", PAY_TRIES);
 		let mut rec = w.btc_swap("s1").unwrap();
 		assert_eq!(w.follow_q(&mut rec, &json!({})).unwrap(), Value::Null);
 		println!("the operator up: {} | {}", rec["state"], rec["note"]);
@@ -1297,13 +1297,13 @@ mod test {
 		println!("cancel, the operator away: {}", e);
 		assert!(!matches!(e, Error::Refused(_)), "asked again, not refused: {}", e);
 		assert_eq!((w.btc_swap("s1").unwrap()["state"].clone(), marked(&w)), (json!("taken"), json!(true)));
-		let op = operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}], "preimage": hex(&PRE)}));
+		let op = operator_answering(status(&h(), &["open"], Some(hex(&PRE))));
 		let mut w = q_swap(&op, "taken", 1);
 		let e = w.btc_swap_cancel("s1").unwrap_err();
 		println!("cancel, the preimage served: {}", e);
 		assert!(matches!(&e, Error::Refused(why) if why.contains("is not cancelled")), "{}", e);
 		assert_eq!((w.btc_swap("s1").unwrap()["state"].clone(), marked(&w)), (json!("taken"), json!(true)));
-		let mut w = q_swap(&operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}]})), "taken", 1);
+		let mut w = q_swap(&operator_answering(status(&h(), &["open"], None)), "taken", 1);
 		assert_eq!(w.btc_swap_cancel("s1").unwrap()["state"], "cancelled");
 		assert_eq!(marked(&w), false);
 	}

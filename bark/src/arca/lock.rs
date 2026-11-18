@@ -114,6 +114,49 @@ pub(crate) fn lock_stands(rec: &Value) -> bool {
 	rec["state"] != "refused"
 }
 
+/// The operator's `lock_status` answer `st` for `hash`, read strictly:
+/// whether it says the payment went through (it serves a preimage that
+/// opens the hash, or calls a lock claimed). An answer of any other shape
+/// than the server's (not an object, another hash or none, no list of
+/// locks, a lock without its leaf, keys and timeout or in a state the
+/// wallet does not know, a preimage not 32 bytes in hex or not opening the
+/// hash) says nothing the wallet can read, and is [`Error::Unreachable`]:
+/// it says nothing of what the operator did, and the caller asks again.
+pub(crate) fn lock_status_went_through(st: &Value, hash: &str) -> Result<bool, Error> {
+	let bad = |why: String| Error::Unreachable(format!("lock_status: the operator's answer is not a lock status of hash {}: {}", hash, why));
+	let o = st.as_object().ok_or_else(|| bad(format!("{} is not an object", st)))?;
+	if o.get("payment_hash").and_then(Value::as_str).map(str::to_ascii_lowercase).as_deref() != Some(hash) {
+		return Err(bad(format!("it names hash {}", o.get("payment_hash").unwrap_or(&Value::Null))));
+	}
+	let locks = o.get("locks").and_then(Value::as_array).ok_or_else(|| bad("it holds no list of locks".into()))?;
+	let hex32 = |v: Option<&Value>| v.and_then(Value::as_str).is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+	let mut claimed = false;
+	for l in locks {
+		if !(l.is_object() && hex32(l.get("leaf_id")) && hex32(l.get("payee")) && hex32(l.get("payer"))
+			&& l.get("timeout").and_then(Value::as_u64).is_some_and(|t| t <= u32::MAX as u64))
+		{
+			return Err(bad(format!("lock {} is not of the form the operator gives", l)));
+		}
+		match l["state"].as_str() {
+			Some("open" | "refunded") => {},
+			Some("claimed") => claimed = true,
+			_ => return Err(bad(format!("a lock is in a state the wallet does not know ({})", l["state"]))),
+		}
+	}
+	let served = match o.get("preimage") {
+		None | Some(Value::Null) => false,
+		Some(Value::String(p)) => {
+			let b = unhex32(p).map_err(|_| bad("its preimage is not 32 bytes in hex".into()))?;
+			if hex(&sha256::Hash::hash(&b).to_byte_array()) != hash {
+				return Err(bad("its preimage does not open the hash".into()));
+			}
+			true
+		},
+		Some(v) => return Err(bad(format!("its preimage {} is not a string", v))),
+	};
+	Ok(served || claimed)
+}
+
 /// Why the paid mark of the payee's lock record `rec` under `hash` stays,
 /// or `None` when it may be cleared: the payment went through (the lock
 /// claimed, its preimage known, `known` when the wallet learnt it elsewhere),
@@ -886,10 +929,12 @@ impl Wallet {
 	/// or `returned`; a BTC swap in any state but `offered`, `taken`,
 	/// `lapsed`, `abandoned`, `btc_failed` or `cancelled`, a state it does
 	/// not know included). Refused too once the lock's exit has started,
-	/// which clearing the mark does not stop. An operator that does not
-	/// answer leaves the mark, with its error (unreachable, not a refusal):
-	/// the caller asks again. A lock never marked paid is answered as it
-	/// stands.
+	/// which clearing the mark does not stop, and for a lock record in a
+	/// state the wallet does not know. An operator that does not answer, or
+	/// whose answer is not a lock status the wallet can read
+	/// ([`lock_status_went_through`]), leaves the mark, with its error
+	/// (unreachable, not a refusal): the caller asks again. A lock never
+	/// marked paid is answered as it stands.
 	pub fn lock_unpaid(&mut self, hash: &str) -> Result<Value, Error> {
 		self.clear_lock_paid(hash, true)
 	}
@@ -898,6 +943,12 @@ impl Wallet {
 	/// under the hash is the caller, having seen its payment fail for good.
 	pub(crate) fn clear_lock_paid(&mut self, hash: &str, swaps: bool) -> Result<Value, Error> {
 		let mut r = self.lock_rec("payee", hash)?.ok_or_else(|| Error::Refused(format!("the wallet asked no lock under hash {}", hash)))?;
+		// A record in a state this wallet does not know says nothing of the
+		// payment: the mark stays.
+		if !matches!(r["state"].as_str(), Some("asked" | "held" | "claimed" | "refunded")) {
+			return Err(Error::Refused(format!("the lock under hash {} is in a state this wallet does not know ({}): it stays marked as it is",
+				hash, r["state"])));
+		}
 		let opens = |p: &str| super::chain::unhex32(p).is_ok_and(|b| hex(&sha256::Hash::hash(&b).to_byte_array()) == hash);
 		let send = self.sends()?.get(hash).cloned();
 		let receive = self.receives()?.get(hash).cloned();
@@ -935,10 +986,8 @@ impl Wallet {
 			// payment went through whatever the caller saw. An operator that
 			// does not answer leaves the mark, and its error is the answer, to
 			// be asked again.
-			let st = self.lock_status(hash)?;
-			let served = st["preimage"].as_str().is_some_and(opens);
-			let claimed = st["locks"].as_array().into_iter().flatten().any(|l| l["state"] == "claimed");
-			if let Some(why) = unpaid_refusal(hash, &r, served || claimed, None, false) {
+			let went = lock_status_went_through(&self.lock_status(hash)?, hash)?;
+			if let Some(why) = unpaid_refusal(hash, &r, went, None, false) {
 				return Err(Error::Refused(why));
 			}
 		}
@@ -1206,7 +1255,7 @@ mod test {
 		assert!(!super::super::btc_swap::pays_nothing_more(&json!({"state": 3})), "a malformed state");
 	}
 
-	use super::super::wallet::{operator_answering, wallet_for_tests};
+	use super::super::wallet::{lock_status_for_tests as status, operator_answering, wallet_for_tests};
 
 	const PRE: [u8; 32] = [0x42; 32];
 
@@ -1242,24 +1291,73 @@ mod test {
 	/// lock claimed: the payment went through, whatever the caller saw.
 	#[test]
 	fn the_mark_stays_when_the_operator_serves_the_preimage_or_the_claim() {
-		let mut w = marked(&operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}], "preimage": hex(&PRE)})));
+		let mut w = marked(&operator_answering(status(&h(), &["open"], Some(hex(&PRE)))));
 		let why = match w.lock_unpaid(&h()) { Err(Error::Refused(why)) => why, r => panic!("{:?}", r.map(|v| v.to_string())) };
 		assert!(why.contains("is known"), "{}", why);
 		assert_eq!(paid(&w), true);
-		let mut w = marked(&operator_answering(json!({"payment_hash": h(), "locks": [{"state": "claimed"}]})));
+		let mut w = marked(&operator_answering(status(&h(), &["claimed"], None)));
 		assert!(matches!(w.lock_unpaid(&h()), Err(Error::Refused(_))), "the operator's claimed lock");
 		assert_eq!(paid(&w), true);
-		// A preimage of another hash is not this one's.
-		let mut w = marked(&operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}], "preimage": hex(&[1; 32])})));
-		assert_eq!(w.lock_unpaid(&h()).unwrap()["was_paid"], true);
-		assert_eq!(paid(&w), false);
+	}
+
+	/// An answer the wallet cannot read says nothing of the payment: not an
+	/// object, no hash or another, no list of locks, a lock not of the
+	/// operator's form or in a state the wallet does not know, a preimage
+	/// that is not 32 bytes in hex or does not open the hash. Each is the
+	/// operator's silence (unreachable, not a refusal, asked again), and the
+	/// mark stays.
+	#[test]
+	fn the_mark_stays_on_an_operator_answer_it_cannot_read() {
+		let mut mystery = status(&h(), &["open"], None);
+		mystery["locks"][0]["state"] = json!("mystery");
+		let mut no_leaf = status(&h(), &["open"], None);
+		no_leaf["locks"][0].as_object_mut().unwrap().remove("leaf_id");
+		let mut no_timeout = status(&h(), &["open"], None);
+		no_timeout["locks"][0]["timeout"] = json!("soon");
+		for answer in [json!({}), Value::Null, json!([]), json!("ok"), json!({"locks": [], "preimage": null}),
+			json!({"payment_hash": "ab".repeat(32), "locks": []}), json!({"payment_hash": h(), "locks": "unreadable"}),
+			json!({"payment_hash": h()}), mystery, no_leaf, no_timeout, json!({"payment_hash": h(), "locks": [null]}),
+			status(&h(), &["open"], Some("zz".repeat(32))), status(&h(), &["open"], Some("ab".into())),
+			status(&h(), &["open"], Some(hex(&[1; 32]))), json!({"payment_hash": h(), "locks": [], "preimage": 7})]
+		{
+			let mut w = marked(&operator_answering(answer.clone()));
+			match w.lock_unpaid(&h()) {
+				Err(Error::Unreachable(why)) => println!("{} -> {}", answer, why),
+				r => panic!("{}: {:?}", answer, r.map(|v| v.to_string())),
+			}
+			assert_eq!(paid(&w), true, "still marked after {}", answer);
+		}
+	}
+
+	/// A lock record in a state this wallet does not know keeps its mark,
+	/// refused before the operator is asked.
+	#[test]
+	fn the_mark_stays_on_a_lock_state_the_wallet_does_not_know() {
+		let op = operator_answering(status(&h(), &["open"], None));
+		for st in [json!("mystery"), json!(7), Value::Null, json!(""), json!({"state": "held"})] {
+			let mut w = wallet_for_tests(&op);
+			let mut rec = json!({"role": "payee", "hash": h(), "paid": true});
+			if !st.is_null() {
+				rec["state"] = st.clone();
+			}
+			w.set_lock("payee", &h(), rec).unwrap();
+			match w.lock_unpaid(&h()) {
+				Err(Error::Refused(why)) => assert!(why.contains("does not know"), "{}: {}", st, why),
+				r => panic!("{}: {:?}", st, r.map(|v| v.to_string())),
+			}
+			assert_eq!(paid(&w), true, "still marked in state {}", st);
+		}
+		// The states it knows: refunded is answered as it stands.
+		let mut w = wallet_for_tests(&op);
+		w.set_lock("payee", &h(), json!({"role": "payee", "hash": h(), "state": "refunded", "paid": true})).unwrap();
+		assert_eq!(w.lock_unpaid(&h()).unwrap()["state"], "refunded");
 	}
 
 	/// The operator knows nothing of the payment: the mark is cleared, and
 	/// asked again the lock is answered as it stands.
 	#[test]
 	fn the_mark_is_cleared_when_nothing_says_the_payment_went_through() {
-		let op = operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}]}));
+		let op = operator_answering(status(&h(), &["open"], None));
 		let mut w = marked(&op);
 		let v = w.lock_unpaid(&h()).unwrap();
 		assert_eq!((v["paid"].clone(), v["was_paid"].clone()), (json!(false), json!(true)), "{}", v);
@@ -1272,7 +1370,7 @@ mod test {
 	/// states, and a payment or receive recorded paid with no preimage.
 	#[test]
 	fn the_mark_stays_for_any_payment_or_swap_not_definitely_failed() {
-		let op = operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}]}));
+		let op = operator_answering(status(&h(), &["open"], None));
 		let refused = |set: &dyn Fn(&Wallet), want: &str| {
 			let mut w = marked(&op);
 			set(&w);

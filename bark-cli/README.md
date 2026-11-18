@@ -1369,8 +1369,11 @@ alone:
   own under the hash is not definitely failed back (a `lightning pay` not
   `failed` or `returned`; a `btc-swap` in any state but `offered`, `taken`,
   `lapsed`, `abandoned`, `btc_failed` or `cancelled`), and once the lock's
-  exit has started. An operator that does not answer leaves the mark, with
-  its error rather than a refusal, to be asked again. A payment in flight
+  exit has started, and for a lock record in a state the wallet does not
+  know. An operator that does not answer, or whose answer is not a lock
+  status the wallet can read (another hash, a lock of a state it does not
+  know, a preimage that is not one of the hash), leaves the mark, with its
+  error rather than a refusal, to be asked again. A payment in flight
   or of unknown state keeps the mark. A lock never marked paid is answered
   as it stands. `btc-swap` clears the mark itself before it ends unpaid
   (`btc_failed` once its payments failed back every time, `abandoned`,
