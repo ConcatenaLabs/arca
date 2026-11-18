@@ -350,13 +350,40 @@ async fn a_coin_spent_into_a_lock_outlives_the_lock() {
 /// are refused before anything is signed, and nothing moves.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_hash_pays_once_through_the_operator_or_straight() {
-	let Some(_lnd) = lightningd("one_hash_pays_once_through_the_operator_or_straight") else { return };
+	let Some(lnd) = lightningd("one_hash_pays_once_through_the_operator_or_straight") else { return };
 	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
 		c.lightning.poll_seconds = 1;
 		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
 	}).await;
 	let x = r.x;
 	let xs = x.to_string();
+	// The operator's Lightning leg in X, as the scenarios above set it up.
+	let ox = tokio::task::block_in_place(|| {
+		let ox = node(&r.rt, &mut r.purse, &lnd, "s1o", true, x, 2_000_000_000);
+		let px = node(&r.rt, &mut r.purse, &lnd, "s1p", true, x, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
+		drop(px);
+		ox
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if a.asset == xs {
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("X's leg up", || g.leg(&x, true).is_ok()).await;
 	let p = wallet_at("once P", &r);
 	let q = wallet_at("once Q", &r);
 	let s = script(&p.ok(&["address"]));
