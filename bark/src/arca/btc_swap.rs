@@ -117,11 +117,13 @@ pub fn send_timeout(median_now: u64, wall_now: u64, latest: u64, exit_q: u64, wi
 	median_now + after_latest.max(least) + gap + 3600
 }
 
-/// Whether swap `s`, as Q, may still pay its BTC or has paid it: `paying`
-/// (Bark holds the payment, or has not said how it ended) or `claiming`
-/// (paid). In `taken` its last payment, if any, failed back.
-pub(crate) fn may_still_pay(s: &Value) -> bool {
-	matches!(s["state"].as_str(), Some("paying" | "claiming"))
+/// Whether swap `s` will pay nothing more and paid nothing under its hash:
+/// `offered` (nothing taken), `taken` (its last payment, if any, definitely
+/// failed back: an unknown reading of Bark's keeps it `paying`), or ended
+/// unpaid (`lapsed`, `abandoned`, `btc_failed`, `cancelled`). Any other
+/// state, one this wallet does not know or none, may still pay or has paid.
+pub(crate) fn pays_nothing_more(s: &Value) -> bool {
+	matches!(s["state"].as_str(), Some("offered" | "taken" | "lapsed" | "abandoned" | "btc_failed" | "cancelled"))
 }
 
 fn wall_now() -> u64 {
@@ -189,7 +191,7 @@ impl Wallet {
 		Ok(self.store.meta(SWAPS)?.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default())
 	}
 
-	fn set_btc_swap(&self, id: &str, mut v: Value) -> Result<(), Error> {
+	pub(crate) fn set_btc_swap(&self, id: &str, mut v: Value) -> Result<(), Error> {
 		v["updated_at"] = json!(wall_now());
 		let mut m = self.btc_swaps_map()?;
 		m.insert(id.to_string(), v);
@@ -489,6 +491,16 @@ impl Wallet {
 		if !matches!(rec["state"].as_str(), Some("offered") | Some("taken")) {
 			return Err(Error::Refused(format!("swap {} is {}: only one not locked yet can be cancelled", id, rec["state"])));
 		}
+		// Q's lock, marked paid before a payment that then failed back: its
+		// mark is cleared first, as when the swap ends unpaid, or the swap
+		// is not cancelled (an operator that does not answer is asked again).
+		let hash = rec["hash"].as_str().unwrap_or("").to_string();
+		if rec["role"] != "P" && self.lock_rec("payee", &hash)?.is_some_and(|l| l["paid"] == true) {
+			self.clear_lock_paid(&hash, true).map_err(|e| match e {
+				Error::Refused(why) => Error::Refused(format!("swap {} is not cancelled: its lock stays marked paid: {}", id, why)),
+				e => e,
+			})?;
+		}
 		rec["state"] = json!("cancelled");
 		rec["outcome"] = json!("cancelled before anything was locked");
 		self.set_btc_swap(id, rec.clone())?;
@@ -608,19 +620,32 @@ impl Wallet {
 		Self::note(rec, outcome);
 	}
 
-	/// Q's swap ended in `taken` (nothing paid, or its last payment failed
-	/// back): the lock under `hash`, marked paid before a payment, is cleared
-	/// of its mark ([`Wallet::lock_unpaid`]), so it is not taken on the chain
-	/// at its home date and goes back to its payer out of round from its
-	/// timeout. A refusal is noted and changes nothing else.
-	fn unmark_failed(&mut self, rec: &mut Value, hash: &str) {
-		if !self.lock_rec("payee", hash).ok().flatten().is_some_and(|l| l["paid"] == true) {
-			return;
+	/// Ends Q's swap from `taken` (nothing paid, or its last payment
+	/// definitely failed back) in `state`, unpaid. The lock under `hash`,
+	/// marked paid before a payment, is first cleared of its mark
+	/// ([`Wallet::lock_unpaid`]), so it is not taken on the chain at its home
+	/// date and goes back to its payer out of round from its timeout. A
+	/// refusal is noted, and the swap ends. While the operator cannot be
+	/// asked, the swap does not end: it stays `taken`, pays nothing, and
+	/// asks again at its next follow.
+	fn end_unpaid(&mut self, rec: &mut Value, hash: &str, state: &str, outcome: &str) -> Result<(), Error> {
+		if !self.lock_rec("payee", hash)?.is_some_and(|l| l["paid"] == true) {
+			Self::end(rec, state, outcome);
+			return Ok(());
 		}
 		match self.clear_lock_paid(hash, false) {
-			Ok(_) => Self::note(rec, "the lock is no longer marked paid: it goes back to its payer from its timeout"),
-			Err(e) => Self::note(rec, &format!("the lock stays marked paid: {}", e)),
+			Ok(_) => {
+				Self::end(rec, state, outcome);
+				Self::note(rec, "the lock is no longer marked paid: it goes back to its payer from its timeout");
+			},
+			Err(Error::Refused(why)) => {
+				Self::end(rec, state, outcome);
+				Self::note(rec, &format!("the lock stays marked paid: {}", why));
+			},
+			Err(e) => Self::note(rec, &format!("{}; the swap ends once the lock's paid mark is cleared, which waits for the operator: {}",
+				outcome, e)),
 		}
+		Ok(())
 	}
 
 	/// P: gives the asset, gets the BTC.
@@ -991,16 +1016,16 @@ impl Wallet {
 					Self::end(rec, "done", "the lock is claimed");
 					return Ok(Value::Null);
 				}
+				// Its payments failed back every time: it pays no more, and
+				// ends once the lock's paid mark is cleared, so the lock goes
+				// back to its payer out of round.
+				let tries = rec["pay_tries"].as_u64().unwrap_or(0);
+				if tries >= PAY_TRIES {
+					self.end_unpaid(rec, &hash, "btc_failed", "the BTC payment did not go through; the asset leg fails back to its payer")?;
+					return Ok(Value::Null);
+				}
 				match self.btc_swap_ready(rec, &bitcoin["ark_info"]) {
 					Ok(None) => {
-						// Its payments failed back every time: the lock's paid mark
-						// is cleared, so it goes back to its payer out of round.
-						let tries = rec["pay_tries"].as_u64().unwrap_or(0);
-						if tries >= PAY_TRIES {
-							Self::end(rec, "btc_failed", "the BTC payment did not go through; the asset leg fails back to its payer");
-							self.unmark_failed(rec, &hash);
-							return Ok(Value::Null);
-						}
 						// Paying: from the lock's home date it is taken on the chain
 						// unless claimed ([`Wallet::locks_home`]).
 						if self.lock_row("payee", &hash)?.is_some() {
@@ -1014,16 +1039,14 @@ impl Wallet {
 					},
 					Ok(Some(why)) => {
 						if r["state"] == "waiting" && rec["invoice_btc_expiry"].as_u64().unwrap_or(0) < wall + PAY_LEFT {
-							Self::end(rec, "lapsed", "the Bitcoin invoice expired before the asset was locked; nothing was paid");
-							self.unmark_failed(rec, &hash);
+							self.end_unpaid(rec, &hash, "lapsed", "the Bitcoin invoice expired before the asset was locked; nothing was paid")?;
 						} else {
 							Self::note(rec, &format!("not paying yet: {}", why));
 						}
 						Ok(Value::Null)
 					},
 					Err(e) => {
-						Self::end(rec, "abandoned", &format!("not paying, ever: {}; the asset leg fails back to its payer", e));
-						self.unmark_failed(rec, &hash);
+						self.end_unpaid(rec, &hash, "abandoned", &format!("not paying, ever: {}; the asset leg fails back to its payer", e))?;
 						Ok(Value::Null)
 					},
 				}
@@ -1124,13 +1147,23 @@ impl Wallet {
 				Self::note(&mut rec, "the BTC payment is in flight");
 				self.set_btc_swap(id, rec)?;
 			},
-			(Some("Q"), Some("pay" | "pay_status"), _) => {
-				// Not paid: tried again while the swap may still pay. A retry of
-				// a payment Bark failed back fails at once and refunds in full.
+			(Some("Q"), Some("pay" | "pay_status"), Some("failed")) => {
+				// Failed back, as Bark read it for certain: tried again while the
+				// swap may still pay. A retry of a payment Bark failed back fails
+				// at once and refunds in full.
 				rec["state"] = json!("taken");
 				let why = result["why"].as_str().map(String::from).unwrap_or_else(|| format!("Bark's status of the payment is {}, which \
 					it reads once it has failed a payment back", result["bark"]["state"].as_str().unwrap_or("unknown")));
 				Self::note(&mut rec, &format!("the BTC payment did not go through: {}", why));
+				self.set_btc_swap(id, rec)?;
+			},
+			(Some("Q"), Some("pay" | "pay_status"), _) => {
+				// Bark could not be read (busy, missing) or named a state the
+				// program does not know: the payment may still be in flight. It
+				// is followed as one, and uses no try.
+				rec["state"] = json!("paying");
+				let why = result["why"].as_str().map(String::from).unwrap_or_else(|| format!("Bark's reading is {}", result["state"]));
+				Self::note(&mut rec, &format!("how the BTC payment stands is not known ({}): followed as in flight", why));
 				self.set_btc_swap(id, rec)?;
 			},
 			_ => {
@@ -1189,6 +1222,90 @@ mod test {
 		assert!(decode(TAKE_KIND, &s, "the take").is_err());
 		assert!(decode(OFFER_KIND, "btc-swap-offer:zz", "the offer").is_err());
 		assert!(decode(OFFER_KIND, "nothing", "the offer").is_err());
+	}
+
+	use super::super::wallet::{operator_answering, wallet_for_tests};
+
+	const PRE: [u8; 32] = [0x43; 32];
+
+	fn h() -> String {
+		hex(&sha256::Hash::hash(&PRE).to_byte_array())
+	}
+
+	/// A wallet at `server` with Q's swap `s1` in `state` after `tries`
+	/// payments, and its lock under the hash marked paid.
+	fn q_swap(server: &str, state: &str, tries: u64) -> Wallet {
+		let w = wallet_for_tests(server);
+		w.set_btc_swap("s1", json!({"id": "s1", "role": "Q", "hash": h(), "state": state, "pay_tries": tries, "leg": "htlc-2"})).unwrap();
+		w.set_lock("payee", &h(), json!({"role": "payee", "hash": h(), "state": "held", "paid": true})).unwrap();
+		w
+	}
+
+	fn marked(w: &Wallet) -> Value {
+		w.lock_rec("payee", &h()).unwrap().unwrap()["paid"].clone()
+	}
+
+	/// Bark could not be read, or named a state the program does not know:
+	/// the payment may be in flight, so the swap follows it as one, uses no
+	/// try and keeps the lock marked. Only a definite reading sends it back
+	/// to `taken`.
+	#[test]
+	fn an_unreadable_bark_reading_is_followed_as_in_flight() {
+		for result in [json!({"action": "pay_status", "state": "unknown", "why": "cannot run Bark (/nonexistent/bark): No such file"}),
+			json!({"action": "pay", "state": "something-new"}), json!({"action": "pay_status"})]
+		{
+			let mut w = q_swap("http://127.0.0.1:1", "paying", 1);
+			let after = w.btc_swap_bitcoin("s1", &result).unwrap();
+			println!("{} -> {}", result, after);
+			let rec = w.btc_swap("s1").unwrap();
+			assert_eq!((rec["state"].as_str(), rec["pay_tries"].as_u64()), (Some("paying"), Some(1)), "{}", rec);
+			assert_eq!(marked(&w), true);
+			assert!(w.lock_unpaid(&h()).is_err(), "a swap paying keeps the mark");
+		}
+		let mut w = q_swap("http://127.0.0.1:1", "paying", 1);
+		w.btc_swap_bitcoin("s1", &json!({"action": "pay_status", "state": "failed", "bark": {"state": "revocable-htlcs"}})).unwrap();
+		assert_eq!(w.btc_swap("s1").unwrap()["state"], "taken", "failed back for certain");
+	}
+
+	/// Three payments failed back: the swap ends `btc_failed` once the
+	/// lock's paid mark is cleared. While the operator cannot be asked it
+	/// stays `taken`, pays nothing more and keeps the mark.
+	#[test]
+	fn three_failed_payments_end_the_swap_once_its_lock_is_unmarked() {
+		let mut w = q_swap("http://127.0.0.1:1", "taken", PAY_TRIES);
+		let mut rec = w.btc_swap("s1").unwrap();
+		assert_eq!(w.follow_q(&mut rec, &json!({})).unwrap(), Value::Null, "nothing more to pay");
+		println!("the operator away: {} | {}", rec["state"], rec["note"]);
+		assert_eq!(rec["state"], "taken");
+		assert_eq!(rec["pay_tries"], PAY_TRIES);
+		assert_eq!(marked(&w), true);
+		let mut w = q_swap(&operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}]})), "taken", PAY_TRIES);
+		let mut rec = w.btc_swap("s1").unwrap();
+		assert_eq!(w.follow_q(&mut rec, &json!({})).unwrap(), Value::Null);
+		println!("the operator up: {} | {}", rec["state"], rec["note"]);
+		assert_eq!(rec["state"], "btc_failed");
+		assert_eq!(rec["pay_tries"], PAY_TRIES);
+		assert_eq!(marked(&w), false, "the lock goes back to its payer out of round");
+	}
+
+	/// Cancelling Q's swap whose payment failed back clears its lock's mark
+	/// first, or does not cancel.
+	#[test]
+	fn a_cancelled_swap_leaves_no_lock_marked() {
+		let mut w = q_swap("http://127.0.0.1:1", "taken", 1);
+		let e = w.btc_swap_cancel("s1").unwrap_err();
+		println!("cancel, the operator away: {}", e);
+		assert!(!matches!(e, Error::Refused(_)), "asked again, not refused: {}", e);
+		assert_eq!((w.btc_swap("s1").unwrap()["state"].clone(), marked(&w)), (json!("taken"), json!(true)));
+		let op = operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}], "preimage": hex(&PRE)}));
+		let mut w = q_swap(&op, "taken", 1);
+		let e = w.btc_swap_cancel("s1").unwrap_err();
+		println!("cancel, the preimage served: {}", e);
+		assert!(matches!(&e, Error::Refused(why) if why.contains("is not cancelled")), "{}", e);
+		assert_eq!((w.btc_swap("s1").unwrap()["state"].clone(), marked(&w)), (json!("taken"), json!(true)));
+		let mut w = q_swap(&operator_answering(json!({"payment_hash": h(), "locks": [{"state": "open"}]})), "taken", 1);
+		assert_eq!(w.btc_swap_cancel("s1").unwrap()["state"], "cancelled");
+		assert_eq!(marked(&w), false);
 	}
 
 	#[test]

@@ -1216,7 +1216,9 @@ fn btc_swap(w: &mut Wallet, datadir: &Path, c: BtcSwapCmd) -> Result<Value, bark
 						Some("cancel_receive") => bitcoin::cancel_receive(datadir, inv),
 						_ => continue,
 					};
-					acted |= result["state"] != "waiting" && result["state"] != "pending";
+					// A payment in flight, or one Bark could not be read on, is asked
+					// again after a pause.
+					acted |= !matches!(result["state"].as_str(), Some("waiting" | "pending" | "unknown"));
 					let after = w.btc_swap_bitcoin(id, &result)?;
 					ran.push(json!({"swap": id, "bitcoin": result, "after": after}));
 				}

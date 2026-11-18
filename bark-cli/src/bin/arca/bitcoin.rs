@@ -564,8 +564,7 @@ pub fn claim_for_swap(datadir: &Path, invoice: &str, wait: Duration) -> Value {
 }
 
 /// A swap's payment of the Bitcoin invoice (Q), and how it stands after:
-/// `{action: pay, state}`, `paid` with the preimage, `pending` while Bark's
-/// server holds it, or `failed`.
+/// `{action: pay, state}`, as [`pay_status_for_swap`] reads it.
 pub fn pay_for_swap(datadir: &Path, invoice: &str) -> Value {
 	if !has_wallet(datadir) {
 		return json!({"action": "pay", "state": "failed", "why": no_wallet().to_string()});
@@ -583,20 +582,31 @@ pub fn pay_for_swap(datadir: &Path, invoice: &str) -> Value {
 
 /// How a swap's payment of the Bitcoin invoice stands at Bark: `paid` with
 /// the preimage; `pending` while Bark's server holds it (`start`,
-/// `htlc-received`, `payment-initiated`); `failed` when it was failed back
-/// (`revocable-htlcs`, the coins coming back to the wallet) or Bark knows no
-/// payment of it (never made, or failed back and its coins returned).
+/// `htlc-received`, `payment-initiated`); `failed` only on a definite
+/// reading, the payment failed back (`revocable-htlcs`, the coins coming
+/// back to the wallet; `revocation-stuck`) or Bark knowing no payment of it
+/// (`unknown`: never made, or failed back and its coins returned, since
+/// Bark keeps a payment from before its first HTLC leaves until it is paid
+/// or revoked). `unknown` when Bark cannot be read (not run, its database
+/// busy) or names a state not listed here: the payment may still be in
+/// flight, and the swap follows it as one.
 pub fn pay_status_for_swap(datadir: &Path, invoice: &str) -> Value {
 	match bark_json(datadir, &["lightning", "pay", "status", invoice, "--no-sync"]) {
 		Ok(s) => {
-			let state = match s["state"].as_str() {
-				Some("paid") => "paid",
-				Some("start" | "htlc-received" | "payment-initiated") => "pending",
-				_ => "failed",
-			};
+			let state = bark_send_state(s["state"].as_str());
 			json!({"action": "pay_status", "state": state, "preimage": s["preimage"], "bark": s})
 		},
-		Err(e) => json!({"action": "pay_status", "state": "failed", "why": e.to_string()}),
+		Err(e) => json!({"action": "pay_status", "state": "unknown", "why": e.to_string()}),
+	}
+}
+
+/// A swap's reading of Bark's state of a payment ([`pay_status_for_swap`]).
+fn bark_send_state(state: Option<&str>) -> &'static str {
+	match state {
+		Some("paid") => "paid",
+		Some("start" | "htlc-received" | "payment-initiated") => "pending",
+		Some("revocable-htlcs" | "revocation-stuck" | "unknown") => "failed",
+		_ => "unknown",
 	}
 }
 
@@ -611,6 +621,25 @@ pub fn cancel_receive(datadir: &Path, invoice: &str) -> Value {
 
 #[cfg(test)]
 mod test {
+	/// Only Bark's definite states count as a failed payment; an unreadable
+	/// Bark or a state not listed is unknown, followed as in flight.
+	#[test]
+	fn only_a_definite_bark_state_counts_as_failed() {
+		use super::bark_send_state as st;
+		assert_eq!(st(Some("paid")), "paid");
+		for s in ["start", "htlc-received", "payment-initiated"] {
+			assert_eq!(st(Some(s)), "pending", "{}", s);
+		}
+		for s in ["revocable-htlcs", "revocation-stuck", "unknown"] {
+			assert_eq!(st(Some(s)), "failed", "{}", s);
+		}
+		for s in [Some("something-new"), Some(""), None] {
+			assert_eq!(st(s), "unknown", "{:?}", s);
+		}
+		let v = super::pay_status_for_swap(std::path::Path::new("/nonexistent/arca-datadir"), "lnbcrt1");
+		assert_eq!(v["state"], "unknown", "Bark not run: {}", v);
+	}
+
 	#[test]
 	fn base64_of_cookie() {
 		assert_eq!(super::base64(b"__cookie__:abc"), "X19jb29raWVfXzphYmM=");

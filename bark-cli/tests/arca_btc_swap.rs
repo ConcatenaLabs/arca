@@ -696,6 +696,96 @@ async fn each_abandoned_swap_leaves_every_leg_with_one_party() {
 	}
 }
 
+/// G, on a lock straight from P (`htlc-2`): Q pays, P never claims, and
+/// Bark fails each of Q's payments back. Each try marks the lock paid just
+/// before it pays; after the third the swap ends `btc_failed` with the
+/// lock's mark cleared (#969), so past its home date Q does not take it on
+/// the chain, an exit it could never finish without the preimage, and from
+/// its timeout P has it back out of round. While Bark cannot be read, the
+/// payment is followed as in flight: no try is used and the mark stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_whose_payments_fail_back_ends_unmarked_and_comes_back_out_of_round() {
+	if skip() {
+		return;
+	}
+	let Some(lnd) = lightningd("a_lock_whose_payments_fail_back_ends_unmarked_and_comes_back_out_of_round") else { return };
+	let (mut r, ox) = operator(&lnd, "sw7").await;
+	let p = dual_wallet(&r, "SGP", 0, None);
+	let q = dual_wallet(&r, "SGQ", 800_000, None);
+	fund_x(&mut r, &p, 2_000_000).await;
+	refill_pool();
+	let (id, hash) = agreed(&r, &p, &q, true, 70_000, 12_000, 1800);
+	follow_until(&p, &id, "locked", 60);
+	assert_eq!(swap_of(&p, &id)["leg"], "htlc-2", "P locks straight to Q");
+	q.ok(&["sync"]);
+	let lock = |w: &Arca| w.ok(&["lock", "list"]).as_array().unwrap().iter().find(|l| l["hash"] == hash.as_str()).cloned().unwrap_or(Value::Null);
+	// A Bark whose reading of a payment fails, as when its database is busy.
+	let real = std::env::var("ARCA_BARK_EXEC").unwrap();
+	let busy = q.dir.join("bark-busy.sh");
+	std::fs::write(&busy, format!("#!/bin/sh\ncase \"$*\" in *\"lightning pay status\"*) echo 'Error: database is locked' >&2; exit 1;; esac\nexec '{}' \"$@\"\n", real)).unwrap();
+	std::fs::set_permissions(&busy, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+	let q_btc0 = spendable_sat(&q);
+	let mut read_busy = false;
+	let t0 = Instant::now();
+	let end = loop {
+		let s = swap_of(&q, &id);
+		if s["state"] == "paying" && !read_busy {
+			let tries = s["pay_tries"].clone();
+			let out = tokio::task::block_in_place(|| Command::new(env!("CARGO_BIN_EXE_arca")).env("ARCA_BARK_EXEC", &busy).arg("--datadir").arg(&q.dir)
+				.args(["btc-swap", "follow", &id, "--claim-slice", "5"]).output().unwrap());
+			let after = swap_of(&q, &id);
+			println!("ROW G Bark not read: {} | {} | tries {} | {}", after["state"], after["note"], after["pay_tries"], String::from_utf8_lossy(&out.stderr).trim());
+			assert_eq!((after["state"].as_str(), after["pay_tries"].clone()), (Some("paying"), tries), "followed as in flight, no try used");
+			assert_eq!(lock(&q)["paid"], true, "the mark stays while the payment is not read");
+			read_busy = true;
+		}
+		let s = follow_one(&q, &id);
+		println!("ROW G Q's swap: {} | {} | tries {} | lock paid {}", s["state"], s["note"], s["pay_tries"], lock(&q)["paid"]);
+		if s["state"] == "btc_failed" {
+			break s;
+		}
+		assert!(t0.elapsed() < Duration::from_secs(400), "Q's payment never ended: {}", s);
+		std::thread::sleep(Duration::from_secs(3));
+	};
+	assert!(read_busy, "a payment was followed while Bark could not be read");
+	assert_eq!(end["pay_tries"], 3, "three tries: {}", end);
+	assert_eq!(lock(&q)["paid"], false, "the lock is no longer marked paid: {}", lock(&q));
+	until_btc(&[&q], 120, "Q's BTC back", || spendable_sat(&q) >= q_btc0);
+	// Past the lock's home date, short of its timeout: Q does not take it on the chain.
+	let t = lock(&p)["timeout"].as_u64().expect("the lock's timeout, as its payer recorded it") as u32;
+	let leaf = lock(&q)["leaf_id"].as_str().unwrap_or("").to_string();
+	while mtp(&r) + 900 < t {
+		advance(&r, (t - 900 - mtp(&r)).min(6 * 3600)).await;
+	}
+	for _ in 0..3 {
+		q.run(&["sync"]);
+		r.produce().await;
+	}
+	let coin = q.ok(&["coins"]).as_array().unwrap().iter().find(|c| c["leaf_id"] == leaf.as_str()).map(|c| c["state"].clone()).unwrap_or(Value::Null);
+	println!("ROW G Q's lock coin past its home date (median {} T {}): {}", mtp(&r), t, coin);
+	assert_eq!(coin, "lock_in", "the cleared lock stays off the chain");
+	// From its timeout P has it back, out of round.
+	advance(&r, 1800).await;
+	let t0 = Instant::now();
+	loop {
+		p.run(&["sync"]);
+		let s = follow_one(&p, &id);
+		if s["state"] == "refunded" {
+			println!("ROW G P's swap: {} | {}", s["state"], s["outcome"]);
+			break;
+		}
+		assert!(t0.elapsed() < Duration::from_secs(180), "P's lock never came back: {}", s);
+		std::thread::sleep(Duration::from_secs(2));
+	}
+	assert_eq!(lock(&p)["state"], "refunded", "out of round: {}", lock(&p));
+	q.ok(&["sync"]);
+	assert_eq!(lock(&q)["state"], "refunded", "Q learns it is gone: {}", lock(&q));
+	drop(ox);
+	for w in [&p, &q] {
+		let _ = std::fs::remove_dir_all(&w.dir);
+	}
+}
+
 /// A parent block of the Sequentia chain's own, which the next Sequentia
 /// blocks anchor to: its height.
 async fn own_anchor(r: &Running) -> u64 {

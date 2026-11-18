@@ -1198,6 +1198,31 @@ async fn a_lock_cleared_of_its_paid_mark_goes_back_to_its_payer_out_of_round() {
 	assert_eq!(q.ok(&["lock", "claim", &h4, &hex(&pre4)])["state"], "claimed");
 	let why = q.refused(&["lock", "unpaid", &h4], "is claimed");
 	println!("lock unpaid of a claimed lock: {}", why);
+
+	// The operator serves the preimage (its payer posted it): the payment went
+	// through whatever the payee saw, and the mark stays.
+	let (pre5, pre6) = ([0x7f; 32], [0x80; 32]);
+	let (h5, h6) = (hash(&pre5), hash(&pre6));
+	for (h, amount) in [(&h5, "40000"), (&h6, "30000")] {
+		let req = q.ok(&["lock", "request", "--asset", &x, "--amount", amount, "--hash", h]);
+		p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "7200"]);
+	}
+	q.ok(&["sync"]);
+	q.ok(&["lock", "paid", &h5]);
+	q.ok(&["lock", "paid", &h6]);
+	let n = lock_sql(&r, &format!("UPDATE swap_lock SET preimage = '\\x{}' WHERE payment_hash = '\\x{}'", hex(&pre5), h5)).await;
+	assert_eq!(n, 1);
+	let why = q.refused(&["lock", "unpaid", &h5], "is known");
+	println!("lock unpaid with the preimage served by the operator: {}", why);
+	assert_eq!(lock(&q, &h5)["paid"], true);
+	// The operator away: the mark stays, and the answer is not a refusal but
+	// the operator's silence, to be asked again.
+	r.server.stop();
+	let (ok, v) = q.run(&["lock", "unpaid", &h6]);
+	println!("lock unpaid with the operator away: ok={} {}", ok, v["error"]);
+	assert!(!ok, "not cleared with the operator away: {}", v);
+	assert_ne!(v["error"]["kind"], "refused", "not a refusal: {}", v);
+	assert_eq!(lock(&q, &h6)["paid"], true, "still marked: {}", lock(&q, &h6));
 }
 
 /// The operator's database is rolled back after a claim was

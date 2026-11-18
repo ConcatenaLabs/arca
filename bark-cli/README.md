@@ -1265,7 +1265,11 @@ running `follow`, which moves its swaps on and runs Bark as each needs.
   its home date at least an hour past the Bitcoin leg's latest moment, and the
   invoice ten minutes from its expiry at least. It pays once; a payment that
   did not go through is tried again at most twice, which Bark refuses at once
-  once it has failed the first back.
+  once it has failed the first back. Only a definite reading of Bark's
+  counts as not gone through: the payment failed back (`revocable-htlcs`,
+  `revocation-stuck`) or Bark knowing none (`unknown`). Bark not run, its
+  database busy, or a state not listed is followed as a payment in flight,
+  and uses no try.
 - P's claim of the BTC reveals the preimage. `follow` claims it in slices
   (`--claim-slice`, 20 seconds) while the payer may pay, since Bark's server
   fails a payment back unless the receiver claims within its forward timeout,
@@ -1358,15 +1362,20 @@ alone:
   so the lock is not taken on the chain at its home date (an exit the
   payee, holding no preimage, could not finish) and goes back to its payer
   out of round from its timeout. It is for a definite failure only: it is
-  refused once the lock is claimed or its preimage is known (to the lock,
-  the wallet's receive or payment under the hash, or served by the
-  operator), while a payment of the wallet's own under the hash may still
-  complete (its `btc-swap` paying, a `lightning pay` not failed back), and
-  once the lock's exit has started. A payment in flight or of unknown state
-  keeps the mark. A lock never marked paid is answered as it stands.
-  `btc-swap` clears the mark itself when its payments failed back every
-  time (`btc_failed`), and when it ends in `abandoned` or `lapsed` after a
-  payment that failed back.
+  refused once the lock is claimed (by the wallet's record or the
+  operator's) or its preimage is known (to the lock, the wallet's receive
+  or payment under the hash, or served by the operator), when a receive or
+  payment under the hash is recorded paid, while a payment of the wallet's
+  own under the hash is not definitely failed back (a `lightning pay` not
+  `failed` or `returned`; a `btc-swap` in any state but `offered`, `taken`,
+  `lapsed`, `abandoned`, `btc_failed` or `cancelled`), and once the lock's
+  exit has started. An operator that does not answer leaves the mark, with
+  its error rather than a refusal, to be asked again. A payment in flight
+  or of unknown state keeps the mark. A lock never marked paid is answered
+  as it stands. `btc-swap` clears the mark itself before it ends unpaid
+  (`btc_failed` once its payments failed back every time, `abandoned`,
+  `lapsed`), and does not end while the operator cannot be asked;
+  `btc-swap cancel` clears it first too, or does not cancel.
 - One hash pays once: `lock to` refuses while the wallet pays under the same
   hash through the operator (`lightning pay`, not yet returned), and
   `lightning pay` refuses while a lock of the wallet's under it stands.
