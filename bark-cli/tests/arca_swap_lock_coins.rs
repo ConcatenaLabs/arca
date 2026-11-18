@@ -421,3 +421,79 @@ async fn one_hash_pays_once_through_the_operator_or_straight() {
 	let locks = p.ok(&["lock", "list"]);
 	assert!(!locks.as_array().unwrap().iter().any(|l| l["hash"] == h2.as_str()), "no lock recorded under the hash: {}", locks);
 }
+
+/// A lock's paid mark is not cleared while a payment of the payee's own
+/// under its hash may still complete. Q holds a lock under a hash and marks
+/// it paid; it then pays, through the operator, an invoice under the same
+/// hash whose receiver has no preimage, so the payment stays in flight.
+/// `lock unpaid` is refused, naming the payment, and the lock stays marked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paid_mark_stays_while_the_payees_payment_may_still_complete() {
+	let Some(lnd) = lightningd("a_paid_mark_stays_while_the_payees_payment_may_still_complete") else { return };
+	let mut r = Running::start_seqln(|c, _, _| {
+		c.fees.lightning_ppm = 1_000;
+		c.lightning.operator_delay_units = 1;
+		c.lightning.owner_delay_units = 2;
+		c.lightning.send_timeout_seconds = 8 * 3600;
+		c.lightning.send_stall_margin_seconds = 3600;
+		c.lightning.poll_seconds = 1;
+		c.lightning.retry_seconds = 10;
+		c.lightning.receive_window_seconds = 600;
+	}).await;
+	let x = r.x;
+	let xs = x.to_string();
+	let ox = tokio::task::block_in_place(|| {
+		let ox = node(&r.rt, &mut r.purse, &lnd, "u1o", true, x, 2_000_000_000);
+		let px = node(&r.rt, &mut r.purse, &lnd, "u1p", true, x, 1_000_000_000);
+		ox.open_channel(&r.rt, &px, x, 1_000_000_000, 300_000_000);
+		drop(px);
+		ox
+	});
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	let mut config = r.config.clone();
+	for a in config.assets.iter_mut() {
+		if a.asset == xs {
+			a.lightning = Some(LegSection::at(ox.rpc_path()));
+		}
+	}
+	r.server.reload(&config).await.unwrap();
+	r.config = config;
+	let g = r.server.gateway.clone();
+	r.wait("X's leg up", || g.leg(&x, true).is_ok()).await;
+	let p = wallet_at("unpaid P", &r);
+	let q = wallet_at("unpaid Q", &r);
+	let w = wallet_at("unpaid W", &r);
+	for a in [&p, &q] {
+		let s = script(&a.ok(&["address"]));
+		r.pay_to(s, x, 3_000_000);
+		r.produce().await;
+		a.ok(&["board", &xs, "2000000"]);
+	}
+	r.produce().await;
+	r.bury().await;
+	r.synced().await;
+	for a in [&p, &q] {
+		r.wait("the board to be credited", || a.ok(&["boards"]).as_array().unwrap().iter().all(|b| b["server"]["state"] == "credited")).await;
+		a.ok(&["sync"]);
+	}
+
+	let h = a_hash("unpaid-in-flight");
+	let req = q.ok(&["lock", "request", "--asset", &xs, "--amount", "50000", "--hash", &h]);
+	p.ok(&["lock", "to", &req.to_string(), "--timeout-in", "30000"]);
+	q.ok(&["sync"]);
+	assert_eq!(q.ok(&["lock", "paid", &h])["paid"], true);
+	// Q's own payment under the hash, to a receiver that has no preimage:
+	// in flight until the operator fails it back.
+	let inv = w.ok(&["lightning", "receive", &xs, "40000", "--hash", &h])["invoice"].as_str().unwrap().to_string();
+	let paying = q.ok(&["lightning", "pay", &inv, "--wait", "5"]);
+	println!("Q pays under the lock's hash: {}", paying);
+	let send = q.ok(&["lightning", "payments"])[&h].clone();
+	assert!(!matches!(send["state"].as_str(), Some("failed" | "returned" | "paid")), "the payment is in flight: {}", send);
+	let why = q.refused(&["lock", "unpaid", &h], "may still complete");
+	println!("lock unpaid while Q's payment is {}: {}", send["state"], why);
+	assert!(why.contains("Lightning payment through the operator"), "{}", why);
+	let l = q.ok(&["lock", "list"]).as_array().unwrap().iter().find(|l| l["hash"] == h.as_str() && l["role"] == "payee").cloned().unwrap();
+	assert_eq!(l["paid"], true, "the lock stays marked: {}", l);
+}

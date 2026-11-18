@@ -114,6 +114,28 @@ pub(crate) fn lock_stands(rec: &Value) -> bool {
 	rec["state"] != "refused"
 }
 
+/// Why the paid mark of the payee's lock record `rec` under `hash` stays,
+/// or `None` when it may be cleared: the payment went through (the lock
+/// claimed, its preimage known, `known` when the wallet learnt it elsewhere),
+/// a payment of the wallet's own under the hash may still complete
+/// (`paying`, said), or the lock's exit has started (`exiting`).
+pub(crate) fn unpaid_refusal(hash: &str, rec: &Value, known: bool, paying: Option<&str>, exiting: bool) -> Option<String> {
+	if rec["state"] == "claimed" {
+		return Some(format!("the lock under hash {} is claimed: its payment went through", hash));
+	}
+	if known || !rec["preimage"].is_null() {
+		return Some(format!("the preimage of hash {} is known: the payment went through, and the lock is claimed with it", hash));
+	}
+	if let Some(p) = paying {
+		return Some(format!("the payment under hash {} may still complete ({}): the lock stays marked paid until it has failed for good", hash, p));
+	}
+	if exiting && rec["paid"] == true {
+		return Some(format!("the lock under hash {}'s exit has started: it is on its way to the chain, where its payer takes it back \
+			from its timeout unless the preimage comes", hash));
+	}
+	None
+}
+
 /// Whether a lock whose transfer failed with `e` is to be recorded as
 /// refused, nothing locked: the operator's own refusal, or a refusal of the
 /// wallet's while every input is live still (`inputs_back`: nothing was
@@ -842,6 +864,71 @@ impl Wallet {
 		Ok(json!({"payment_hash": hash, "paid": true}))
 	}
 
+	/// Clears the mark [`Self::lock_paid`] set, once the wallet's payment
+	/// for the preimage of `hash` has failed for good: the lock is then not
+	/// taken on the chain at its home date, and goes back to its payer out of
+	/// round from its timeout, as a lock never paid for does. Only the
+	/// program that paid knows its payment failed for good, and it calls this
+	/// on a definite failure alone, never while the payment is in flight or
+	/// its state unknown: a lock left unmarked while its payment completes
+	/// is claimed out of round only while the operator co-signs or serves the
+	/// preimage. A separate command from `lock_paid`, so a library without it
+	/// refuses the call rather than marking the lock paid.
+	///
+	/// Refused for a hash the wallet asked no lock under, and whenever the
+	/// payment went through or may still: the lock claimed, the preimage
+	/// known (to the lock, the wallet's receive or payment under the hash, or
+	/// served by the operator), a payment of the wallet's own under the hash
+	/// not failed (its BTC swap paying or claiming, a Lightning payment
+	/// through the operator). Refused too once the lock's exit has started,
+	/// which clearing the mark does not stop. A lock never marked paid is
+	/// answered as it stands.
+	pub fn lock_unpaid(&mut self, hash: &str) -> Result<Value, Error> {
+		self.clear_lock_paid(hash, true)
+	}
+
+	/// [`Self::lock_unpaid`]; `swaps` false when the wallet's own BTC swap
+	/// under the hash is the caller, having seen its payment fail for good.
+	pub(crate) fn clear_lock_paid(&mut self, hash: &str, swaps: bool) -> Result<Value, Error> {
+		let mut r = self.lock_rec("payee", hash)?.ok_or_else(|| Error::Refused(format!("the wallet asked no lock under hash {}", hash)))?;
+		let opens = |p: &str| super::chain::unhex32(p).is_ok_and(|b| hex(&sha256::Hash::hash(&b).to_byte_array()) == hash);
+		let send = self.sends()?.get(hash).cloned();
+		let receive = self.receives()?.get(hash).cloned();
+		let mut known = [send.as_ref(), receive.as_ref()].into_iter().flatten().any(|v| v["preimage"].as_str().is_some_and(opens));
+		let mut paying = send.as_ref().filter(|s| !matches!(s["state"].as_str(), Some("failed" | "returned" | "paid")))
+			.map(|s| format!("its Lightning payment through the operator is {}", s["state"].as_str().unwrap_or("being made")));
+		if swaps && paying.is_none() {
+			paying = self.btc_swaps_map()?.values().find(|s| s["role"] == "Q" && s["hash"] == hash && super::btc_swap::may_still_pay(s))
+				.map(|s| format!("its BTC swap is {}", s["state"].as_str().unwrap_or("")));
+		}
+		let held = matches!(r["state"].as_str(), Some("asked" | "held"));
+		if held && !known && r["preimage"].is_null() && r["paid"] == true {
+			// The operator serves the preimage once the payer posted it: the
+			// payment went through whatever the caller saw.
+			known = self.lock_status(hash).ok().and_then(|s| s["preimage"].as_str().map(opens)).unwrap_or(false);
+		}
+		// The lock's coin leaves `lock_in` once its exit starts: the record
+		// names its leaf from the moment it was held.
+		let leaf = match self.lock_row("payee", hash)? {
+			Some(row) => Some(row.leaf_id),
+			None => r["leaf_id"].as_str().map(String::from),
+		};
+		let exiting = match leaf {
+			Some(l) => self.store.exit(&l)?.is_some(),
+			None => false,
+		};
+		if let Some(why) = unpaid_refusal(hash, &r, known, paying.as_deref(), exiting) {
+			return Err(Error::Refused(why));
+		}
+		let was = r["paid"] == true;
+		if was {
+			r["paid"] = json!(false);
+			r["unpaid_at"] = json!(wall_now());
+			self.set_lock("payee", hash, r.clone())?;
+		}
+		Ok(json!({"payment_hash": hash, "paid": false, "was_paid": was, "state": r["state"]}))
+	}
+
 	/// Hands the payee's wallet the preimage of `hash`, learnt elsewhere (a
 	/// BTC payment that settled): kept, posted to the operator, and the lock
 	/// claimed at once when the wallet holds it.
@@ -1054,6 +1141,44 @@ mod test {
 		assert!(lock_refused(&mine, true), "the wallet's refusal before the post: every input live, nothing locked");
 		assert!(!lock_refused(&mine, false), "the wallet's refusal after the post: the lock may stand, the request stands");
 		assert!(!lock_refused(&Error::Unreachable("timeout".into()), true), "no answer: the request stands");
+	}
+
+	/// The paid mark is cleared only on a definite failure: never once the
+	/// payment went through (the lock claimed, the preimage known anywhere),
+	/// never while a payment of the wallet's under the hash may complete,
+	/// never once the lock's exit has started.
+	#[test]
+	fn a_paid_mark_is_cleared_only_once_the_payment_failed_for_good() {
+		let h = "ab".repeat(32);
+		let paid = json!({"state": "held", "paid": true});
+		assert_eq!(unpaid_refusal(&h, &paid, false, None, false), None, "failed for good: cleared");
+		assert_eq!(unpaid_refusal(&h, &json!({"state": "held"}), false, None, false), None, "never marked: answered as it stands");
+		assert_eq!(unpaid_refusal(&h, &json!({"state": "asked", "paid": true}), false, None, false), None);
+		let claimed = unpaid_refusal(&h, &json!({"state": "claimed", "paid": true, "preimage": "00"}), false, None, false).unwrap();
+		assert!(claimed.contains("is claimed"), "{}", claimed);
+		let with_pre = unpaid_refusal(&h, &json!({"state": "held", "paid": true, "preimage": "00"}), false, None, false).unwrap();
+		assert!(with_pre.contains("preimage") && with_pre.contains("is known"), "{}", with_pre);
+		let elsewhere = unpaid_refusal(&h, &paid, true, None, false).unwrap();
+		assert!(elsewhere.contains("is known"), "{}", elsewhere);
+		let paying = unpaid_refusal(&h, &paid, false, Some("its BTC swap is paying"), false).unwrap();
+		assert!(paying.contains("may still complete") && paying.contains("its BTC swap is paying"), "{}", paying);
+		let exiting = unpaid_refusal(&h, &paid, false, None, true).unwrap();
+		assert!(exiting.contains("exit has started"), "{}", exiting);
+		assert_eq!(unpaid_refusal(&h, &json!({"state": "held"}), false, None, true), None, "never marked, exiting: nothing to clear");
+		// The preimage outranks a payment still running: it went through.
+		assert!(unpaid_refusal(&h, &paid, true, Some("x"), true).unwrap().contains("is known"));
+	}
+
+	/// A swap may still pay while Bark holds its payment or once it paid;
+	/// in `taken` and its ends its last payment failed back.
+	#[test]
+	fn a_swap_may_still_pay_only_while_paying_or_claiming() {
+		for s in ["paying", "claiming"] {
+			assert!(super::super::btc_swap::may_still_pay(&json!({"state": s})), "{}", s);
+		}
+		for s in ["offered", "taken", "btc_failed", "abandoned", "lapsed", "done"] {
+			assert!(!super::super::btc_swap::may_still_pay(&json!({"state": s})), "{}", s);
+		}
 	}
 
 	#[test]

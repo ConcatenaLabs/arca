@@ -117,6 +117,13 @@ pub fn send_timeout(median_now: u64, wall_now: u64, latest: u64, exit_q: u64, wi
 	median_now + after_latest.max(least) + gap + 3600
 }
 
+/// Whether swap `s`, as Q, may still pay its BTC or has paid it: `paying`
+/// (Bark holds the payment, or has not said how it ended) or `claiming`
+/// (paid). In `taken` its last payment, if any, failed back.
+pub(crate) fn may_still_pay(s: &Value) -> bool {
+	matches!(s["state"].as_str(), Some("paying" | "claiming"))
+}
+
 fn wall_now() -> u64 {
 	web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -601,6 +608,21 @@ impl Wallet {
 		Self::note(rec, outcome);
 	}
 
+	/// Q's swap ended in `taken` (nothing paid, or its last payment failed
+	/// back): the lock under `hash`, marked paid before a payment, is cleared
+	/// of its mark ([`Wallet::lock_unpaid`]), so it is not taken on the chain
+	/// at its home date and goes back to its payer out of round from its
+	/// timeout. A refusal is noted and changes nothing else.
+	fn unmark_failed(&mut self, rec: &mut Value, hash: &str) {
+		if !self.lock_rec("payee", hash).ok().flatten().is_some_and(|l| l["paid"] == true) {
+			return;
+		}
+		match self.clear_lock_paid(hash, false) {
+			Ok(_) => Self::note(rec, "the lock is no longer marked paid: it goes back to its payer from its timeout"),
+			Err(e) => Self::note(rec, &format!("the lock stays marked paid: {}", e)),
+		}
+	}
+
 	/// P: gives the asset, gets the BTC.
 	fn follow_p(&mut self, rec: &mut Value, bitcoin: &Value) -> Result<Value, Error> {
 		let hash = rec["hash"].as_str().unwrap_or("").to_string();
@@ -971,16 +993,19 @@ impl Wallet {
 				}
 				match self.btc_swap_ready(rec, &bitcoin["ark_info"]) {
 					Ok(None) => {
+						// Its payments failed back every time: the lock's paid mark
+						// is cleared, so it goes back to its payer out of round.
+						let tries = rec["pay_tries"].as_u64().unwrap_or(0);
+						if tries >= PAY_TRIES {
+							Self::end(rec, "btc_failed", "the BTC payment did not go through; the asset leg fails back to its payer");
+							self.unmark_failed(rec, &hash);
+							return Ok(Value::Null);
+						}
 						// Paying: from the lock's home date it is taken on the chain
 						// unless claimed ([`Wallet::locks_home`]).
 						if self.lock_row("payee", &hash)?.is_some() {
 							self.lock_paid(&hash)?;
 							rec["leg"] = json!("htlc-2");
-						}
-						let tries = rec["pay_tries"].as_u64().unwrap_or(0);
-						if tries >= PAY_TRIES {
-							Self::end(rec, "btc_failed", "the BTC payment did not go through; the asset leg fails back to its payer");
-							return Ok(Value::Null);
 						}
 						rec["pay_tries"] = json!(tries + 1);
 						rec["state"] = json!("paying");
@@ -990,6 +1015,7 @@ impl Wallet {
 					Ok(Some(why)) => {
 						if r["state"] == "waiting" && rec["invoice_btc_expiry"].as_u64().unwrap_or(0) < wall + PAY_LEFT {
 							Self::end(rec, "lapsed", "the Bitcoin invoice expired before the asset was locked; nothing was paid");
+							self.unmark_failed(rec, &hash);
 						} else {
 							Self::note(rec, &format!("not paying yet: {}", why));
 						}
@@ -997,6 +1023,7 @@ impl Wallet {
 					},
 					Err(e) => {
 						Self::end(rec, "abandoned", &format!("not paying, ever: {}; the asset leg fails back to its payer", e));
+						self.unmark_failed(rec, &hash);
 						Ok(Value::Null)
 					},
 				}
