@@ -2,7 +2,7 @@
 # A payment name's invoice on the Bitcoin ark: the wallet's library (bark-wasm's
 # command set, run natively by its `regtest_drive` example) asks the server for
 # an invoice that commits to the SHA-256 of a payment name's LNURL-pay metadata
-# (BOLT11 `h`, as LUD-06 asks), and an outside payer that checks the hash pays it.
+# (BOLT11 `h`, as LUD-06 asks), and an outside payer pays it.
 # It needs a captaind built with
 # contrib/operator-bundle/patches/captaind-description-hash.patch.
 #
@@ -10,10 +10,11 @@
 #   - An invoice asked with a memo and no hash is made as it always was: the memo,
 #     no `h` (the field left out changes nothing).
 #   - A hash that is not 64 hex characters, or a hash beside a memo, is refused.
-#   - The peer, a Core Lightning node, pays the invoice with `pay … description=`,
-#     which checks the description against the invoice's hash: with the metadata
-#     it pays, and the wallet claims the payment; with another string it refuses
-#     before anything moves.
+#   - The peer, a Core Lightning node, reads the hash from the invoice
+#     (`decode`) and pays it, and the wallet claims the payment.
+# Core Lightning 26's `pay` no longer checks a description against the hash
+# (xpay, which serves it, ignores one; the old `pay` that did is deprecated), so
+# the hash is checked here against sha256 of the metadata's bytes.
 #
 #   H=… REGTEST=…/regtest.sh DRIVE=…/regtest_drive description-hash-drive.sh
 set -euo pipefail
@@ -71,15 +72,11 @@ if out=$(d invoice "{\"sats\":\"21000\",\"description\":\"x\",\"description_hash
 echo "$out" | grep -q "not both" || fail "a hash beside a memo, refused for another reason: $out"
 echo "hash and memo: $(echo "$out" | grep -o "give a description.*" | head -1)"
 
-echo "=== a payer checking the hash: another description is refused ==="
-if out=$(R peer -k pay bolt11="$inv" description='[["text/plain","Payment to mallory"]]' 2>&1); then fail "the peer paid with another description: $out"; fi
-echo "refused: $(echo "$out" | json | jq -c '{code, message}' 2>/dev/null || echo "$out" | tail -2)"
-
-echo "=== a payer checking the hash: the metadata pays, the wallet claims ==="
+echo "=== the peer pays it, the wallet claims ==="
 before=$(d balance | jq -r .spendable)
-( R peer -k pay bolt11="$inv" description="$META" > "$H/description-hash-pay.out" 2>&1 ) &
+( R peer pay "$inv" > "$H/description-hash-pay.out" 2>&1 ) &
 payer=$!
-got=$(timeout 120 "$DRIVE" "$W" receive_status "{\"hash\":\"$(jq -r .payment_hash <<< "$dec")\",\"claim\":true,\"wait\":true}")
+got=$(timeout 120 "$DRIVE" "$W" receive_status "{\"hash\":\"$(jq -r .payment_hash <<< "$dec")\",\"claim\":true,\"wait\":true}") || fail "the claim did not finish: $got"
 echo "$got" | jq -c .
 wait "$payer" || fail "the peer's payment failed: $(cat "$H/description-hash-pay.out")"
 jq -c '{status, amount_msat}' < <(json < "$H/description-hash-pay.out")

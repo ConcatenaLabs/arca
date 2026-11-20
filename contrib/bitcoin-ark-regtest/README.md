@@ -79,9 +79,8 @@ once and hold what a third store holds:
 
 `description-hash-drive.sh` runs it once more for a payment name's invoice: the
 wallet asks for an invoice that commits to the SHA-256 of a name's LNURL-pay
-metadata (BOLT11 `h`, as LUD-06 asks), the peer refuses to pay it under another
-description and pays it under the metadata (Core Lightning's `pay` checks the
-description against the hash), and the wallet claims the payment. An invoice
+metadata (BOLT11 `h`, as LUD-06 asks), the peer reads that hash from the invoice
+and pays it, and the wallet claims the payment. An invoice
 asked with a memo and no hash comes back as it always has. It needs a
 `captaind` built with `contrib/operator-bundle/patches/captaind-description-hash.patch`,
 as the workflow builds it:
