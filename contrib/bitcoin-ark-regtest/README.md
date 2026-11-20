@@ -20,7 +20,7 @@ The binaries are not built here. It takes:
 | `CORE_BIN` | A directory with `bitcoind` and `bitcoin-cli`, version 31 or later (captaind's own minimum) |
 | `CLN_BIN` | A directory with upstream `lightningd` and `lightning-cli`, whose plugins include `cln-grpc` |
 | `HOLD` | Boltz's hold plugin (`github.com/BoltzExchange/hold`) |
-| `CAPTAIND` | Bark's `captaind` (`gitlab.com/ark-bitcoin/bark`, package `bark-server`) |
+| `CAPTAIND` | Bark's `captaind` (`gitlab.com/ark-bitcoin/bark`, package `bark-server`), with `contrib/operator-bundle/patches/captaind-description-hash.patch` for `description-hash-drive.sh` |
 | `PG_BIN` | A directory with `initdb`, `postgres` and `psql` |
 | `PORT_BASE` | The first of the 100 loopback ports it uses (23100 by default, below Linux's ephemeral range) |
 
@@ -76,3 +76,16 @@ once and hold what a third store holds:
     ARK_SH=/path/to/a/script/that/runs/regtest.sh \
     DRIVE=bark-wasm/target/debug/examples/regtest_drive \
     contrib/bitcoin-ark-regtest/board-recovery.sh
+
+`description-hash-drive.sh` runs it once more for a payment name's invoice: the
+wallet asks for an invoice that commits to the SHA-256 of a name's LNURL-pay
+metadata (BOLT11 `h`, as LUD-06 asks), the peer refuses to pay it under another
+description and pays it under the metadata (Core Lightning's `pay` checks the
+description against the hash), and the wallet claims the payment. An invoice
+asked with a memo and no hash comes back as it always has. It needs a
+`captaind` built with `contrib/operator-bundle/patches/captaind-description-hash.patch`,
+as the workflow builds it:
+
+    H=… REGTEST=/path/to/a/script/that/runs/regtest.sh \
+    DRIVE=bark-wasm/target/debug/examples/regtest_drive \
+    contrib/bitcoin-ark-regtest/description-hash-drive.sh

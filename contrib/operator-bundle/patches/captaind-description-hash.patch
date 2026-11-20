@@ -1,0 +1,245 @@
+Bark's server (captaind) 0.7.1, commit 8f5d8c4f: a Lightning receive can commit
+its invoice to a description hash.
+
+StartLightningReceiveRequest gains `optional bytes description_hash = 1000`
+(numbered far from upstream's own fields). When a client sends it, captaind
+asks the hold plugin for an invoice whose BOLT11 `h` field is that hash, in
+place of a memo (the plugin already takes `Description::Hash`). This is what
+LUD-06 asks of an LNURL-pay service: the invoice commits to sha256 of the
+metadata the payer was served, and a payer that checks it pays only such an
+invoice.
+
+It only adds. A request without the field is handled exactly as before; a
+request with both a description and a hash, or a hash that is not 32 bytes, is
+refused as an invalid argument. A server without this patch ignores the field
+and makes the invoice without a hash, which the Arca wallet library detects
+and refuses. The struct literals of upstream's own client and tests gain
+`description_hash: None` so the tree still builds.
+
+Applies to a clean checkout of 8f5d8c4f with `git apply`, before or after
+bark-testnet4.patch and bark-reorg-repair.patch.
+
+diff --git a/bark/src/actions/lightning/receive.rs b/bark/src/actions/lightning/receive.rs
+index 7a0466d0a..649978fb6 100644
+--- a/bark/src/actions/lightning/receive.rs
++++ b/bark/src/actions/lightning/receive.rs
+@@ -357,6 +357,7 @@ pub(crate) async fn start_lightning_receive(
+ 		min_cltv_delta: requested_min_cltv_delta as u32,
+ 		mailbox_id: Some(mailbox_id.serialize()),
+ 		description,
++		description_hash: None,
+ 	};
+ 
+ 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();
+diff --git a/server-rpc/protos/bark_server.proto b/server-rpc/protos/bark_server.proto
+index a9dfd3983..edc4efc3d 100644
+--- a/server-rpc/protos/bark_server.proto
++++ b/server-rpc/protos/bark_server.proto
+@@ -317,6 +317,12 @@ message StartLightningReceiveRequest {
+ 	uint32 min_cltv_delta = 3;
+ 	optional bytes mailbox_id = 4;
+ 	optional string description = 5;
++	// The SHA-256 of a description given elsewhere, which the invoice commits
++	// to in its `h` field in place of a memo: LUD-06's sha256 of the LNURL-pay
++	// metadata. Thirty-two bytes, never together with `description`. A server
++	// that does not know this field makes the invoice without it, so a client
++	// checks the invoice it gets back. Numbered far from upstream's fields.
++	optional bytes description_hash = 1000;
+ }
+ 
+ message StartLightningReceiveResponse {
+diff --git a/server/src/ln/mod.rs b/server/src/ln/mod.rs
+index 6b41663f4..d36ef1789 100644
+--- a/server/src/ln/mod.rs
++++ b/server/src/ln/mod.rs
+@@ -40,6 +40,45 @@ use crate::database::ln::{
+ use crate::error::ContextExt;
+ use crate::{check_max_amount, telemetry, Server, CAPTAIND_API_KEY};
+ 
++/// What a receive's invoice says about the payment: a memo (BOLT11 `d`), or
++/// the SHA-256 of a description given elsewhere (BOLT11 `h`), such as the
++/// LNURL-pay metadata a payer checks the invoice against (LUD-06).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum ReceiveDescription {
++	Memo(String),
++	Hash([u8; 32]),
++}
++
++impl ReceiveDescription {
++	/// The description a receive request asks for: none, a memo, or a hash,
++	/// never both.
++	pub fn from_request(
++		memo: Option<String>,
++		hash: Option<Vec<u8>>,
++	) -> anyhow::Result<Option<ReceiveDescription>> {
++		match (memo, hash) {
++			(Some(_), Some(_)) => bail!("give a description or a description hash, not both"),
++			(None, Some(h)) => {
++				let h = <[u8; 32]>::try_from(h.as_slice()).map_err(|_| anyhow::anyhow!(
++					"a description hash has 32 bytes, not {}", h.len(),
++				))?;
++				Ok(Some(ReceiveDescription::Hash(h)))
++			},
++			(Some(m), None) => Ok(Some(ReceiveDescription::Memo(m))),
++			(None, None) => Ok(None),
++		}
++	}
++
++	/// The hold plugin's form of it.
++	pub fn into_hold(self) -> cln_rpc::plugins::hold::invoice_request::Description {
++		use cln_rpc::plugins::hold::invoice_request::Description;
++		match self {
++			ReceiveDescription::Memo(m) => Description::Memo(m),
++			ReceiveDescription::Hash(h) => Description::Hash(h.to_vec()),
++		}
++	}
++}
++
+ 
+ 
+ /// Validate the client-requested HTLC-recv VTXO expiry leaves at
+@@ -526,7 +565,7 @@ impl Server {
+ 		amount: Amount,
+ 		min_cltv_delta: BlockDelta,
+ 		mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
+-		description: Option<String>,
++		description: Option<ReceiveDescription>,
+ 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
+ 		info!("Starting bolt11 board with payment_hash: {}", payment_hash.as_hex());
+ 
+@@ -553,7 +592,7 @@ impl Server {
+ 		}
+ 
+ 		// Pre-check the description so we reject invalid input before reaching cln.
+-		if let Some(desc) = description.as_ref() {
++		if let Some(ReceiveDescription::Memo(desc)) = description.as_ref() {
+ 			if let Err(e) = lightning_invoice::Description::new(desc.clone()) {
+ 				return badarg!("invalid invoice description: {}", e);
+ 			}
+@@ -992,6 +1031,31 @@ mod tests {
+ 	/// Typical config delta used in tests.
+ 	const DELTA: BlockDelta = 40;
+ 
++	#[test]
++	fn receive_description_from_request() {
++		use cln_rpc::plugins::hold::invoice_request::Description;
++
++		assert_eq!(ReceiveDescription::from_request(None, None).unwrap(), None);
++
++		let memo = ReceiveDescription::from_request(Some("coffee".into()), None).unwrap().unwrap();
++		assert_eq!(memo.clone().into_hold(), Description::Memo("coffee".into()));
++
++		// LUD-06: the hash of exactly the metadata the payer was served.
++		let metadata = r#"[["text/plain","Payment to alice"],["text/identifier","alice@example.com"]]"#;
++		let h = sha256::Hash::hash(metadata.as_bytes()).to_byte_array();
++		let hash = ReceiveDescription::from_request(None, Some(h.to_vec())).unwrap().unwrap();
++		assert_eq!(hash, ReceiveDescription::Hash(h));
++		assert_eq!(hash.into_hold(), Description::Hash(h.to_vec()));
++
++		let both = ReceiveDescription::from_request(Some("coffee".into()), Some(h.to_vec()));
++		assert_eq!(both.unwrap_err().to_string(), "give a description or a description hash, not both");
++
++		let short = ReceiveDescription::from_request(None, Some(vec![7; 31]));
++		assert_eq!(short.unwrap_err().to_string(), "a description hash has 32 bytes, not 31");
++		let long = ReceiveDescription::from_request(None, Some(vec![7; 33]));
++		assert_eq!(long.unwrap_err().to_string(), "a description hash has 32 bytes, not 33");
++	}
++
+ 	/// Build a signed bolt11 invoice, standing in for one we issued via cln.
+ 	///
+ 	/// `key` picks the payee identity: a sender forging an invoice for someone
+diff --git a/server/src/ln/node_manager.rs b/server/src/ln/node_manager.rs
+index b8bf63c77..34ed84be2 100644
+--- a/server/src/ln/node_manager.rs
++++ b/server/src/ln/node_manager.rs
+@@ -508,7 +508,7 @@ impl LightningManager {
+ 		payment_hash: PaymentHash,
+ 		amount: Amount,
+ 		cltv_delta: BlockDelta,
+-		description: Option<String>,
++		description: Option<super::ReceiveDescription>,
+ 		receiver_mailbox_id: Option<MailboxIdentifier>,
+ 	) -> anyhow::Result<Bolt11Invoice> {
+ 		let node = self.hold_active_node().context("no active hold-compatible cln node")?;
+@@ -539,7 +539,7 @@ impl LightningManager {
+ 			min_final_cltv_expiry: Some(cltv_delta as u64),
+ 			expiry: Some(self.invoice_expiry.as_secs()),
+ 			routing_hints: vec![],
+-			description: description.map(hold_plugin::invoice_request::Description::Memo),
++			description: description.map(super::ReceiveDescription::into_hold),
+ 		}).await?.into_inner();
+ 
+ 		let invoice = Bolt11Invoice::from_str(&res.bolt11)?;
+diff --git a/server/src/rpcserver/ark.rs b/server/src/rpcserver/ark.rs
+index 402ae347d..1b95fdedc 100644
+--- a/server/src/rpcserver/ark.rs
++++ b/server/src/rpcserver/ark.rs
+@@ -439,12 +439,15 @@ impl rpc::server::ArkService for Server {
+ 			.transpose()
+ 			.map_err(|_| tonic::Status::invalid_argument("invalid mailbox_id"))?;
+ 
++		let description = crate::ln::ReceiveDescription::from_request(req.description, req.description_hash)
++			.map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
++
+ 		let resp = self.start_lightning_receive(
+ 			payment_hash,
+ 			amount,
+ 			req.min_cltv_delta as BlockDelta,
+ 			mailbox_id,
+-			req.description,
++			description,
+ 		).await.to_status()?;
+ 
+ 		Ok(tonic::Response::new(resp))
+diff --git a/testing/tests/server/lightning.rs b/testing/tests/server/lightning.rs
+index bc1d91a45..a7c542110 100644
+--- a/testing/tests/server/lightning.rs
++++ b/testing/tests/server/lightning.rs
+@@ -836,6 +836,7 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
+ 		min_cltv_delta: 6,
+ 		mailbox_id: None,
+ 		description: None,
++		description_hash: None,
+ 	}).await.unwrap();
+ 
+ 	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+@@ -1193,6 +1194,7 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
+ 			min_cltv_delta,
+ 			mailbox_id: None,
+ 			description: None,
++			description_hash: None,
+ 		})
+ 		.await
+ 		.expect("start receive failed")
+@@ -1326,6 +1328,7 @@ async fn settled_hash_cannot_fund_new_receive() {
+ 			min_cltv_delta: 6,
+ 			mailbox_id: None,
+ 			description: None,
++			description_hash: None,
+ 		})
+ 		.await
+ 		.expect_err("receive for an already-settled hash must be refused");
+@@ -1394,6 +1397,7 @@ async fn settled_hash_replay_claim_still_settles_hold() {
+ 		min_cltv_delta: 6,
+ 		mailbox_id: None,
+ 		description: None,
++		description_hash: None,
+ 	}).await.expect("receive should be allowed while H is unsettled").into_inner().bolt11;
+ 
+ 	let pay_invoice_2 = {
+@@ -2047,6 +2051,7 @@ async fn refuse_receive_with_unlock_hash_as_payment_hash() {
+ 		min_cltv_delta: 8,
+ 		mailbox_id: None,
+ 		description: None,
++		description_hash: None,
+ 	}).await.expect_err("must refuse a payment hash that is an existing unlock hash");
+ 	assert_eq!(err.code(), tonic::Code::InvalidArgument);
+ 	assert!(err.message().contains("unlock hash"), "unexpected error: {err:?}");
+@@ -2279,6 +2284,7 @@ async fn prevent_double_pay_via_canceled_subscription_and_inflight_xpay() {
+ 			min_cltv_delta: 6,
+ 			mailbox_id: None,
+ 			description: None,
++			description_hash: None,
+ 		}).await.unwrap().into_inner().bolt11;
+ 
+ 	// 4. Pay invoice-2 from Eve's node. The HTLC is held by the server's

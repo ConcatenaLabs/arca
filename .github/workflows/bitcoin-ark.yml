@@ -9,6 +9,7 @@ on:
       - 'bark-wasm/**'
       - 'lib/**'
       - 'contrib/bitcoin-ark-regtest/**'
+      - 'contrib/operator-bundle/patches/**'
       - '.github/workflows/bitcoin-ark.yml'
   pull_request:
     paths:
@@ -17,12 +18,14 @@ on:
       - 'bark-wasm/**'
       - 'lib/**'
       - 'contrib/bitcoin-ark-regtest/**'
+      - 'contrib/operator-bundle/patches/**'
       - '.github/workflows/bitcoin-ark.yml'
   workflow_dispatch:
 
 # The wallet's Bitcoin side against a real Bitcoin ark on regtest
 # (contrib/bitcoin-ark-regtest): Bark's server and client at the release the
-# Arca client bundles, built from Bark's upstream repository, its Lightning
+# Arca client bundles, built from Bark's upstream repository (captaind with the
+# description-hash patch the operator bundle builds it with), its Lightning
 # gateway on upstream Core Lightning with Boltz's hold plugin (the versions
 # Bark tests with), and Bitcoin Core 31, the least captaind runs with. On
 # regtest the client needs nothing of the testnet4 patch the Arca client
@@ -71,7 +74,7 @@ jobs:
             ~/.cargo/git
             ${{ runner.temp }}/target-bark
             ${{ runner.temp }}/target-hold
-          key: bitcoin-ark-${{ env.BARK_COMMIT }}-${{ hashFiles('contrib/operator-bundle/patches/bark-reorg-repair.patch') }}-${{ env.HOLD_COMMIT }}
+          key: bitcoin-ark-${{ env.BARK_COMMIT }}-${{ hashFiles('contrib/operator-bundle/patches/bark-reorg-repair.patch', 'contrib/operator-bundle/patches/captaind-description-hash.patch') }}-${{ env.HOLD_COMMIT }}
 
       - name: Bark (captaind, bark, barkd) and the hold plugin
         env:
@@ -81,6 +84,7 @@ jobs:
           git init -q "$RUNNER_TEMP/bark" && cd "$RUNNER_TEMP/bark"
           git fetch -q --depth 1 https://gitlab.com/ark-bitcoin/bark.git "$BARK_COMMIT" && git checkout -q FETCH_HEAD
           git apply "$GITHUB_WORKSPACE/contrib/operator-bundle/patches/bark-reorg-repair.patch"
+          git apply "$GITHUB_WORKSPACE/contrib/operator-bundle/patches/captaind-description-hash.patch"
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-bark" cargo build --locked -p bark-server --bin captaind \
             -p bark-cli --bin bark --bin barkd
           git init -q "$RUNNER_TEMP/hold" && cd "$RUNNER_TEMP/hold"
@@ -133,6 +137,11 @@ jobs:
         run: |
           ARK_SH=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
             contrib/bitcoin-ark-regtest/board-recovery.sh
+
+      - name: A payment name's invoice commits to its metadata, and a checking payer pays it
+        run: |
+          H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
+            contrib/bitcoin-ark-regtest/description-hash-drive.sh
 
       - name: The harness's logs
         if: failure()

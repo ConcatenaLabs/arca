@@ -10,7 +10,7 @@ use ark::lightning::{Bolt11InvoiceExt, Preimage, PaymentHash};
 use crate::Wallet;
 use crate::actions::DriveMode;
 use crate::actions::lightning::receive::{
-	Htlcs, LightningReceive, LightningReceiveState, Progress,
+	Htlcs, LightningReceive, LightningReceiveState, Progress, ReceiveDescription,
 	ln_recv_action_id, start_lightning_receive
 };
 use crate::movement::MovementStatus;
@@ -128,7 +128,30 @@ impl Wallet {
 		description: Option<String>,
 		token: Option<String>,
 	) -> anyhow::Result<Bolt11Invoice> {
-		let start = start_lightning_receive(self, amount, description, token, None).await?;
+		let start = start_lightning_receive(
+			self, amount, description.map(ReceiveDescription::Memo), token, None,
+		).await?;
+		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
+		Ok(start.invoice.clone())
+	}
+
+	/// Like [`Self::bolt11_invoice`], but the invoice commits to
+	/// `description_hash` (BOLT11 `h`) instead of carrying a memo: the hash of
+	/// a description the payer gets elsewhere, such as LUD-06's sha256 of the
+	/// LNURL-pay metadata a payment name served.
+	///
+	/// The invoice the server returns is checked to carry exactly that hash
+	/// and refused otherwise; a server that does not support the field makes
+	/// one without it, which is refused with an error saying so.
+	pub async fn bolt11_invoice_with_description_hash(
+		&self,
+		amount: Amount,
+		description_hash: bitcoin::hashes::sha256::Hash,
+		token: Option<String>,
+	) -> anyhow::Result<Bolt11Invoice> {
+		let start = start_lightning_receive(
+			self, amount, Some(ReceiveDescription::Hash(description_hash)), token, None,
+		).await?;
 		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
 		Ok(start.invoice.clone())
 	}
@@ -163,7 +186,7 @@ impl Wallet {
 		token: Option<String>,
 	) -> anyhow::Result<Bolt11Invoice> {
 		let start = start_lightning_receive(
-			self, amount, description, token, Some(claim_destination),
+			self, amount, description.map(ReceiveDescription::Memo), token, Some(claim_destination),
 		).await?;
 		self.inner.db.upsert_wallet_action_checkpoint(&start.id(), &start.clone().into()).await?;
 		Ok(start.invoice.clone())

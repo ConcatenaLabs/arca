@@ -67,6 +67,42 @@ fn validate_bolt11_payment_hash(
 	Ok(())
 }
 
+/// What an invoice the wallet asks the server for says about the payment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiveDescription {
+	/// A memo, carried in the invoice's `d` field.
+	Memo(String),
+	/// The SHA-256 of a description given elsewhere, carried in the
+	/// invoice's `h` field: LUD-06's sha256 of the LNURL-pay metadata a payer
+	/// checks the invoice against.
+	Hash(bitcoin::hashes::sha256::Hash),
+}
+
+/// Refuse an invoice that does not commit to the description hash asked for.
+///
+/// A server that does not know the request's `description_hash` field drops
+/// it and makes the invoice with no description, which a payer checking the
+/// hash would refuse; that answer must never reach the payer as if it were
+/// the invoice asked for.
+fn validate_bolt11_description_hash(
+	invoice: &Bolt11Invoice,
+	expected: bitcoin::hashes::sha256::Hash,
+) -> anyhow::Result<()> {
+	use lightning_invoice::Bolt11InvoiceDescriptionRef;
+	match invoice.description() {
+		Bolt11InvoiceDescriptionRef::Hash(h) if h.0 == expected => Ok(()),
+		Bolt11InvoiceDescriptionRef::Hash(h) => bail!(
+			"Ark server returned an invoice committing to description hash {}, expected {}",
+			h.0, expected,
+		),
+		Bolt11InvoiceDescriptionRef::Direct(_) => bail!(
+			"Ark server returned an invoice without the description hash {}: \
+			the server does not support committing an invoice to a description hash",
+			expected,
+		),
+	}
+}
+
 /// An incoming lightning payment, persisted as a single checkpoint row
 /// stored at invoice creation time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,7 +343,7 @@ pub(crate) enum IncomingStatus {
 pub(crate) async fn start_lightning_receive(
 	wallet: &Wallet,
 	amount: Amount,
-	description: Option<String>,
+	description: Option<ReceiveDescription>,
 	token: Option<String>,
 	claim_destination: Option<ark::Address>,
 ) -> anyhow::Result<LightningReceive> {
@@ -356,7 +392,14 @@ pub(crate) async fn start_lightning_receive(
 		amount_sat: amount.to_sat(),
 		min_cltv_delta: requested_min_cltv_delta as u32,
 		mailbox_id: Some(mailbox_id.serialize()),
-		description,
+		description: match &description {
+			Some(ReceiveDescription::Memo(m)) => Some(m.clone()),
+			_ => None,
+		},
+		description_hash: match &description {
+			Some(ReceiveDescription::Hash(h)) => Some(bitcoin::hashes::Hash::to_byte_array(*h).to_vec()),
+			_ => None,
+		},
 	};
 
 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();
@@ -365,6 +408,17 @@ pub(crate) async fn start_lightning_receive(
 	let invoice = Bolt11Invoice::from_str(&resp.bolt11)
 		.context("invalid bolt11 invoice returned by Ark server")?;
 	validate_bolt11_payment_hash(&invoice, payment_hash)?;
+	if let Some(ReceiveDescription::Hash(h)) = description {
+		if let Err(e) = validate_bolt11_description_hash(&invoice, h) {
+			// The server holds a payment to this invoice for nobody: let it go.
+			if let Err(ce) = srv.client.cancel_lightning_receive(
+				protos::CancelLightningReceiveRequest { payment_hash: payment_hash.to_vec() },
+			).await {
+				warn!("server did not cancel the refused receive {}: {}", payment_hash, ce);
+			}
+			return Err(e);
+		}
+	}
 
 	let (_, key_index) = wallet.derive_store_next_keypair().await?;
 
@@ -880,6 +934,48 @@ mod tests {
 			err.to_string().contains("returned invoice with payment hash"),
 			"{err:?}",
 		);
+	}
+
+	fn signed_invoice(description: lightning_invoice::Bolt11InvoiceDescription) -> Bolt11Invoice {
+		use bitcoin::hashes::Hash;
+		use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+		use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+		let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+		InvoiceBuilder::new(Currency::Regtest)
+			.invoice_description(description)
+			.payment_hash(bitcoin::hashes::sha256::Hash::hash(b"preimage"))
+			.payment_secret(PaymentSecret([9u8; 32]))
+			.current_timestamp()
+			.min_final_cltv_expiry_delta(18)
+			.amount_milli_satoshis(21_000_000)
+			.build_signed(|m| Secp256k1::new().sign_ecdsa_recoverable(&Message::from_digest(*m.as_ref()), &key))
+			.unwrap()
+	}
+
+	#[test]
+	fn validate_bolt11_description_hash_takes_only_the_hash_asked_for() {
+		use bitcoin::hashes::{sha256, Hash};
+		use lightning_invoice::{Bolt11InvoiceDescription, Description, Sha256};
+
+		// LUD-06: the hash of exactly the metadata string the payer was served.
+		let metadata = r#"[["text/plain","Payment to alice"],["text/identifier","alice@example.com"]]"#;
+		let h = sha256::Hash::hash(metadata.as_bytes());
+
+		let committed = signed_invoice(Bolt11InvoiceDescription::Hash(Sha256(h)));
+		validate_bolt11_description_hash(&committed, h).unwrap();
+
+		// Another hash: the metadata of another name, or the string re-serialised.
+		let respaced = metadata.replace(",", ", ");
+		let other = sha256::Hash::hash(respaced.as_bytes());
+		let err = validate_bolt11_description_hash(&committed, other).unwrap_err();
+		assert!(err.to_string().contains("committing to description hash"), "{err}");
+
+		// A server that dropped the field made a plain invoice: refused.
+		let plain = signed_invoice(Bolt11InvoiceDescription::Direct(Description::new("Payment to alice".into()).unwrap()));
+		let err = validate_bolt11_description_hash(&plain, h).unwrap_err();
+		assert!(err.to_string().contains("does not support committing an invoice to a description hash"), "{err}");
+		let empty = signed_invoice(Bolt11InvoiceDescription::Direct(Description::empty()));
+		assert!(validate_bolt11_description_hash(&empty, h).is_err());
 	}
 
 	/// The blocks we ask the server to put between the tip and `htlc_expiry`

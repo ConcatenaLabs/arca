@@ -75,7 +75,7 @@ socket, on the machine.
 
 - 4 cores, 8 GB of memory, and 60 GB of free disk: Bitcoin testnet4 with its
   transaction index is the largest part, 15 GB; the Sequentia chain about 1
-  GB. The first install builds four programs from source, which takes an hour
+  GB. The first install builds five programs from source, which takes an hour
   or more and about 10 GB of build space.
 - For a public operator: a DNS name pointing at the machine, and TCP 80, 443,
   9835 and 9935 reaching it from the internet (a router's port forwarding at

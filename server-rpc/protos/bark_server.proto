@@ -317,6 +317,12 @@ message StartLightningReceiveRequest {
 	uint32 min_cltv_delta = 3;
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
+	// The SHA-256 of a description given elsewhere, which the invoice commits
+	// to in its `h` field in place of a memo: LUD-06's sha256 of the LNURL-pay
+	// metadata. Thirty-two bytes, never together with `description`. A server
+	// that does not know this field makes the invoice without it, so a client
+	// checks the invoice it gets back. Numbered far from upstream's fields.
+	optional bytes description_hash = 1000;
 }
 
 message StartLightningReceiveResponse {
