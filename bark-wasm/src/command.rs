@@ -266,8 +266,9 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 		// An invoice the server holds a payment to until the wallet claims it;
 		// the wallet's daemon claims it as soon as it is held. With
 		// `description_hash` (64 hex characters) the invoice commits to that
-		// hash instead of carrying a memo (LUD-06: sha256 of the LNURL-pay
-		// metadata), and one that does not is refused.
+		// hash instead of carrying a memo (a payment name's: sha256 of its LNURL-pay
+		// metadata, which payers that check the description hash compare), and one
+		// that does not is refused.
 		"invoice" => {
 			let amount = sats_arg(args, "sats")?;
 			let desc = args.get("description").and_then(|v| v.as_str()).map(|s| s.to_owned());

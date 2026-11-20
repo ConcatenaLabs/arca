@@ -4,10 +4,11 @@ its invoice to a description hash.
 StartLightningReceiveRequest gains `optional bytes description_hash = 1000`
 (numbered far from upstream's own fields). When a client sends it, captaind
 asks the hold plugin for an invoice whose BOLT11 `h` field is that hash, in
-place of a memo (the plugin already takes `Description::Hash`). This is what
-LUD-06 asks of an LNURL-pay service: the invoice commits to sha256 of the
-metadata the payer was served, and a payer that checks it pays only such an
-invoice.
+place of a memo (the plugin already takes `Description::Hash`). An LNURL-pay
+service (a Lightning address) needs this: LUD-06 as first written had the
+payer check that the invoice's description hash is sha256 of the metadata it
+was served, and payers that still make that check refuse an invoice that
+does not commit to it. The current LUD-06 text no longer asks for the check.
 
 It only adds. A request without the field is handled exactly as before; a
 request with both a description and a hash, or a hash that is not 32 bytes, is
@@ -32,7 +33,7 @@ index 7a0466d0a..649978fb6 100644
  
  	let resp = srv.client.start_lightning_receive(req).await?.into_inner();
 diff --git a/server-rpc/protos/bark_server.proto b/server-rpc/protos/bark_server.proto
-index a9dfd3983..edc4efc3d 100644
+index a9dfd3983..708a436ed 100644
 --- a/server-rpc/protos/bark_server.proto
 +++ b/server-rpc/protos/bark_server.proto
 @@ -317,6 +317,12 @@ message StartLightningReceiveRequest {
@@ -40,8 +41,8 @@ index a9dfd3983..edc4efc3d 100644
  	optional bytes mailbox_id = 4;
  	optional string description = 5;
 +	// The SHA-256 of a description given elsewhere, which the invoice commits
-+	// to in its `h` field in place of a memo: LUD-06's sha256 of the LNURL-pay
-+	// metadata. Thirty-two bytes, never together with `description`. A server
++	// to in its `h` field in place of a memo: for a payment name, sha256 of the
++	// LNURL-pay metadata, which payers that check the hash compare. Thirty-two bytes, never together with `description`. A server
 +	// that does not know this field makes the invoice without it, so a client
 +	// checks the invoice it gets back. Numbered far from upstream's fields.
 +	optional bytes description_hash = 1000;
@@ -49,7 +50,7 @@ index a9dfd3983..edc4efc3d 100644
  
  message StartLightningReceiveResponse {
 diff --git a/server/src/ln/mod.rs b/server/src/ln/mod.rs
-index 6b41663f4..d36ef1789 100644
+index 6b41663f4..8eb56a514 100644
 --- a/server/src/ln/mod.rs
 +++ b/server/src/ln/mod.rs
 @@ -40,6 +40,45 @@ use crate::database::ln::{
@@ -58,7 +59,7 @@ index 6b41663f4..d36ef1789 100644
  
 +/// What a receive's invoice says about the payment: a memo (BOLT11 `d`), or
 +/// the SHA-256 of a description given elsewhere (BOLT11 `h`), such as the
-+/// LNURL-pay metadata a payer checks the invoice against (LUD-06).
++/// LNURL-pay metadata a payer that checks the description hash compares it with.
 +#[derive(Debug, Clone, PartialEq, Eq)]
 +pub enum ReceiveDescription {
 +	Memo(String),
@@ -129,7 +130,7 @@ index 6b41663f4..d36ef1789 100644
 +		let memo = ReceiveDescription::from_request(Some("coffee".into()), None).unwrap().unwrap();
 +		assert_eq!(memo.clone().into_hold(), Description::Memo("coffee".into()));
 +
-+		// LUD-06: the hash of exactly the metadata the payer was served.
++		// A payment name's: the hash of exactly the metadata the payer was served.
 +		let metadata = r#"[["text/plain","Payment to alice"],["text/identifier","alice@example.com"]]"#;
 +		let h = sha256::Hash::hash(metadata.as_bytes()).to_byte_array();
 +		let hash = ReceiveDescription::from_request(None, Some(h.to_vec())).unwrap().unwrap();

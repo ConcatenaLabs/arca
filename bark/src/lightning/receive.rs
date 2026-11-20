@@ -137,12 +137,16 @@ impl Wallet {
 
 	/// Like [`Self::bolt11_invoice`], but the invoice commits to
 	/// `description_hash` (BOLT11 `h`) instead of carrying a memo: the hash of
-	/// a description the payer gets elsewhere, such as LUD-06's sha256 of the
-	/// LNURL-pay metadata a payment name served.
+	/// a description the payer gets elsewhere, such as sha256 of the LNURL-pay
+	/// metadata a payment name served, which payers that check the description
+	/// hash compare.
 	///
 	/// The invoice the server returns is checked to carry exactly that hash
 	/// and refused otherwise; a server that does not support the field makes
-	/// one without it, which is refused with an error saying so.
+	/// one without it, which is refused with an error saying so. The wallet
+	/// then asks the server once to cancel that invoice and never tries again;
+	/// a server that refuses the cancel (Bark 0.7.1 refuses every one) keeps
+	/// that one invoice, which nobody was given, unpaid until it expires.
 	pub async fn bolt11_invoice_with_description_hash(
 		&self,
 		amount: Amount,

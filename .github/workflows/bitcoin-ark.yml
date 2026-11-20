@@ -87,6 +87,13 @@ jobs:
           git apply "$GITHUB_WORKSPACE/contrib/operator-bundle/patches/captaind-description-hash.patch"
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-bark" cargo build --locked -p bark-server --bin captaind \
             -p bark-cli --bin bark --bin barkd
+          # captaind as released, without the patch: the description-hash drive swaps it in to show
+          # what a wallet meets at a server that cannot commit an invoice to a hash.
+          # Both builds write target-bark/debug/captaind, so each is copied out as it is made.
+          cp "$RUNNER_TEMP/target-bark/debug/captaind" "$RUNNER_TEMP/captaind-patched"
+          git worktree add -q --detach "$RUNNER_TEMP/bark-plain" HEAD
+          (cd "$RUNNER_TEMP/bark-plain" && CARGO_TARGET_DIR="$RUNNER_TEMP/target-bark" cargo build --locked -p bark-server --bin captaind)
+          cp "$RUNNER_TEMP/target-bark/debug/captaind" "$RUNNER_TEMP/captaind-plain"
           git init -q "$RUNNER_TEMP/hold" && cd "$RUNNER_TEMP/hold"
           git fetch -q --depth 1 https://github.com/BoltzExchange/hold.git "$HOLD_COMMIT" && git checkout -q FETCH_HEAD
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-hold" cargo build --locked --bin hold
@@ -105,7 +112,7 @@ jobs:
           cat > "$RUNNER_TEMP/ark.sh" <<EOF
           #!/usr/bin/env bash
           export H=$RUNNER_TEMP/h CORE_BIN=$RUNNER_TEMP/core/bin CLN_BIN=$RUNNER_TEMP/cln/usr/bin \
-            HOLD=$RUNNER_TEMP/target-hold/debug/hold CAPTAIND=$RUNNER_TEMP/target-bark/debug/captaind \
+            HOLD=$RUNNER_TEMP/target-hold/debug/hold CAPTAIND=\${CAPTAIND:-$RUNNER_TEMP/captaind-patched} \
             PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | tail -1)
           exec $GITHUB_WORKSPACE/contrib/bitcoin-ark-regtest/regtest.sh "\$@"
           EOF
@@ -127,11 +134,6 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo build --locked --features native --example regtest_drive
 
-      - name: A payment name's invoice commits to its metadata, and a payer pays it
-        run: |
-          H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
-            contrib/bitcoin-ark-regtest/description-hash-drive.sh
-
       - name: Limits lowered under coins made before
         run: |
           H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh \
@@ -142,6 +144,11 @@ jobs:
         run: |
           ARK_SH=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
             contrib/bitcoin-ark-regtest/board-recovery.sh
+
+      - name: A payment name's invoice commits to its metadata, and a payer pays it
+        run: |
+          H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
+            OLD_CAPTAIND=$RUNNER_TEMP/captaind-plain contrib/bitcoin-ark-regtest/description-hash-drive.sh
 
       - name: The harness's logs
         if: failure()

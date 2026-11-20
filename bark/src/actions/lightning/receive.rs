@@ -73,8 +73,8 @@ pub enum ReceiveDescription {
 	/// A memo, carried in the invoice's `d` field.
 	Memo(String),
 	/// The SHA-256 of a description given elsewhere, carried in the
-	/// invoice's `h` field: LUD-06's sha256 of the LNURL-pay metadata a payer
-	/// checks the invoice against.
+	/// invoice's `h` field: for a payment name, sha256 of the LNURL-pay metadata,
+	/// which a payer that checks the description hash compares it with.
 	Hash(bitcoin::hashes::sha256::Hash),
 }
 
@@ -410,13 +410,20 @@ pub(crate) async fn start_lightning_receive(
 	validate_bolt11_payment_hash(&invoice, payment_hash)?;
 	if let Some(ReceiveDescription::Hash(h)) = description {
 		if let Err(e) = validate_bolt11_description_hash(&invoice, h) {
-			// The server holds a payment to this invoice for nobody: let it go.
-			if let Err(ce) = srv.client.cancel_lightning_receive(
+			// The server holds a payment to this invoice for nobody: ask it, once, to let it go.
+			// Nothing retries: one refused request leaves at most this one invoice behind, which
+			// nobody was given and which ends at its expiry. Bark 0.7.1 refuses every cancel.
+			let left = match srv.client.cancel_lightning_receive(
 				protos::CancelLightningReceiveRequest { payment_hash: payment_hash.to_vec() },
 			).await {
-				warn!("server did not cancel the refused receive {}: {}", payment_hash, ce);
-			}
-			return Err(e);
+				Ok(_) => "the server cancelled the invoice it made".to_string(),
+				Err(ce) => {
+					warn!("server did not cancel the refused receive {}: {}", payment_hash, ce);
+					format!("the server would not cancel the invoice it made ({}), so it keeps \
+						that one invoice unpaid until it expires; nobody was given it", ce.message())
+				},
+			};
+			return Err(anyhow::anyhow!("{:#}; {}", e, left));
 		}
 	}
 
@@ -957,7 +964,7 @@ mod tests {
 		use bitcoin::hashes::{sha256, Hash};
 		use lightning_invoice::{Bolt11InvoiceDescription, Description, Sha256};
 
-		// LUD-06: the hash of exactly the metadata string the payer was served.
+		// A payment name's: the hash of exactly the metadata string the payer was served.
 		let metadata = r#"[["text/plain","Payment to alice"],["text/identifier","alice@example.com"]]"#;
 		let h = sha256::Hash::hash(metadata.as_bytes());
 

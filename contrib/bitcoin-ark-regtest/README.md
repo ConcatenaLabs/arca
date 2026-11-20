@@ -79,12 +79,18 @@ once and hold what a third store holds:
 
 `description-hash-drive.sh` runs it once more for a payment name's invoice: the
 wallet asks for an invoice that commits to the SHA-256 of a name's LNURL-pay
-metadata (BOLT11 `h`, as LUD-06 asks), the peer reads that hash from the invoice
+metadata (BOLT11 `h`, which payers that check an LNURL-pay invoice's description
+hash compare with the metadata), the peer reads that hash from the invoice
 and pays it, and the wallet claims the payment. An invoice
-asked with a memo and no hash comes back as it always has. It needs a
+asked with a memo and no hash comes back as it always has. With `OLD_CAPTAIND`
+naming a `captaind` built without the patch, it then swaps the server for that
+one: the wallet refuses the plain invoice it gets back and says the server keeps
+it (Bark 0.7.1 refuses every cancel), and one request leaves exactly one invoice
+on the gateway. It needs a
 `captaind` built with `contrib/operator-bundle/patches/captaind-description-hash.patch`,
 as the workflow builds it:
 
     H=… REGTEST=/path/to/a/script/that/runs/regtest.sh \
     DRIVE=bark-wasm/target/debug/examples/regtest_drive \
+    [OLD_CAPTAIND=/path/to/captaind-without-the-patch] \
     contrib/bitcoin-ark-regtest/description-hash-drive.sh
