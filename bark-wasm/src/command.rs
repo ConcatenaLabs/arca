@@ -81,6 +81,16 @@ fn hash_arg(args: &Value) -> anyhow::Result<PaymentHash> {
 	PaymentHash::from_str(str_arg(args, "hash")?).map_err(|_| anyhow!("'hash' is not a payment hash"))
 }
 
+/// The optional `description_hash`: the SHA-256 an invoice commits to, as 64
+/// hex characters in the order the hash is computed.
+fn description_hash_arg(args: &Value) -> anyhow::Result<Option<bitcoin::hashes::sha256::Hash>> {
+	let Some(v) = args.get("description_hash").filter(|v| !v.is_null()) else { return Ok(None) };
+	let s = v.as_str().ok_or_else(|| anyhow!("'description_hash' is not a string"))?;
+	let bytes = <[u8; 32]>::from_hex(s)
+		.map_err(|_| anyhow!("'description_hash' is not 64 hex characters"))?;
+	Ok(Some(<bitcoin::hashes::sha256::Hash as bitcoin::hashes::Hash>::from_byte_array(bytes)))
+}
+
 fn btc_address(wallet_net: Network, s: &str) -> anyhow::Result<bitcoin::Address> {
 	let a = bitcoin::Address::from_str(s).context("not a Bitcoin address")?;
 	a.require_network(wallet_net).context("the address is for another Bitcoin network")
@@ -254,11 +264,20 @@ pub async fn run(wallet: &Wallet, cmd: &str, args: &Value) -> anyhow::Result<Val
 			Ok(json!({ "fee": sat(e.fee), "gross": sat(e.gross_amount), "max_route_delay": max_route_delay(&info) }))
 		},
 		// An invoice the server holds a payment to until the wallet claims it;
-		// the wallet's daemon claims it as soon as it is held.
+		// the wallet's daemon claims it as soon as it is held. With
+		// `description_hash` (64 hex characters) the invoice commits to that
+		// hash instead of carrying a memo (a payment name's: sha256 of its LNURL-pay
+		// metadata, which payers that check the description hash compare), and one
+		// that does not is refused.
 		"invoice" => {
 			let amount = sats_arg(args, "sats")?;
 			let desc = args.get("description").and_then(|v| v.as_str()).map(|s| s.to_owned());
-			let inv = wallet.bolt11_invoice(amount, desc, None).await?;
+			let hash = description_hash_arg(args)?;
+			let inv = match hash {
+				Some(_) if desc.is_some() => bail!("give a description or a description_hash, not both"),
+				Some(h) => wallet.bolt11_invoice_with_description_hash(amount, h, None).await?,
+				None => wallet.bolt11_invoice(amount, desc, None).await?,
+			};
 			let expires_at = inv.duration_since_epoch().as_secs() + inv.expiry_time().as_secs();
 			Ok(json!({
 				"invoice": inv.to_string(),
@@ -407,6 +426,20 @@ mod test {
 		let b = seed(Network::Testnet4, &format!("  {}\n", phrase)).unwrap();
 		assert_eq!(a.fingerprint(), b.fingerprint());
 		assert!(seed(Network::Testnet4, "not a phrase").is_err());
+	}
+
+	#[test]
+	fn description_hashes() {
+		use bitcoin::hashes::{sha256, Hash};
+		let metadata = r#"[["text/plain","Payment to alice"],["text/identifier","alice@example.com"]]"#;
+		let h = sha256::Hash::hash(metadata.as_bytes());
+		let hex = h.to_byte_array().iter().map(|b| format!("{:02x}", b)).collect::<String>();
+		assert_eq!(description_hash_arg(&json!({ "description_hash": hex })).unwrap(), Some(h));
+		assert_eq!(description_hash_arg(&json!({})).unwrap(), None);
+		assert_eq!(description_hash_arg(&json!({ "description_hash": null })).unwrap(), None);
+		assert!(description_hash_arg(&json!({ "description_hash": &hex[..62] })).is_err());
+		assert!(description_hash_arg(&json!({ "description_hash": format!("{}zz", &hex[..62]) })).is_err());
+		assert!(description_hash_arg(&json!({ "description_hash": 7 })).is_err());
 	}
 
 	#[test]

@@ -52,6 +52,8 @@ fi
 # shellcheck disable=SC1091
 . "$HERE/pins.env"
 : "${NAME:=arca-bundle}" "${SEQ_CHAIN:=test}" "${BTC_CHAIN:=testnet4}" "${BUILD_JOBS:=2}"
+: "${CAPTAIND_FROM:=source}"
+case $CAPTAIND_FROM in source|release) ;; *) echo "CAPTAIND_FROM is source or release, not $CAPTAIND_FROM" >&2; exit 1;; esac
 : "${ARCA_ASSETS:=}" "${ARCA_FEE_ASSETS:=}" "${ARCA_EXIT_DELAY_UNITS:=254 338}" "${ARCA_ROUND_INTERVAL:=60}" "${ARCA_SEND_TIMEOUT:=777600}"
 : "${DOMAIN:=}" "${CONTACT_NAME:=}" "${CONTACT_EMAIL:=}" "${REGISTRY_URL:=https://sequentiatestnet.com/registry}"
 : "${PEER_ARCA_URL:=}" "${PEER_HOST:=}" "${PEER_SEQLN_PORT:=19850}" "${PEER_BTC_LN_PORT:=19746}"
@@ -824,7 +826,7 @@ unpack "$cln_tar" "cln-$CLN_VERSION"
 link "cln-$CLN_VERSION" cln cln
 say "Core Lightning $CLN_VERSION"
 rel=https://gitlab.com/api/v4/projects/ark-bitcoin%2Fbark/packages/generic/release-assets/server-${BARK_SERVER_VERSION//./%2E}
-fetch "$rel/captaind-${BARK_SERVER_VERSION//./%2E}-linux-x86_64" "captaind-$BARK_SERVER_VERSION" "$CAPTAIND_SHA256"
+[ "$CAPTAIND_FROM" = release ] && fetch "$rel/captaind-${BARK_SERVER_VERSION//./%2E}-linux-x86_64" "captaind-$BARK_SERVER_VERSION" "$CAPTAIND_SHA256"
 fetch "$rel/watchmand-${BARK_SERVER_VERSION//./%2E}-linux-x86_64" "watchmand-$BARK_SERVER_VERSION" "$WATCHMAND_SHA256"
 say "Bark's server and watchman $BARK_SERVER_VERSION"
 if [ -n "$DOMAIN" ] || [ "${WITH_CADDY:-}" = 1 ]; then
@@ -886,6 +888,19 @@ fi
 build bark "$CACHE/build/bark" "$BARK_COMMIT+$BARK_PATCH_SHA256+$BARK_REORG_PATCH_SHA256" env CARGO_TARGET_DIR="$CACHE/build/bark-target" \
   cargo build --release --locked -p bark-cli --bin bark --bin barkd
 
+if [ "$CAPTAIND_FROM" = source ]; then
+  step "Bark's server (captaind), with the description-hash patch"
+  # The release's commit and its build (release profile, default features), plus
+  # one patch that only adds: a receive may commit its invoice to a description hash.
+  [ "$(sha256_of "$HERE/patches/captaind-description-hash.patch")" = "$CAPTAIND_PATCH_SHA256" ] || die "patches/captaind-description-hash.patch is not the patch pins.env names"
+  if [ "$(cat "$CACHE/build/captaind.built" 2>/dev/null)" != "$BARK_COMMIT+$CAPTAIND_PATCH_SHA256" ]; then
+    clone_at https://gitlab.com/ark-bitcoin/bark.git "$CACHE/build/captaind" "$BARK_COMMIT"
+    git -C "$CACHE/build/captaind" apply "$HERE/patches/captaind-description-hash.patch"
+  fi
+  build captaind "$CACHE/build/captaind" "$BARK_COMMIT+$CAPTAIND_PATCH_SHA256" env CARGO_TARGET_DIR="$CACHE/build/captaind-target" \
+    cargo build --release --locked -p bark-server --bin captaind
+fi
+
 step "the hold-invoice plugin, with the testnet4 patch"
 [ "$(sha256_of "$HERE/patches/hold-testnet4.patch")" = "$HOLD_PATCH_SHA256" ] || die "patches/hold-testnet4.patch is not the patch pins.env names"
 if [ "$(cat "$CACHE/build/hold.built" 2>/dev/null)" != "$HOLD_COMMIT+$HOLD_PATCH_SHA256" ]; then
@@ -925,7 +940,8 @@ put "$CACHE/build/arca-target/release/arca" arca
 put "$CACHE/build/bark-target/release/bark" bark
 put "$CACHE/build/bark-target/release/barkd" barkd
 put "$CACHE/build/hold-target/release/hold" hold
-put "$CACHE/dl/captaind-$BARK_SERVER_VERSION" captaind
+if [ "$CAPTAIND_FROM" = source ]; then put "$CACHE/build/captaind-target/release/captaind" captaind
+else put "$CACHE/dl/captaind-$BARK_SERVER_VERSION" captaind; fi
 put "$CACHE/dl/watchmand-$BARK_SERVER_VERSION" watchmand
 put "$HERE/fee-proxy.py" fee-proxy.py
 if [ -n "$DOMAIN" ] || [ "${WITH_CADDY:-}" = 1 ]; then put "$OPT/caddy-$CADDY_VERSION/caddy" caddy; fi

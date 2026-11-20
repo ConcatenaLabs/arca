@@ -157,7 +157,7 @@ Amounts are whole sats (strings or numbers), hashes and preimages hex.
 | `pay` | `invoice`, `max_fee_sats`?, `max_delay`?, `wait`? | `state` (`complete` with `preimage`, `pending`, `failed` with `reason`) |
 | `pay_status` | `hash`, `drive`? | `state` (`complete`, `pending`, `none`) |
 | `pay_fee` | `sats` | `fee`, `gross`, `max_route_delay` |
-| `invoice` | `sats`, `description`? | `invoice`, `payment_hash`, `expires_at` |
+| `invoice` | `sats`, `description`? or `description_hash`? (64 hex characters: the invoice commits to that SHA-256 in its `h` field, so a payment name's invoice commits to its LNURL-pay metadata for payers that check it; one that does not is refused, and the error says whether the server kept it) | `invoice`, `payment_hash`, `expires_at` |
 | `receive_status` | `hash`, `claim`?, `wait`? | `state` (`paid` with `preimage`, `waiting`, `unknown`) |
 | `receive_fee` | `sats` | `fee`, `net` |
 | `offboard`, `offboard_fee` | `address` (Bitcoin), `sats` or `all` | `txid` / `fee` |

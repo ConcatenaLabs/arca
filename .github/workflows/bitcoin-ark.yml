@@ -9,6 +9,7 @@ on:
       - 'bark-wasm/**'
       - 'lib/**'
       - 'contrib/bitcoin-ark-regtest/**'
+      - 'contrib/operator-bundle/patches/**'
       - '.github/workflows/bitcoin-ark.yml'
   pull_request:
     paths:
@@ -17,12 +18,14 @@ on:
       - 'bark-wasm/**'
       - 'lib/**'
       - 'contrib/bitcoin-ark-regtest/**'
+      - 'contrib/operator-bundle/patches/**'
       - '.github/workflows/bitcoin-ark.yml'
   workflow_dispatch:
 
 # The wallet's Bitcoin side against a real Bitcoin ark on regtest
 # (contrib/bitcoin-ark-regtest): Bark's server and client at the release the
-# Arca client bundles, built from Bark's upstream repository, its Lightning
+# Arca client bundles, built from Bark's upstream repository (captaind with the
+# description-hash patch the operator bundle builds it with), its Lightning
 # gateway on upstream Core Lightning with Boltz's hold plugin (the versions
 # Bark tests with), and Bitcoin Core 31, the least captaind runs with. On
 # regtest the client needs nothing of the testnet4 patch the Arca client
@@ -71,7 +74,7 @@ jobs:
             ~/.cargo/git
             ${{ runner.temp }}/target-bark
             ${{ runner.temp }}/target-hold
-          key: bitcoin-ark-${{ env.BARK_COMMIT }}-${{ hashFiles('contrib/operator-bundle/patches/bark-reorg-repair.patch') }}-${{ env.HOLD_COMMIT }}
+          key: bitcoin-ark-${{ env.BARK_COMMIT }}-${{ hashFiles('contrib/operator-bundle/patches/bark-reorg-repair.patch', 'contrib/operator-bundle/patches/captaind-description-hash.patch') }}-${{ env.HOLD_COMMIT }}
 
       - name: Bark (captaind, bark, barkd) and the hold plugin
         env:
@@ -81,8 +84,16 @@ jobs:
           git init -q "$RUNNER_TEMP/bark" && cd "$RUNNER_TEMP/bark"
           git fetch -q --depth 1 https://gitlab.com/ark-bitcoin/bark.git "$BARK_COMMIT" && git checkout -q FETCH_HEAD
           git apply "$GITHUB_WORKSPACE/contrib/operator-bundle/patches/bark-reorg-repair.patch"
+          git apply "$GITHUB_WORKSPACE/contrib/operator-bundle/patches/captaind-description-hash.patch"
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-bark" cargo build --locked -p bark-server --bin captaind \
             -p bark-cli --bin bark --bin barkd
+          # captaind as released, without the patch: the description-hash drive swaps it in to show
+          # what a wallet meets at a server that cannot commit an invoice to a hash.
+          # Both builds write target-bark/debug/captaind, so each is copied out as it is made.
+          cp "$RUNNER_TEMP/target-bark/debug/captaind" "$RUNNER_TEMP/captaind-patched"
+          git worktree add -q --detach "$RUNNER_TEMP/bark-plain" HEAD
+          (cd "$RUNNER_TEMP/bark-plain" && CARGO_TARGET_DIR="$RUNNER_TEMP/target-bark" cargo build --locked -p bark-server --bin captaind)
+          cp "$RUNNER_TEMP/target-bark/debug/captaind" "$RUNNER_TEMP/captaind-plain"
           git init -q "$RUNNER_TEMP/hold" && cd "$RUNNER_TEMP/hold"
           git fetch -q --depth 1 https://github.com/BoltzExchange/hold.git "$HOLD_COMMIT" && git checkout -q FETCH_HEAD
           CARGO_TARGET_DIR="$RUNNER_TEMP/target-hold" cargo build --locked --bin hold
@@ -101,7 +112,7 @@ jobs:
           cat > "$RUNNER_TEMP/ark.sh" <<EOF
           #!/usr/bin/env bash
           export H=$RUNNER_TEMP/h CORE_BIN=$RUNNER_TEMP/core/bin CLN_BIN=$RUNNER_TEMP/cln/usr/bin \
-            HOLD=$RUNNER_TEMP/target-hold/debug/hold CAPTAIND=$RUNNER_TEMP/target-bark/debug/captaind \
+            HOLD=$RUNNER_TEMP/target-hold/debug/hold CAPTAIND=\${CAPTAIND:-$RUNNER_TEMP/captaind-patched} \
             PG_BIN=$(ls -d /usr/lib/postgresql/*/bin | tail -1)
           exec $GITHUB_WORKSPACE/contrib/bitcoin-ark-regtest/regtest.sh "\$@"
           EOF
@@ -133,6 +144,11 @@ jobs:
         run: |
           ARK_SH=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
             contrib/bitcoin-ark-regtest/board-recovery.sh
+
+      - name: A payment name's invoice commits to its metadata, and a payer pays it
+        run: |
+          H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
+            OLD_CAPTAIND=$RUNNER_TEMP/captaind-plain contrib/bitcoin-ark-regtest/description-hash-drive.sh
 
       - name: The harness's logs
         if: failure()

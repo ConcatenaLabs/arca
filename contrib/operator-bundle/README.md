@@ -19,6 +19,7 @@ and run it.
 | `fee-proxy.py` | The Bitcoin node's RPC with fee estimates from the live mempool, for `captaind`, `watchmand` and the Bitcoin gateway |
 | `patches/bark-testnet4.patch` | Adds testnet4 to the networks Bark's client lists, and lets a testnet4 wallet pay its network's invoices |
 | `patches/bark-reorg-repair.patch` | Lets the client's on-chain sync follow the node again after a reorg orphans the wallet's newest checkpoints, which otherwise stops it for good (the repair in `bark/src/onchain/bdk.rs`) |
+| `patches/captaind-description-hash.patch` | Lets a Lightning receive on Bark's server commit its invoice to a description hash (BOLT11 `h`), so a payment name's invoice commits to its LNURL-pay metadata for payers that check it; the installer builds `captaind` from the release's commit with it |
 | `patches/hold-testnet4.patch` | Lets Boltz's [hold-invoice plugin](https://github.com/BoltzExchange/hold) run on testnet4 |
 | `windows/setup-wsl.ps1` | The Windows side: WSL2, the distro, the ports, start at boot |
 
