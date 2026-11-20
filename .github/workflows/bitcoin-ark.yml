@@ -127,6 +127,11 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo build --locked --features native --example regtest_drive
 
+      - name: A payment name's invoice commits to its metadata, and a payer pays it
+        run: |
+          H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
+            contrib/bitcoin-ark-regtest/description-hash-drive.sh
+
       - name: Limits lowered under coins made before
         run: |
           H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh \
@@ -137,11 +142,6 @@ jobs:
         run: |
           ARK_SH=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
             contrib/bitcoin-ark-regtest/board-recovery.sh
-
-      - name: A payment name's invoice commits to its metadata, and a checking payer pays it
-        run: |
-          H=$RUNNER_TEMP/h REGTEST=$RUNNER_TEMP/ark.sh DRIVE=$GITHUB_WORKSPACE/bark-wasm/target/debug/examples/regtest_drive \
-            contrib/bitcoin-ark-regtest/description-hash-drive.sh
 
       - name: The harness's logs
         if: failure()

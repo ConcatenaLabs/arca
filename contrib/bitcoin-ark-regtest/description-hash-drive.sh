@@ -74,14 +74,17 @@ echo "hash and memo: $(echo "$out" | grep -o "give a description.*" | head -1)"
 
 echo "=== the peer pays it, the wallet claims ==="
 before=$(d balance | jq -r .spendable)
-( R peer pay "$inv" > "$H/description-hash-pay.out" 2>&1 ) &
+# The payer is bounded and stopped with the script, so a payment that hangs fails the drive
+# instead of holding it open.
+( timeout 150 "$REGTEST" peer pay "$inv" > "$H/description-hash-pay.out" 2>&1 ) &
 payer=$!
+trap 'kill "$payer" 2>/dev/null || true' EXIT
 got=$(timeout 120 "$DRIVE" "$W" receive_status "{\"hash\":\"$(jq -r .payment_hash <<< "$dec")\",\"claim\":true,\"wait\":true}") || fail "the claim did not finish: $got"
 echo "$got" | jq -c .
+[ "$(jq -r .state <<< "$got")" = paid ] || fail "the wallet did not claim the payment: $got"
 wait "$payer" || fail "the peer's payment failed: $(cat "$H/description-hash-pay.out")"
 jq -c '{status, amount_msat}' < <(json < "$H/description-hash-pay.out")
 [ "$(json < "$H/description-hash-pay.out" | jq -r .status)" = complete ] || fail "the peer's payment is not complete"
-[ "$(jq -r .state <<< "$got")" = paid ] || fail "the wallet did not claim the payment"
 after=$(d balance | jq -r .spendable)
 echo "spendable: $before -> $after"
 [ "$after" -gt "$before" ] || fail "the payment did not reach the wallet"
