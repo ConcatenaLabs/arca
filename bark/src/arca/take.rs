@@ -49,7 +49,7 @@ use super::client::key_proof_digest;
 use super::pay::{leaf_probe, In, Out};
 use super::round::{fee_within, schedule_of, DEFAULT_MAX_FEE_PPM};
 use super::wallet::{sign, Wallet};
-use super::{random32, Error};
+use super::Error;
 
 /// An order as the wallet read it: where it rests, its terms, what it holds,
 /// and the terms as they were handed to the wallet.
@@ -231,7 +231,7 @@ impl Wallet {
 		};
 		let row = self.store.coin(&coin)?.ok_or_else(|| Error::Store(format!("no coin {}", coin)))?;
 		// The leaf wanted, under a fresh key the wallet holds.
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "take")?;
 		let exit_delay: RelativeTime = self.exit_delay();

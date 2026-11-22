@@ -63,8 +63,17 @@ one mnemonic serves both:
 
 - each leaf has a key of its own, `m/6'/account'/c1'/c2'/c3'/c4'`, where
   `c1`…`c4` are the first four 31-bit chunks of `SHA256("Arca/key" ‖
-  owner_nonce)` and the owner nonce is 32 random bytes drawn for that leaf
-  alone. The nonce goes into the leaf's record, so a record names its own key;
+  owner_nonce)` and the owner nonce is drawn for that leaf alone: 16 random
+  bytes `r` and the first 16 bytes of `HMAC-SHA256(scan key, "Arca/nonce-tag"
+  ‖ r)`. The nonce goes into the leaf's record, so a record names its own key,
+  and its tag tells the wallet's leaves from any other's with one HMAC each
+  (see Restoring while the operator is unreachable). Never a counter: a
+  leaf's pair of signatures is rebindable to any output of the same script,
+  asset and amount, so no two leaves of a wallet may share a script, and a
+  counter would repeat after a restore or on a second device;
+- the scan key is `HMAC-SHA256(k, "Arca/scan-key")`, `k` the secret of the
+  key that same derivation gives for the fixed nonce `SHA256("Arca/scan")`. It
+  finds the wallet's leaves and spends none of them;
 - the mailbox key is the key that same derivation gives for the fixed nonce
   `SHA256("Arca/mailbox")`, so any wallet on the kit derives it from the
   mnemonic with the kit's own leaf derivation. It signs only the tagged
@@ -281,6 +290,37 @@ day until the latest such a request could lapse, 27 days on
 (`receive_requests` shows it as `owner: "restored"`); `forget-request
 restored` ends that hold once no request was outstanding. An open swap offer,
 and a board whose registration never reached the server, are not recovered.
+
+### Restoring while the operator is unreachable
+
+Every tree the operator publishes (`/v1/tree`) holds what an exit needs for
+each of its leaves: the owner key and nonce, the operator's nonce, the exit
+delay, the value and, once released, the preimage. A copy of the trees made
+by anyone serves as well as the operator's own, since every tree is rebuilt
+and checked against the round on the chain. So the mnemonic, the operator's
+signed registry entry and the trees restore a wallet with no word from the
+operator:
+
+    arca create --operator-record operator.json --node-url … --mnemonic "…"
+    arca restore-trees ./trees
+
+`create --operator-record FILE` takes an operator's registry entry
+(`{"record", "signature"}`, from the registry or any copy of it), checks the
+operator's signature over it, and pins its operator key, chain and keepers
+without asking the server. `restore-trees DIR` reads every `.json` file of
+`DIR` (each a tree as `/v1/tree` serves it, or a list of them), rebuilds and
+checks each tree, and takes every leaf whose owner nonce carries the wallet's
+tag, as `restore` takes a leaf from the published tree: its record checked
+against the round on the chain, the preimage the tree published, its unroll
+authorisations signed again by the mnemonic. A leaf held already is left as
+it is; `--untagged` also looks, by their keys, at leaves whose nonces carry
+no tag, one key derivation a leaf. `exit` then takes each coin home, the
+operator never asked.
+
+The operator alone knows which coins were given up in a refresh it never
+released, so such a coin also reads live after a restore from the trees. A
+coin received out of round and not yet refreshed into a round is in no tree,
+and is not found this way.
 
 ### What it checks
 

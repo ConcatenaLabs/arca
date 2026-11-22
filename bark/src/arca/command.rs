@@ -27,7 +27,7 @@ use super::{Config, Error, Wallet};
 /// Every command [`run`] takes, with its arguments.
 pub const COMMANDS: &str = "info, address, openamp_key, balance, coins {held?, brief?}, record {leaf_id}, board_quote {asset, amount, fee_asset?}, \
 	board {asset, amount, fee_asset?, shown?}, boards, receive {asset?, amount?, channels?}, forget_request {owner}, send {request, amount?, route?, \
-	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore {at_once?}, restore_history {budget_ms?}, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
+	asset?}, send_quote {request, amount?, route?, asset?}, mailbox, restore {at_once?}, restore_from_trees {trees, untagged?}, restore_history {budget_ms?}, quote {leaves?, max_fee_ppm?, piece?, pieces?}, participate {leaves?, not_before?, max_fee_ppm?, piece?, pieces?, shown}, \
 	participations, settle_quote {asset, value, expiry}, sync {catch_up?, deposits?, budget_ms?}, deposits {budget_ms?}, hand_over_forfeits, schedule, recheck, exit_quote {leaf_id, fee_asset?}, exit {leaf_id, fee_asset?, shown?}, speed_up {txid, fee_asset?, rate?, max_fee?}, \
 	refresh_received {max_fee_ppm?, leaves?}, refresh_needed {idle_seconds?}, withdraw_participation {participation}, refusals, \
 	take_quote {order, amount?, max_fee_ppm?}, take {order, amount?, max_fee_ppm?, shown?}, order_quote {sell, amount, want, rate_num, \
@@ -390,6 +390,11 @@ fn command_of(w: &mut Wallet, command: &str, a: &Value) -> Result<Value, Error> 
 		// them. Otherwise the program runs `deposits` as soon as it returns
 		// (`deposits.owed`), and `sync` steps through the history.
 		"restore" => w.restore_with(a["at_once"].as_bool() == Some(true)),
+		// From published trees alone, the server not asked: `trees`, each as
+		// `/v1/tree` serves it; `untagged` also looks at the leaves whose
+		// nonces carry no tag, by their keys.
+		"restore_from_trees" => w.restore_from_trees(a["trees"].as_array().map(Vec::as_slice).unwrap_or_default(),
+			a["untagged"].as_bool() == Some(true)),
 		// One step of the coins a restore left to be checked after it, or with
 		// `budget_ms` a slice of about that long; `sync` runs a slice too.
 		// `{"left": 0}` once none is left.

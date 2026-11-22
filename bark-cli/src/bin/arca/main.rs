@@ -70,14 +70,21 @@ enum Cmd {
 	#[command(visible_alias = "join")]
 	Create {
 		/// The Arca server's base URL.
-		#[arg(long, required_unless_present = "from_registry", conflicts_with = "from_registry")]
+		#[arg(long, required_unless_present_any = ["from_registry", "operator_record"], conflicts_with_all = ["from_registry", "operator_record"])]
 		server: Option<String>,
 		/// The operator key of an operator the registry lists: the wallet
 		/// reads its record, checks the operator's signature over it, takes
 		/// the server's address from it, and is created only when that server
 		/// shows the record's key, chain and keepers.
-		#[arg(long, requires = "registry")]
+		#[arg(long, requires = "registry", conflicts_with = "operator_record")]
 		from_registry: Option<String>,
+		/// A file holding an operator's registry entry (`{"record",
+		/// "signature"}`, from the registry or any copy of it): the wallet
+		/// checks the operator's signature over it and is created from it
+		/// alone, the server not asked, for a restore while the operator is
+		/// unreachable (`restore-trees`).
+		#[arg(long)]
+		operator_record: Option<PathBuf>,
 		/// The registry's base URL (`https://host/registry`).
 		#[arg(long, env = "ARCA_REGISTRY")]
 		registry: Option<String>,
@@ -339,6 +346,20 @@ enum Cmd {
 		/// with the rest, and makes the watchtowers' deposits in its `sync`.
 		#[arg(long)]
 		at_once: bool,
+	},
+	/// Restores the wallet's leaves from published trees alone, the server
+	/// not asked: every `.json` file of `dir`, each a tree as `/v1/tree`
+	/// serves it (or a list of them), from any copy of them. Each tree is
+	/// rebuilt and checked against the chain; a leaf is the wallet's when
+	/// its owner nonce carries the wallet's tag. Then `exit` takes each coin
+	/// home.
+	RestoreTrees {
+		/// The directory of published trees.
+		dir: PathBuf,
+		/// Also looks, by their keys, at leaves whose nonces carry no tag
+		/// (made before nonces were tagged): one key derivation a leaf.
+		#[arg(long)]
+		untagged: bool,
 	},
 	/// One step of the history a restore left: at most 20 of its coins,
 	/// checked as the restore checks a coin. `sync` runs a slice of about a
@@ -1507,7 +1528,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	if let Cmd::Operators { registry, genesis } = &cli.command {
 		return bark::arca::command::operators(registry, genesis.as_deref());
 	}
-	if let Cmd::Create { server, from_registry, registry, node_url, node_user, node_password_file, node_cookie, mnemonic, mnemonic_file,
+	if let Cmd::Create { server, from_registry, operator_record, registry, node_url, node_user, node_password_file, node_cookie, mnemonic, mnemonic_file,
 		account, exit_delay_units, min_exit_delay_units, max_exit_delay_units, restore_at_once } = cli.command
 	{
 		// `-` reads the standard input itself: a path such as /dev/stdin
@@ -1526,9 +1547,17 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		};
 		// From the registry: the record's signature checked here, the server's
 		// address taken from it, and what the server must show to be pinned.
-		let (server, joined) = match (server, from_registry) {
-			(Some(s), None) => (s, None),
-			(None, Some(key)) => {
+		let offline = operator_record.is_some();
+		let (server, joined) = match (server, from_registry, operator_record) {
+			(None, None, Some(f)) => {
+				let text = std::fs::read_to_string(&f).map_err(|e| bark::arca::Error::Io(format!("{}: {}", f.display(), e)))?;
+				let entry: serde_json::Value = serde_json::from_str(&text)
+					.map_err(|e| bark::arca::Error::Parse(format!("{}: {}", f.display(), e)))?;
+				let (listing, expect) = bark::arca::registry::verified(&entry)?;
+				(entry["record"]["api"].as_str().unwrap_or("").to_string(), Some((expect, listing)))
+			},
+			(Some(s), None, None) => (s, None),
+			(None, Some(key), None) => {
 				let r = bark::arca::registry::RegistryClient::new(registry.as_deref().unwrap_or(""))?;
 				let (record, listing) = r.operator(&key)?;
 				let expect = bark::arca::registry::Expected::of(&record)?;
@@ -1541,6 +1570,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 			cfg.expect = Some(e);
 			l
 		});
+		cfg.offline = offline;
 		cfg.node_user = node_user;
 		cfg.node_password = match node_password_file {
 			Some(f) => Some(std::fs::read_to_string(&f).map_err(|e| bark::arca::Error::Io(format!("{}: {}", f.display(), e)))?
@@ -1573,7 +1603,10 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		}
 		// A mnemonic given may have held coins: they are restored from what
 		// the server serves to the wallet's mailbox key, every record checked.
-		if restoring {
+		if restoring && offline {
+			info["restore"] = json!({"note": "created from the operator's signed record alone, the server not asked: restore-trees takes \
+				the wallet's coins from the trees the operator published"});
+		} else if restoring {
 			info["restore"] = w.restore_with(restore_at_once).unwrap_or_else(|e| json!({"error": {"kind": e.kind(), "message": e.to_string(),
 				"note": "the restore stopped at this error: what it took before it is kept (`arca coins`, `arca participations`), and \
 				`arca restore` takes the rest once the cause is gone"}}));
@@ -1594,7 +1627,7 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 	// spend through the operator, and refuses while no witness succeeds.
 	// `sync` takes the exit steps whose date has come before it asks the
 	// operator anything, and witnesses itself, patiently.
-	if !matches!(cli.command, Cmd::Address | Cmd::OpenampKey | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
+	if !matches!(cli.command, Cmd::Address | Cmd::RestoreTrees { .. } | Cmd::OpenampKey | Cmd::Balance { .. } | Cmd::Coins | Cmd::Record { .. } | Cmd::Refusals | Cmd::Participations
 		| Cmd::Exit { .. } | Cmd::SpeedUp { .. } | Cmd::Schedule | Cmd::Sync { .. } | Cmd::Orders | Cmd::Offboards | Cmd::Order(OrderCmd::Refund { .. }) | Cmd::Claims { .. }
 		| Cmd::Channel(ChannelCmd::List) | Cmd::Channel(ChannelCmd::Exit { .. })
 		| Cmd::Distributions | Cmd::Plans | Cmd::Watchtower(_))
@@ -1707,6 +1740,20 @@ fn run(cli: Cli) -> Result<Value, bark::arca::Error> {
 		Cmd::Lightning(LightningCmd::Receives) => w.lightning_receives(),
 		Cmd::Lightning(LightningCmd::Claim { .. }) => unreachable!("handled above"),
 		Cmd::Restore { at_once } => w.restore_with(at_once),
+		Cmd::RestoreTrees { dir, untagged } => {
+			let mut trees = vec![];
+			let mut files: Vec<PathBuf> = std::fs::read_dir(&dir).map_err(|e| bark::arca::Error::Io(format!("{}: {}", dir.display(), e)))?
+				.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+			files.sort();
+			for f in files {
+				let text = std::fs::read_to_string(&f).map_err(|e| bark::arca::Error::Io(format!("{}: {}", f.display(), e)))?;
+				match serde_json::from_str::<serde_json::Value>(&text).map_err(|e| bark::arca::Error::Parse(format!("{}: {}", f.display(), e)))? {
+					serde_json::Value::Array(l) => trees.extend(l),
+					t => trees.push(t),
+				}
+			}
+			w.restore_from_trees(&trees, untagged)
+		},
 		Cmd::RestoreHistory { budget_ms } => match w.restore_history_within(budget_ms)? {
 			Some(v) => Ok(v),
 			None => Ok(json!({"left": 0})),

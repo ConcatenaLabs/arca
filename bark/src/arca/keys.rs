@@ -4,11 +4,23 @@
 //!
 //! - **Leaf keys**, one per leaf instance: `m/6'/account'/c1'/c2'/c3'/c4'`,
 //!   where `c1` to `c4` are the first four 31-bit chunks, most significant bit
-//!   first, of `SHA256("Arca/key" ‖ owner_nonce)`. The owner nonce is 32
-//!   random bytes the wallet draws for every leaf it asks for, and goes into
+//!   first, of `SHA256("Arca/key" ‖ owner_nonce)`. The owner nonce is drawn
+//!   for every leaf the wallet asks for ([`Keys::owner_nonce`]), and goes into
 //!   the leaf's salt and its record, so a record names its own key and a
 //!   restore needs no index scan. A key never comes from a counter, which a
-//!   restore would repeat.
+//!   restore would repeat: a leaf's pair of signatures is rebindable to any
+//!   output of the same script, asset and amount, so no two leaves of the
+//!   wallet may share a script, whatever the leaf's creator does.
+//! - **Tagged owner nonces.** An owner nonce is 16 random bytes `r` and the
+//!   first 16 bytes of `HMAC-SHA256(scan key, "Arca/nonce-tag" ‖ r)`, so a
+//!   restore that holds only the mnemonic and published trees tells its own
+//!   leaves from every other leaf with one HMAC each ([`Keys::drew`]), and a
+//!   nonce stays as unique as 128 random bits make it. The scan key is
+//!   `HMAC-SHA256(k, "Arca/scan-key")`, `k` the secret of the kit's leaf key
+//!   for the fixed nonce `SHA256("Arca/scan")`: it finds the wallet's leaves
+//!   and spends none of them, so a wallet may hand it to a service that scans
+//!   for it. Without it a tag reads as random bytes, and no leaf names its
+//!   wallet.
 //! - **The mailbox key**: the key the kit's own leaf derivation gives for the
 //!   fixed nonce [`MAILBOX_NONCE`], `SHA256("Arca/mailbox")`, at
 //!   `m/6'/account'/c1'/c2'/c3'/c4'`. Any wallet on the kit derives it from
@@ -51,7 +63,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use elements::bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
-use elements::hashes::{hash160, sha256, Hash};
+use elements::hashes::hmac::{Hmac, HmacEngine};
+use elements::hashes::{hash160, sha256, Hash, HashEngine};
 use elements::secp256k1_zkp::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
 use elements::Script;
 use lwk_signer::SwSigner;
@@ -71,6 +84,43 @@ pub const MAILBOX_TAG: &[u8] = b"Arca/mailbox";
 /// every wallet, so the key follows from the mnemonic and the account alone.
 pub fn mailbox_nonce() -> [u8; 32] {
 	sha256::Hash::hash(MAILBOX_TAG).to_byte_array()
+}
+
+/// The tag whose hash is the nonce of the leaf key the scan key comes from.
+pub const SCAN_TAG: &[u8] = b"Arca/scan";
+
+/// What the scan key is the HMAC of, under that leaf key's secret.
+pub const SCAN_KEY_TAG: &[u8] = b"Arca/scan-key";
+
+/// What begins the message a nonce's tag is the HMAC of.
+pub const NONCE_TAG: &[u8] = b"Arca/nonce-tag";
+
+/// The bytes of an owner nonce that are random; the rest is their tag.
+pub const NONCE_RANDOM: usize = 16;
+
+/// The nonce of the leaf key the scan key comes from: `SHA256("Arca/scan")`.
+pub fn scan_nonce() -> [u8; 32] {
+	sha256::Hash::hash(SCAN_TAG).to_byte_array()
+}
+
+/// The tag of the random bytes `r` of an owner nonce, under `scan_key`: the
+/// first [`NONCE_RANDOM`] bytes of `HMAC-SHA256(scan_key, "Arca/nonce-tag" ‖ r)`.
+pub fn nonce_tag(scan_key: &[u8; 32], r: &[u8]) -> [u8; NONCE_RANDOM] {
+	let mut e = HmacEngine::<sha256::Hash>::new(scan_key);
+	e.input(NONCE_TAG);
+	e.input(r);
+	let mac = Hmac::<sha256::Hash>::from_engine(e).to_byte_array();
+	let mut tag = [0u8; NONCE_RANDOM];
+	tag.copy_from_slice(&mac[..NONCE_RANDOM]);
+	tag
+}
+
+/// Whether `nonce` carries the tag of its own random bytes under `scan_key`:
+/// a nonce the wallet of that scan key drew.
+pub fn tagged(scan_key: &[u8; 32], nonce: &[u8; 32]) -> bool {
+	let tag = nonce_tag(scan_key, &nonce[..NONCE_RANDOM]);
+	// Compared in full, whatever byte differs first: the tag is a MAC.
+	tag.iter().zip(&nonce[NONCE_RANDOM..]).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0
 }
 
 /// The on-chain chains: scripts handed out to be paid, and change.
@@ -122,6 +172,9 @@ pub struct Keys {
 	/// that cost; the branch's key gives a new one in one step.
 	derived: Mutex<HashMap<(u32, u32, u32), Keypair>>,
 	branches: Mutex<HashMap<(u32, u32), Xpriv>>,
+	/// The scan key, derived once ([`Keys::scan_key`]): every owner nonce
+	/// the wallet draws and every leaf a restore looks at needs it.
+	scan: Mutex<Option<[u8; 32]>>,
 }
 
 impl Keys {
@@ -129,7 +182,8 @@ impl Keys {
 	/// coin type `coin_type` (0 on the main chain, 1 elsewhere).
 	pub fn new(mnemonic: &str, account: u32, coin_type: u32) -> Result<Keys, Error> {
 		let signer = SwSigner::new(mnemonic, false).map_err(|e| Error::Keys(e.to_string()))?;
-		Ok(Keys { signer, account, coin_type, secp: Secp256k1::new(), derived: Mutex::default(), branches: Mutex::default() })
+		Ok(Keys { signer, account, coin_type, secp: Secp256k1::new(), derived: Mutex::default(), branches: Mutex::default(),
+			scan: Mutex::default() })
 	}
 
 	fn keypair_at(&self, path: &DerivationPath) -> Result<Keypair, Error> {
@@ -151,6 +205,37 @@ impl Keys {
 	/// The mailbox key: the leaf key of [`mailbox_nonce`].
 	pub fn mailbox(&self) -> Result<Keypair, Error> {
 		self.leaf(&mailbox_nonce())
+	}
+
+	/// The scan key: `HMAC-SHA256(k, "Arca/scan-key")`, `k` the secret of
+	/// the leaf key of [`scan_nonce`]. It tells the wallet's owner nonces
+	/// from any other ([`Keys::drew`]) and signs nothing.
+	pub fn scan_key(&self) -> Result<[u8; 32], Error> {
+		if let Some(k) = *self.scan.lock().expect("the scan key") {
+			return Ok(k);
+		}
+		let secret = self.leaf(&scan_nonce())?.secret_bytes();
+		let mut e = HmacEngine::<sha256::Hash>::new(&secret);
+		e.input(SCAN_KEY_TAG);
+		let k = Hmac::<sha256::Hash>::from_engine(e).to_byte_array();
+		*self.scan.lock().expect("the scan key") = Some(k);
+		Ok(k)
+	}
+
+	/// A fresh owner nonce: [`NONCE_RANDOM`] bytes from the system's source
+	/// and their tag under the scan key ([`nonce_tag`]).
+	pub fn owner_nonce(&self) -> Result<[u8; 32], Error> {
+		let mut nonce = super::random32();
+		let tag = nonce_tag(&self.scan_key()?, &nonce[..NONCE_RANDOM]);
+		nonce[NONCE_RANDOM..].copy_from_slice(&tag);
+		Ok(nonce)
+	}
+
+	/// Whether this wallet drew `nonce` ([`Keys::owner_nonce`]). A nonce
+	/// drawn before nonces were tagged reads as not drawn; its leaf is still
+	/// the wallet's when its owner key is the key the nonce derives.
+	pub fn drew(&self, nonce: &[u8; 32]) -> Result<bool, Error> {
+		Ok(tagged(&self.scan_key()?, nonce))
 	}
 
 	/// The key at `m/purpose'/coin'/0'/branch/index`, derived once
@@ -355,5 +440,51 @@ mod tests {
 		let s = keys.onchain_script(RECEIVE, 0).unwrap();
 		let a = bitcoin::Address::from_str("tb1q6rz28mcfaxtmd6v789l9rrlrusdprr9pqcpvkl").unwrap().assume_checked();
 		assert_eq!(s.as_bytes(), a.script_pubkey().as_bytes());
+	}
+
+	#[test]
+	fn the_scan_key_is_the_hmac_of_the_leaf_key_of_its_nonce() {
+		let keys = Keys::new(MNEMONIC, 0, 1).unwrap();
+		let secret = keys.leaf(&sha256::Hash::hash(b"Arca/scan").to_byte_array()).unwrap().secret_bytes();
+		let mut e = HmacEngine::<sha256::Hash>::new(&secret);
+		e.input(b"Arca/scan-key");
+		assert_eq!(keys.scan_key().unwrap(), Hmac::<sha256::Hash>::from_engine(e).to_byte_array());
+		// Kept, and the same on every call; per account; not the secret itself.
+		assert_eq!(keys.scan_key().unwrap(), keys.scan_key().unwrap());
+		assert_ne!(Keys::new(MNEMONIC, 1, 1).unwrap().scan_key().unwrap(), keys.scan_key().unwrap());
+		assert_ne!(keys.scan_key().unwrap(), secret);
+		// Its nonce is neither the mailbox's nor one a draw gives.
+		assert_ne!(scan_nonce(), mailbox_nonce());
+		assert!(!keys.drew(&scan_nonce()).unwrap());
+	}
+
+	#[test]
+	fn a_drawn_nonce_carries_the_tag_of_its_random_half() {
+		let keys = Keys::new(MNEMONIC, 0, 1).unwrap();
+		let other = Keys::new("legal winner thank year wave sausage worth useful legal winner thank yellow", 0, 1).unwrap();
+		let k = keys.scan_key().unwrap();
+		let mut seen = std::collections::BTreeSet::new();
+		for _ in 0..64 {
+			let n = keys.owner_nonce().unwrap();
+			assert_eq!(n[NONCE_RANDOM..], nonce_tag(&k, &n[..NONCE_RANDOM]));
+			assert!(keys.drew(&n).unwrap(), "the wallet that drew it");
+			assert!(!other.drew(&n).unwrap(), "another mnemonic's wallet");
+			assert!(!Keys::new(MNEMONIC, 1, 1).unwrap().drew(&n).unwrap(), "another account");
+			// Any byte changed, in either half, and the tag fails.
+			for i in [0, NONCE_RANDOM - 1, NONCE_RANDOM, 31] {
+				let mut m = n;
+				m[i] ^= 1;
+				assert!(!keys.drew(&m).unwrap(), "byte {} changed", i);
+			}
+			assert!(seen.insert(n), "a fresh nonce each draw");
+		}
+		// A nonce drawn wholly at random, as before tags, reads as not drawn.
+		assert!(!keys.drew(&[7; 32]).unwrap());
+		// The tag is the HMAC's first half, by its definition.
+		let r = [0xab; NONCE_RANDOM];
+		let mut e = HmacEngine::<sha256::Hash>::new(&k);
+		e.input(b"Arca/nonce-tag");
+		e.input(&r);
+		assert_eq!(nonce_tag(&k, &r)[..], Hmac::<sha256::Hash>::from_engine(e).to_byte_array()[..NONCE_RANDOM]);
 	}
 }

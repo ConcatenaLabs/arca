@@ -105,6 +105,12 @@ pub struct Config {
 	/// server must show before it is pinned (its key, chain and keepers).
 	/// Only [`Wallet::create`] and [`Wallet::create_in`] read it.
 	pub expect: Option<super::registry::Expected>,
+	/// With [`Config::expect`], whether the wallet is created from the
+	/// record alone, the server not asked: for a restore while the operator
+	/// is unreachable, from the trees it published
+	/// ([`Wallet::restore_from_trees`]). The record's signature, checked
+	/// before, is what pins the operator key, its chain and its keepers.
+	pub offline: bool,
 }
 
 /// Whether the operator makes `landing-2` leaves, as its `info` lists its
@@ -165,6 +171,7 @@ impl Config {
 		Config {
 			server: server.into(), node_url: node_url.into(), node_user: None, node_password: None, node_cookie: None,
 			account: 0, exit_delay_units: d, min_exit_delay_units: d, max_exit_delay_units: max, expect: None,
+			offline: false,
 		}
 	}
 }
@@ -884,6 +891,9 @@ impl Wallet {
 		}
 		let genesis = chain.genesis()?;
 		let chain_name = chain.chain_name()?;
+		if cfg.offline {
+			return Self::pins_of_record(cfg, &chain, genesis.to_string(), chain_name);
+		}
 		let server = ServerClient::new(&cfg.server)?;
 		let info = server.info()?;
 		// A server joined from its registry record is the record's operator,
@@ -897,17 +907,39 @@ impl Wallet {
 			return Err(Error::Refused(format!("the server serves the chain of genesis {}; the node is on {}", server_genesis, genesis)));
 		}
 		let operator: XOnlyPublicKey = parse("the operator key", info["operator"].as_str().unwrap_or(""))?;
+		Self::check_delays(cfg)?;
+		let keepers = Self::keepers_of(&info)?.to_string();
+		let tip = chain.tip()?;
+		let anchor_depth = info["finality"]["anchor_depth"].as_u64().map(|d| d.to_string()).unwrap_or_default();
+		Ok(Pins { genesis: genesis.to_string(), chain_name, operator: operator.to_string(), keepers, tip_height: tip.height, tip_hash: tip.hash.to_string(),
+			anchor_depth })
+	}
+
+	/// What [`Wallet::create`] pins with [`Config::offline`]: the operator
+	/// key, its chain and its keepers from the record ([`Config::expect`]),
+	/// the chain and its tip from the node; no anchor depth, which only the
+	/// operator's `info` publishes, so the wallet keeps its own default.
+	fn pins_of_record(cfg: &Config, chain: &ChainSource, genesis: String, chain_name: String) -> Result<Pins, Error> {
+		let e = cfg.expect.as_ref().ok_or_else(|| Error::Refused("a wallet is created offline only from an operator's signed record".into()))?;
+		if e.genesis != genesis {
+			return Err(Error::Refused(format!("the record names the chain of genesis {}; the node is on {}", e.genesis, genesis)));
+		}
+		Self::check_delays(cfg)?;
+		let keepers = Self::keepers_of(&json!({"keepers": {"keys": e.keepers.0, "required": e.keepers.1}}))?.to_string();
+		let tip = chain.tip()?;
+		Ok(Pins { genesis, chain_name, operator: e.operator.to_string(), keepers, tip_height: tip.height, tip_hash: tip.hash.to_string(),
+			anchor_depth: String::new() })
+	}
+
+	/// Refuses exit delays a wallet cannot ask for or accept.
+	fn check_delays(cfg: &Config) -> Result<(), Error> {
 		for (what, d) in [("asked", cfg.exit_delay_units), ("least", cfg.min_exit_delay_units), ("most", cfg.max_exit_delay_units)] {
 			RelativeTime::from_units(d).map_err(|e| Error::Refused(format!("the {} exit delay: {}", what, e)))?;
 		}
 		if !(cfg.min_exit_delay_units..=cfg.max_exit_delay_units).contains(&cfg.exit_delay_units) {
 			return Err(Error::Refused("the exit delay asked for is outside the bounds the wallet accepts".into()));
 		}
-		let keepers = Self::keepers_of(&info)?.to_string();
-		let tip = chain.tip()?;
-		let anchor_depth = info["finality"]["anchor_depth"].as_u64().map(|d| d.to_string()).unwrap_or_default();
-		Ok(Pins { genesis: genesis.to_string(), chain_name, operator: operator.to_string(), keepers, tip_height: tip.height, tip_hash: tip.hash.to_string(),
-			anchor_depth })
+		Ok(())
 	}
 
 	/// Writes the pins in one transaction, the genesis last. A store that holds
@@ -983,7 +1015,7 @@ impl Wallet {
 			exit_delay_units: parse("exit delay", &get("exit_delay_units")?)?,
 			min_exit_delay_units: parse("exit delay", &get("min_exit_delay_units")?)?,
 			max_exit_delay_units: parse("exit delay", &get("max_exit_delay_units")?)?,
-			expect: None,
+			expect: None, offline: false,
 		};
 		let genesis = Chain::new(parse("the genesis hash", &get("genesis")?)?);
 		let operator = parse("the operator key", &get("operator")?)?;
@@ -4633,7 +4665,7 @@ impl Wallet {
 		}
 		let change = self.new_script(CHANGE)?;
 		let operator_nonce = self.server.operator_nonce()?;
-		let owner_nonce = random32();
+		let owner_nonce = self.keys.owner_nonce()?;
 		let key = self.keys.leaf(&owner_nonce)?;
 		let owner = key.x_only_public_key().0;
 		self.store.put_nonce(&owner_nonce, &owner.serialize(), "board")?;
