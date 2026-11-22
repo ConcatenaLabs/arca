@@ -34,7 +34,7 @@ use super::pay::{In, Margins};
 use super::round::{fee_within, refresh_fee, schedule_of, DEFAULT_MAX_FEE_PPM};
 use super::take::offboard_fee;
 use super::wallet::{sign, Wallet};
-use super::{random32, Error};
+use super::Error;
 
 /// The wallet's offboards, each `{offboard, asset, amount, script, at?,
 /// unlock_after?}`, kept beside its participations.
@@ -100,7 +100,7 @@ impl Wallet {
 	/// template the operator makes ([`Wallet::landing_rule`]), since the
 	/// operator makes no other leaf of such an asset; `vtxo-1` otherwise.
 	pub(crate) fn change_wanted(&self, info: &Value, asset: AssetId, value: u64, purpose: &str) -> Result<(Wanted, Value), Error> {
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
 		let landing = self.landing_rule(info, asset)?;

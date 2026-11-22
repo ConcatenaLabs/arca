@@ -953,7 +953,7 @@ impl Wallet {
 		// landing key, landing-2 where the operator makes it; the operator's
 		// statement is checked against the wallet's node.
 		let landing = self.landing_rule(info, asset)?;
-		let nonce = super::random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "refresh")?;
 		// A channel leaf: the operator's side on top of the wallet's, with
@@ -987,7 +987,7 @@ impl Wallet {
 				let (n, o) = if k == 0 {
 					(nonce, owner)
 				} else {
-					let n = super::random32();
+					let n = self.keys.owner_nonce()?;
 					let o = self.keys.leaf_xonly(&n)?;
 					self.store.put_nonce(&n, &o.serialize(), "refresh")?;
 					(n, o)
@@ -1026,7 +1026,7 @@ impl Wallet {
 			}
 			let mut nonces = vec![entry];
 			if let Some(k) = kept {
-				let n2 = super::random32();
+				let n2 = self.keys.owner_nonce()?;
 				let o2 = self.keys.leaf_xonly(&n2)?;
 				self.store.put_nonce(&n2, &o2.serialize(), "refresh")?;
 				let t2 = if self.asks_vtxo2() { Template::Vtxo2 } else { Template::Vtxo1 };

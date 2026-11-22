@@ -305,7 +305,7 @@ impl Wallet {
 	/// maker that gives BTC, whose taker names the hash): what a lock
 	/// request carries of it, its nonce kept for the lock.
 	pub(crate) fn lock_key(&mut self) -> Result<Value, Error> {
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), "lock")?;
 		Ok(json!({"owner": hex(&owner.serialize()), "owner_nonce": hex(&nonce),

@@ -304,7 +304,7 @@ impl Wallet {
 		let at = p.timeout(timeout)?;
 		// A probe of the leaf the payment would make, for the margins: its key
 		// is derived and kept nowhere.
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: p.inv.payment_hash,
 			timeout: MedianTime::from_consensus(at).map_err(|e| Error::Refused(e.to_string()))?, operator_delay: p.operator_delay };
@@ -363,7 +363,7 @@ impl Wallet {
 		let inv = p.inv.clone();
 		let at = p.timeout(timeout)?;
 		let timeout = MedianTime::from_consensus(at).map_err(|e| Error::Refused(e.to_string()))?;
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		let terms = HtlcTerms { direction: HtlcDirection::Send, payment_hash: inv.payment_hash, timeout, operator_delay };
 		let exit_delay = self.exit_delay().max(owner_delay);
@@ -779,7 +779,7 @@ impl Wallet {
 			return Err(Error::Refused(format!("the wallet's exit delay of {} units is not longer than the operator's delay of {}",
 				exit_delay.units(), operator_delay)));
 		}
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let key = self.keys.leaf(&nonce)?;
 		let owner = key.x_only_public_key().0;
 		self.store.put_nonce(&nonce, &owner.serialize(), "lightning-receive")?;
@@ -855,7 +855,7 @@ impl Wallet {
 		let timeout = MedianTime::from_consensus(self.now()?.to_consensus_u32().saturating_add(7 * 86_400))
 			.map_err(|e| Error::Refused(e.to_string()))?;
 		let probe_leaf = |htlc: Option<HtlcTerms>| -> Result<NewLeaf, Error> {
-			let nonce = random32();
+			let nonce = self.keys.owner_nonce()?;
 			Ok(NewLeaf { lock: None, v2: false, owner: self.keys.leaf_xonly(&nonce)?, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(),
 				htlc, landing: None })
 		};

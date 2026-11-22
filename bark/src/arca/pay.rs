@@ -447,7 +447,7 @@ impl Wallet {
 		// A payment to this request comes out of round: the operator's bond
 		// covers it, or the wallet says the operator posts none.
 		let bond_note = self.bond_gate(asset.zip(value))?;
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let key = self.keys.leaf_xonly(&nonce)?;
 		// When it was handed out, by the chain's clock, and when it lapses.
 		let now = self.now()?.to_consensus_u32();
@@ -520,7 +520,7 @@ impl Wallet {
 
 	/// A fresh leaf of the wallet's own, its nonce stored.
 	fn own_leaf(&self, purpose: &str) -> Result<NewLeaf, Error> {
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		self.store.put_nonce(&nonce, &owner.serialize(), purpose)?;
 		Ok(NewLeaf { lock: None, owner, owner_nonce: nonce, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None,
@@ -4103,7 +4103,7 @@ impl Wallet {
 	/// What [`Self::respend_to_self`] of `rows` would leave the wallet, and
 	/// its fee, before anything is signed: `(asset, value, fee)`.
 	pub(crate) fn respend_quote(&mut self, rows: Vec<CoinRow>) -> Result<(AssetId, u64, u64), Error> {
-		let n = random32();
+		let n = self.keys.owner_nonce()?;
 		let leaf = NewLeaf { lock: None, v2: false, owner: self.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: self.exit_delay(), htlc: None, landing: None };
 		let held: u64 = rows.iter().map(|r| r.value).sum();
 		let (asset, _, value) = self.respend_plan(rows, &leaf)?;

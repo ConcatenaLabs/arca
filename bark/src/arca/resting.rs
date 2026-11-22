@@ -379,12 +379,12 @@ impl Wallet {
 		}
 		// The order's leaf key, its four credit keys, and the order key its
 		// landed order pays and refunds to.
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		let mut credit_nonces = [[0u8; 32]; CREDIT_KEYS];
 		let mut credits = [[0u8; 32]; CREDIT_KEYS];
 		for i in 0..CREDIT_KEYS {
-			credit_nonces[i] = random32();
+			credit_nonces[i] = self.keys.owner_nonce()?;
 			credits[i] = self.keys.leaf_xonly(&credit_nonces[i])?.serialize();
 		}
 		let index = self.store.take_index(ORDERS)?;
@@ -677,7 +677,7 @@ impl Wallet {
 		// order out of what it offers rather than show a fill that cannot go.
 		self.resting_exit(&info, &o)?;
 		let leaf = |w: &Wallet| -> Result<NewLeaf, Error> {
-			let n = random32();
+			let n = w.keys.owner_nonce()?;
 			Ok(NewLeaf { lock: None, v2: false, owner: w.keys.leaf_xonly(&n)?, owner_nonce: n, creator_nonce: random32(), exit_delay: w.exit_delay(), htlc: None, landing: None })
 		};
 		let (got, change_leaf) = (leaf(self)?, leaf(self)?);
@@ -1158,12 +1158,12 @@ impl Wallet {
 		let a = policy.terms().asset_a;
 		// The new coin's leaf key and credit keys; its landed order is the
 		// order's own, unchanged.
-		let nonce = random32();
+		let nonce = self.keys.owner_nonce()?;
 		let owner = self.keys.leaf_xonly(&nonce)?;
 		let mut credit_nonces = [[0u8; 32]; CREDIT_KEYS];
 		let mut credits = [[0u8; 32]; CREDIT_KEYS];
 		for i in 0..CREDIT_KEYS {
-			credit_nonces[i] = random32();
+			credit_nonces[i] = self.keys.owner_nonce()?;
 			credits[i] = self.keys.leaf_xonly(&credit_nonces[i])?.serialize();
 		}
 		let terms = OrderLeafTerms { landed: policy.landed, credits };

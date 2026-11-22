@@ -46,6 +46,13 @@
 //! such a request could last ([`super::wallet::REQUEST_HOLDS`] from the
 //! restore), since a payment to one is read only by `sync`.
 //!
+//! While the operator is unreachable, the trees it published restore what
+//! rests on a round ([`Wallet::restore_from_trees`]): each tree is rebuilt
+//! and checked against the chain, and the wallet's leaves are those whose
+//! owner nonces carry its tag ([`super::keys::Keys::drew`]), so no copy of
+//! the trees needs trust and the mnemonic finds its own leaves among
+//! everyone's.
+//!
 //! Two live stores of one mnemonic draw their own owner nonces. A coin paid
 //! to a receive request the other store handed out reaches each one's
 //! mailbox under a nonce it never drew: the mailbox read asks the operator
@@ -102,6 +109,12 @@ pub(crate) const HISTORY_NOTE: &str = "the coins the server serves as given up f
 pub(crate) const DEPOSITS_NOTE: &str = "the coins restored are deposited with the watchtowers right after the restore returns (the \
 	command deposits, which the program runs at once); until they are, a coin rests on this wallet alone to answer anything published \
 	on the chain against it, and every sync makes them first while they are owed";
+
+/// What a restore from published trees says of what it took.
+pub(crate) const OFFLINE_NOTE: &str = "restored from published trees, with no word from the operator: every coin is checked against \
+	the chain, its tree and the mnemonic. The operator alone knows which coins were given up in a refresh it never released, so such \
+	a coin also reads live here. Take every coin home with exit while the operator stays away; once it answers again, restore reads \
+	what it serves";
 
 /// One coin the restore could not take, and why.
 fn missed(leaf: &str, why: impl Into<String>) -> Value {
@@ -521,6 +534,89 @@ impl Wallet {
 		}
 		out["cost_by_step"] = steps.done();
 		Ok(out)
+	}
+
+	/// Restores the wallet's leaves from published trees alone (`trees`,
+	/// each as `/v1/tree` serves it, from any copy of it), the server not
+	/// asked: for a wallet whose operator is unreachable. Every tree is
+	/// rebuilt and checked as a restore through the server checks it
+	/// ([`super::round::rebuild_batch`]); a tree of another chain, or one
+	/// that does not build, is refused and named. A leaf is the wallet's when
+	/// its owner nonce carries the wallet's tag ([`super::keys::Keys::drew`]),
+	/// one HMAC a leaf; with `untagged`, also when its owner key is the key
+	/// its nonce derives, one derivation a leaf, for leaves made before
+	/// nonces were tagged. Each leaf of the wallet's is then taken as
+	/// [`Self::leaf_from_tree`] takes one: against the round on the chain,
+	/// with the preimage the tree published and the unroll authorisations the
+	/// mnemonic signs again. A leaf held already is left as it is.
+	pub fn restore_from_trees(&mut self, trees: &[Value], untagged: bool) -> Result<Value, Error> {
+		let now = self.now()?;
+		let genesis = self.genesis.genesis_hash().to_string();
+		let mut built: BTreeMap<(String, u32), (Value, Batch)> = BTreeMap::new();
+		let (mut restored, mut not_recovered, mut refused, mut looked) = (vec![], vec![], vec![], 0usize);
+		for t in trees {
+			let (Some(txid), Some(vout)) = (t["round_txid"].as_str(), t["batch_vout"].as_u64().and_then(|v| u32::try_from(v).ok())) else {
+				refused.push(json!({"why": "not a published tree: it names no round_txid and batch_vout"}));
+				continue;
+			};
+			let at = format!("{}:{}", txid, vout);
+			if t["genesis_hash"].as_str() != Some(genesis.as_str()) {
+				refused.push(json!({"tree": at, "why": format!("a tree of the chain of genesis {}; this wallet is on {}", t["genesis_hash"], genesis)}));
+				continue;
+			}
+			let batch = match super::round::rebuild_batch(t) {
+				Ok(b) => b,
+				Err(e) => {
+					refused.push(json!({"tree": at, "why": e.to_string()}));
+					continue;
+				},
+			};
+			built.insert((txid.to_string(), vout), (t.clone(), batch));
+			for (i, l) in t["leaves"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
+				looked += 1;
+				let Ok(nonce) = unhex32(l["owner_nonce"].as_str().unwrap_or("")) else { continue };
+				let mine = self.keys.drew(&nonce)?
+					|| (untagged && l["owner"].as_str() == Some(hex(&self.keys.leaf_xonly(&nonce)?.serialize()).as_str()));
+				if !mine {
+					continue;
+				}
+				match self.restore_tree_leaf(&mut built, txid, vout, i, &nonce, now) {
+					Ok(v) => restored.push(v),
+					Err(why) => not_recovered.push(json!({"tree": at, "leaf_index": i, "why": why})),
+				}
+			}
+		}
+		Ok(json!({
+			"trees": trees.len(), "leaves_looked_at": looked, "restored": restored, "not_recovered": not_recovered, "refused": refused,
+			"note": self.spelling.say(OFFLINE_NOTE),
+		}))
+	}
+
+	/// Takes leaf `index` of the published tree of `txid:vout` (in `trees`),
+	/// the wallet's under its key of `nonce`: checked against the chain as a
+	/// held coin is, and kept `live` or `pending` as the chain stands.
+	fn restore_tree_leaf(&mut self, trees: &mut BTreeMap<(String, u32), (Value, Batch)>, txid: &str, vout: u32, index: usize, nonce: &[u8; 32],
+		now: MedianTime) -> Result<Value, String>
+	{
+		let (record, _) = self.leaf_from_tree(trees, txid, vout, index, nonce, None, now)?;
+		let owner = self.keys.leaf_xonly(nonce).map_err(|e| e.to_string())?;
+		let a = self.checked_as_held(&record, &owner, nonce, now)?;
+		let id = a.valid.id.to_string();
+		let out = |state: &str| json!({"leaf_id": id, "asset": a.valid.asset.to_string(), "value": a.valid.value, "state": state,
+			"batch": format!("{}:{}", txid, vout), "leaf_index": index});
+		if let Some(c) = self.store.coin(&id).map_err(|e| e.to_string())? {
+			return Ok(out(&c.state));
+		}
+		let (state, note) = if a.all_final() { ("live", String::new()) } else { ("pending", format!("waiting: {}", a.waiting())) };
+		let row = self.row(&record, &a, state, &note).map_err(|e| e.to_string())?;
+		self.store.atomically(|s| {
+			if s.nonce(nonce)?.is_none() {
+				s.put_nonce(nonce, &owner.serialize(), "restored")?;
+			}
+			s.put_coin(&row)?;
+			s.use_nonce(nonce, &id)
+		}).map_err(|e| e.to_string())?;
+		Ok(out(state))
 	}
 
 	/// The keeper set the wallet pinned from `info` (when it was created) is

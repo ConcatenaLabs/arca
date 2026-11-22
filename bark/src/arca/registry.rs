@@ -161,6 +161,16 @@ impl RegistryClient {
 	}
 }
 
+/// An entry of the registry (`{"record", "signature"}`), from the registry
+/// or from any copy of it: its signature checked, what a wallet shows of
+/// it, and what it pins. The copy needs no trust, since only the operator's
+/// signature makes it verify; a wallet created from it while the operator
+/// is unreachable pins its key, chain and keepers ([`super::Config::offline`]).
+pub fn verified(entry: &Value) -> Result<(Value, Expected), Error> {
+	let shown = listing(entry)?;
+	Ok((shown, Expected::of(&entry["record"])?))
+}
+
 /// One entry of the registry's list, its signature checked: what a wallet
 /// shows of it.
 fn listing(e: &Value) -> Result<Value, Error> {

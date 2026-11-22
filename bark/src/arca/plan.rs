@@ -57,7 +57,7 @@ use super::keys::{p2wpkh, RECEIVE};
 use super::round::{fee_within, LeafTerms, NewRecord, FREE_WINDOW};
 use super::store::CoinRow;
 use super::wallet::{amount, sign, Wallet};
-use super::{random32, Error, DEFAULT_MAX_FEE_PPM};
+use super::{Error, DEFAULT_MAX_FEE_PPM};
 
 /// The tag of the hash a step's preimage is: `SHA256(T ‖ secret(A) ‖ nonce)`.
 pub const PREIMAGE_TAG: &[u8] = b"Arca/plan-preimage";
@@ -370,7 +370,7 @@ impl Wallet {
 		let rows = self.plan_coins(coins)?;
 		let mut out = vec![];
 		for c in rows {
-			let nonces: Vec<[u8; 32]> = (0..steps).map(|_| random32()).collect();
+			let nonces: Vec<[u8; 32]> = (0..steps).map(|_| self.keys.owner_nonce()).collect::<Result<_, _>>()?;
 			let q = self.quote_plan(&c, &nonces)?;
 			out.push(self.quote_json(&c, &q, steps, max_fee_ppm)?);
 		}
@@ -433,7 +433,7 @@ impl Wallet {
 		};
 		let key = self.coin_key(&c.owner_nonce)?;
 		let mailbox = self.keys.mailbox()?;
-		let nonces: Vec<[u8; 32]> = (0..steps).map(|_| random32()).collect();
+		let nonces: Vec<[u8; 32]> = (0..steps).map(|_| self.keys.owner_nonce()).collect::<Result<_, _>>()?;
 		let keys: Vec<elements::secp256k1_zkp::Keypair> = nonces.iter().map(|n| self.keys.leaf(n)).collect::<Result<_, _>>()?;
 		let q = self.quote_plan(c, &nonces)?;
 		let shown = self.quote_json(c, &q, steps, max_fee_ppm)?;
